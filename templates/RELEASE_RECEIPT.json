@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "status": "draft",
+  "source": {
+    "repository": "",
+    "base_branch": "",
+    "commit": "",
+    "pull_request_url": "",
+    "merge_commit": ""
+  },
+  "artifact": {
+    "kind": "",
+    "version": "",
+    "build": "",
+    "workflow_url": "",
+    "archive_sha256": ""
+  },
+  "verification": {
+    "required_gates": [],
+    "external_state": "pending_external_evidence",
+    "smoke_result": "not_run",
+    "observed_at_utc": ""
+  },
+  "approvals": {
+    "release_authorized": false,
+    "authorized_by": "",
+    "authorized_at_utc": ""
+  }
+}
