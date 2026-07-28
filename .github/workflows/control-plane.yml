@@ -1,0 +1,52 @@
+name: Control Plane
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: control-plane-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run local control-plane gates
+        shell: bash
+        run: |
+          bash tests/run.sh
+          scripts/control-plane policy-check --policy .codex/project-policy.toml
+          scripts/control-plane doctor
+
+  macos-smoke:
+    name: macos-smoke
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run smoke verification
+        shell: bash
+        run: |
+          bash tests/run.sh
+          scripts/control-plane policy-check --policy .codex/project-policy.toml
