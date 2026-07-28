@@ -172,7 +172,7 @@ Definition of Done:
 
 ```text
 framed → planned → ready → implementing → verifying
-→ review_ready → pushed → pr_draft → pr_ready → merged
+→ review_ready → committed → pushed → pr_draft → pr_ready → merged
 → base_verified → release_pending → released → observed → closed
 ```
 

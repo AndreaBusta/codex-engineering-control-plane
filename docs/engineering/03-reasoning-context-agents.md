@@ -15,6 +15,19 @@ El esfuerzo se recomienda al iniciar una tarea o agente. No se afirmará que se
 ha cambiado el razonamiento de una ejecución ya iniciada si Codex no ofrece ese
 control.
 
+## Modo de interacción
+
+Razonamiento y modo son decisiones distintas. `high` no implica `/plan`, y una
+tarea larga no necesita `xhigh` en cada paso.
+
+- `/plan`: descubrir, comparar opciones y fijar un enfoque antes de editar;
+- `/goal`: mantener un resultado claro a través de muchos pasos;
+- `/plan` seguido de `/goal`: aclarar primero y ejecutar después;
+- modo actual: tareas acotadas.
+
+El router debe avisar la recomendación y su motivo, nunca cambiarla por el
+usuario. Goal mode no concede nuevos permisos.
+
 ## Elegir esfuerzo sin que el usuario clasifique
 
 Evaluar:

@@ -10,4 +10,10 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q control_plane tests
 bash -n scripts/control-plane tests/run.sh
 scripts/control-plane policy-check --policy .codex/project-policy.toml --json >/dev/null
+scripts/control-plane registry-check \
+  --registry .codex/resource-registry.toml \
+  --policy .codex/project-policy.toml \
+  --json >/dev/null
+scripts/control-plane inventory --json >/dev/null
+scripts/control-plane doctor --json >/dev/null
 git diff --check

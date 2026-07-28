@@ -18,11 +18,13 @@ todavía no existe.
 ## Nivel 1 — Audit local
 
 - añadir policy;
+- añadir registry y lock;
 - ejecutar `policy-check`;
+- ejecutar `registry-check`, `inventory` y `route --mode audit`;
 - usar preflight read/write;
 - aplicar plantillas;
 - medir falsos positivos;
-- mantener hooks desactivados.
+- mantener hooks en audit y `pending_hook_trust` hasta revisión humana.
 
 Un fallo produce diagnóstico, no una mutación automática.
 
@@ -67,13 +69,17 @@ La protección remota es autoritativa para integración.
 
 ## Migración de un proyecto
 
-1. copiar solo policy, CLI y runbooks necesarios;
+1. ejecutar `adopt plan` sin mutar el destino;
 2. detectar rama base y remote;
-3. sustituir gates genéricos por comandos reales;
-4. ejecutar tests en modo audit;
-5. corregir falsos positivos;
-6. abrir PR;
-7. activar enforcement después.
+3. revisar el plan target-specific: policy, registry, `AGENTS.md`, hooks,
+   rama base, remote y digests finales;
+4. guardar el JSON aprobado y ejecutar `adopt apply --plan ...`;
+5. ejecutar `adopt verify`;
+6. ejecutar corpus en modo audit;
+7. revisar hooks con `/hooks`;
+8. corregir falsos positivos;
+9. abrir PR;
+10. activar soft-enforce y enforcement después de sus umbrales.
 
 No copiar una policy `main` si el proyecto usa `develop`. No inventar scheme,
 workspace o test command.
@@ -150,13 +156,17 @@ Subir de nivel solo si:
 
 ## Estado actual de este repositorio
 
-Nivel 1 local. Faltan:
+Nivel 1 audit v2:
 
-- commit inicial;
-- remote;
-- CI;
-- Ruleset;
-- hooks;
-- integración con proveedor.
+- v1 integrada en `origin/main`;
+- remote y CI Ubuntu operativos;
+- policy, registry, lock, router, lifecycle, leases, adopción transaccional y
+  upgrade versionado implementados en la candidata;
+- hooks audit creados pero `pending_hook_trust`;
+- macOS manual pendiente antes de confiar hooks;
+- Ruleset no disponible para este repositorio privado con el plan actual;
+- GitHub remoto y TestFlight siguen `pending_external_evidence` cuando una
+  tarea concreta los requiera;
+- no se ha instalado el sistema en otros repositorios.
 
-Estas carencias son visibles y no se interpretan como fallo del gate local.
+Estas limitaciones son estados explícitos, no permisos implícitos.

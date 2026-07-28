@@ -1,0 +1,54 @@
+{
+  "description": "Codex Engineering Control Plane v2 audit hooks; review exact hashes with /hooks before trusting.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "timeout": 3,
+            "additionalContextLimit": 4096
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "timeout": 3,
+            "additionalContextLimit": 4096
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "timeout": 3,
+            "additionalContextLimit": 4096
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK-EXAMPLE-001",
+  "objective": "Implement one coherent, verified local change.",
+  "intent": "implement",
+  "phase": "implement",
+  "requested_outcome": "local_change",
+  "goals": [
+    {
+      "id": "goal-primary",
+      "summary": "Produce the requested behavior.",
+      "domains": [
+        "project"
+      ],
+      "depends_on": []
+    }
+  ],
+  "domains": [
+    "project"
+  ],
+  "signals": [
+    "multi_file"
+  ],
+  "scope_paths": [
+    "src/",
+    "tests/"
+  ],
+  "risk": {
+    "uncertainty": 2,
+    "blast_radius": 1,
+    "irreversibility": 1,
+    "verification_complexity": 2
+  },
+  "effects": [
+    {
+      "name": "local_read",
+      "source": "model_inference"
+    },
+    {
+      "name": "local_write",
+      "source": "user_explicit"
+    }
+  ],
+  "explicit_resources": [],
+  "excluded_resources": []
+}

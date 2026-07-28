@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Mapping
 import subprocess
 
+from control_plane.repository import git_environment
+
 
 @dataclass(frozen=True)
 class GateError:
@@ -56,6 +58,7 @@ def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
             check=False,
             capture_output=True,
             text=True,
+            env=git_environment(),
         )
     except OSError:
         return subprocess.CompletedProcess(
