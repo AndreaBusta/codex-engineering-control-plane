@@ -306,7 +306,8 @@ python3 -m control_plane.cli policy-check --policy .codex/project-policy.toml --
 python3 -m control_plane.cli doctor --json
 ```
 
-Resultado final: `58` tests, `0` fallos; policy válida; doctor local válido.
+Resultado final actual: `63` tests, `0` fallos; policy válida; doctor local
+válido.
 
 - [x] **Step 2: Inspeccionar seguridad y diff**
 
@@ -316,13 +317,13 @@ git diff --check
 git status --short --branch
 ```
 
-Resultado final: ningún patrón de asignación de secreto detectado, comprobación
-de whitespace satisfactoria y estado Git identificado como rama huérfana
-`codex/control-plane-v1` con todos los artefactos aún sin commit.
+En el checkpoint local original no se detectaron secretos ni errores de
+whitespace; el repositorio seguía huérfano y sin remote. Esa limitación fue
+resuelta posteriormente en el hito remoto autorizado.
 
 - [x] **Step 3: Entregar límites honestos**
 
-Informar expresamente:
+En la entrega local original se informó expresamente:
 
 - dependencias: no instaladas;
 - secretos: no leídos ni modificados;
@@ -331,6 +332,20 @@ Informar expresamente:
 - commit/push/PR/merge/release: no ejecutados;
 - siguiente autorización: commit inicial y conexión remota.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
-No ejecutar en esta entrega. Requiere una autorización posterior y explícita.
+No se ejecutó en la entrega original. Tras autorización posterior se crearon:
+
+- `f5018e3` — baseline vacío de `main`;
+- `0e8fd05` — primera versión completa de la rama.
+
+## Task 10: Hito remoto autorizado
+
+- [x] Crear repositorio privado.
+- [x] Subir `main` antes que la feature.
+- [x] Subir `codex/control-plane-v1`.
+- [x] Abrir Draft PR #1 contra `main`.
+- [x] Ejecutar y verificar el check remoto `verify`.
+- [x] Limitar merges a squash y activar borrado automático de rama.
+- [ ] Activar Ruleset: bloqueado por el plan de GitHub para repositorios privados.
+- [ ] Fusionar: fuera de alcance mientras el PR permanezca Draft.

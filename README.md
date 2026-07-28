@@ -13,9 +13,25 @@ GitHub o TestFlight. Separa:
 
 ## Estado de esta entrega
 
-La v1 contiene policy, CLI, tests herméticos, runbooks y plantillas. Este
-repositorio todavía no tiene commit inicial ni remote; por tanto, no puede
-demostrar integración remota ni crear un worktree basado en un commit real.
+La v1 contiene policy, CLI, tests herméticos, runbooks, plantillas y CI. Está
+publicada en el repositorio privado
+[`AndreaBusta/codex-engineering-control-plane`](https://github.com/AndreaBusta/codex-engineering-control-plane).
+
+Estado remoto:
+
+- `main` contiene únicamente el baseline inicial;
+- `codex/control-plane-v1` contiene el sistema;
+- el [Draft PR #1](https://github.com/AndreaBusta/codex-engineering-control-plane/pull/1)
+  está abierto contra `main`;
+- el check remoto `verify` ha pasado;
+- macOS se ejecuta solo manualmente para limitar consumo;
+- el PR todavía no se ha fusionado.
+
+GitHub ha rechazado Rulesets y protección clásica de rama para este repositorio
+privado con el plan actual. Se permite únicamente squash merge y se borrará la
+rama remota después de una futura integración. Hasta disponer de protección
+remota, el preflight, el Draft PR y CI reducen riesgo, pero no impiden por sí
+solos un push directo realizado fuera del proceso.
 
 ## Inicio rápido
 
@@ -26,7 +42,7 @@ scripts/control-plane preflight --mode read --offline
 bash tests/run.sh
 ```
 
-Cuando el repositorio tenga remote y referencias actualizadas:
+Con remote y referencias actualizadas:
 
 ```bash
 scripts/control-plane preflight --mode write --refresh
