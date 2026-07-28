@@ -35,4 +35,4 @@ required = ["relevant_tests", "diff_review", "pull_request"]
 required = ["written_plan", "relevant_tests", "independent_review", "pull_request"]
 
 [gates.T3]
-required = ["written_plan", "security_review", "rollback_plan", "independent_review", "release_proof"]
+required = ["written_plan", "security_review", "rollback_plan", "independent_review"]

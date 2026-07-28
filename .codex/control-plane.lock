@@ -1,0 +1,18 @@
+schema_version = 1
+product_version = "2.0.0"
+policy_schema = 1
+registry_schema = 1
+task_schema = 1
+route_schema = 1
+receipt_schema = 1
+hook_mode = "audit"
+hook_trust = "pending_hook_trust"
+runtime_package = "control_plane"
+
+[digests]
+project_policy = "sha256:84ac53ebd751c92be82c8d7ebafa7af15d22ca0ed19f773b27ef0f8496a0f4c3"
+resource_registry = "sha256:90c1a4fe84fe7442a40a8a7012870061c850d8b298c836a152201a7d6fd55731"
+hooks = "sha256:a890b88ead151408ae682a6a4454990be590080abb6baf5e93c8c36d5a532db0"
+hook_entrypoint = "sha256:5f945e735fa342f23c87b8cc4a42d966ebf0db68bc10bcc912437b2c4f528116"
+entrypoint = "sha256:789aef09d80eca63a44bae18fd26be4935f252c2e089f9218f19ee1e1f727e41"
+runtime = "sha256:6b8e572de7ad8c48e30527b0da3b3f88457ac19f8af0ed6aed78e1b62558ba7a"

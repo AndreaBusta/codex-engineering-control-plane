@@ -3,6 +3,10 @@
 Control plane local para convertir un objetivo expresado en lenguaje natural en
 un flujo de ingeniería proporcional, verificable y recuperable.
 
+Es multidominio: detecta perfiles iOS, Android, PWA/web, SaaS/backend, flujos de
+texto con IA, híbridos y genéricos. Los perfiles cambian los checks técnicos,
+no rebajan los gates profesionales comunes.
+
 No intenta reemplazar el juicio de Codex ni fingir que un script local controla
 GitHub o TestFlight. Separa:
 
@@ -13,19 +17,16 @@ GitHub o TestFlight. Separa:
 
 ## Estado de esta entrega
 
-La v1 contiene policy, CLI, tests herméticos, runbooks, plantillas y CI. Está
-publicada en el repositorio privado
+La v1 fue fusionada mediante PR #1. La v2 parte del squash commit
+`5476fa7d6a40773ef478f9c090154b78195a28af` demostrado en `origin/main` y
+añade router, registry, inventory, lifecycle, leases, receipts, hooks audit,
+adopción reversible y assurance. Está versionada en el repositorio privado
 [`AndreaBusta/codex-engineering-control-plane`](https://github.com/AndreaBusta/codex-engineering-control-plane).
 
-Estado remoto:
-
-- `main` contiene únicamente el baseline inicial;
-- `codex/control-plane-v1` contiene el sistema;
-- el [Draft PR #1](https://github.com/AndreaBusta/codex-engineering-control-plane/pull/1)
-  está abierto contra `main`;
-- el check remoto `verify` ha pasado;
-- macOS se ejecuta solo manualmente para limitar consumo;
-- el PR todavía no se ha fusionado.
+La candidata v2 se desarrolla en `codex/resource-router-v2`. Un cambio local o
+un PR abierto no se describe como integrado hasta demostrar el merge remoto.
+Los hooks permanecen `pending_hook_trust` y macOS se ejecuta manualmente antes
+de confiar sus hashes.
 
 GitHub ha rechazado Rulesets y protección clásica de rama para este repositorio
 privado con el plan actual. Se permite únicamente squash merge y se borrará la
@@ -37,6 +38,10 @@ solos un push directo realizado fuera del proceso.
 
 ```bash
 scripts/control-plane policy-check --policy .codex/project-policy.toml
+scripts/control-plane registry-check \
+  --registry .codex/resource-registry.toml \
+  --policy .codex/project-policy.toml
+scripts/control-plane inventory --json
 scripts/control-plane doctor
 scripts/control-plane preflight --mode read --offline
 bash tests/run.sh
@@ -82,6 +87,26 @@ scripts/control-plane preflight --mode release --refresh
 Los modos `write` y `release` devuelven exit code 1 si el gate falla. El modo
 `read` conserva la capacidad de investigar un estado dirty o detached.
 
+### Seleccionar recursos
+
+```bash
+scripts/control-plane route \
+  --task templates/TASK_ENVELOPE.json \
+  --mode audit \
+  --json
+```
+
+El router selecciona; no ejecuta ni autoriza. Consulta
+[Enrutamiento automático](docs/engineering/10-resource-routing.md).
+
+### Lifecycle y adopción
+
+```bash
+scripts/control-plane task status --task-id TASK-EXAMPLE-001
+scripts/control-plane adopt plan --target /ruta/al/repositorio
+scripts/control-plane upgrade plan --target /ruta/al/repositorio
+```
+
 ## Dónde leer
 
 - [Diseño](docs/superpowers/specs/2026-07-28-codex-engineering-control-plane-design.md)
@@ -94,6 +119,10 @@ Los modos `write` y `release` devuelven exit code 1 si el gate falla. El modo
 - [Adopción](docs/engineering/07-adoption.md)
 - [Configuración global de Codex](docs/engineering/08-global-codex-configuration.md)
 - [Auditoría, DAFO y riesgos](docs/engineering/09-audit-dafo-and-risk-register.md)
+- [Router y contratos](docs/engineering/10-resource-routing.md)
+- [Lifecycle, hooks y adopción](docs/engineering/11-lifecycle-hooks-adoption.md)
+- [Multidominio y recomendación de `/plan` o `/goal`](docs/engineering/12-multidominio-y-modos.md)
+- [Threat model](SECURITY.md)
 
 ## Límites
 
@@ -104,4 +133,5 @@ El control plane no:
 - hace commit, push, PR, merge o release por sí solo;
 - sustituye Rulesets o checks obligatorios;
 - prueba el estado de TestFlight sin consultar Apple;
-- calcula tokens exactos sin telemetría de plataforma.
+- calcula tokens exactos sin telemetría de plataforma;
+- trata un hook o plugin como frontera completa de seguridad.

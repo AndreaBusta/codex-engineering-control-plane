@@ -1,0 +1,405 @@
+schema_version = 1
+registry_id = "codex-engineering-control-plane"
+
+[router]
+default_mode = "audit"
+external_effect_default = "deny"
+max_context_output_bytes = 4096
+
+[budgets.T0]
+max_recommended = 0
+max_agents = 0
+max_context_units = 1
+
+[budgets.T1]
+max_recommended = 1
+max_agents = 0
+max_context_units = 4
+
+[budgets.T2]
+max_recommended = 2
+max_agents = 1
+max_context_units = 8
+
+[budgets.T3]
+max_recommended = 3
+max_agents = 2
+max_context_units = 12
+
+[[resources]]
+id = "instruction.project-agents"
+kind = "instruction"
+provider = "codex-host"
+locator = "repo://AGENTS.md"
+capabilities = ["instructions.project"]
+scope = "project"
+authority = "project"
+trust = "trusted_project"
+selection = "required"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "native"
+context_class = "tiny"
+canonical = true
+priority = 1000
+requires = []
+conflicts = []
+supersedes = []
+aliases = []
+output_contract = "instructions"
+
+[[resources]]
+id = "skill.verified-workflow"
+kind = "skill"
+provider = "codex-skill"
+locator = "user-skill://verified-workflow"
+capabilities = ["workflow.verified"]
+scope = "global"
+authority = "global"
+trust = "trusted_global"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "progressive"
+context_class = "small"
+canonical = true
+priority = 900
+requires = []
+conflicts = []
+supersedes = []
+aliases = []
+output_contract = "verified-workflow-v1"
+
+[[resources]]
+id = "document.operating-model"
+kind = "document"
+provider = "repository"
+locator = "repo://docs/engineering/01-operating-model.md"
+capabilities = ["documentation.operating-model"]
+scope = "project"
+authority = "project"
+trust = "trusted_project"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "progressive"
+context_class = "small"
+canonical = true
+priority = 500
+requires = []
+conflicts = []
+supersedes = []
+aliases = []
+output_contract = "markdown"
+
+[[resources]]
+id = "mcp.github-pr-read"
+kind = "mcp_tool"
+provider = "github"
+locator = "mcp://github/get-pull-request"
+capabilities = ["git.remote-proof"]
+scope = "plugin"
+authority = "global"
+trust = "trusted_global"
+selection = "available"
+effects = ["network_read"]
+egress = "metadata"
+data_classes = ["repository_metadata"]
+approval = "task"
+load_strategy = "tool"
+context_class = "small"
+canonical = true
+priority = 600
+requires = []
+conflicts = []
+supersedes = []
+aliases = []
+output_contract = "github-pr-snapshot-v1"
+
+[[resources]]
+id = "mcp.release-provider-evidence"
+kind = "mcp_tool"
+provider = "release-provider"
+locator = "mcp://release/provider-evidence"
+capabilities = ["release.provenance"]
+scope = "plugin"
+authority = "global"
+trust = "unverified_external"
+selection = "available"
+effects = ["network_read"]
+egress = "metadata"
+data_classes = ["repository_metadata"]
+approval = "task"
+load_strategy = "tool"
+context_class = "small"
+canonical = true
+priority = 650
+requires = []
+conflicts = []
+supersedes = []
+aliases = []
+output_contract = "release-provider-snapshot-v1"
+
+[[resources]]
+id = "gate.targeted-validation"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/targeted-validation"
+capabilities = ["gate.targeted_validation"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["targeted_validation"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.diff-review"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/diff-review"
+capabilities = ["gate.diff_review"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["diff_review"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.relevant-tests"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/relevant-tests"
+capabilities = ["gate.relevant_tests"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["relevant_tests"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.written-plan"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/written-plan"
+capabilities = ["gate.written_plan"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["written_plan"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.independent-review"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/independent-review"
+capabilities = ["gate.independent_review"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["independent_review"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.pull-request"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/pull-request"
+capabilities = ["gate.pull_request"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["pull_request"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.security-review"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/security-review"
+capabilities = ["gate.security_review"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["security_review"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.rollback-plan"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/rollback-plan"
+capabilities = ["gate.rollback_plan"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["rollback_plan"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.release-proof"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/release-proof"
+capabilities = ["gate.release_proof"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["release_proof"]
+output_contract = "gate-result-v1"
+
+[[routes]]
+id = "structured-engineering"
+priority = 500
+tiers = ["T2", "T3"]
+phases = ["research", "plan", "implement", "verify", "review", "integrate", "release", "observe", "operate"]
+intents = ["audit", "plan", "diagnose", "implement", "review", "integrate", "release", "operate"]
+domains_any = []
+signals_any = []
+signals_all = []
+effects_any = []
+required_capabilities = ["workflow.verified"]
+recommended_resources = ["document.operating-model"]
+forbidden_resources = []
+
+[[routes]]
+id = "remote-integration-proof"
+priority = 600
+tiers = ["T1", "T2", "T3"]
+phases = ["integrate"]
+intents = ["integrate"]
+domains_any = []
+signals_any = []
+signals_all = []
+effects_any = ["remote_write"]
+required_capabilities = ["git.remote-proof"]
+recommended_resources = []
+forbidden_resources = []
+
+[[routes]]
+id = "release-provenance"
+priority = 900
+tiers = ["T3"]
+phases = ["release"]
+intents = ["release"]
+domains_any = []
+signals_any = []
+signals_all = []
+effects_any = []
+required_capabilities = ["release.provenance"]
+recommended_resources = []
+forbidden_resources = []

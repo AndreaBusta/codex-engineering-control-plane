@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from control_plane.policy import load_policy, validate_policy
@@ -13,16 +16,45 @@ ROOT = Path(__file__).parents[1]
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def test_repository_discovery_ignores_git_environment_redirection(self) -> None:
+        from control_plane.repository import discover_repository, git_environment
+
+        with tempfile.TemporaryDirectory() as temporary:
+            outer = Path(temporary)
+            actual = outer / "actual"
+            redirect = outer / "redirect"
+            for repository in (actual, redirect):
+                subprocess.run(
+                    ["git", "init", "-q", "-b", "main", str(repository)],
+                    check=True,
+                    env=git_environment(),
+                )
+            with patch.dict(
+                os.environ,
+                {
+                    "GIT_DIR": str(redirect / ".git"),
+                    "GIT_WORK_TREE": str(redirect),
+                },
+            ):
+                self.assertEqual(discover_repository(actual), actual.resolve())
+
     def test_required_artifacts_exist(self) -> None:
         required = (
             ".codex/project-policy.toml",
+            ".codex/resource-registry.toml",
+            ".codex/control-plane.lock",
+            ".codex/hooks.json",
+            ".codex/hooks/control_plane_hook.py",
             ".github/PULL_REQUEST_TEMPLATE.md",
             ".github/workflows/control-plane.yml",
             ".gitignore",
             "AGENTS.md",
             "README.md",
+            "SECURITY.md",
             "docs/adr/README.md",
             "docs/adr/TEMPLATE.md",
+            "docs/adr/0001-router-hibrido-y-resolver-puro.md",
+            "docs/adr/0002-distribucion-hooks-leases-y-enforcement.md",
             "docs/engineering/01-operating-model.md",
             "docs/engineering/02-git-pr-merge.md",
             "docs/engineering/03-reasoning-context-agents.md",
@@ -32,10 +64,21 @@ class RepositoryContractTests(unittest.TestCase):
             "docs/engineering/07-adoption.md",
             "docs/engineering/08-global-codex-configuration.md",
             "docs/engineering/09-audit-dafo-and-risk-register.md",
+            "docs/engineering/10-resource-routing.md",
+            "docs/engineering/11-lifecycle-hooks-adoption.md",
+            "docs/engineering/12-multidominio-y-modos.md",
+            "docs/profiles/generic.md",
+            "docs/profiles/ios.md",
+            "docs/profiles/android.md",
+            "docs/profiles/web-pwa.md",
+            "docs/profiles/saas-backend.md",
+            "docs/profiles/ai-text-pipeline.md",
             "scripts/control-plane",
             "templates/HANDOFF.md",
             "templates/RELEASE_RECEIPT.json",
             "templates/TASK.md",
+            "templates/TASK_ENVELOPE.json",
+            "templates/RESOURCE_USE_RECEIPT.json",
             "tests/run.sh",
         )
 
