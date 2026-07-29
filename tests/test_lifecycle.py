@@ -150,6 +150,69 @@ class LifecycleTests(unittest.TestCase):
         )
         return context
 
+    def _active_verification_fixture(
+        self, *, task_id: str, profile: str
+    ):
+        from control_plane.lifecycle import (
+            TaskLease,
+            TaskStore,
+            _atomic_json,
+        )
+
+        repository, _, common_dir, _ = self._two_worktree_repository(
+            task_id.lower()
+        )
+        session_id = f"session-{task_id.lower()}"
+        store = TaskStore(common_dir, runtime_digest=self.digest)
+        store.start(
+            task_id,
+            outcome="local_change",
+            branch="main",
+            task_digest=self.digest,
+            decision_digest=self.digest,
+        )
+        for target, evidence in (
+            ("planned", None),
+            ("ready", {"preflight_ok": True}),
+            ("implementing", None),
+            ("verifying", {"implementation_complete": True}),
+        ):
+            state = store.transition(
+                task_id,
+                target,
+                evidence=evidence,
+                current_branch="main",
+            )
+        lease = TaskLease.acquire(
+            common_dir,
+            task_id=task_id,
+            worktree=str(repository),
+            branch="main",
+            session_id=session_id,
+            paths=["."],
+            policy_digest=self.digest,
+        )
+        context = self._verification_context_for_repo(
+            repository,
+            self.state_dir / f"{task_id.lower()}-temp",
+            task_id=task_id,
+            profile=profile,
+            session_id=session_id,
+            lease_digest=lease["lease_digest"],
+        )
+        state.update(
+            {
+                "verification_profile": context.profile,
+                "verification_profile_digest": context.profile_digest,
+                "verification_runtime_digest": context.runtime_digest,
+                "verification_target_digest": context.target_digest,
+                "verification_content_trust": context.content_trust,
+                "session_id": session_id,
+            }
+        )
+        _atomic_json(store._path(task_id), state)
+        return repository, common_dir, store, state, context, lease
+
     def test_every_task_state_is_owned_by_exact_runtime_digest(self) -> None:
         from control_plane.contracts import contract_digest
         from control_plane.lifecycle import TaskStore
@@ -377,7 +440,10 @@ class LifecycleTests(unittest.TestCase):
         import control_plane.host_bridge as bridge
         from control_plane.contracts import contract_digest
         from control_plane.lifecycle import TaskStore, _atomic_json
-        from tests.host_adapter_test_support import native_session_event
+        from tests.host_adapter_test_support import (
+            governing_policy,
+            native_session_event,
+        )
         from tests.router_test_support import task_envelope
 
         repository, _, common_dir, _ = self._two_worktree_repository(
@@ -390,6 +456,18 @@ class LifecycleTests(unittest.TestCase):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/control-plane.git",
+            ],
+            check=True,
+        )
         session_id = f"session-{task_id.lower()}"
         invocation_id = f"invocation-{task_id.lower()}"
         task = task_envelope(
@@ -447,6 +525,21 @@ class LifecycleTests(unittest.TestCase):
             clock=lambda: 100.0,
             ttl_seconds=30,
         )
+        policy = governing_policy(
+            policy={
+                "git": {
+                    "remote": "origin",
+                    "base_branch": "main",
+                }
+            },
+            policy_digest=self.digest,
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            governing_base_commit=head,
+            session_id=session_id,
+            invocation_id=invocation_id,
+            freshness_deadline=130.0,
+        )
         context = bridge.create_remote_effect_context(
             task=task,
             expected_task_digest=task_digest,
@@ -457,6 +550,7 @@ class LifecycleTests(unittest.TestCase):
             expected_pr_number=expected_pr_number,
             expected_base_sha=expected_base_sha,
             expected_checks_digest=expected_checks_digest,
+            governing_policy=policy,
             host_capability=capability,
         )
         return {
@@ -471,7 +565,182 @@ class LifecycleTests(unittest.TestCase):
             "session_id": session_id,
             "invocation_id": invocation_id,
             "context": context,
+            "governing_policy": policy,
         }
+
+    def _pr_mutation_fixture(
+        self,
+        *,
+        task_id: str,
+        expected_pr_number: int | None,
+        expected_base_sha: str,
+        expected_checks_digest: str | None,
+    ):
+        import control_plane.host_bridge as bridge
+        from control_plane.contracts import contract_digest
+        from tests.host_adapter_test_support import (
+            governing_policy,
+            governing_runtime_observation,
+            native_github_provider_event,
+            native_session_event,
+            native_user_interaction_event,
+        )
+
+        branch = f"codex/{task_id.lower()}"
+        fixture = self._remote_effect_fixture(
+            task_id=task_id,
+            effect="pull_request",
+            outcome="pull_request",
+            branch=branch,
+            expected_pr_number=expected_pr_number,
+            expected_base_sha=expected_base_sha,
+            expected_checks_digest=expected_checks_digest,
+        )
+        context = bridge.validate_remote_effect_context(
+            fixture["context"],
+            expected_task_digest=fixture["task_digest"],
+            expected_repo=fixture["repository"],
+            expected_worktree=fixture["repository"],
+            expected_branch=branch,
+            expected_head=fixture["head"],
+            expected_session=fixture["session_id"],
+            expected_invocation_id=fixture["invocation_id"],
+            expected_effect="pull_request",
+            expected_pr_number=expected_pr_number,
+            expected_base_sha=expected_base_sha,
+            expected_checks_digest=expected_checks_digest,
+        )
+        runtime = governing_runtime_observation(
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            policy_digest=self.digest,
+            attestor_worktree=str(fixture["repository"].resolve()),
+            target_worktree=str(fixture["repository"].resolve()),
+            governing_base_commit=fixture["head"],
+            runtime_layout="source",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            freshness_deadline=130.0,
+        )
+        policy = governing_policy(
+            policy={
+                "git": {
+                    "remote": "origin",
+                    "base_branch": "main",
+                }
+            },
+            policy_digest=self.digest,
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            governing_base_commit=fixture["head"],
+            remote_repository="example/control-plane",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            freshness_deadline=130.0,
+        )
+        native_provider = native_github_provider_event(
+            event_id=f"provider-{task_id.lower()}",
+            repository="example/control-plane",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+        )
+
+        def provider_preflight(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            if operation == "github_auth_status":
+                return 0, b""
+            if operation == "github_repository_access":
+                return 0, b'{"nameWithOwner":"example/control-plane"}'
+            raise AssertionError(f"unexpected provider operation: {operation}")
+
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=provider_preflight,
+        ):
+            provider = bridge.approve_github_pr_write_provider(
+                native_provider,
+                governing_runtime=runtime,
+                governing_policy=policy,
+                expected_repository="example/control-plane",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+        title = bridge.validate_pull_request_title(
+            f"Stabilize {task_id}"
+        )
+        body = bridge.validate_pull_request_body(
+            "Bounded pull request mutation test."
+        )
+        subject_digest = contract_digest(
+            {
+                "context": context.context_digest,
+                "title": title.digest,
+                "body": body.digest,
+                "draft": True,
+                "expected_pr_number": expected_pr_number,
+            }
+        )
+        capability = bridge.attest_host_adapter_capability(
+            native_session_event(
+                event_id=f"session-{task_id.lower()}",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=fixture["session_id"],
+            expected_invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        authorization = bridge.frame_effect_authorization(
+            native_user_interaction_event(
+                event_id=f"authorize-{task_id.lower()}",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                task_digest=fixture["task_digest"],
+                subject_digest=subject_digest,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=capability,
+            task_digest=fixture["task_digest"],
+            session_id=fixture["session_id"],
+            repository_identity=fixture["repository"],
+            worktree_identity=fixture["repository"],
+            branch=branch,
+            expected_head=fixture["head"],
+            subject_digest=subject_digest,
+            scope_paths=(".",),
+            effect="pull_request",
+            operation_nonce=f"tool-{task_id.lower()}",
+            invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        request = bridge.build_pull_request_mutation_request(
+            context=context,
+            provider=provider,
+            authorization=authorization,
+            title=title,
+            body=body,
+            draft=True,
+            expected_pr_number=expected_pr_number,
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            tool_use_id=f"tool-{task_id.lower()}",
+            clock=lambda: 100.0,
+        )
+        fixture.update(
+            {
+                "context": context,
+                "provider": provider,
+                "authorization": authorization,
+                "request": request,
+            }
+        )
+        return fixture
 
     def test_all_declared_legal_transitions_and_illegal_pairs(self) -> None:
         from control_plane.lifecycle import (
@@ -711,6 +980,191 @@ class LifecycleTests(unittest.TestCase):
                 clock=lambda: 100.0,
             )
 
+    def test_candidate_json_cannot_self_certify_supplemental_assurance(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import (
+            CompletedVerificationCommand,
+            VERIFICATION_SUPPLEMENTAL_RECEIPTS,
+            _atomic_json,
+            run_verification_profile,
+        )
+
+        (
+            _repository,
+            common_dir,
+            store,
+            state,
+            context,
+            _lease,
+        ) = self._active_verification_fixture(
+            task_id="TASK-VERIFY-FORGED-SUPPLEMENTAL",
+            profile="control_plane_assurance",
+        )
+        receipts = (
+            common_dir
+            / "codex-control-plane"
+            / "verification-receipts"
+            / context.task_id
+        )
+        for kind in VERIFICATION_SUPPLEMENTAL_RECEIPTS[context.profile]:
+            semantic = {
+                "schema_version": 1,
+                "kind": kind,
+                "task_id": context.task_id,
+                "task_digest": context.task_digest,
+                "head": context.expected_head,
+                "profile": context.profile,
+                "profile_digest": context.profile_digest,
+                "generation": state["generation"],
+                "session_id": context.session_id,
+                "lease_digest": context.lease_digest,
+                "status": "PASS",
+                "subject_digest": self.digest,
+            }
+            _atomic_json(
+                receipts / f"{kind}.json",
+                {
+                    **semantic,
+                    "receipt_digest": contract_digest(semantic),
+                },
+            )
+
+        def completed(
+            *,
+            context,
+            command_id: str,
+            clock,
+        ) -> CompletedVerificationCommand:
+            del clock
+            return CompletedVerificationCommand(
+                command_id=command_id,
+                returncode=0,
+                status="PASS",
+                output_digest=self.digest,
+                output_truncated=False,
+                before_snapshot_digest=self.digest,
+                after_snapshot_digest=self.digest,
+                context_digest=context.context_digest,
+            )
+
+        with (
+            patch(
+                "control_plane.lifecycle._run_verification_command",
+                side_effect=completed,
+            ),
+            self.assertRaisesRegex(
+                ValueError, "E_VERIFICATION_EVIDENCE"
+            ),
+        ):
+            run_verification_profile(
+                context=context,
+                task_store=store,
+                expected_generation=state["generation"],
+                clock=lambda: 100.0,
+            )
+
+    def test_governing_runtime_publishes_supplemental_evidence_by_cas(
+        self,
+    ) -> None:
+        from control_plane.lifecycle import (
+            CompletedVerificationCommand,
+            VERIFICATION_SUPPLEMENTAL_RECEIPTS,
+            frame_verification_supplemental_evidence_set,
+            publish_verification_supplemental_evidence,
+            run_verification_profile,
+        )
+        from tests.host_adapter_test_support import (
+            governing_runtime_observation,
+        )
+
+        (
+            repository,
+            _common_dir,
+            store,
+            state,
+            context,
+            _lease,
+        ) = self._active_verification_fixture(
+            task_id="TASK-VERIFY-HOST-SUPPLEMENTAL",
+            profile="control_plane_assurance",
+        )
+        runtime = governing_runtime_observation(
+            runtime_digest=context.runtime_digest,
+            lock_digest=self.digest,
+            policy_digest=self.digest,
+            attestor_worktree=str(repository.resolve()),
+            target_worktree=str(repository.resolve()),
+            governing_base_commit=context.expected_head,
+            runtime_layout="source",
+            session_id=context.session_id,
+            invocation_id="host-supplemental",
+            freshness_deadline=130.0,
+        )
+        specifications = {
+            kind: {
+                "status": (
+                    "AUDIT"
+                    if kind == "SkillPressureEvaluationReceipt"
+                    else "PASS"
+                ),
+                "subject_digest": self.digest,
+            }
+            for kind in VERIFICATION_SUPPLEMENTAL_RECEIPTS[
+                context.profile
+            ]
+        }
+        evidence = frame_verification_supplemental_evidence_set(
+            governing_runtime=runtime,
+            context=context,
+            expected_generation=state["generation"] + 1,
+            specifications=specifications,
+            clock=lambda: 100.0,
+        )
+        published = publish_verification_supplemental_evidence(
+            task_store=store,
+            context=context,
+            evidence=evidence,
+            expected_generation=state["generation"],
+            clock=lambda: 100.0,
+        )
+
+        def completed(
+            *,
+            context,
+            command_id: str,
+            clock,
+        ) -> CompletedVerificationCommand:
+            del clock
+            return CompletedVerificationCommand(
+                command_id=command_id,
+                returncode=0,
+                status="PASS",
+                output_digest=self.digest,
+                output_truncated=False,
+                before_snapshot_digest=self.digest,
+                after_snapshot_digest=self.digest,
+                context_digest=context.context_digest,
+            )
+
+        with patch(
+            "control_plane.lifecycle._run_verification_command",
+            side_effect=completed,
+        ):
+            receipt = run_verification_profile(
+                context=context,
+                task_store=store,
+                expected_generation=published["generation"],
+                supplemental_evidence=evidence,
+                clock=lambda: 100.0,
+            )
+
+        self.assertEqual(
+            len(receipt.supplemental_receipt_digests), 3
+        )
+        self.assertEqual(store.status(context.task_id)["state"], "review_ready")
+
     def test_bootstrap_state_is_owned_and_closed_by_immutable_base_runtime(
         self,
     ) -> None:
@@ -941,6 +1395,7 @@ class LifecycleTests(unittest.TestCase):
                 expected_pr_number=None,
                 expected_base_sha=None,
                 expected_checks_digest=None,
+                governing_policy={"policy": "forged"},
                 host_capability={"capability": "forged"},
             )
 
@@ -1535,12 +1990,300 @@ class LifecycleTests(unittest.TestCase):
                 clock=lambda: 100.0,
             )
 
+    def test_stage_rejects_directory_glob_before_descendant_clean_filter(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import TaskLease, TaskStore
+        from tests.host_adapter_test_support import (
+            governing_runtime_observation,
+            native_session_event,
+            native_user_interaction_event,
+        )
+
+        repository, _, common_dir, _ = self._two_worktree_repository(
+            "descendant-filter"
+        )
+        head = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        task_id = "TASK-STAGE-DESCENDANT-FILTER"
+        session_id = "session-stage-descendant-filter"
+        invocation_id = "stage-descendant-filter"
+        store = TaskStore(common_dir)
+        store.start(
+            task_id,
+            outcome="local_change",
+            branch="main",
+            task_digest=self.digest,
+            decision_digest=self.digest,
+        )
+        for state_name, evidence in (
+            ("planned", None),
+            ("ready", {"preflight_ok": True}),
+            ("implementing", None),
+            ("verifying", {"implementation_complete": True}),
+            (
+                "review_ready",
+                {
+                    "gates_ok": True,
+                    "documentation_decision": self.digest,
+                },
+            ),
+        ):
+            store.transition(
+                task_id,
+                state_name,
+                evidence=evidence,
+                current_branch="main",
+            )
+        lease = TaskLease.acquire(
+            common_dir,
+            task_id=task_id,
+            worktree=str(repository),
+            branch="main",
+            session_id=session_id,
+            paths=["."],
+            policy_digest=self.digest,
+        )
+        task_context = {
+            "task_id": task_id,
+            "task_digest": self.digest,
+            "lease_digest": lease["lease_digest"],
+        }
+        runtime = governing_runtime_observation(
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            policy_digest=self.digest,
+            attestor_worktree=str(repository.resolve()),
+            target_worktree=str(repository.resolve()),
+            governing_base_commit=head,
+            runtime_layout="source",
+            session_id=session_id,
+            invocation_id=invocation_id,
+            freshness_deadline=130.0,
+        )
+        directory = repository / "dir"
+        directory.mkdir()
+        (directory / "file.txt").write_text(
+            "descendant\n", encoding="utf-8"
+        )
+        (repository / ".gitattributes").write_text(
+            "dir/file.txt filter=evil\n", encoding="utf-8"
+        )
+        marker = repository / "clean-filter-executed"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "config",
+                "filter.evil.clean",
+                f"sh -c 'touch {marker}; cat'",
+            ],
+            check=True,
+        )
+        raw_inventory = bridge.observe_worktree_inventory(
+            canonical_common_git_dir=common_dir,
+            invocation_id="inventory-stage-descendant-filter",
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+            max_output_bytes=1_000_000,
+        )
+        inventory = bridge.validate_worktree_inventory_observation(
+            raw_inventory,
+            expected_common_git_dir=common_dir,
+            expected_invocation_id="inventory-stage-descendant-filter",
+            clock=lambda: 100.0,
+        )
+        subject_digest = contract_digest({"paths": ("dir",)})
+        capability = bridge.attest_host_adapter_capability(
+            native_session_event(
+                event_id="session-stage-descendant-filter",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=session_id,
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        authorization = bridge.frame_effect_authorization(
+            native_user_interaction_event(
+                event_id="authorize-stage-descendant-filter",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                task_digest=self.digest,
+                subject_digest=subject_digest,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=capability,
+            task_digest=self.digest,
+            session_id=session_id,
+            repository_identity=repository,
+            worktree_identity=repository,
+            branch="main",
+            expected_head=head,
+            subject_digest=subject_digest,
+            scope_paths=("dir",),
+            effect="local_write",
+            operation_nonce="tool-stage-descendant-filter",
+            invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+
+        with self.assertRaisesRegex(ValueError, "E_GIT_EFFECT"):
+            bridge.stage_allowlisted_paths(
+                governing_runtime=runtime,
+                task_context=task_context,
+                inventory=inventory,
+                lease=lease,
+                authorization=authorization,
+                paths=("dir/**",),
+                expected_head=head,
+                session_id=session_id,
+                invocation_id=invocation_id,
+                tool_use_id="tool-stage-descendant-filter",
+                clock=lambda: 100.0,
+            )
+        self.assertFalse(marker.exists())
+        self.assertFalse(authorization._consumed)
+
     def test_candidate_cannot_self_host_stage_commit_push_or_pr(self) -> None:
         import control_plane.host_bridge as bridge
 
         with self.assertRaisesRegex(TypeError, "host-bound"):
             bridge.GoverningRuntimeObservation()
         self.test_governing_git_effects_reject_serialized_authority()
+
+    def test_feature_push_rejects_remote_repository_swap_after_framing(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        from tests.host_adapter_test_support import (
+            governing_runtime_observation,
+            native_session_event,
+            native_user_interaction_event,
+        )
+
+        fixture = self._remote_effect_fixture(
+            task_id="TASK-FEATURE-PUSH-REMOTE-SWAP",
+            effect="remote_write",
+            outcome="pull_request",
+            branch="codex/feature-push-remote-swap",
+        )
+        context = bridge.validate_remote_effect_context(
+            fixture["context"],
+            expected_task_digest=fixture["task_digest"],
+            expected_repo=fixture["repository"],
+            expected_worktree=fixture["repository"],
+            expected_branch=fixture["branch"],
+            expected_head=fixture["head"],
+            expected_session=fixture["session_id"],
+            expected_invocation_id=fixture["invocation_id"],
+            expected_effect="remote_write",
+            expected_pr_number=None,
+            expected_base_sha=None,
+            expected_checks_digest=None,
+        )
+        runtime = governing_runtime_observation(
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            policy_digest=self.digest,
+            attestor_worktree=str(fixture["repository"].resolve()),
+            target_worktree=str(fixture["repository"].resolve()),
+            governing_base_commit=fixture["head"],
+            runtime_layout="source",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            freshness_deadline=130.0,
+        )
+        policy = fixture["governing_policy"]
+        raw_inventory = bridge.observe_worktree_inventory(
+            canonical_common_git_dir=fixture["common_dir"],
+            invocation_id="inventory-feature-push-remote-swap",
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+            max_output_bytes=1_000_000,
+        )
+        inventory = bridge.validate_worktree_inventory_observation(
+            raw_inventory,
+            expected_common_git_dir=fixture["common_dir"],
+            expected_invocation_id="inventory-feature-push-remote-swap",
+            clock=lambda: 100.0,
+        )
+        capability = bridge.attest_host_adapter_capability(
+            native_session_event(
+                event_id="session-feature-push-remote-swap",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=fixture["session_id"],
+            expected_invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        authorization = bridge.frame_effect_authorization(
+            native_user_interaction_event(
+                event_id="authorize-feature-push-remote-swap",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                task_digest=fixture["task_digest"],
+                subject_digest=context.context_digest,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=capability,
+            task_digest=fixture["task_digest"],
+            session_id=fixture["session_id"],
+            repository_identity=fixture["repository"],
+            worktree_identity=fixture["repository"],
+            branch=fixture["branch"],
+            expected_head=fixture["head"],
+            subject_digest=context.context_digest,
+            scope_paths=(".",),
+            effect="remote_write",
+            operation_nonce="tool-feature-push-remote-swap",
+            invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(fixture["repository"]),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/attacker/exfiltration.git",
+            ],
+            check=True,
+        )
+
+        with patch.object(
+            bridge, "_execute_native_remote", return_value=(1, b"")
+        ) as remote_executor:
+            with self.assertRaisesRegex(ValueError, "E_REMOTE_EFFECT"):
+                bridge.push_validated_feature(
+                    context=context,
+                    governing_runtime=runtime,
+                    governing_policy=policy,
+                    authorization=authorization,
+                    inventory=inventory,
+                    session_id=fixture["session_id"],
+                    invocation_id=fixture["invocation_id"],
+                    tool_use_id="tool-feature-push-remote-swap",
+                    clock=lambda: 100.0,
+                )
+        remote_executor.assert_not_called()
+        self.assertFalse(authorization._consumed)
 
     def test_feature_push_and_pr_mutation_consume_distinct_closed_contexts(
         self,
@@ -1588,21 +2331,7 @@ class LifecycleTests(unittest.TestCase):
             invocation_id=push_fixture["invocation_id"],
             freshness_deadline=130.0,
         )
-        push_policy = governing_policy(
-            policy={
-                "git": {
-                    "remote": "origin",
-                    "base_branch": "main",
-                }
-            },
-            policy_digest=self.digest,
-            runtime_digest=self.digest,
-            lock_digest=self.digest,
-            governing_base_commit=push_fixture["head"],
-            session_id=push_fixture["session_id"],
-            invocation_id=push_fixture["invocation_id"],
-            freshness_deadline=130.0,
-        )
+        push_policy = push_fixture["governing_policy"]
         raw_push_inventory = bridge.observe_worktree_inventory(
             canonical_common_git_dir=push_fixture["common_dir"],
             invocation_id="inventory-feature-push",
@@ -1653,18 +2382,6 @@ class LifecycleTests(unittest.TestCase):
             ttl_seconds=30,
         )
 
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(push_fixture["repository"]),
-                "remote",
-                "add",
-                "origin",
-                "https://github.com/example/control-plane.git",
-            ],
-            check=True,
-        )
         forged_push_runtime = object.__new__(type(push_runtime))
         for name in type(push_runtime).__slots__:
             setattr(
@@ -1943,17 +2660,30 @@ class LifecycleTests(unittest.TestCase):
         )
         native_provider = native_github_provider_event(
             event_id="provider-feature-pr",
-            repository="owner/repository",
+            repository="example/control-plane",
             session_id=pr_fixture["session_id"],
             invocation_id=pr_fixture["invocation_id"],
         )
         def feature_pr_provider(arguments, **kwargs):
+            if arguments[-4:] == [
+                "remote",
+                "get-url",
+                "--push",
+                "origin",
+            ]:
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    stdout=(
+                        "https://github.com/example/control-plane.git\n"
+                    ),
+                )
             if arguments[1:3] == ["auth", "status"]:
                 return subprocess.CompletedProcess(arguments, 0)
             return subprocess.CompletedProcess(
                 arguments,
                 0,
-                stdout=b'{"nameWithOwner":"owner/repository"}',
+                stdout=b'{"nameWithOwner":"example/control-plane"}',
             )
 
         with patch(
@@ -1964,7 +2694,7 @@ class LifecycleTests(unittest.TestCase):
                 native_provider,
                 governing_runtime=pr_runtime,
                 governing_policy=pr_policy,
-                expected_repository="owner/repository",
+                expected_repository="example/control-plane",
                 session_id=pr_fixture["session_id"],
                 invocation_id=pr_fixture["invocation_id"],
                 clock=lambda: 100.0,
@@ -2043,7 +2773,7 @@ class LifecycleTests(unittest.TestCase):
 
         pr_payload = {
             "number": 9,
-            "url": "https://github.com/owner/repository/pull/9",
+            "url": "https://github.com/example/control-plane/pull/9",
             "isDraft": True,
             "baseRefName": "main",
             "headRefName": pr_fixture["branch"],
@@ -2073,6 +2803,43 @@ class LifecycleTests(unittest.TestCase):
                 return subprocess.CompletedProcess(
                     arguments, 0, stdout="", stderr=""
                 )
+            if arguments[-4:] == [
+                "remote",
+                "get-url",
+                "--push",
+                "origin",
+            ]:
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    stdout=(
+                        "https://github.com/example/control-plane.git\n"
+                    ),
+                )
+            if arguments[1:3] == ["pr", "list"]:
+                return subprocess.CompletedProcess(
+                    arguments, 0, stdout=b"[]"
+                )
+            if (
+                arguments[1] == "api"
+                and "/git/ref/heads/" in arguments[2]
+            ):
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    stdout=json.dumps(
+                        {"object": {"sha": "a" * 40}}
+                    ).encode("utf-8"),
+                )
+            if (
+                arguments[1] == "api"
+                and "/check-runs?per_page=100" in arguments[2]
+            ):
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    stdout=b'{"total_count":0,"check_runs":[]}',
+                )
             if arguments[1:3] == ["pr", "create"]:
                 return subprocess.CompletedProcess(arguments, 0)
             if arguments[1:3] == ["pr", "view"]:
@@ -2094,7 +2861,7 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "E_PR_MUTATION"):
             bridge.validate_pull_request_mutation(
                 observed,
-                expected_repository="owner/repository",
+                expected_repository="example/control-plane",
                 expected_base="main",
                 expected_head_branch=pr_fixture["branch"],
                 expected_head_sha=pr_fixture["head"],
@@ -2113,7 +2880,7 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "E_PR_MUTATION"):
             bridge.validate_pull_request_mutation(
                 forged_observation,
-                expected_repository="owner/repository",
+                expected_repository="example/control-plane",
                 expected_base="main",
                 expected_head_branch=pr_fixture["branch"],
                 expected_head_sha=pr_fixture["head"],
@@ -2125,7 +2892,7 @@ class LifecycleTests(unittest.TestCase):
             )
         validated_pr = bridge.validate_pull_request_mutation(
             observed,
-            expected_repository="owner/repository",
+            expected_repository="example/control-plane",
             expected_base="main",
             expected_head_branch=pr_fixture["branch"],
             expected_head_sha=pr_fixture["head"],
@@ -2212,15 +2979,174 @@ class LifecycleTests(unittest.TestCase):
             session_id=fixture["session_id"],
             invocation_id=fixture["invocation_id"],
         )
+        with (
+            patch(
+                "control_plane.host_bridge.subprocess.run"
+            ) as mismatched_repository_executor,
+            self.assertRaisesRegex(ValueError, "E_GITHUB_PR_PROVIDER"),
+        ):
+            bridge.approve_github_pr_write_provider(
+                event,
+                governing_runtime=runtime,
+                governing_policy=policy,
+                expected_repository="owner/repository",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+        mismatched_repository_executor.assert_not_called()
+        self.assertFalse(event._consumed)
+        self.assertFalse(runtime._consumed)
+        self.assertFalse(policy._consumed)
+
+        event = native_github_provider_event(
+            event_id="provider-secret-free-canonical",
+            repository="example/control-plane",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(fixture["repository"]),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/attacker/exfiltration.git",
+            ],
+            check=True,
+        )
+        early_provider_calls: list[str] = []
+
+        def early_drift_provider(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            early_provider_calls.append(operation)
+            if operation == "github_auth_status":
+                return 0, b""
+            return 0, b'{"nameWithOwner":"example/control-plane"}'
+
+        with (
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=early_drift_provider,
+            ),
+            self.assertRaisesRegex(ValueError, "E_GITHUB_PR_PROVIDER"),
+        ):
+            bridge.approve_github_pr_write_provider(
+                event,
+                governing_runtime=runtime,
+                governing_policy=policy,
+                expected_repository="example/control-plane",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+        self.assertEqual(early_provider_calls, [])
+        self.assertFalse(event._consumed)
+        self.assertFalse(runtime._consumed)
+        self.assertFalse(policy._consumed)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(fixture["repository"]),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/example/control-plane.git",
+            ],
+            check=True,
+        )
+
+        late_provider_calls: list[str] = []
+
+        def late_drift_provider(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            late_provider_calls.append(operation)
+            if operation == "github_auth_status":
+                return 0, b""
+            if operation == "github_repository_access":
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(fixture["repository"]),
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://github.com/attacker/exfiltration.git",
+                    ],
+                    check=True,
+                )
+                return (
+                    0,
+                    b'{"nameWithOwner":"example/control-plane"}',
+                )
+            raise AssertionError(f"unexpected operation: {operation}")
+
+        with (
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=late_drift_provider,
+            ),
+            self.assertRaisesRegex(ValueError, "E_GITHUB_PR_PROVIDER"),
+        ):
+            bridge.approve_github_pr_write_provider(
+                event,
+                governing_runtime=runtime,
+                governing_policy=policy,
+                expected_repository="example/control-plane",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+        self.assertEqual(
+            late_provider_calls,
+            ["github_auth_status", "github_repository_access"],
+        )
+        self.assertFalse(event._consumed)
+        self.assertFalse(runtime._consumed)
+        self.assertFalse(policy._consumed)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(fixture["repository"]),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/example/control-plane.git",
+            ],
+            check=True,
+        )
 
         def ready_provider(arguments, **kwargs):
+            if arguments[-4:] == [
+                "remote",
+                "get-url",
+                "--push",
+                "origin",
+            ]:
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    stdout=(
+                        "https://github.com/example/control-plane.git\n"
+                    ),
+                )
             if arguments[1:3] == ["auth", "status"]:
                 return subprocess.CompletedProcess(arguments, 0)
             if arguments[1:3] == ["repo", "view"]:
                 return subprocess.CompletedProcess(
                     arguments,
                     0,
-                    stdout=b'{"nameWithOwner":"owner/repository"}',
+                    stdout=b'{"nameWithOwner":"example/control-plane"}',
                 )
             raise AssertionError(f"unexpected provider argv: {arguments}")
 
@@ -2242,23 +3168,28 @@ class LifecycleTests(unittest.TestCase):
                 event,
                 governing_runtime=runtime,
                 governing_policy=policy,
-                expected_repository="owner/repository",
+                expected_repository="example/control-plane",
                 session_id=fixture["session_id"],
                 invocation_id=fixture["invocation_id"],
                 clock=lambda: 100.0,
                 ttl_seconds=30,
             )
-        self.assertEqual(provider_doctor.call_count, 2)
+        github_calls = [
+            call
+            for call in provider_doctor.call_args_list
+            if call.args[0][0] == "gh"
+        ]
+        self.assertEqual(len(github_calls), 2)
         for call in provider_doctor.call_args_list:
             environment = call.kwargs["env"]
             self.assertNotIn("GH_TOKEN", environment)
             self.assertNotIn("CLOUD_SECRET", environment)
             self.assertNotIn("canary-secret", environment.values())
-        self.assertEqual(provider.repository, "owner/repository")
+        self.assertEqual(provider.repository, "example/control-plane")
 
         wrong_repository_event = native_github_provider_event(
             event_id="provider-wrong-repository",
-            repository="owner/repository",
+            repository="example/control-plane",
             session_id=fixture["session_id"],
             invocation_id=fixture["invocation_id"],
         )
@@ -2283,7 +3214,7 @@ class LifecycleTests(unittest.TestCase):
                 wrong_repository_event,
                 governing_runtime=runtime,
                 governing_policy=policy,
-                expected_repository="owner/repository",
+                expected_repository="example/control-plane",
                 session_id=fixture["session_id"],
                 invocation_id=fixture["invocation_id"],
                 clock=lambda: 100.0,
@@ -2291,6 +3222,550 @@ class LifecycleTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "secret-like"):
             bridge.validate_pull_request_body("token ghp_" + "x" * 40)
+
+    def test_pr_mutation_revalidates_remote_before_egress_and_effect(
+        self,
+    ) -> None:
+        import json
+        import control_plane.host_bridge as bridge
+
+        framed = self._pr_mutation_fixture(
+            task_id="TASK-PR-REMOTE-BEFORE-EGRESS",
+            expected_pr_number=None,
+            expected_base_sha="a" * 40,
+            expected_checks_digest=None,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(framed["repository"]),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/attacker/exfiltration.git",
+            ],
+            check=True,
+        )
+        provider_calls: list[str] = []
+
+        def forbidden_provider(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            provider_calls.append(operation)
+            return 0, b"[]"
+
+        with (
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=forbidden_provider,
+            ),
+            self.assertRaisesRegex(ValueError, "E_PR_MUTATION"),
+        ):
+            bridge.execute_pull_request_mutation(
+                framed["request"], clock=lambda: 100.0
+            )
+        self.assertEqual(provider_calls, [])
+
+        late = self._pr_mutation_fixture(
+            task_id="TASK-PR-REMOTE-BEFORE-EFFECT",
+            expected_pr_number=None,
+            expected_base_sha="a" * 40,
+            expected_checks_digest=None,
+        )
+        late_calls: list[str] = []
+
+        def late_drift_provider(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            late_calls.append(operation)
+            if operation == "github_pull_request_precondition_pr":
+                return 0, b"[]"
+            if operation == "github_pull_request_precondition_base":
+                return (
+                    0,
+                    json.dumps(
+                        {"object": {"sha": "a" * 40}}
+                    ).encode("utf-8"),
+                )
+            if operation == "github_pull_request_precondition_checks":
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(late["repository"]),
+                        "remote",
+                        "set-url",
+                        "origin",
+                        "https://github.com/attacker/exfiltration.git",
+                    ],
+                    check=True,
+                )
+                return 0, b'{"total_count":0,"check_runs":[]}'
+            if operation == "github_pull_request_mutation":
+                return 0, b""
+            if operation == "github_pull_request_observe":
+                return (
+                    0,
+                    json.dumps(
+                        {
+                            "number": 7,
+                            "url": (
+                                "https://github.com/"
+                                "example/control-plane/pull/7"
+                            ),
+                            "isDraft": True,
+                            "baseRefName": "main",
+                            "headRefName": late["branch"],
+                            "headRefOid": late["head"],
+                        }
+                    ).encode("utf-8"),
+                )
+            raise AssertionError(f"unexpected operation: {operation}")
+
+        with (
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=late_drift_provider,
+            ),
+            self.assertRaisesRegex(ValueError, "E_PR_MUTATION"),
+        ):
+            bridge.execute_pull_request_mutation(
+                late["request"], clock=lambda: 100.0
+            )
+        self.assertNotIn("github_pull_request_mutation", late_calls)
+
+    def test_pr_mutation_rejects_provider_tampering_before_egress(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+
+        fixture = self._pr_mutation_fixture(
+            task_id="TASK-PR-PROVIDER-TAMPER",
+            expected_pr_number=None,
+            expected_base_sha="a" * 40,
+            expected_checks_digest=None,
+        )
+        fixture["provider"].repository = "attacker/exfiltration"
+        provider_calls: list[str] = []
+
+        def forbidden_provider(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            provider_calls.append(operation)
+            return 0, b"[]"
+
+        with (
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=forbidden_provider,
+            ),
+            self.assertRaisesRegex(ValueError, "E_PR_MUTATION"),
+        ):
+            bridge.execute_pull_request_mutation(
+                fixture["request"], clock=lambda: 100.0
+            )
+        self.assertEqual(provider_calls, [])
+
+    def test_host_authorization_consumption_is_atomic(self) -> None:
+        import control_plane.host_bridge as bridge
+        from tests.host_adapter_test_support import (
+            native_session_event,
+            native_user_interaction_event,
+        )
+
+        fixture = self._remote_effect_fixture(
+            task_id="TASK-AUTHORIZATION-CAS",
+            effect="remote_write",
+            outcome="pull_request",
+            branch="codex/authorization-cas",
+        )
+        capability = bridge.attest_host_adapter_capability(
+            native_session_event(
+                event_id="session-authorization-cas",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=fixture["session_id"],
+            expected_invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        authorization = bridge.frame_effect_authorization(
+            native_user_interaction_event(
+                event_id="authorize-authorization-cas",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                task_digest=fixture["task_digest"],
+                subject_digest=fixture["context"].context_digest,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=capability,
+            task_digest=fixture["task_digest"],
+            session_id=fixture["session_id"],
+            repository_identity=fixture["repository"],
+            worktree_identity=fixture["repository"],
+            branch=fixture["branch"],
+            expected_head=fixture["head"],
+            subject_digest=fixture["context"].context_digest,
+            scope_paths=(".",),
+            effect="remote_write",
+            operation_nonce="tool-authorization-cas",
+            invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        consume_cells = dict(
+            zip(
+                bridge._consume_runtime_host_object.__code__.co_freevars,
+                bridge._consume_runtime_host_object.__closure__,
+                strict=True,
+            )
+        )
+        registry_cell = consume_cells["issued"]
+        original_registry = registry_cell.cell_contents
+        pop_barrier = threading.Barrier(2)
+
+        class BarrierPopDict(dict):
+            def pop(self, key, default=None):
+                try:
+                    pop_barrier.wait(timeout=0.25)
+                except threading.BrokenBarrierError:
+                    pass
+                return super().pop(key, default)
+
+        gated_registry = BarrierPopDict(original_registry)
+        registry_cell.cell_contents = gated_registry
+        successes: list[str] = []
+        errors: list[str] = []
+
+        def consume_once() -> None:
+            try:
+                result = bridge.consume_authorization(
+                    authorization,
+                    expected_task_digest=fixture["task_digest"],
+                    expected_session_id=fixture["session_id"],
+                    expected_repository_identity=fixture["repository"],
+                    expected_worktree_identity=fixture["repository"],
+                    expected_branch=fixture["branch"],
+                    expected_head=fixture["head"],
+                    expected_subject_digest=fixture["context"].context_digest,
+                    expected_scope_paths=(".",),
+                    expected_effect="remote_write",
+                    expected_operation_nonce="tool-authorization-cas",
+                    expected_invocation_id=fixture["invocation_id"],
+                    clock=lambda: 100.0,
+                )
+                successes.append(result.authorization_id)
+            except ValueError as error:
+                errors.append(str(error))
+
+        workers = [
+            threading.Thread(target=consume_once, daemon=True)
+            for _ in range(2)
+        ]
+        try:
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=2)
+        finally:
+            original_registry.clear()
+            original_registry.update(gated_registry)
+            registry_cell.cell_contents = original_registry
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(errors), 1)
+
+    def test_pr_mutation_reobserves_live_pr_base_and_checks_before_effect(
+        self,
+    ) -> None:
+        import json
+        import control_plane.host_bridge as bridge
+        from control_plane.contracts import contract_digest
+
+        expected_base_sha = "a" * 40
+        for drift in ("pr", "base", "checks"):
+            with self.subTest(drift=drift):
+                check = {
+                    "id": 17,
+                    "name": "verify",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "app_slug": "github-actions",
+                }
+                checks_digest = contract_digest((check,))
+                fixture = self._pr_mutation_fixture(
+                    task_id=f"TASK-PR-LIVE-{drift.upper()}",
+                    expected_pr_number=7,
+                    expected_base_sha=expected_base_sha,
+                    expected_checks_digest=checks_digest,
+                )
+                live_pr = {
+                    "number": 7,
+                    "baseRefName": "main",
+                    "headRefName": fixture["branch"],
+                    "headRefOid": fixture["head"],
+                }
+                live_base = {"object": {"sha": expected_base_sha}}
+                live_check = {
+                    **check,
+                    "head_sha": fixture["head"],
+                }
+                if drift == "pr":
+                    live_pr["headRefOid"] = "f" * 40
+                elif drift == "base":
+                    live_base["object"]["sha"] = "b" * 40
+                else:
+                    live_check["conclusion"] = "failure"
+                calls: list[str] = []
+
+                def provider(operation, arguments, max_output_bytes):
+                    del arguments, max_output_bytes
+                    calls.append(operation)
+                    if operation == "github_pull_request_precondition_pr":
+                        return 0, json.dumps(live_pr).encode("utf-8")
+                    if operation == "github_pull_request_precondition_base":
+                        return 0, json.dumps(live_base).encode("utf-8")
+                    if operation == "github_pull_request_precondition_checks":
+                        payload = {
+                            "total_count": 1,
+                            "check_runs": [
+                                {
+                                    key: value
+                                    for key, value in live_check.items()
+                                    if key != "app_slug"
+                                }
+                                | {
+                                    "app": {
+                                        "slug": live_check["app_slug"]
+                                    }
+                                }
+                            ],
+                        }
+                        return 0, json.dumps(payload).encode("utf-8")
+                    if operation == "github_pull_request_mutation":
+                        return 0, b""
+                    if operation == "github_pull_request_observe":
+                        payload = {
+                            **live_pr,
+                            "url": (
+                                "https://github.com/example/control-plane/pull/7"
+                            ),
+                            "isDraft": True,
+                        }
+                        return 0, json.dumps(payload).encode("utf-8")
+                    raise AssertionError(
+                        f"unexpected provider operation: {operation}"
+                    )
+
+                with (
+                    patch.object(
+                        bridge,
+                        "_native_host_remote_executor",
+                        side_effect=provider,
+                    ),
+                    self.assertRaisesRegex(ValueError, "E_PR_MUTATION"),
+                ):
+                    bridge.execute_pull_request_mutation(
+                        fixture["request"], clock=lambda: 100.0
+                    )
+                self.assertNotIn(
+                    "github_pull_request_mutation", calls
+                )
+
+    def test_pr_mutation_claim_is_atomic_before_remote_effect(self) -> None:
+        import json
+        import control_plane.host_bridge as bridge
+        from control_plane.contracts import contract_digest
+
+        expected_base_sha = "a" * 40
+        check = {
+            "id": 17,
+            "name": "verify",
+            "status": "completed",
+            "conclusion": "success",
+            "app_slug": "github-actions",
+        }
+        fixture = self._pr_mutation_fixture(
+            task_id="TASK-PR-ATOMIC-CLAIM",
+            expected_pr_number=7,
+            expected_base_sha=expected_base_sha,
+            expected_checks_digest=contract_digest((check,)),
+        )
+        first_effect_entered = threading.Event()
+        release_first_effect = threading.Event()
+        mutation_calls: list[int] = []
+        mutation_lock = threading.Lock()
+        observations: list[object] = []
+        errors: list[Exception] = []
+
+        def provider(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            if operation == "github_pull_request_precondition_pr":
+                payload = {
+                    "number": 7,
+                    "baseRefName": "main",
+                    "headRefName": fixture["branch"],
+                    "headRefOid": fixture["head"],
+                }
+                return 0, json.dumps(payload).encode("utf-8")
+            if operation == "github_pull_request_precondition_base":
+                payload = {"object": {"sha": expected_base_sha}}
+                return 0, json.dumps(payload).encode("utf-8")
+            if operation == "github_pull_request_precondition_checks":
+                payload = {
+                    "total_count": 1,
+                    "check_runs": [
+                        {
+                            **{
+                                key: value
+                                for key, value in check.items()
+                                if key != "app_slug"
+                            },
+                            "head_sha": fixture["head"],
+                            "app": {"slug": check["app_slug"]},
+                        }
+                    ],
+                }
+                return 0, json.dumps(payload).encode("utf-8")
+            if operation == "github_pull_request_mutation":
+                with mutation_lock:
+                    mutation_calls.append(len(mutation_calls) + 1)
+                    call_number = len(mutation_calls)
+                if call_number == 1:
+                    first_effect_entered.set()
+                    if not release_first_effect.wait(timeout=5):
+                        raise AssertionError(
+                            "test did not release the first effect"
+                        )
+                return 0, b""
+            if operation == "github_pull_request_observe":
+                payload = {
+                    "number": 7,
+                    "url": (
+                        "https://github.com/example/control-plane/pull/7"
+                    ),
+                    "isDraft": True,
+                    "baseRefName": "main",
+                    "headRefName": fixture["branch"],
+                    "headRefOid": fixture["head"],
+                }
+                return 0, json.dumps(payload).encode("utf-8")
+            raise AssertionError(
+                f"unexpected provider operation: {operation}"
+            )
+
+        def execute() -> None:
+            try:
+                observations.append(
+                    bridge.execute_pull_request_mutation(
+                        fixture["request"], clock=lambda: 100.0
+                    )
+                )
+            except Exception as error:
+                errors.append(error)
+
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=provider,
+        ):
+            first = threading.Thread(target=execute)
+            first.start()
+            self.assertTrue(first_effect_entered.wait(timeout=5))
+            second = threading.Thread(target=execute)
+            second.start()
+            second.join(timeout=5)
+            self.assertFalse(second.is_alive())
+            release_first_effect.set()
+            first.join(timeout=5)
+            self.assertFalse(first.is_alive())
+
+        self.assertEqual(len(mutation_calls), 1)
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "E_PR_MUTATION")
+
+    def test_pr_mutation_unknown_outcome_recovers_by_observation_only(
+        self,
+    ) -> None:
+        import json
+        import control_plane.host_bridge as bridge
+
+        expected_base_sha = "a" * 40
+        fixture = self._pr_mutation_fixture(
+            task_id="TASK-PR-UNKNOWN-OUTCOME",
+            expected_pr_number=7,
+            expected_base_sha=expected_base_sha,
+            expected_checks_digest=None,
+        )
+        calls: list[str] = []
+
+        def provider(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            calls.append(operation)
+            if operation == "github_pull_request_precondition_pr":
+                payload = {
+                    "number": 7,
+                    "baseRefName": "main",
+                    "headRefName": fixture["branch"],
+                    "headRefOid": fixture["head"],
+                }
+                return 0, json.dumps(payload).encode("utf-8")
+            if operation == "github_pull_request_precondition_base":
+                payload = {"object": {"sha": expected_base_sha}}
+                return 0, json.dumps(payload).encode("utf-8")
+            if operation == "github_pull_request_precondition_checks":
+                return 0, b'{"total_count":0,"check_runs":[]}'
+            if operation == "github_pull_request_mutation":
+                return 1, b""
+            if operation == "github_pull_request_observe":
+                payload = {
+                    "number": 7,
+                    "url": (
+                        "https://github.com/example/control-plane/pull/7"
+                    ),
+                    "isDraft": True,
+                    "baseRefName": "main",
+                    "headRefName": fixture["branch"],
+                    "headRefOid": fixture["head"],
+                }
+                return 0, json.dumps(payload).encode("utf-8")
+            raise AssertionError(
+                f"unexpected provider operation: {operation}"
+            )
+
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=provider,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "E_PR_MUTATION_OUTCOME_UNKNOWN"
+            ):
+                bridge.execute_pull_request_mutation(
+                    fixture["request"], clock=lambda: 100.0
+                )
+            mutation_count = calls.count(
+                "github_pull_request_mutation"
+            )
+            with self.assertRaisesRegex(ValueError, "E_PR_MUTATION"):
+                bridge.execute_pull_request_mutation(
+                    fixture["request"], clock=lambda: 100.0
+                )
+            recovered = (
+                bridge.recover_pull_request_mutation_outcome(
+                    fixture["request"], clock=lambda: 100.0
+                )
+            )
+
+        self.assertEqual(
+            calls.count("github_pull_request_mutation"),
+            mutation_count,
+        )
+        self.assertEqual(recovered.number, 7)
 
     def test_blocked_preserves_resume_state(self) -> None:
         from control_plane.lifecycle import TaskStore
@@ -2695,6 +4170,65 @@ class LifecycleTests(unittest.TestCase):
                 / "codex-control-plane"
                 / "leases"
                 / "TASK-REGISTRY-RACE.json"
+            ).exists()
+        )
+
+    def test_worktree_inventory_reobserves_branch_and_head_before_lease(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        from control_plane.lifecycle import TaskLease, _common_lease_lock
+
+        repository, _, common_dir, _ = self._two_worktree_repository(
+            "stale-branch"
+        )
+        observation = bridge.observe_worktree_inventory(
+            canonical_common_git_dir=common_dir,
+            invocation_id="inventory-stale-branch",
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+            max_output_bytes=1_000_000,
+        )
+        inventory = bridge.validate_worktree_inventory_observation(
+            observation,
+            expected_common_git_dir=common_dir,
+            expected_invocation_id="inventory-stale-branch",
+            clock=lambda: 100.0,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "switch",
+                "-c",
+                "codex/switched-after-observation",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        with _common_lease_lock(common_dir) as token:
+            with self.assertRaisesRegex(
+                ValueError, "E_LEASE_OBSERVATION_STALE"
+            ):
+                TaskLease._acquire_locked(
+                    token,
+                    task_id="TASK-STALE-BRANCH-INVENTORY",
+                    worktree=str(repository),
+                    branch="main",
+                    session_id="session-stale-branch-inventory",
+                    policy_digest=self.digest,
+                    scopes=["."],
+                    inventory=inventory,
+                )
+        self.assertFalse(
+            (
+                common_dir
+                / "codex-control-plane"
+                / "leases"
+                / "TASK-STALE-BRANCH-INVENTORY.json"
             ).exists()
         )
 

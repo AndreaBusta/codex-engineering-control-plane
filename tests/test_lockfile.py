@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -155,6 +156,8 @@ class LockfileTests(unittest.TestCase):
             hook = subprocess.run(
                 [
                     "python3",
+                    "-I",
+                    "-B",
                     str(
                         root
                         / ".codex"
@@ -173,6 +176,71 @@ class LockfileTests(unittest.TestCase):
             self.assertEqual(hook.returncode, 0, hook.stderr)
             self.assertNotIn("ISOLATED_SHADOW_IMPORTED", completed.stderr)
             self.assertNotIn("ISOLATED_SHADOW_IMPORTED", hook.stderr)
+
+    def test_source_launcher_and_hook_ignore_top_level_stdlib_shadow(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._source_runtime_fixture(root)
+            launcher_marker = root / "launcher-stdlib-shadow-executed"
+            hook_marker = root / "hook-stdlib-shadow-executed"
+            (root / "argparse.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(launcher_marker)!r}).write_text('executed')\n"
+                "raise RuntimeError('ARGPARSE_SHADOW_EXECUTED')\n",
+                encoding="utf-8",
+            )
+            (root / "json.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(hook_marker)!r}).write_text('executed')\n"
+                "raise RuntimeError('JSON_SHADOW_EXECUTED')\n",
+                encoding="utf-8",
+            )
+            self._refresh_source_runtime_digest(root)
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(root)
+
+            completed = subprocess.run(
+                [
+                    str(root / "scripts" / "control-plane"),
+                    "policy-check",
+                    "--policy",
+                    str(root / ".codex" / "project-policy.toml"),
+                    "--json",
+                ],
+                cwd=root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            hook = subprocess.run(
+                [
+                    "python3",
+                    "-I",
+                    "-B",
+                    str(
+                        root
+                        / ".codex"
+                        / "hooks"
+                        / "control_plane_hook.py"
+                    ),
+                ],
+                cwd=root,
+                env=environment,
+                input='{"hook_event_name":"UserPromptSubmit"}',
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(hook.returncode, 0, hook.stderr)
+            self.assertFalse(launcher_marker.exists())
+            self.assertFalse(hook_marker.exists())
+            self.assertNotIn("ARGPARSE_SHADOW_EXECUTED", completed.stderr)
+            self.assertNotIn("JSON_SHADOW_EXECUTED", hook.stderr)
 
     def test_runtime_layout_mismatch_missing_or_empty_fails_before_import(
         self,

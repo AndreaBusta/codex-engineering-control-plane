@@ -434,11 +434,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RUNTIME_ROOT="$PROJECT_ROOT/.codex/runtime"
+PYTHON_BIN="$(command -v python3)"
 
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONSAFEPATH=1
-python3 -P -B - "$PROJECT_ROOT" <<'PY'
+exec "$PYTHON_BIN" -I -B -c '
+import importlib
+import importlib.util
 from hashlib import sha256
 from pathlib import Path
 import sys
@@ -467,27 +467,41 @@ for path in modules:
     if path.is_symlink() or not path.is_file():
         raise SystemExit("E_RUNTIME_LAYOUT: invalid isolated runtime module")
     hasher.update(path.name.encode())
-    hasher.update(b"\\0")
+    hasher.update(bytes((0,)))
     hasher.update(path.read_bytes())
-    hasher.update(b"\\0")
+    hasher.update(bytes((0,)))
 if lock.get("digests", {{}}).get("runtime") != f"sha256:{{hasher.hexdigest()}}":
     raise SystemExit("E_RUNTIME_DIGEST: isolated runtime does not match lock")
-PY
-export PYTHONPATH="$RUNTIME_ROOT"
-cd "$RUNTIME_ROOT"
-exec python3 -P -B -m {RUNTIME_PACKAGE}.cli "$@"
+spec = importlib.util.spec_from_file_location(
+    "{RUNTIME_PACKAGE}",
+    runtime / "__init__.py",
+    submodule_search_locations=[str(runtime)],
+)
+if spec is None or spec.loader is None:
+    raise SystemExit("E_RUNTIME_LAYOUT: isolated runtime cannot be loaded")
+package = importlib.util.module_from_spec(spec)
+sys.modules["{RUNTIME_PACKAGE}"] = package
+spec.loader.exec_module(package)
+cli = importlib.import_module("{RUNTIME_PACKAGE}.cli")
+raise SystemExit(cli.main(sys.argv[2:]))
+' "$PROJECT_ROOT" "$@"
 """.encode("utf-8")
 
 
 def _render_hook_entrypoint(source_root: Path) -> bytes:
     del source_root
-    return f'''#!/usr/bin/env python3
+    return f'''#!/usr/bin/env -S python3 -I -B
 """Isolated project-local entrypoint for bounded Codex audit hooks."""
 from __future__ import annotations
+import sys
+
+if not sys.flags.isolated or not sys.flags.safe_path:
+    raise SystemExit("E_RUNTIME_BOOTSTRAP: hook requires python3 -I -B")
+
 import importlib
+import importlib.util
 from hashlib import sha256
 from pathlib import Path
-import sys
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -527,10 +541,17 @@ def validate_runtime() -> None:
         raise RuntimeError("E_RUNTIME_DIGEST: isolated runtime does not match lock")
 
 validate_runtime()
-sys.path[:] = [str(RUNTIME)] + [
-    item for item in sys.path
-    if item and Path(item).resolve() != ROOT.resolve()
-]
+runtime = RUNTIME / "{RUNTIME_PACKAGE}"
+spec = importlib.util.spec_from_file_location(
+    "{RUNTIME_PACKAGE}",
+    runtime / "__init__.py",
+    submodule_search_locations=[str(runtime)],
+)
+if spec is None or spec.loader is None:
+    raise RuntimeError("E_RUNTIME_LAYOUT: isolated runtime cannot be loaded")
+package = importlib.util.module_from_spec(spec)
+sys.modules["{RUNTIME_PACKAGE}"] = package
+spec.loader.exec_module(package)
 run_hook = importlib.import_module("{RUNTIME_PACKAGE}.hooks").run_hook
 
 def main() -> int:

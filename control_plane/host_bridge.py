@@ -8,9 +8,11 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import subprocess
 import tempfile
+import threading
 import tomllib
 from typing import Callable, Mapping
 from uuid import uuid4
@@ -31,6 +33,13 @@ from control_plane.scopes import normalize_scope
 
 
 _GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40,64}$", re.ASCII)
+_GITHUB_HTTPS_REMOTE = re.compile(
+    r"https://github\.com/"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/"
+    r"(?P<repository>[A-Za-z0-9_.-]+?)(?:\.git)?",
+    re.ASCII,
+)
+_PR_MUTATION_CLAIM_LOCK = threading.Lock()
 
 
 def _native_host_adapter_unavailable(_: object, __: str) -> bool:
@@ -91,7 +100,41 @@ def _native_host_object_is_valid(value: object, kind: str) -> bool:
 
 
 def _runtime_host_object_registry():
+    remote_context_bindings = (
+        "task_digest",
+        "task_id",
+        "repository_identity",
+        "worktree_identity",
+        "remote_repository",
+        "remote_name",
+        "branch",
+        "head",
+        "session_id",
+        "invocation_id",
+        "effect",
+        "expected_pr_number",
+        "expected_base_sha",
+        "expected_checks_digest",
+        "context_digest",
+    )
     snapshotted_bindings = {
+        "verification_supplemental_evidence": (
+            "observation_id",
+            "kind",
+            "receipt_digest",
+            "status",
+            "subject_digest",
+            "task_id",
+            "task_digest",
+            "head",
+            "profile",
+            "profile_digest",
+            "generation",
+            "session_id",
+            "lease_digest",
+            "context_digest",
+            "freshness_deadline",
+        ),
         "pull_request_mutation_observation": (
             "repository",
             "base",
@@ -116,12 +159,81 @@ def _runtime_host_object_registry():
             "invocation_id",
             "freshness_deadline",
         ),
+        "remote_effect_context": remote_context_bindings,
+        "validated_remote_effect_context": remote_context_bindings,
+        "pr_request_context": remote_context_bindings,
+        "claimed_pr_request_context": remote_context_bindings,
+        "github_pr_write_provider": (
+            "provider_id",
+            "repository",
+            "base_branch",
+            "session_id",
+            "invocation_id",
+            "freshness_deadline",
+        ),
+        "pr_request_provider": (
+            "provider_id",
+            "repository",
+            "base_branch",
+            "session_id",
+            "invocation_id",
+            "freshness_deadline",
+        ),
     }
     issued: dict[
         int, tuple[object, str, tuple[object, ...] | None]
     ] = {}
+    registry_lock = threading.RLock()
 
     def snapshot(value: object, kind: str) -> tuple[object, ...] | None:
+        if kind in {
+            "pr_mutation_request",
+            "pr_mutation_unknown_request",
+        }:
+            try:
+                context = value.context
+                provider = value.provider
+                title = value.title
+                body = value.body
+                return (
+                    context,
+                    context.context_digest,
+                    context.remote_repository,
+                    context.remote_name,
+                    context.branch,
+                    context.head,
+                    provider,
+                    provider.provider_id,
+                    provider.repository,
+                    provider.base_branch,
+                    provider.session_id,
+                    provider.invocation_id,
+                    provider.freshness_deadline,
+                    title,
+                    title.value,
+                    title.digest,
+                    body,
+                    body.value,
+                    body.digest,
+                    value.draft,
+                    value.expected_pr_number,
+                    value.session_id,
+                    value.invocation_id,
+                    value.request_digest,
+                    value._effect_bindings,
+                    (
+                        value._execution_state
+                        if kind == "pr_mutation_unknown_request"
+                        else "ready"
+                    ),
+                    (
+                        value._recovery_consumed
+                        if kind == "pr_mutation_unknown_request"
+                        else False
+                    ),
+                )
+            except AttributeError:
+                return ()
         names = snapshotted_bindings.get(kind)
         if names is None:
             return None
@@ -131,22 +243,31 @@ def _runtime_host_object_registry():
             return ()
 
     def register(value: object, kind: str) -> None:
-        issued[id(value)] = (value, kind, snapshot(value, kind))
+        with registry_lock:
+            issued[id(value)] = (value, kind, snapshot(value, kind))
 
     def is_live(value: object, kind: str) -> bool:
-        entry = issued.get(id(value))
-        return (
-            entry is not None
-            and entry[0] is value
-            and entry[1] == kind
-            and entry[2] == snapshot(value, kind)
-        )
+        with registry_lock:
+            entry = issued.get(id(value))
+            return (
+                entry is not None
+                and entry[0] is value
+                and entry[1] == kind
+                and entry[2] == snapshot(value, kind)
+            )
 
     def consume(value: object, kind: str) -> bool:
-        if not is_live(value, kind):
-            return False
-        issued.pop(id(value), None)
-        return True
+        with registry_lock:
+            entry = issued.get(id(value))
+            if (
+                entry is None
+                or entry[0] is not value
+                or entry[1] != kind
+                or entry[2] != snapshot(value, kind)
+            ):
+                return False
+            issued.pop(id(value), None)
+            return True
 
     return register, is_live, consume
 
@@ -312,6 +433,107 @@ def _records_digest(records: tuple[WorktreeInventoryRecord, ...]) -> str:
             }
             for item in records
         ]
+    )
+
+
+def _bounded_git_admin_text(path: Path, *, max_bytes: int) -> str:
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or path.stat().st_size > max_bytes
+    ):
+        raise ValueError(
+            "E_LEASE_OBSERVATION_STALE: Git identity file is unavailable"
+        )
+    try:
+        return path.read_bytes().decode("utf-8").strip()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(
+            "E_LEASE_OBSERVATION_STALE: Git identity file is invalid"
+        ) from error
+
+
+def _resolve_live_branch_head(common_dir: Path, ref: str) -> str:
+    parsed = PurePosixPath(ref)
+    if (
+        not ref.startswith("refs/heads/")
+        or parsed.is_absolute()
+        or ".." in parsed.parts
+        or "\\" in ref
+        or "\x00" in ref
+    ):
+        raise ValueError(
+            "E_LEASE_OBSERVATION_STALE: worktree branch ref is invalid"
+        )
+    loose = common_dir.joinpath(*parsed.parts)
+    parent = loose.parent
+    while parent != common_dir:
+        if parent.is_symlink():
+            raise ValueError(
+                "E_LEASE_OBSERVATION_STALE: branch ref path is unsafe"
+            )
+        parent = parent.parent
+    if loose.exists():
+        head = _bounded_git_admin_text(loose, max_bytes=256)
+        if _GIT_OBJECT_ID.fullmatch(head) is None:
+            raise ValueError(
+                "E_LEASE_OBSERVATION_STALE: branch head is invalid"
+            )
+        return head
+    packed = common_dir / "packed-refs"
+    if not packed.exists():
+        raise ValueError(
+            "E_LEASE_OBSERVATION_STALE: branch head is unavailable"
+        )
+    for line in _bounded_git_admin_text(
+        packed, max_bytes=4_194_304
+    ).splitlines():
+        if not line or line.startswith(("#", "^")):
+            continue
+        try:
+            object_id, candidate = line.split(" ", 1)
+        except ValueError as error:
+            raise ValueError(
+                "E_LEASE_OBSERVATION_STALE: packed refs are invalid"
+            ) from error
+        if candidate == ref:
+            if _GIT_OBJECT_ID.fullmatch(object_id) is None:
+                raise ValueError(
+                    "E_LEASE_OBSERVATION_STALE: packed branch head is invalid"
+                )
+            return object_id
+    raise ValueError(
+        "E_LEASE_OBSERVATION_STALE: branch head is unavailable"
+    )
+
+
+def _live_worktree_record(
+    item: WorktreeInventoryRecord, common_dir: Path
+) -> WorktreeInventoryRecord:
+    worktree = Path(item.worktree)
+    git_dir = _resolve_worktree_git_dir(worktree, common_dir)
+    head_value = _bounded_git_admin_text(
+        git_dir / "HEAD", max_bytes=4096
+    )
+    if head_value.startswith("ref: "):
+        ref = head_value[len("ref: ") :]
+        head = _resolve_live_branch_head(common_dir, ref)
+        branch = ref[len("refs/heads/") :]
+        detached = False
+    else:
+        if _GIT_OBJECT_ID.fullmatch(head_value) is None:
+            raise ValueError(
+                "E_LEASE_OBSERVATION_STALE: detached head is invalid"
+            )
+        head = head_value
+        branch = None
+        detached = True
+    return WorktreeInventoryRecord(
+        worktree=str(worktree.resolve()),
+        git_dir=str(git_dir),
+        head=head,
+        branch=branch,
+        detached=detached,
     )
 
 
@@ -947,6 +1169,29 @@ def _git_text(worktree: Path, arguments: list[str]) -> str:
     return completed.stdout.strip()
 
 
+def _canonical_github_repository_from_url(
+    value: object, *, code: str
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{code}: GitHub repository URL is invalid")
+    match = _GITHUB_HTTPS_REMOTE.fullmatch(value)
+    if (
+        match is None
+        or "@" in value
+        or "?" in value
+        or "#" in value
+        or match.group("owner") in {".", ".."}
+        or match.group("repository") in {".", ".."}
+    ):
+        raise ValueError(
+            f"{code}: credential-free github.com HTTPS is required"
+        )
+    return (
+        f"{match.group('owner').casefold()}/"
+        f"{match.group('repository').casefold()}"
+    )
+
+
 def observe_local_git_state(
     *,
     task_state: Mapping[str, object],
@@ -1339,6 +1584,9 @@ def _sanitized_git_environment() -> dict[str, str]:
         "GIT_CONFIG_SYSTEM": "/dev/null",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_LITERAL_PATHSPECS": "1",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "",
         "SSH_ASKPASS": "",
@@ -1386,6 +1634,89 @@ def _closed_git_argv(
         str(worktree),
         *arguments,
     ]
+
+
+def _governing_git_bytes(
+    worktree: Path,
+    arguments: list[str],
+    *,
+    max_output_bytes: int,
+) -> bytes:
+    completed = subprocess.run(
+        _closed_git_argv(worktree, arguments),
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=_sanitized_git_environment(),
+        timeout=10,
+    )
+    payload = completed.stdout
+    if (
+        completed.returncode != 0
+        or not isinstance(payload, bytes)
+        or len(payload) > max_output_bytes
+    ):
+        raise ValueError(
+            "E_GOVERNING_RUNTIME: immutable Git object is unavailable"
+        )
+    return payload
+
+
+def _governing_tree_entries(
+    worktree: Path,
+    treeish: str,
+    *,
+    path: str | None = None,
+) -> tuple[tuple[str, str, str], ...]:
+    arguments = ["ls-tree", "-z", treeish]
+    if path is not None:
+        arguments.extend(["--", path])
+    payload = _governing_git_bytes(
+        worktree, arguments, max_output_bytes=262_144
+    )
+    entries: list[tuple[str, str, str]] = []
+    for raw in payload.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, raw_name = raw.split(b"\t", 1)
+            mode, object_type, _object_id = metadata.decode(
+                "ascii"
+            ).split(" ", 2)
+            name = raw_name.decode("utf-8")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise ValueError(
+                "E_GOVERNING_RUNTIME: immutable Git tree is invalid"
+            ) from error
+        if "\x00" in name or not name:
+            raise ValueError(
+                "E_GOVERNING_RUNTIME: immutable Git tree is invalid"
+            )
+        entries.append((mode, object_type, name))
+    return tuple(entries)
+
+
+def _governing_regular_blob(
+    worktree: Path,
+    commit: str,
+    relative_path: str,
+    *,
+    max_output_bytes: int,
+) -> bytes:
+    entries = _governing_tree_entries(
+        worktree, commit, path=relative_path
+    )
+    if entries != (("100644", "blob", relative_path),) and entries != (
+        ("100755", "blob", relative_path),
+    ):
+        raise ValueError(
+            "E_GOVERNING_RUNTIME: governing path is not a regular blob"
+        )
+    return _governing_git_bytes(
+        worktree,
+        ["cat-file", "blob", f"{commit}:{relative_path}"],
+        max_output_bytes=max_output_bytes,
+    )
 
 
 def _canonical_directory(value: Path | str, *, code: str) -> Path:
@@ -1625,15 +1956,7 @@ def _inventory_is_current(
     common_dir = Path(inventory.common_git_dir)
     try:
         refreshed = tuple(
-            WorktreeInventoryRecord(
-                worktree=item.worktree,
-                git_dir=str(
-                    _resolve_worktree_git_dir(Path(item.worktree), common_dir)
-                ),
-                head=item.head,
-                branch=item.branch,
-                detached=item.detached,
-            )
+            _live_worktree_record(item, common_dir)
             for item in inventory.records
         )
         registered = {
@@ -1644,7 +1967,7 @@ def _inventory_is_current(
         observed_linked = {
             item.git_dir for item in inventory.records if item.git_dir != str(common_dir)
         }
-    except OSError:
+    except (OSError, ValueError):
         return False
     return (
         registered == observed_linked
@@ -2009,6 +2332,8 @@ def attest_verification_governing_runtime(
     lock_path = attestor / ".codex" / "control-plane.lock"
     policy_path = attestor / ".codex" / "project-policy.toml"
     if (
+        _GIT_OBJECT_ID.fullmatch(governing_base_commit) is None
+        or
         head != governing_base_commit
         or status
         or expected_runtime_layout not in {"source", "isolated"}
@@ -2023,7 +2348,31 @@ def attest_verification_governing_runtime(
         raise ValueError(
             "E_GOVERNING_RUNTIME: attestor binding or cleanliness is invalid"
         )
-    lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    lock_bytes = _governing_regular_blob(
+        attestor,
+        governing_base_commit,
+        ".codex/control-plane.lock",
+        max_output_bytes=131_072,
+    )
+    policy_bytes = _governing_regular_blob(
+        attestor,
+        governing_base_commit,
+        ".codex/project-policy.toml",
+        max_output_bytes=131_072,
+    )
+    if (
+        lock_path.read_bytes() != lock_bytes
+        or policy_path.read_bytes() != policy_bytes
+    ):
+        raise ValueError(
+            "E_GOVERNING_RUNTIME: governing filesystem bytes drifted"
+        )
+    try:
+        lock = tomllib.loads(lock_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(
+            "E_GOVERNING_RUNTIME: immutable lock is invalid"
+        ) from error
     package = (
         "control_plane"
         if expected_runtime_layout == "source"
@@ -2041,14 +2390,46 @@ def attest_verification_governing_runtime(
         or not runtime.is_dir()
     ):
         raise ValueError("E_GOVERNING_RUNTIME: locked runtime layout drifted")
+    runtime_relative = (
+        "control_plane"
+        if expected_runtime_layout == "source"
+        else f".codex/runtime/{package}"
+    )
+    tree_entries = _governing_tree_entries(
+        attestor, f"{governing_base_commit}:{runtime_relative}"
+    )
+    committed_modules = tuple(
+        sorted(
+            name
+            for mode, object_type, name in tree_entries
+            if object_type == "blob"
+            and mode in {"100644", "100755"}
+            and name.endswith(".py")
+            and "/" not in name
+        )
+    )
     hasher = sha256()
     modules = sorted(runtime.glob("*.py"))
+    if tuple(path.name for path in modules) != committed_modules:
+        raise ValueError(
+            "E_GOVERNING_RUNTIME: runtime module inventory drifted"
+        )
     for path in modules:
         if path.is_symlink() or not path.is_file():
             raise ValueError("E_GOVERNING_RUNTIME: runtime module is invalid")
+        committed_bytes = _governing_regular_blob(
+            attestor,
+            governing_base_commit,
+            f"{runtime_relative}/{path.name}",
+            max_output_bytes=1_048_576,
+        )
+        if path.read_bytes() != committed_bytes:
+            raise ValueError(
+                "E_GOVERNING_RUNTIME: governing runtime bytes drifted"
+            )
         hasher.update(path.name.encode("utf-8"))
         hasher.update(b"\0")
-        hasher.update(path.read_bytes())
+        hasher.update(committed_bytes)
         hasher.update(b"\0")
     runtime_digest = f"sha256:{hasher.hexdigest()}"
     if not modules or lock.get("digests", {}).get("runtime") != runtime_digest:
@@ -2058,8 +2439,8 @@ def attest_verification_governing_runtime(
     observation._consumed = False
     values = {
         "runtime_digest": runtime_digest,
-        "lock_digest": f"sha256:{sha256(lock_path.read_bytes()).hexdigest()}",
-        "policy_digest": f"sha256:{sha256(policy_path.read_bytes()).hexdigest()}",
+        "lock_digest": f"sha256:{sha256(lock_bytes).hexdigest()}",
+        "policy_digest": f"sha256:{sha256(policy_bytes).hexdigest()}",
         "attestor_worktree": str(attestor),
         "target_worktree": str(target),
         "governing_base_commit": governing_base_commit,
@@ -2097,6 +2478,8 @@ class RemoteEffectContext:
         "task_id",
         "repository_identity",
         "worktree_identity",
+        "remote_repository",
+        "remote_name",
         "branch",
         "head",
         "session_id",
@@ -2119,6 +2502,8 @@ class ValidatedRemoteEffectContext:
         "task_id",
         "repository_identity",
         "worktree_identity",
+        "remote_repository",
+        "remote_name",
         "branch",
         "head",
         "session_id",
@@ -2154,8 +2539,14 @@ def create_remote_effect_context(
     expected_pr_number: int | None,
     expected_base_sha: str | None,
     expected_checks_digest: str | None,
+    governing_policy: object,
     host_capability: object,
 ) -> RemoteEffectContext:
+    from control_plane.policy import (
+        GoverningPolicy,
+        _governing_policy_is_live,
+    )
+
     if (
         not isinstance(task, Mapping)
         or validate_task_envelope(task)
@@ -2163,6 +2554,10 @@ def create_remote_effect_context(
         or type(local_git) is not LocalGitObservation
         or local_git.provider != "git"
         or type(host_capability) is not HostAdapterCapability
+        or type(governing_policy) is not GoverningPolicy
+        or not _governing_policy_is_live(
+            governing_policy, clock=host_capability._clock
+        )
         or not _runtime_host_object_is_live(
             host_capability, "host_capability"
         )
@@ -2252,6 +2647,28 @@ def create_remote_effect_context(
         raise ValueError(
             "E_REMOTE_EFFECT_CONTEXT: integration requires a separate outcome"
         )
+    policy_git = governing_policy.policy.get("git", {})
+    remote_name = policy_git.get("remote")
+    if not isinstance(remote_name, str) or not remote_name:
+        raise ValueError(
+            "E_REMOTE_EFFECT_CONTEXT: governing remote is unavailable"
+        )
+    try:
+        live_remote_repository = _canonical_github_repository_from_url(
+            _git_text(
+                worktree,
+                ["remote", "get-url", "--push", remote_name],
+            ),
+            code="E_REMOTE_EFFECT_CONTEXT",
+        )
+    except ValueError as error:
+        raise ValueError(
+            "E_REMOTE_EFFECT_CONTEXT: governing remote is unavailable"
+        ) from error
+    if live_remote_repository != governing_policy.remote_repository:
+        raise ValueError(
+            "E_REMOTE_EFFECT_CONTEXT: governing remote identity drifted"
+        )
     if not _consume_runtime_host_object(
         host_capability, "host_capability"
     ):
@@ -2266,6 +2683,8 @@ def create_remote_effect_context(
         "task_id": task_id,
         "repository_identity": str(repository),
         "worktree_identity": str(worktree),
+        "remote_repository": governing_policy.remote_repository,
+        "remote_name": remote_name,
         "branch": local_git.branch,
         "head": head,
         "session_id": session_id,
@@ -2285,6 +2704,8 @@ def create_remote_effect_context(
                 "task_id",
                 "repository_identity",
                 "worktree_identity",
+                "remote_repository",
+                "remote_name",
                 "branch",
                 "head",
                 "session_id",
@@ -2328,6 +2749,8 @@ def validate_remote_effect_context(
             "task_id",
             "repository_identity",
             "worktree_identity",
+            "remote_repository",
+            "remote_name",
             "branch",
             "head",
             "session_id",
@@ -2427,6 +2850,9 @@ def _assert_remote_effect_context_live(
             or _runtime_host_object_is_live(
                 context, "pr_request_context"
             )
+            or _runtime_host_object_is_live(
+                context, "claimed_pr_request_context"
+            )
         )
         or _git_text(worktree, ["rev-parse", "HEAD"]) != context.head
         or _git_text(worktree, ["branch", "--show-current"])
@@ -2436,6 +2862,20 @@ def _assert_remote_effect_context_live(
             ["status", "--porcelain=v2", "--untracked-files=all"],
         )
     ):
+        raise ValueError(f"{code}: validated remote context drifted")
+    try:
+        live_remote_repository = _canonical_github_repository_from_url(
+            _git_text(
+                worktree,
+                ["remote", "get-url", "--push", context.remote_name],
+            ),
+            code=code,
+        )
+    except (AttributeError, ValueError) as error:
+        raise ValueError(
+            f"{code}: validated remote context drifted"
+        ) from error
+    if live_remote_repository != context.remote_repository:
         raise ValueError(f"{code}: validated remote context drifted")
     state_dir = _git_dir_for_worktree(worktree)
     state_path = (
@@ -2517,6 +2957,58 @@ def _assert_no_external_git_filters(
         raise ValueError(
             "E_GIT_FILTER: external clean filters are not permitted"
         )
+
+
+def _assert_exact_stage_paths(
+    worktree: Path,
+    requested: tuple[str, ...],
+    normalized: tuple[str, ...],
+) -> None:
+    if len(requested) != len(normalized):
+        raise ValueError("E_GIT_EFFECT: stage path inventory is invalid")
+    for raw, relative in zip(requested, normalized):
+        target = worktree / relative
+        if (
+            raw != relative
+            or relative == "."
+            or any(character in raw for character in "*?[]")
+            or target.is_symlink()
+            or target.is_dir()
+        ):
+            raise ValueError(
+                "E_GIT_EFFECT: stage requires exact literal file paths"
+            )
+        resolved = target.resolve(strict=False)
+        if worktree not in resolved.parents:
+            raise ValueError(
+                "E_GIT_EFFECT: stage path escaped the worktree"
+            )
+        parent = target.parent
+        while parent != worktree:
+            if parent.is_symlink():
+                raise ValueError(
+                    "E_GIT_EFFECT: stage path traverses a symlink"
+                )
+            parent = parent.parent
+        if target.exists() and not target.is_file():
+            raise ValueError(
+                "E_GIT_EFFECT: stage target is not a regular file"
+            )
+        if not target.exists():
+            tracked = subprocess.run(
+                _closed_git_argv(
+                    worktree,
+                    ["ls-files", "--error-unmatch", "--", relative],
+                ),
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_sanitized_git_environment(),
+            )
+            if tracked.returncode != 0:
+                raise ValueError(
+                    "E_GIT_EFFECT: missing stage target is not tracked"
+                )
 
 
 def _assert_no_unsafe_transport_config(worktree: Path) -> None:
@@ -2702,7 +3194,7 @@ def stage_allowlisted_paths(
     owned = tuple(str(item) for item in lease_mapping.get("paths", ()))
     if (
         not paths
-        or any(item is None or item.endswith("/**") for item in normalized)
+        or any(item is None for item in normalized)
         or any(
             not any(
                 scope == "."
@@ -2714,8 +3206,10 @@ def stage_allowlisted_paths(
         )
     ):
         raise ValueError("E_GIT_EFFECT: stage paths exceed the writer lease")
+    exact_paths = tuple(str(item) for item in normalized)
+    _assert_exact_stage_paths(worktree, paths, exact_paths)
     _assert_no_external_git_filters(
-        worktree, tuple(str(item) for item in normalized)
+        worktree, exact_paths
     )
     subject_digest = contract_digest({"paths": normalized})
     consume_authorization(
@@ -2737,6 +3231,8 @@ def stage_allowlisted_paths(
         inventory,
         expected_common_git_dir=Path(inventory.common_git_dir),
     )
+    _assert_exact_stage_paths(worktree, paths, exact_paths)
+    _assert_no_external_git_filters(worktree, exact_paths)
     completed = subprocess.run(
         _closed_git_argv(
             worktree, ["add", "--", *normalized]
@@ -2943,6 +3439,7 @@ def push_validated_feature(
         or not remote
         or not isinstance(base, str)
         or context.branch == base
+        or context.remote_name != remote
         or context.session_id != session_id
         or context.invocation_id != invocation_id
     ):
@@ -2951,23 +3448,22 @@ def push_validated_feature(
         context, code="E_REMOTE_EFFECT"
     )
     push_url = _git_text(
-        Path(context.worktree_identity),
-        ["remote", "get-url", "--push", remote],
+        Path(context.worktree_identity), ["remote", "get-url", "--push", remote]
     )
-    if (
-        "\n" in push_url
-        or re.fullmatch(
-            r"https://github\.com/"
-            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?",
-            push_url,
+    try:
+        live_remote_repository = _canonical_github_repository_from_url(
+            push_url, code="E_REMOTE_EFFECT"
         )
-        is None
-        or "@" in push_url
-        or "?" in push_url
-        or "#" in push_url
-    ):
+    except ValueError as error:
         raise ValueError(
             "E_REMOTE_EFFECT: push URL requires credential-free github.com HTTPS"
+        ) from error
+    if (
+        context.remote_repository != governing_policy.remote_repository
+        or live_remote_repository != context.remote_repository
+    ):
+        raise ValueError(
+            "E_REMOTE_EFFECT: push repository identity drifted"
         )
     _assert_no_unsafe_transport_config(Path(context.worktree_identity))
     consume_authorization(
@@ -2989,6 +3485,20 @@ def push_validated_feature(
         inventory,
         expected_common_git_dir=Path(inventory.common_git_dir),
     )
+    revalidated_push_url = _git_text(
+        Path(context.worktree_identity),
+        ["remote", "get-url", "--push", remote],
+    )
+    if (
+        revalidated_push_url != push_url
+        or _canonical_github_repository_from_url(
+            revalidated_push_url, code="E_REMOTE_EFFECT"
+        )
+        != context.remote_repository
+    ):
+        raise ValueError(
+            "E_REMOTE_EFFECT: push repository identity drifted"
+        )
     push_returncode, _ = _execute_native_remote(
         "git_feature_push",
         tuple(
@@ -2996,7 +3506,7 @@ def push_validated_feature(
                 context.worktree_identity,
                 [
                     "push",
-                    remote,
+                    revalidated_push_url,
                     (
                         f"refs/heads/{context.branch}:"
                         f"refs/heads/{context.branch}"
@@ -3014,7 +3524,7 @@ def push_validated_feature(
                 [
                     "ls-remote",
                     "--heads",
-                    remote,
+                    revalidated_push_url,
                     f"refs/heads/{context.branch}",
                 ],
             )
@@ -3101,6 +3611,42 @@ class ValidatedGitHubPullRequestWriteProvider:
         raise TypeError("GitHub PR write provider is host-bound")
 
 
+def _assert_governing_pr_remote_live(
+    *,
+    governing_runtime: GoverningRuntimeObservation,
+    governing_policy: object,
+    expected_repository: str,
+) -> None:
+    policy_git = governing_policy.policy.get("git", {})
+    remote_name = policy_git.get("remote")
+    if not isinstance(remote_name, str) or not remote_name:
+        raise ValueError(
+            "E_GITHUB_PR_PROVIDER: governing remote is unavailable"
+        )
+    try:
+        live_repository = _canonical_github_repository_from_url(
+            _git_text(
+                _canonical_directory(
+                    governing_runtime.target_worktree,
+                    code="E_GITHUB_PR_PROVIDER",
+                ),
+                ["remote", "get-url", "--push", remote_name],
+            ),
+            code="E_GITHUB_PR_PROVIDER",
+        )
+    except ValueError as error:
+        raise ValueError(
+            "E_GITHUB_PR_PROVIDER: governing remote is unavailable"
+        ) from error
+    if (
+        live_repository != expected_repository
+        or governing_policy.remote_repository != expected_repository
+    ):
+        raise ValueError(
+            "E_GITHUB_PR_PROVIDER: governing remote identity drifted"
+        )
+
+
 def approve_github_pr_write_provider(
     native_provider_event: object,
     *,
@@ -3132,6 +3678,7 @@ def approve_github_pr_write_provider(
         or not _governing_policy_is_live_for_runtime(
             governing_policy, governing_runtime, clock=clock
         )
+        or governing_policy.remote_repository != expected_repository
         or native_provider_event.repository != expected_repository
         or native_provider_event.session_id != session_id
         or native_provider_event.invocation_id != invocation_id
@@ -3146,6 +3693,11 @@ def approve_github_pr_write_provider(
         raise ValueError(
             "E_GITHUB_PR_PROVIDER: governing base branch is unavailable"
         )
+    _assert_governing_pr_remote_live(
+        governing_runtime=governing_runtime,
+        governing_policy=governing_policy,
+        expected_repository=expected_repository,
+    )
     auth_returncode, _ = _execute_native_remote(
         "github_auth_status",
         ("gh", "auth", "status", "--hostname", "github.com"),
@@ -3178,6 +3730,11 @@ def approve_github_pr_write_provider(
         raise ValueError(
             "E_GITHUB_PR_PROVIDER: exact repository access is not ready"
         )
+    _assert_governing_pr_remote_live(
+        governing_runtime=governing_runtime,
+        governing_policy=governing_policy,
+        expected_repository=expected_repository,
+    )
     if not _consume_governing_policy(
         governing_policy
     ) or not _consume_governing_runtime_observation(governing_runtime):
@@ -3238,6 +3795,9 @@ def validate_pull_request_body(value: str) -> ValidatedPullRequestBody:
 class ValidatedPullRequestMutationRequest:
     __slots__ = (
         "_consumed",
+        "_execution_state",
+        "_recovery_consumed",
+        "_effect_bindings",
         "context",
         "provider",
         "title",
@@ -3253,6 +3813,25 @@ class ValidatedPullRequestMutationRequest:
         cls, *_: object, **__: object
     ) -> "ValidatedPullRequestMutationRequest":
         raise TypeError("validated PR mutation request is host-bound")
+
+
+@dataclass(frozen=True)
+class _PullRequestMutationEffectBindings:
+    repository: str
+    base_branch: str
+    branch: str
+    head: str
+    remote_repository: str
+    remote_name: str
+    expected_base_sha: str
+    expected_checks_digest: str | None
+    expected_pr_number: int | None
+    title: str
+    body: str
+    draft: bool
+    session_id: str
+    invocation_id: str
+    provider_freshness_deadline: float
 
 
 def build_pull_request_mutation_request(
@@ -3285,6 +3864,7 @@ def build_pull_request_mutation_request(
         or context.expected_pr_number != expected_pr_number
         or context.session_id != session_id
         or context.invocation_id != invocation_id
+        or provider.repository != context.remote_repository
         or provider.session_id != session_id
         or provider.invocation_id != invocation_id
     ):
@@ -3323,8 +3903,12 @@ def build_pull_request_mutation_request(
     context._consumed = True
     provider._consumed = True
     _register_runtime_host_object(context, "pr_request_context")
+    _register_runtime_host_object(provider, "pr_request_provider")
     request = object.__new__(ValidatedPullRequestMutationRequest)
     request._consumed = False
+    request._execution_state = "ready"
+    request._recovery_consumed = False
+    request._effect_bindings = None
     request.context = context
     request.provider = provider
     request.title = title
@@ -3374,70 +3958,299 @@ class ValidatedPullRequestMutationObservation(PullRequestMutationObservation):
     pass
 
 
-def execute_pull_request_mutation(
-    request: object, *, clock: Callable[[], float]
-) -> PullRequestMutationObservation:
-    if (
-        type(request) is not ValidatedPullRequestMutationRequest
-        or not _runtime_host_object_is_live(
-            request, "pr_mutation_request"
-        )
-        or request._consumed
-    ):
-        raise ValueError("E_PR_MUTATION: typed request is required")
-    context = request.context
-    repository = request.provider.repository
-    base = request.provider.base_branch
-    _assert_remote_effect_context_live(context, code="E_PR_MUTATION")
-    if (
-        not isinstance(base, str)
-        or not base
-        or not isinstance(context.expected_base_sha, str)
-        or _GIT_OBJECT_ID.fullmatch(context.expected_base_sha) is None
-    ):
-        raise ValueError("E_PR_MUTATION: base binding is required")
-    if request.expected_pr_number is None:
-        arguments = (
-            "gh",
-            "pr",
-            "create",
-            "--repo",
-            repository,
-            "--base",
-            base,
-            "--head",
-            context.branch,
-            "--title",
-            request.title.value,
-            "--body",
-            request.body.value,
-        )
-        if request.draft:
-            arguments = (*arguments, "--draft")
-    else:
-        arguments = (
-            "gh",
-            "pr",
-            "edit",
-            str(request.expected_pr_number),
-            "--repo",
-            repository,
-            "--title",
-            request.title.value,
-            "--body",
-            request.body.value,
-        )
-    mutation_returncode, _ = _execute_native_remote(
-        "github_pull_request_mutation",
+def _github_json_response(
+    operation: str,
+    arguments: tuple[str, ...],
+    *,
+    max_output_bytes: int,
+) -> object:
+    returncode, raw = _execute_native_remote(
+        operation,
         arguments,
-        max_output_bytes=0,
+        max_output_bytes=max_output_bytes,
     )
-    if mutation_returncode != 0:
-        raise ValueError("E_PR_MUTATION: provider mutation failed")
+    if returncode != 0:
+        raise ValueError(
+            "E_PR_MUTATION: live provider precondition is unavailable"
+        )
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(
+            "E_PR_MUTATION: live provider precondition is invalid"
+        ) from error
+
+
+def _live_github_checks_digest(
+    payload: object, *, expected_head: str
+) -> str | None:
+    if not isinstance(payload, Mapping):
+        raise ValueError("E_PR_MUTATION: live checks are invalid")
+    total_count = payload.get("total_count")
+    raw_runs = payload.get("check_runs")
+    if (
+        not isinstance(total_count, int)
+        or isinstance(total_count, bool)
+        or not 0 <= total_count <= 100
+        or not isinstance(raw_runs, list)
+        or len(raw_runs) != total_count
+    ):
+        raise ValueError("E_PR_MUTATION: live checks are incomplete")
+    checks: list[dict[str, object]] = []
+    identifiers: set[int] = set()
+    for raw_run in raw_runs:
+        if not isinstance(raw_run, Mapping):
+            raise ValueError("E_PR_MUTATION: live checks are invalid")
+        identifier = raw_run.get("id")
+        name = raw_run.get("name")
+        status = raw_run.get("status")
+        conclusion = raw_run.get("conclusion")
+        head_sha = raw_run.get("head_sha")
+        app = raw_run.get("app")
+        app_slug = app.get("slug") if isinstance(app, Mapping) else None
+        if (
+            not isinstance(identifier, int)
+            or isinstance(identifier, bool)
+            or identifier <= 0
+            or identifier in identifiers
+            or not isinstance(name, str)
+            or not name
+            or not isinstance(status, str)
+            or not status
+            or (
+                conclusion is not None
+                and not isinstance(conclusion, str)
+            )
+            or head_sha != expected_head
+            or not isinstance(app_slug, str)
+            or not app_slug
+        ):
+            raise ValueError("E_PR_MUTATION: live checks are invalid")
+        identifiers.add(identifier)
+        checks.append(
+            {
+                "id": identifier,
+                "name": name,
+                "status": status,
+                "conclusion": conclusion,
+                "app_slug": app_slug,
+            }
+        )
+    if not checks:
+        return None
+    checks.sort(
+        key=lambda item: (
+            int(item["id"]),
+            str(item["name"]),
+            str(item["app_slug"]),
+        )
+    )
+    return contract_digest(tuple(checks))
+
+
+def _assert_live_pull_request_preconditions(
+    bindings: _PullRequestMutationEffectBindings,
+) -> None:
+    repository = bindings.repository
+    base = bindings.base_branch
+    if bindings.expected_pr_number is None:
+        raw_pr = _github_json_response(
+            "github_pull_request_precondition_pr",
+            (
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                repository,
+                "--state",
+                "open",
+                "--base",
+                base,
+                "--head",
+                bindings.branch,
+                "--limit",
+                "2",
+                "--json",
+                "number,baseRefName,headRefName,headRefOid",
+            ),
+            max_output_bytes=16_384,
+        )
+        if raw_pr != []:
+            raise ValueError(
+                "E_PR_MUTATION: live PR number drifted"
+            )
+    else:
+        raw_pr = _github_json_response(
+            "github_pull_request_precondition_pr",
+            (
+                "gh",
+                "pr",
+                "view",
+                str(bindings.expected_pr_number),
+                "--repo",
+                repository,
+                "--json",
+                "number,baseRefName,headRefName,headRefOid",
+            ),
+            max_output_bytes=16_384,
+        )
+        if (
+            not isinstance(raw_pr, Mapping)
+            or raw_pr.get("number") != bindings.expected_pr_number
+            or raw_pr.get("baseRefName") != base
+            or raw_pr.get("headRefName") != bindings.branch
+            or raw_pr.get("headRefOid") != bindings.head
+        ):
+            raise ValueError("E_PR_MUTATION: live PR binding drifted")
+    raw_base = _github_json_response(
+        "github_pull_request_precondition_base",
+        (
+            "gh",
+            "api",
+            f"repos/{repository}/git/ref/heads/{base}",
+        ),
+        max_output_bytes=16_384,
+    )
+    base_object = (
+        raw_base.get("object")
+        if isinstance(raw_base, Mapping)
+        else None
+    )
+    if (
+        not isinstance(base_object, Mapping)
+        or base_object.get("sha") != bindings.expected_base_sha
+    ):
+        raise ValueError("E_PR_MUTATION: live base SHA drifted")
+    raw_checks = _github_json_response(
+        "github_pull_request_precondition_checks",
+        (
+            "gh",
+            "api",
+            (
+                f"repos/{repository}/commits/{bindings.head}/"
+                "check-runs?per_page=100"
+            ),
+        ),
+        max_output_bytes=262_144,
+    )
+    if (
+        _live_github_checks_digest(
+            raw_checks, expected_head=bindings.head
+        )
+        != bindings.expected_checks_digest
+    ):
+        raise ValueError("E_PR_MUTATION: live checks digest drifted")
+
+
+def _claim_pull_request_mutation(
+    request: object,
+) -> tuple[
+    ValidatedPullRequestMutationRequest,
+    ValidatedRemoteEffectContext,
+    _PullRequestMutationEffectBindings,
+]:
+    with _PR_MUTATION_CLAIM_LOCK:
+        context = getattr(request, "context", None)
+        provider = getattr(request, "provider", None)
+        title = getattr(request, "title", None)
+        body = getattr(request, "body", None)
+        expected_request_digest = (
+            contract_digest(
+                {
+                    "context": context.context_digest,
+                    "provider": provider.provider_id,
+                    "title": title.digest,
+                    "body": body.digest,
+                    "draft": request.draft,
+                    "expected_pr_number": request.expected_pr_number,
+                    "session_id": request.session_id,
+                    "invocation_id": request.invocation_id,
+                }
+            )
+            if (
+                type(context) is ValidatedRemoteEffectContext
+                and type(provider)
+                is ValidatedGitHubPullRequestWriteProvider
+                and type(title) is ValidatedPullRequestTitle
+                and type(body) is ValidatedPullRequestBody
+            )
+            else None
+        )
+        if (
+            type(request) is not ValidatedPullRequestMutationRequest
+            or request._consumed
+            or request._execution_state != "ready"
+            or request._effect_bindings is not None
+            or type(context) is not ValidatedRemoteEffectContext
+            or type(provider)
+            is not ValidatedGitHubPullRequestWriteProvider
+            or type(title) is not ValidatedPullRequestTitle
+            or type(body) is not ValidatedPullRequestBody
+            or not _runtime_host_object_is_live(
+                request, "pr_mutation_request"
+            )
+            or not _runtime_host_object_is_live(
+                context, "pr_request_context"
+            )
+            or not _runtime_host_object_is_live(
+                provider, "pr_request_provider"
+            )
+            or request.request_digest != expected_request_digest
+            or provider.repository != context.remote_repository
+            or request.session_id != context.session_id
+            or request.invocation_id != context.invocation_id
+            or provider.session_id != context.session_id
+            or provider.invocation_id != context.invocation_id
+        ):
+            raise ValueError(
+                "E_PR_MUTATION: typed unclaimed request is required"
+            )
+        bindings = _PullRequestMutationEffectBindings(
+            repository=provider.repository,
+            base_branch=provider.base_branch,
+            branch=context.branch,
+            head=context.head,
+            remote_repository=context.remote_repository,
+            remote_name=context.remote_name,
+            expected_base_sha=str(context.expected_base_sha),
+            expected_checks_digest=context.expected_checks_digest,
+            expected_pr_number=request.expected_pr_number,
+            title=title.value,
+            body=body.value,
+            draft=request.draft,
+            session_id=request.session_id,
+            invocation_id=request.invocation_id,
+            provider_freshness_deadline=provider.freshness_deadline,
+        )
+        if not _consume_runtime_host_object(
+            request, "pr_mutation_request"
+        ) or not _consume_runtime_host_object(
+            context, "pr_request_context"
+        ) or not _consume_runtime_host_object(
+            provider, "pr_request_provider"
+        ):
+            raise ValueError(
+                "E_PR_MUTATION: request claim is unavailable"
+            )
+        request._consumed = True
+        request._execution_state = "claimed"
+        request._effect_bindings = bindings
+        _register_runtime_host_object(
+            context, "claimed_pr_request_context"
+        )
+        return request, context, bindings
+
+
+def _observe_pull_request_mutation(
+    bindings: _PullRequestMutationEffectBindings,
+    *,
+    clock: Callable[[], float],
+) -> PullRequestMutationObservation:
+    repository = bindings.repository
     selector = (
-        str(request.expected_pr_number)
-        if request.expected_pr_number is not None
-        else context.branch
+        str(bindings.expected_pr_number)
+        if bindings.expected_pr_number is not None
+        else bindings.branch
     )
     observed_returncode, observed_output = _execute_native_remote(
         "github_pull_request_observe",
@@ -3456,32 +4269,193 @@ def execute_pull_request_mutation(
     try:
         payload = json.loads(observed_output)
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise ValueError("E_PR_MUTATION: provider observation failed") from error
-    if observed_returncode != 0:
-        raise ValueError("E_PR_MUTATION: provider observation failed")
-    if not _consume_runtime_host_object(
-        request, "pr_mutation_request"
-    ) or not _consume_runtime_host_object(
-        context, "pr_request_context"
+        raise ValueError(
+            "E_PR_MUTATION: provider observation failed"
+        ) from error
+    number = payload.get("number") if isinstance(payload, Mapping) else None
+    url = payload.get("url") if isinstance(payload, Mapping) else None
+    draft = payload.get("isDraft") if isinstance(payload, Mapping) else None
+    if (
+        observed_returncode != 0
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or number <= 0
+        or (
+            bindings.expected_pr_number is not None
+            and number != bindings.expected_pr_number
+        )
+        or not isinstance(url, str)
+        or not url.startswith(
+            f"https://github.com/{repository}/pull/"
+        )
+        or not isinstance(draft, bool)
+        or payload.get("baseRefName") != bindings.base_branch
+        or payload.get("headRefName") != bindings.branch
+        or payload.get("headRefOid") != bindings.head
     ):
-        raise ValueError("E_PR_MUTATION: request binding is not host-issued")
-    request._consumed = True
+        raise ValueError(
+            "E_PR_MUTATION: provider observation binding drifted"
+        )
     now = float(clock())
     observation = object.__new__(PullRequestMutationObservation)
     observation._consumed = False
     observation.repository = repository
-    observation.base = str(payload["baseRefName"])
-    observation.head_branch = str(payload["headRefName"])
-    observation.head_sha = str(payload["headRefOid"])
-    observation.number = int(payload["number"])
-    observation.url = str(payload["url"])
-    observation.draft = bool(payload["isDraft"])
-    observation.session_id = request.session_id
-    observation.invocation_id = request.invocation_id
+    observation.base = bindings.base_branch
+    observation.head_branch = bindings.branch
+    observation.head_sha = bindings.head
+    observation.number = number
+    observation.url = url
+    observation.draft = draft
+    observation.session_id = bindings.session_id
+    observation.invocation_id = bindings.invocation_id
     observation.freshness_deadline = now + 30
     _register_runtime_host_object(
         observation, "pull_request_mutation_observation"
     )
+    return observation
+
+
+def execute_pull_request_mutation(
+    request: object, *, clock: Callable[[], float]
+) -> PullRequestMutationObservation:
+    request, context, bindings = _claim_pull_request_mutation(request)
+    repository = bindings.repository
+    base = bindings.base_branch
+    try:
+        _assert_remote_effect_context_live(context, code="E_PR_MUTATION")
+        if (
+            not isinstance(base, str)
+            or not base
+            or _GIT_OBJECT_ID.fullmatch(bindings.expected_base_sha) is None
+            or float(clock()) > bindings.provider_freshness_deadline
+        ):
+            raise ValueError("E_PR_MUTATION: base binding is required")
+        _assert_live_pull_request_preconditions(bindings)
+        _assert_remote_effect_context_live(
+            context, code="E_PR_MUTATION"
+        )
+    except Exception:
+        _consume_runtime_host_object(
+            context, "claimed_pr_request_context"
+        )
+        request._execution_state = "precondition_failed"
+        raise
+    if not _consume_runtime_host_object(
+        context, "claimed_pr_request_context"
+    ):
+        request._execution_state = "precondition_failed"
+        raise ValueError(
+            "E_PR_MUTATION: claimed context is unavailable"
+        )
+    if bindings.expected_pr_number is None:
+        arguments = (
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            repository,
+            "--base",
+            base,
+            "--head",
+            bindings.branch,
+            "--title",
+            bindings.title,
+            "--body",
+            bindings.body,
+        )
+        if bindings.draft:
+            arguments = (*arguments, "--draft")
+    else:
+        arguments = (
+            "gh",
+            "pr",
+            "edit",
+            str(bindings.expected_pr_number),
+            "--repo",
+            repository,
+            "--title",
+            bindings.title,
+            "--body",
+            bindings.body,
+        )
+    request._execution_state = "effect_started"
+    try:
+        mutation_returncode, _ = _execute_native_remote(
+            "github_pull_request_mutation",
+            arguments,
+            max_output_bytes=0,
+        )
+    except Exception as error:
+        request._execution_state = "outcome_unknown"
+        _register_runtime_host_object(
+            request, "pr_mutation_unknown_request"
+        )
+        raise ValueError(
+            "E_PR_MUTATION_OUTCOME_UNKNOWN: request consumed; "
+            "observe the exact selector and never retry the effect"
+        ) from error
+    if mutation_returncode != 0:
+        request._execution_state = "outcome_unknown"
+        _register_runtime_host_object(
+            request, "pr_mutation_unknown_request"
+        )
+        raise ValueError(
+            "E_PR_MUTATION_OUTCOME_UNKNOWN: request consumed; "
+            "observe the exact selector and never retry the effect"
+        )
+    request._execution_state = "effect_acknowledged"
+    try:
+        observation = _observe_pull_request_mutation(
+            bindings, clock=clock
+        )
+    except Exception as error:
+        request._execution_state = "outcome_unknown"
+        _register_runtime_host_object(
+            request, "pr_mutation_unknown_request"
+        )
+        raise ValueError(
+            "E_PR_MUTATION_OUTCOME_UNKNOWN: effect acknowledged but "
+            "observation is inconclusive; never retry the effect"
+        ) from error
+    request._execution_state = "completed"
+    return observation
+
+
+def recover_pull_request_mutation_outcome(
+    request: object, *, clock: Callable[[], float]
+) -> PullRequestMutationObservation:
+    with _PR_MUTATION_CLAIM_LOCK:
+        bindings = getattr(request, "_effect_bindings", None)
+        if (
+            type(request) is not ValidatedPullRequestMutationRequest
+            or request._execution_state != "outcome_unknown"
+            or request._recovery_consumed
+            or type(bindings) is not _PullRequestMutationEffectBindings
+            or not _runtime_host_object_is_live(
+                request, "pr_mutation_unknown_request"
+            )
+            or float(clock()) > bindings.provider_freshness_deadline
+        ):
+            raise ValueError(
+                "E_PR_MUTATION_RECOVERY: fresh unknown outcome is required"
+            )
+        if not _consume_runtime_host_object(
+            request, "pr_mutation_unknown_request"
+        ):
+            raise ValueError(
+                "E_PR_MUTATION_RECOVERY: request recovery claim failed"
+            )
+        request._recovery_consumed = True
+    try:
+        observation = _observe_pull_request_mutation(
+            bindings, clock=clock
+        )
+    except Exception as error:
+        raise ValueError(
+            "E_PR_MUTATION_RECOVERY_PENDING: exact provider observation "
+            "is inconclusive; do not repeat the effect"
+        ) from error
+    request._execution_state = "recovered"
     return observation
 
 

@@ -211,6 +211,7 @@ def governing_policy(
     runtime_digest: str,
     lock_digest: str,
     governing_base_commit: str,
+    remote_repository: str = "example/control-plane",
     session_id: str,
     invocation_id: str,
     freshness_deadline: float,
@@ -224,6 +225,7 @@ def governing_policy(
     result.runtime_digest = runtime_digest
     result.lock_digest = lock_digest
     result.governing_base_commit = governing_base_commit
+    result.remote_repository = remote_repository
     result.session_id = session_id
     result.invocation_id = invocation_id
     result.freshness_deadline = freshness_deadline
@@ -233,6 +235,7 @@ def governing_policy(
             "runtime_digest": runtime_digest,
             "lock_digest": lock_digest,
             "governing_base_commit": governing_base_commit,
+            "remote_repository": remote_repository,
             "session_id": session_id,
             "invocation_id": invocation_id,
         }

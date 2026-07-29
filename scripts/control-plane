@@ -3,10 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON_BIN="$(command -v python3)"
 
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONSAFEPATH=1
-python3 -P -B - "$PROJECT_ROOT" <<'PY'
+exec "$PYTHON_BIN" -I -B -c '
+import importlib
+import importlib.util
 from hashlib import sha256
 from pathlib import Path
 import sys
@@ -34,13 +35,22 @@ for path in modules:
     if path.is_symlink() or not path.is_file():
         raise SystemExit("E_RUNTIME_LAYOUT: invalid source runtime module")
     hasher.update(path.name.encode())
-    hasher.update(b"\0")
+    hasher.update(bytes((0,)))
     hasher.update(path.read_bytes())
-    hasher.update(b"\0")
+    hasher.update(bytes((0,)))
 observed = f"sha256:{hasher.hexdigest()}"
 if lock.get("digests", {}).get("runtime") != observed:
     raise SystemExit("E_RUNTIME_DIGEST: source runtime does not match lock")
-PY
-export PYTHONPATH="$PROJECT_ROOT"
-cd "$PROJECT_ROOT"
-exec python3 -P -B -m control_plane.cli "$@"
+spec = importlib.util.spec_from_file_location(
+    "control_plane",
+    runtime / "__init__.py",
+    submodule_search_locations=[str(runtime)],
+)
+if spec is None or spec.loader is None:
+    raise SystemExit("E_RUNTIME_LAYOUT: source runtime cannot be loaded")
+package = importlib.util.module_from_spec(spec)
+sys.modules["control_plane"] = package
+spec.loader.exec_module(package)
+cli = importlib.import_module("control_plane.cli")
+raise SystemExit(cli.main(sys.argv[2:]))
+' "$PROJECT_ROOT" "$@"

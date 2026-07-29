@@ -548,6 +548,26 @@ class AdoptionTests(unittest.TestCase):
             "raise RuntimeError('TOP_LEVEL_SHADOW_IMPORTED')\n",
             encoding="utf-8",
         )
+        launcher_marker = (
+            self.scenario.repo / "isolated-launcher-stdlib-shadow-executed"
+        )
+        hook_marker = (
+            self.scenario.repo / "isolated-hook-stdlib-shadow-executed"
+        )
+        (self.scenario.repo / "argparse.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(launcher_marker)!r}).write_text('executed')\n"
+            "raise RuntimeError('ARGPARSE_SHADOW_EXECUTED')\n",
+            encoding="utf-8",
+        )
+        (self.scenario.repo / "json.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(hook_marker)!r}).write_text('executed')\n"
+            "raise RuntimeError('JSON_SHADOW_EXECUTED')\n",
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(self.scenario.repo)
 
         completed = subprocess.run(
             [
@@ -562,6 +582,7 @@ class AdoptionTests(unittest.TestCase):
                 "--json",
             ],
             cwd=self.scenario.repo,
+            env=environment,
             check=False,
             capture_output=True,
             text=True,
@@ -572,6 +593,8 @@ class AdoptionTests(unittest.TestCase):
         hook = subprocess.run(
             [
                 "python3",
+                "-I",
+                "-B",
                 str(
                     self.scenario.repo
                     / ".codex"
@@ -580,6 +603,7 @@ class AdoptionTests(unittest.TestCase):
                 ),
             ],
             cwd=self.scenario.repo,
+            env=environment,
             input=json.dumps(
                 {
                     "hook_event_name": "UserPromptSubmit",
@@ -594,6 +618,10 @@ class AdoptionTests(unittest.TestCase):
         self.assertIn("CONTROL_PLANE_AUDIT_V2", hook.stdout)
         self.assertNotIn("TOP_LEVEL_SHADOW_IMPORTED", completed.stderr)
         self.assertNotIn("TOP_LEVEL_SHADOW_IMPORTED", hook.stderr)
+        self.assertFalse(launcher_marker.exists())
+        self.assertFalse(hook_marker.exists())
+        self.assertNotIn("ARGPARSE_SHADOW_EXECUTED", completed.stderr)
+        self.assertNotIn("JSON_SHADOW_EXECUTED", hook.stderr)
         for module in ("host_bridge.py", "scopes.py"):
             self.assertIn(module, RUNTIME_MODULES)
             self.assertTrue(

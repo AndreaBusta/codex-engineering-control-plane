@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from hashlib import sha256
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ def _complete_policy_recovery(
     proposed_value: str,
     governing_policy_value: str,
     policy_digest: str,
+    lock_digest: str,
     head: str,
     session_id: str,
     invocation_id: str,
@@ -59,7 +61,7 @@ def _complete_policy_recovery(
     )
     runtime = governing_runtime_observation(
         runtime_digest=policy_digest,
-        lock_digest=policy_digest,
+        lock_digest=lock_digest,
         policy_digest=policy_digest,
         attestor_worktree=str(root.resolve()),
         target_worktree=str(root.resolve()),
@@ -73,7 +75,7 @@ def _complete_policy_recovery(
         policy=load_policy(Path(governing_policy_value)),
         policy_digest=policy_digest,
         runtime_digest=policy_digest,
-        lock_digest=policy_digest,
+        lock_digest=lock_digest,
         governing_base_commit=head,
         session_id=session_id,
         invocation_id=invocation_id,
@@ -152,7 +154,10 @@ def _complete_policy_recovery(
         branch="main",
         expected_head=head,
         subject_digest=draft.draft_digest,
-        scope_paths=(".codex/project-policy.toml",),
+        scope_paths=(
+            ".codex/control-plane.lock",
+            ".codex/project-policy.toml",
+        ),
         effect="local_write",
         operation_nonce="tool-policy-recovery",
         invocation_id=invocation_id,
@@ -189,6 +194,24 @@ class PolicyContractTests(unittest.TestCase):
             )
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            subprocess.run(
+                ["git", "init", "-b", "main", str(root)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/example/control-plane.git",
+                ],
+                check=True,
+            )
             policy_path = root / ".codex" / "project-policy.toml"
             policy_path.parent.mkdir()
             policy_path.write_bytes(FIXTURE.read_bytes())
@@ -226,7 +249,213 @@ class PolicyContractTests(unittest.TestCase):
                 ttl_seconds=30,
             )
             self.assertEqual(policy.policy_digest, digest)
+            self.assertEqual(
+                policy.remote_repository, "example/control-plane"
+            )
             self.assertTrue(runtime._consumed)
+
+    def test_governing_runtime_attestor_rejects_assume_unchanged_bytes(
+        self,
+    ) -> None:
+        from control_plane.host_bridge import (
+            attest_verification_governing_runtime,
+        )
+        from control_plane.lockfile import runtime_digest
+
+        source = Path(__file__).parents[1]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            attestor = root / "attestor"
+            target = root / "target"
+            attestor.mkdir()
+            target.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main", str(attestor)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(attestor),
+                    "config",
+                    "user.name",
+                    "Governing Runtime Tests",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(attestor),
+                    "config",
+                    "user.email",
+                    "tests@example.invalid",
+                ],
+                check=True,
+            )
+            tracked = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    "HEAD",
+                    "--",
+                    "control_plane",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            tracked.extend(
+                [
+                    ".codex/control-plane.lock",
+                    ".codex/project-policy.toml",
+                ]
+            )
+            for relative in tracked:
+                destination = attestor / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                blob = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(source),
+                        "show",
+                        f"HEAD:{relative}",
+                    ],
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                destination.write_bytes(blob)
+            subprocess.run(
+                ["git", "-C", str(attestor), "add", "."],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(attestor),
+                    "commit",
+                    "-m",
+                    "immutable governing base",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            base = subprocess.run(
+                ["git", "-C", str(attestor), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            clean = attest_verification_governing_runtime(
+                attestor_worktree=attestor,
+                governing_base_commit=base,
+                target_worktree=target,
+                expected_runtime_layout="source",
+                session_id="session-governing-clean",
+                invocation_id="governing-clean",
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+            self.assertEqual(clean.governing_base_commit, base)
+
+            scopes = attestor / "control_plane" / "scopes.py"
+            scopes.write_text(
+                scopes.read_text(encoding="utf-8")
+                + "\n# hidden governing runtime drift\n",
+                encoding="utf-8",
+            )
+            lock = attestor / ".codex" / "control-plane.lock"
+            changed_runtime_digest = runtime_digest(
+                attestor, "control_plane", runtime_layout="source"
+            )
+            lock.write_text(
+                "\n".join(
+                    (
+                        f'runtime = "{changed_runtime_digest}"'
+                        if line.startswith("runtime = ")
+                        else line
+                    )
+                    for line in lock.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(attestor),
+                    "update-index",
+                    "--assume-unchanged",
+                    "control_plane/scopes.py",
+                    ".codex/control-plane.lock",
+                ],
+                check=True,
+            )
+            status = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(attestor),
+                    "status",
+                    "--porcelain=v2",
+                    "--untracked-files=all",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(status, "")
+
+            actual_run = subprocess.run
+            governing_git_environments: list[dict[str, str]] = []
+
+            def observe_governing_git(arguments, **kwargs):
+                if "ls-tree" in arguments or "cat-file" in arguments:
+                    governing_git_environments.append(dict(kwargs["env"]))
+                return actual_run(arguments, **kwargs)
+
+            with (
+                patch(
+                    "control_plane.host_bridge.subprocess.run",
+                    side_effect=observe_governing_git,
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "E_GOVERNING_RUNTIME"
+                ),
+            ):
+                attest_verification_governing_runtime(
+                    attestor_worktree=attestor,
+                    governing_base_commit=base,
+                    target_worktree=target,
+                    expected_runtime_layout="source",
+                    session_id="session-governing-hidden-drift",
+                    invocation_id="governing-hidden-drift",
+                    clock=lambda: 100.0,
+                    ttl_seconds=30,
+                )
+            self.assertTrue(governing_git_environments)
+            self.assertTrue(
+                all(
+                    environment["GIT_NO_LAZY_FETCH"] == "1"
+                    and environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+                    and environment["GIT_CONFIG_NOSYSTEM"] == "1"
+                    for environment in governing_git_environments
+                )
+            )
 
     def test_remote_policy_decision_and_policy_only_update_are_governing_base_owned(
         self,
@@ -272,11 +501,98 @@ class PolicyContractTests(unittest.TestCase):
                 ],
                 check=True,
             )
+            project_root = Path(__file__).parents[1]
+            shutil.copytree(
+                project_root / "control_plane",
+                root / "control_plane",
+            )
+            shutil.copytree(
+                project_root / "scripts",
+                root / "scripts",
+            )
+            (root / ".codex").mkdir()
+            shutil.copytree(
+                project_root / ".codex" / "hooks",
+                root / ".codex" / "hooks",
+            )
+            for name in (
+                "hooks.json",
+                "resource-registry.toml",
+                "control-plane.lock",
+            ):
+                shutil.copy2(
+                    project_root / ".codex" / name,
+                    root / ".codex" / name,
+                )
             target = root / ".codex" / "project-policy.toml"
-            target.parent.mkdir()
             target.write_bytes(FIXTURE.read_bytes())
+            lock_path = root / ".codex" / "control-plane.lock"
+            from control_plane.lockfile import runtime_digest
+
+            authority_digests = {
+                "project_policy": (
+                    "sha256:" + sha256(target.read_bytes()).hexdigest()
+                ),
+                "resource_registry": (
+                    "sha256:"
+                    + sha256(
+                        (
+                            root
+                            / ".codex"
+                            / "resource-registry.toml"
+                        ).read_bytes()
+                    ).hexdigest()
+                ),
+                "hooks": (
+                    "sha256:"
+                    + sha256(
+                        (root / ".codex" / "hooks.json").read_bytes()
+                    ).hexdigest()
+                ),
+                "hook_entrypoint": (
+                    "sha256:"
+                    + sha256(
+                        (
+                            root
+                            / ".codex"
+                            / "hooks"
+                            / "control_plane_hook.py"
+                        ).read_bytes()
+                    ).hexdigest()
+                ),
+                "entrypoint": (
+                    "sha256:"
+                    + sha256(
+                        (root / "scripts" / "control-plane").read_bytes()
+                    ).hexdigest()
+                ),
+                "runtime": runtime_digest(
+                    root,
+                    "control_plane",
+                    runtime_layout="source",
+                ),
+            }
+            lock_path.write_text(
+                "\n".join(
+                    (
+                        f'{name} = "{authority_digests[name]}"'
+                        if name in authority_digests
+                        else line
+                    )
+                    for line in lock_path.read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                    for name in (
+                        [line.split(" = ", 1)[0]]
+                        if " = " in line
+                        else [""]
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             subprocess.run(
-                ["git", "-C", str(root), "add", ".codex/project-policy.toml"],
+                ["git", "-C", str(root), "add", "."],
                 check=True,
             )
             subprocess.run(
@@ -301,12 +617,15 @@ class PolicyContractTests(unittest.TestCase):
             policy_digest = (
                 "sha256:" + sha256(target.read_bytes()).hexdigest()
             )
+            lock_digest = (
+                "sha256:" + sha256(lock_path.read_bytes()).hexdigest()
+            )
             session_id = "session-policy-update"
             invocation_id = "invocation-policy-update"
             task_id = "TASK-POLICY-UPDATE"
             runtime = governing_runtime_observation(
                 runtime_digest=policy_digest,
-                lock_digest=policy_digest,
+                lock_digest=lock_digest,
                 policy_digest=policy_digest,
                 attestor_worktree=str(root.resolve()),
                 target_worktree=str(root.resolve()),
@@ -320,7 +639,7 @@ class PolicyContractTests(unittest.TestCase):
                 policy=load_policy(target),
                 policy_digest=policy_digest,
                 runtime_digest=policy_digest,
-                lock_digest=policy_digest,
+                lock_digest=lock_digest,
                 governing_base_commit=head,
                 session_id=session_id,
                 invocation_id=invocation_id,
@@ -341,7 +660,10 @@ class PolicyContractTests(unittest.TestCase):
                 worktree=str(root),
                 branch="main",
                 session_id=session_id,
-                paths=[".codex/project-policy.toml"],
+                paths=[
+                    ".codex/control-plane.lock",
+                    ".codex/project-policy.toml",
+                ],
                 policy_digest=policy_digest,
             )
             task_context = {
@@ -459,7 +781,10 @@ class PolicyContractTests(unittest.TestCase):
                     branch="main",
                     expected_head=head,
                     subject_digest=draft.draft_digest,
-                    scope_paths=(".codex/project-policy.toml",),
+                    scope_paths=(
+                        ".codex/control-plane.lock",
+                        ".codex/project-policy.toml",
+                    ),
                     effect="local_write",
                     operation_nonce="tool-policy-update",
                     invocation_id=invocation_id,
@@ -539,10 +864,11 @@ from tests.host_adapter_test_support import (
 root = Path(sys.argv[1])
 proposed = Path(sys.argv[2])
 policy_digest = sys.argv[3]
-head = sys.argv[4]
-session_id = sys.argv[5]
-invocation_id = sys.argv[6]
-task_id = sys.argv[7]
+lock_digest = sys.argv[4]
+head = sys.argv[5]
+session_id = sys.argv[6]
+invocation_id = sys.argv[7]
+task_id = sys.argv[8]
 state_dir = worktree_git_dir(root)
 state = json.loads(
     (state_dir / "codex-control-plane" / "tasks" / f"{task_id}.json")
@@ -562,7 +888,7 @@ governing_policy_path = (
 )
 runtime = governing_runtime_observation(
     runtime_digest=policy_digest,
-    lock_digest=policy_digest,
+    lock_digest=lock_digest,
     policy_digest=policy_digest,
     attestor_worktree=str(root.resolve()),
     target_worktree=str(root.resolve()),
@@ -576,7 +902,7 @@ policy = governing_policy(
     policy=load_policy(governing_policy_path),
     policy_digest=policy_digest,
     runtime_digest=policy_digest,
-    lock_digest=policy_digest,
+    lock_digest=lock_digest,
     governing_base_commit=head,
     session_id=session_id,
     invocation_id=invocation_id,
@@ -655,7 +981,10 @@ authorization = bridge.frame_effect_authorization(
     branch="main",
     expected_head=head,
     subject_digest=draft.draft_digest,
-    scope_paths=(".codex/project-policy.toml",),
+    scope_paths=(
+        ".codex/control-plane.lock",
+        ".codex/project-policy.toml",
+    ),
     effect="local_write",
     operation_nonce="tool-policy-recovery",
     invocation_id=invocation_id,
@@ -680,6 +1009,7 @@ print(receipt.generation)
                     str(root),
                     str(proposed),
                     policy_digest,
+                    lock_digest,
                     head,
                     session_id,
                     invocation_id,
@@ -696,6 +1026,39 @@ print(receipt.generation)
             self.assertEqual(
                 load_policy(target)["git"]["remote"], "upstream"
             )
+            import tomllib
+
+            updated_lock = tomllib.loads(
+                lock_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                updated_lock["digests"]["project_policy"],
+                "sha256:" + sha256(target.read_bytes()).hexdigest(),
+            )
+            from control_plane.lockfile import validate_lock
+
+            self.assertEqual(validate_lock(root), [])
+            for arguments in (
+                (
+                    "policy-check",
+                    "--policy",
+                    str(target),
+                    "--json",
+                ),
+                ("doctor", "--repo", str(root), "--json"),
+            ):
+                completed = subprocess.run(
+                    [str(root / "scripts" / "control-plane"), *arguments],
+                    cwd=root,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stdout + completed.stderr,
+                )
             self.assertEqual(store.status(task_id)["generation"], 1)
             transaction_root = (
                 state_dir
@@ -733,7 +1096,8 @@ print(receipt.generation)
         for phase in (
             "allocating",
             "prepared",
-            "policy_replaced",
+            "replacing_pair",
+            "pair_replaced",
             "committed",
         ):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temp_dir:
@@ -770,13 +1134,20 @@ print(receipt.generation)
                 target = root / ".codex" / "project-policy.toml"
                 target.parent.mkdir()
                 target.write_bytes(FIXTURE.read_bytes())
+                lock_path = root / ".codex" / "control-plane.lock"
+                lock_path.write_text(
+                    "schema_version = 1\n\n[digests]\n"
+                    "project_policy = "
+                    f'"sha256:{sha256(target.read_bytes()).hexdigest()}"\n',
+                    encoding="utf-8",
+                )
                 subprocess.run(
                     [
                         "git",
                         "-C",
                         str(root),
                         "add",
-                        ".codex/project-policy.toml",
+                        ".codex",
                     ],
                     check=True,
                 )
@@ -809,12 +1180,15 @@ print(receipt.generation)
                 policy_digest = (
                     "sha256:" + sha256(target.read_bytes()).hexdigest()
                 )
+                lock_digest = (
+                    "sha256:" + sha256(lock_path.read_bytes()).hexdigest()
+                )
                 session_id = f"session-policy-recovery-{phase}"
                 invocation_id = f"invocation-policy-recovery-{phase}"
                 task_id = "TASK-POLICY-RECOVERY"
                 runtime = governing_runtime_observation(
                     runtime_digest=policy_digest,
-                    lock_digest=policy_digest,
+                    lock_digest=lock_digest,
                     policy_digest=policy_digest,
                     attestor_worktree=str(root.resolve()),
                     target_worktree=str(root.resolve()),
@@ -828,7 +1202,7 @@ print(receipt.generation)
                     policy=load_policy(target),
                     policy_digest=policy_digest,
                     runtime_digest=policy_digest,
-                    lock_digest=policy_digest,
+                    lock_digest=lock_digest,
                     governing_base_commit=head,
                     session_id=session_id,
                     invocation_id=invocation_id,
@@ -849,7 +1223,10 @@ print(receipt.generation)
                     worktree=str(root),
                     branch="main",
                     session_id=session_id,
-                    paths=[".codex/project-policy.toml"],
+                    paths=[
+                        ".codex/control-plane.lock",
+                        ".codex/project-policy.toml",
+                    ],
                     policy_digest=policy_digest,
                 )
                 draft = project_remote_policy_update_plan(
@@ -872,7 +1249,7 @@ print(receipt.generation)
                 )
                 transaction.mkdir(parents=True)
                 journal = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "draft_digest": draft.draft_digest,
                     "task_id": draft.task_id,
                     "task_digest": draft.task_digest,
@@ -881,6 +1258,8 @@ print(receipt.generation)
                     "generation": draft.generation,
                     "before_digest": draft.before_digest,
                     "after_digest": draft.after_digest,
+                    "lock_before_digest": draft.lock_before_digest,
+                    "lock_after_digest": draft.lock_after_digest,
                     "phase": phase,
                 }
                 (transaction / "journal.json").write_text(
@@ -894,8 +1273,19 @@ print(receipt.generation)
                     (
                         transaction / "project-policy.after.toml"
                     ).write_bytes(proposed.read_bytes())
-                if phase in {"policy_replaced", "committed"}:
+                    (
+                        transaction / "control-plane.before.lock"
+                    ).write_bytes(
+                        lock_path.read_bytes()
+                    )
+                    (
+                        transaction / "control-plane.after.lock"
+                    ).write_bytes(draft.lock_after_bytes)
+                if phase == "replacing_pair":
                     target.write_bytes(proposed.read_bytes())
+                if phase in {"pair_replaced", "committed"}:
+                    target.write_bytes(proposed.read_bytes())
+                    lock_path.write_bytes(draft.lock_after_bytes)
                 if phase == "committed":
                     state_path = (
                         state_dir
@@ -923,6 +1313,7 @@ print(receipt.generation)
                         str(proposed),
                         str(FIXTURE),
                         policy_digest,
+                        lock_digest,
                         head,
                         session_id,
                         invocation_id,
@@ -939,6 +1330,14 @@ print(receipt.generation)
                 self.assertEqual(recovered.stdout.strip(), "1")
                 self.assertEqual(
                     load_policy(target)["git"]["remote"], "upstream"
+                )
+                import tomllib
+
+                self.assertEqual(
+                    tomllib.loads(
+                        lock_path.read_text(encoding="utf-8")
+                    )["digests"]["project_policy"],
+                    "sha256:" + sha256(target.read_bytes()).hexdigest(),
                 )
                 self.assertEqual(store.status(task_id)["generation"], 1)
                 committed_journal = json.loads(

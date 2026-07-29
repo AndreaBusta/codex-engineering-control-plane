@@ -1,12 +1,17 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -B
 """Project-local entrypoint for bounded Codex audit hooks."""
 
 from __future__ import annotations
 
+import sys
+
+if not sys.flags.isolated or not sys.flags.safe_path:
+    raise SystemExit("E_RUNTIME_BOOTSTRAP: hook requires python3 -I -B")
+
 import importlib
+import importlib.util
 from hashlib import sha256
 from pathlib import Path
-import sys
 import tomllib
 
 
@@ -50,11 +55,17 @@ def _validate_source_runtime() -> None:
 
 
 _validate_source_runtime()
-sys.path[:] = [str(ROOT)] + [
-    item
-    for item in sys.path
-    if item and Path(item).resolve() != ROOT.resolve()
-]
+runtime = ROOT / "control_plane"
+spec = importlib.util.spec_from_file_location(
+    "control_plane",
+    runtime / "__init__.py",
+    submodule_search_locations=[str(runtime)],
+)
+if spec is None or spec.loader is None:
+    raise RuntimeError("E_RUNTIME_LAYOUT: source runtime cannot be loaded")
+package = importlib.util.module_from_spec(spec)
+sys.modules["control_plane"] = package
+spec.loader.exec_module(package)
 run_hook = importlib.import_module("control_plane.hooks").run_hook
 
 

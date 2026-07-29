@@ -23,6 +23,8 @@ from control_plane.host_bridge import (
     TrustedAuthorization,
     _consume_governing_runtime_observation,
     _consume_runtime_host_object,
+    _canonical_github_repository_from_url,
+    _git_text,
     _governing_runtime_observation_is_live,
     _native_host_object_is_valid,
     _register_runtime_host_object,
@@ -122,6 +124,7 @@ class GoverningPolicy:
         "runtime_digest",
         "lock_digest",
         "governing_base_commit",
+        "remote_repository",
         "session_id",
         "invocation_id",
         "freshness_deadline",
@@ -137,6 +140,7 @@ _GOVERNING_POLICY_BINDING_FIELDS = (
     "runtime_digest",
     "lock_digest",
     "governing_base_commit",
+    "remote_repository",
     "session_id",
     "invocation_id",
 )
@@ -173,6 +177,21 @@ def _governing_policy_is_issued_for_runtime(
         or not _governing_runtime_observation_is_live(governing_runtime)
     ):
         return False
+    return (
+        _governing_policy_is_issued(policy)
+        and policy.runtime_digest == governing_runtime.runtime_digest
+        and policy.lock_digest == governing_runtime.lock_digest
+        and policy.policy_digest == governing_runtime.policy_digest
+        and policy.governing_base_commit
+        == governing_runtime.governing_base_commit
+        and policy.session_id == governing_runtime.session_id
+        and policy.invocation_id == governing_runtime.invocation_id
+    )
+
+
+def _governing_policy_is_issued(policy: object) -> bool:
+    if type(policy) is not GoverningPolicy:
+        return False
     issued = _ISSUED_GOVERNING_POLICIES.get(id(policy))
     expected_binding_digest = contract_digest(
         {
@@ -188,13 +207,15 @@ def _governing_policy_is_issued_for_runtime(
         and _runtime_host_object_is_live(policy, "governing_policy")
         and not policy._consumed
         and policy.binding_digest == expected_binding_digest
-        and policy.runtime_digest == governing_runtime.runtime_digest
-        and policy.lock_digest == governing_runtime.lock_digest
-        and policy.policy_digest == governing_runtime.policy_digest
-        and policy.governing_base_commit
-        == governing_runtime.governing_base_commit
-        and policy.session_id == governing_runtime.session_id
-        and policy.invocation_id == governing_runtime.invocation_id
+    )
+
+
+def _governing_policy_is_live(
+    policy: object, *, clock: object
+) -> bool:
+    return (
+        _governing_policy_is_issued(policy)
+        and float(clock()) <= policy.freshness_deadline
     )
 
 
@@ -309,6 +330,16 @@ def load_governing_policy_from_runtime(
         raise ValueError("E_GOVERNING_POLICY: policy is invalid") from error
     if policy.get("schema_version") != 1 or validate_policy(policy):
         raise ValueError("E_GOVERNING_POLICY: policy contract is invalid")
+    remote = policy.get("git", {}).get("remote")
+    if not isinstance(remote, str):
+        raise ValueError("E_GOVERNING_POLICY: policy remote is invalid")
+    remote_repository = _canonical_github_repository_from_url(
+        _git_text(
+            Path(governing_runtime.attestor_worktree),
+            ["remote", "get-url", "--push", remote],
+        ),
+        code="E_GOVERNING_POLICY",
+    )
     result = object.__new__(GoverningPolicy)
     result._consumed = False
     result.policy = dict(policy)
@@ -316,6 +347,7 @@ def load_governing_policy_from_runtime(
     result.runtime_digest = governing_runtime.runtime_digest
     result.lock_digest = governing_runtime.lock_digest
     result.governing_base_commit = governing_runtime.governing_base_commit
+    result.remote_repository = remote_repository
     result.session_id = governing_runtime.session_id
     result.invocation_id = governing_runtime.invocation_id
     result.freshness_deadline = float(clock()) + float(ttl_seconds)
@@ -325,6 +357,7 @@ def load_governing_policy_from_runtime(
             "runtime_digest": result.runtime_digest,
             "lock_digest": result.lock_digest,
             "governing_base_commit": result.governing_base_commit,
+            "remote_repository": result.remote_repository,
             "session_id": result.session_id,
             "invocation_id": result.invocation_id,
         }
@@ -471,6 +504,10 @@ class ProjectRemotePolicyUpdateDraft:
         "before_digest",
         "after_bytes",
         "after_digest",
+        "lock_path",
+        "lock_before_digest",
+        "lock_after_bytes",
+        "lock_after_digest",
         "task_digest",
         "lease_digest",
         "runtime_digest",
@@ -493,6 +530,9 @@ def _mint_project_remote_policy_update_draft(
     path: str,
     before_digest: str,
     after_bytes: bytes,
+    lock_path: str,
+    lock_before_digest: str,
+    lock_after_bytes: bytes,
     task_digest: str,
     lease_digest: str,
     runtime_digest: str,
@@ -509,6 +549,12 @@ def _mint_project_remote_policy_update_draft(
         "before_digest": before_digest,
         "after_bytes": after_bytes,
         "after_digest": f"sha256:{sha256(after_bytes).hexdigest()}",
+        "lock_path": lock_path,
+        "lock_before_digest": lock_before_digest,
+        "lock_after_bytes": lock_after_bytes,
+        "lock_after_digest": (
+            f"sha256:{sha256(lock_after_bytes).hexdigest()}"
+        ),
         "task_digest": task_digest,
         "lease_digest": lease_digest,
         "runtime_digest": runtime_digest,
@@ -525,6 +571,9 @@ def _mint_project_remote_policy_update_draft(
             "path": draft.path,
             "before_digest": draft.before_digest,
             "after_digest": draft.after_digest,
+            "lock_path": draft.lock_path,
+            "lock_before_digest": draft.lock_before_digest,
+            "lock_after_digest": draft.lock_after_digest,
             "task_digest": draft.task_digest,
             "lease_digest": draft.lease_digest,
             "runtime_digest": draft.runtime_digest,
@@ -537,12 +586,53 @@ def _mint_project_remote_policy_update_draft(
     return draft
 
 
+def _render_policy_coherent_lock(
+    lock_bytes: bytes,
+    *,
+    before_policy_digest: str,
+    after_policy_digest: str,
+) -> bytes:
+    if len(lock_bytes) > 1_048_576:
+        raise ValueError("E_REMOTE_POLICY_DRAFT: lock exceeds cap")
+    try:
+        lock = tomllib.loads(lock_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(
+            "E_REMOTE_POLICY_DRAFT: control-plane lock is invalid"
+        ) from error
+    digests = lock.get("digests")
+    matches = list(
+        re.finditer(
+            rb'(?m)^(project_policy[ \t]*=[ \t]*")'
+            rb'sha256:[0-9a-f]{64}("[ \t]*)$',
+            lock_bytes,
+        )
+    )
+    if (
+        not isinstance(digests, Mapping)
+        or digests.get("project_policy") != before_policy_digest
+        or len(matches) != 1
+    ):
+        raise ValueError(
+            "E_REMOTE_POLICY_DRAFT: lock policy binding drifted"
+        )
+    match = matches[0]
+    return (
+        lock_bytes[: match.start(1)]
+        + match.group(1)
+        + after_policy_digest.encode("ascii")
+        + match.group(2)
+        + lock_bytes[match.end(2) :]
+    )
+
+
 def _recoverable_project_remote_policy_update_draft(
     *,
     governing_runtime: GoverningRuntimeObservation,
     governing_policy: GoverningPolicy,
     candidate_raw: bytes,
     target_path: Path,
+    target_lock_path: Path,
     task_context: Mapping[str, Any],
     lease: Mapping[str, Any],
     repository_identity: str,
@@ -599,11 +689,19 @@ def _recoverable_project_remote_policy_update_draft(
                 "generation",
                 "before_digest",
                 "after_digest",
+                "lock_before_digest",
+                "lock_after_digest",
                 "phase",
             }
-            or journal.get("schema_version") != 1
+            or journal.get("schema_version") != 2
             or journal.get("phase")
-            not in {"allocating", "prepared", "policy_replaced", "committed"}
+            not in {
+                "allocating",
+                "prepared",
+                "replacing_pair",
+                "pair_replaced",
+                "committed",
+            }
             or not isinstance(journal.get("generation"), int)
             or isinstance(journal.get("generation"), bool)
         ):
@@ -622,7 +720,7 @@ def _recoverable_project_remote_policy_update_draft(
             and (
                 task_generation == journal_generation
                 or (
-                    phase in {"policy_replaced", "committed"}
+                    phase in {"pair_replaced", "committed"}
                     and task_generation == journal_generation + 1
                 )
             )
@@ -632,15 +730,31 @@ def _recoverable_project_remote_policy_update_draft(
             continue
         backup_path = transaction / "project-policy.before.toml"
         after_path = transaction / "project-policy.after.toml"
+        lock_backup_path = transaction / "control-plane.before.lock"
+        lock_after_path = transaction / "control-plane.after.lock"
         target_raw = target_path.read_bytes()
         target_digest = f"sha256:{sha256(target_raw).hexdigest()}"
+        target_lock_raw = target_lock_path.read_bytes()
+        target_lock_digest = (
+            f"sha256:{sha256(target_lock_raw).hexdigest()}"
+        )
         if phase == "allocating":
-            if target_digest != journal.get("before_digest"):
+            if (
+                target_digest != journal.get("before_digest")
+                or target_lock_digest
+                != journal.get("lock_before_digest")
+            ):
                 raise ValueError(
-                    "E_REMOTE_POLICY_RECOVERY: allocating policy drifted"
+                    "E_REMOTE_POLICY_RECOVERY: allocating pair drifted"
                 )
             before_raw = target_raw
             after_raw = candidate_raw
+            lock_before_raw = target_lock_raw
+            lock_after_raw = _render_policy_coherent_lock(
+                lock_before_raw,
+                before_policy_digest=str(journal["before_digest"]),
+                after_policy_digest=candidate_digest,
+            )
             if backup_path.exists() and (
                 backup_path.is_symlink()
                 or not backup_path.is_file()
@@ -659,6 +773,24 @@ def _recoverable_project_remote_policy_update_draft(
                 raise ValueError(
                     "E_REMOTE_POLICY_RECOVERY: candidate binding is invalid"
                 )
+            if lock_backup_path.exists() and (
+                lock_backup_path.is_symlink()
+                or not lock_backup_path.is_file()
+                or lock_backup_path.stat().st_size > 1_048_576
+                or lock_backup_path.read_bytes() != lock_before_raw
+            ):
+                raise ValueError(
+                    "E_REMOTE_POLICY_RECOVERY: lock backup binding is invalid"
+                )
+            if lock_after_path.exists() and (
+                lock_after_path.is_symlink()
+                or not lock_after_path.is_file()
+                or lock_after_path.stat().st_size > 1_048_576
+                or lock_after_path.read_bytes() != lock_after_raw
+            ):
+                raise ValueError(
+                    "E_REMOTE_POLICY_RECOVERY: lock candidate binding is invalid"
+                )
         else:
             if (
                 not backup_path.is_file()
@@ -667,12 +799,20 @@ def _recoverable_project_remote_policy_update_draft(
                 or after_path.is_symlink()
                 or backup_path.stat().st_size > 131_072
                 or after_path.stat().st_size > 131_072
+                or not lock_backup_path.is_file()
+                or lock_backup_path.is_symlink()
+                or not lock_after_path.is_file()
+                or lock_after_path.is_symlink()
+                or lock_backup_path.stat().st_size > 1_048_576
+                or lock_after_path.stat().st_size > 1_048_576
             ):
                 raise ValueError(
-                    "E_REMOTE_POLICY_RECOVERY: durable policy artifacts are invalid"
+                    "E_REMOTE_POLICY_RECOVERY: durable pair artifacts are invalid"
                 )
             before_raw = backup_path.read_bytes()
             after_raw = after_path.read_bytes()
+            lock_before_raw = lock_backup_path.read_bytes()
+            lock_after_raw = lock_after_path.read_bytes()
         before_digest = f"sha256:{sha256(before_raw).hexdigest()}"
         try:
             before_policy = tomllib.loads(before_raw.decode("utf-8"))
@@ -685,6 +825,16 @@ def _recoverable_project_remote_policy_update_draft(
             or after_raw != candidate_raw
             or before_policy != governing_policy.policy
             or before_digest != governing_policy.policy_digest
+            or f"sha256:{sha256(lock_before_raw).hexdigest()}"
+            != journal.get("lock_before_digest")
+            or lock_after_raw
+            != _render_policy_coherent_lock(
+                lock_before_raw,
+                before_policy_digest=before_digest,
+                after_policy_digest=candidate_digest,
+            )
+            or f"sha256:{sha256(lock_after_raw).hexdigest()}"
+            != journal.get("lock_after_digest")
         ):
             raise ValueError(
                 "E_REMOTE_POLICY_RECOVERY: durable policy binding drifted"
@@ -697,6 +847,11 @@ def _recoverable_project_remote_policy_update_draft(
             path=str(target_path.resolve()),
             before_digest=before_digest,
             after_bytes=candidate_raw,
+            lock_path=str(target_lock_path.resolve()),
+            lock_before_digest=(
+                f"sha256:{sha256(lock_before_raw).hexdigest()}"
+            ),
+            lock_after_bytes=lock_after_raw,
             task_digest=str(task_context["task_digest"]),
             lease_digest=str(lease["lease_digest"]),
             runtime_digest=governing_runtime.runtime_digest,
@@ -708,6 +863,8 @@ def _recoverable_project_remote_policy_update_draft(
             != draft.draft_digest.removeprefix("sha256:")
             or target_digest
             not in {draft.before_digest, draft.after_digest}
+            or target_lock_digest
+            not in {draft.lock_before_digest, draft.lock_after_digest}
         ):
             raise ValueError(
                 "E_REMOTE_POLICY_RECOVERY: reconstructed draft is invalid"
@@ -755,6 +912,11 @@ def project_remote_policy_update_plan(
         / ".codex"
         / "project-policy.toml"
     )
+    target_lock_path = (
+        Path(governing_runtime.target_worktree)
+        / ".codex"
+        / "control-plane.lock"
+    )
     if (
         candidate_path.is_symlink()
         or not candidate_path.is_file()
@@ -762,12 +924,20 @@ def project_remote_policy_update_plan(
         or target_path.is_symlink()
         or not target_path.is_file()
         or target_path.stat().st_size > 131_072
+        or target_lock_path.is_symlink()
+        or not target_lock_path.is_file()
+        or target_lock_path.stat().st_size > 1_048_576
     ):
-        raise ValueError("E_REMOTE_POLICY_DRAFT: policy path is not allowlisted")
+        raise ValueError(
+            "E_REMOTE_POLICY_DRAFT: policy/lock pair is not allowlisted"
+        )
     candidate_raw = candidate_path.read_bytes()
     before_raw = target_path.read_bytes()
     candidate = load_policy(candidate_path)
     before_policy = load_policy(target_path)
+    candidate_digest = (
+        f"sha256:{sha256(candidate_raw).hexdigest()}"
+    )
     if validate_policy(candidate):
         raise ValueError("E_REMOTE_POLICY_DRAFT: candidate policy is invalid")
     immutable_sections = {
@@ -798,6 +968,10 @@ def project_remote_policy_update_plan(
             scope_owns(str(item), ".codex/project-policy.toml")
             for item in normalized_paths
         )
+        or not any(
+            scope_owns(str(item), ".codex/control-plane.lock")
+            for item in normalized_paths
+        )
         or not isinstance(task_context.get("generation"), int)
         or isinstance(task_context.get("generation"), bool)
     ):
@@ -812,6 +986,7 @@ def project_remote_policy_update_plan(
         governing_policy=governing_policy,
         candidate_raw=candidate_raw,
         target_path=target_path,
+        target_lock_path=target_lock_path,
         task_context=task_context,
         lease=lease,
         repository_identity=repository_identity,
@@ -819,6 +994,21 @@ def project_remote_policy_update_plan(
     )
     if recovery is not None:
         return recovery
+    lock_before_raw = target_lock_path.read_bytes()
+    lock_before_digest = (
+        f"sha256:{sha256(lock_before_raw).hexdigest()}"
+    )
+    lock_after_raw = _render_policy_coherent_lock(
+        lock_before_raw,
+        before_policy_digest=(
+            f"sha256:{sha256(before_raw).hexdigest()}"
+        ),
+        after_policy_digest=candidate_digest,
+    )
+    if lock_before_digest != governing_runtime.lock_digest:
+        raise ValueError(
+            "E_REMOTE_POLICY_DRAFT: governing lock bytes drifted"
+        )
     if (
         before_policy != governing_policy.policy
         or f"sha256:{sha256(before_raw).hexdigest()}"
@@ -835,6 +1025,9 @@ def project_remote_policy_update_plan(
         path=str(target_path.resolve()),
         before_digest=f"sha256:{sha256(before_raw).hexdigest()}",
         after_bytes=candidate_raw,
+        lock_path=str(target_lock_path.resolve()),
+        lock_before_digest=lock_before_digest,
+        lock_after_bytes=lock_after_raw,
         task_digest=str(task_context["task_digest"]),
         lease_digest=str(lease["lease_digest"]),
         runtime_digest=governing_runtime.runtime_digest,
@@ -847,6 +1040,8 @@ class ProjectRemotePolicyUpdateReceipt:
     draft_digest: str
     before_digest: str
     after_digest: str
+    lock_before_digest: str
+    lock_after_digest: str
     generation: int
     runtime_digest: str
 
@@ -858,6 +1053,8 @@ def _policy_update_receipt(
         draft_digest=draft.draft_digest,
         before_digest=draft.before_digest,
         after_digest=draft.after_digest,
+        lock_before_digest=draft.lock_before_digest,
+        lock_after_digest=draft.lock_after_digest,
         generation=draft.generation + 1,
         runtime_digest=draft.runtime_digest,
     )
@@ -872,6 +1069,9 @@ def _recover_policy_update_locked(
     journal_path: Path,
     backup_path: Path,
     after_path: Path,
+    lock_path: Path,
+    lock_backup_path: Path,
+    lock_after_path: Path,
 ) -> ProjectRemotePolicyUpdateReceipt:
     try:
         journal = json.loads(journal_path.read_text(encoding="utf-8"))
@@ -893,9 +1093,11 @@ def _recover_policy_update_locked(
             "generation",
             "before_digest",
             "after_digest",
+            "lock_before_digest",
+            "lock_after_digest",
             "phase",
         }
-        or journal.get("schema_version") != 1
+        or journal.get("schema_version") != 2
         or journal.get("draft_digest") != draft.draft_digest
         or journal.get("task_id") != draft.task_id
         or journal.get("task_digest") != draft.task_digest
@@ -904,19 +1106,37 @@ def _recover_policy_update_locked(
         or journal.get("generation") != draft.generation
         or journal.get("before_digest") != draft.before_digest
         or journal.get("after_digest") != draft.after_digest
+        or journal.get("lock_before_digest")
+        != draft.lock_before_digest
+        or journal.get("lock_after_digest") != draft.lock_after_digest
         or journal.get("phase")
-        not in {"allocating", "prepared", "policy_replaced", "committed"}
+        not in {
+            "allocating",
+            "prepared",
+            "replacing_pair",
+            "pair_replaced",
+            "committed",
+        }
     ):
         raise ValueError(
             "E_REMOTE_POLICY_RECOVERY: journal binding is invalid"
         )
     phase = str(journal["phase"])
-    current_bytes = policy_path.read_bytes()
-    current_digest = f"sha256:{sha256(current_bytes).hexdigest()}"
+    current_policy_bytes = policy_path.read_bytes()
+    current_policy_digest = (
+        f"sha256:{sha256(current_policy_bytes).hexdigest()}"
+    )
+    current_lock_bytes = lock_path.read_bytes()
+    current_lock_digest = (
+        f"sha256:{sha256(current_lock_bytes).hexdigest()}"
+    )
     if phase == "allocating":
-        if current_digest != draft.before_digest:
+        if (
+            current_policy_digest != draft.before_digest
+            or current_lock_digest != draft.lock_before_digest
+        ):
             raise ValueError(
-                "E_REMOTE_POLICY_RECOVERY: allocating policy drifted"
+                "E_REMOTE_POLICY_RECOVERY: allocating pair drifted"
             )
         if backup_path.exists():
             if (
@@ -928,7 +1148,7 @@ def _recover_policy_update_locked(
                     "E_REMOTE_POLICY_RECOVERY: backup binding is invalid"
                 )
         else:
-            _atomic_bytes(backup_path, current_bytes)
+            _atomic_bytes(backup_path, current_policy_bytes)
         if after_path.exists():
             if (
                 after_path.is_symlink()
@@ -940,6 +1160,28 @@ def _recover_policy_update_locked(
                 )
         else:
             _atomic_bytes(after_path, draft.after_bytes)
+        if lock_backup_path.exists():
+            if (
+                lock_backup_path.is_symlink()
+                or f"sha256:{sha256(lock_backup_path.read_bytes()).hexdigest()}"
+                != draft.lock_before_digest
+            ):
+                raise ValueError(
+                    "E_REMOTE_POLICY_RECOVERY: lock backup binding is invalid"
+                )
+        else:
+            _atomic_bytes(lock_backup_path, current_lock_bytes)
+        if lock_after_path.exists():
+            if (
+                lock_after_path.is_symlink()
+                or f"sha256:{sha256(lock_after_path.read_bytes()).hexdigest()}"
+                != draft.lock_after_digest
+            ):
+                raise ValueError(
+                    "E_REMOTE_POLICY_RECOVERY: lock candidate binding is invalid"
+                )
+        else:
+            _atomic_bytes(lock_after_path, draft.lock_after_bytes)
         journal["phase"] = "prepared"
         _atomic_policy_json(journal_path, journal)
         phase = "prepared"
@@ -953,35 +1195,80 @@ def _recover_policy_update_locked(
         or f"sha256:{sha256(after_path.read_bytes()).hexdigest()}"
         != draft.after_digest
         or after_path.read_bytes() != draft.after_bytes
+        or not lock_backup_path.is_file()
+        or lock_backup_path.is_symlink()
+        or f"sha256:{sha256(lock_backup_path.read_bytes()).hexdigest()}"
+        != draft.lock_before_digest
+        or not lock_after_path.is_file()
+        or lock_after_path.is_symlink()
+        or f"sha256:{sha256(lock_after_path.read_bytes()).hexdigest()}"
+        != draft.lock_after_digest
+        or lock_after_path.read_bytes() != draft.lock_after_bytes
     ):
         raise ValueError(
-            "E_REMOTE_POLICY_RECOVERY: durable policy artifacts are invalid"
+            "E_REMOTE_POLICY_RECOVERY: durable pair artifacts are invalid"
         )
+    if phase == "replacing_pair":
+        _atomic_bytes(policy_path, backup_path.read_bytes())
+        _atomic_bytes(lock_path, lock_backup_path.read_bytes())
+        journal["phase"] = "prepared"
+        _atomic_policy_json(journal_path, journal)
+        phase = "prepared"
     if phase == "prepared":
-        if current_digest == draft.before_digest:
-            _atomic_bytes(policy_path, after_path.read_bytes())
-        elif current_digest != draft.after_digest:
+        current_policy_digest = (
+            f"sha256:{sha256(policy_path.read_bytes()).hexdigest()}"
+        )
+        current_lock_digest = (
+            f"sha256:{sha256(lock_path.read_bytes()).hexdigest()}"
+        )
+        if (
+            current_policy_digest != draft.before_digest
+            or current_lock_digest != draft.lock_before_digest
+        ):
             raise ValueError(
-                "E_REMOTE_POLICY_RECOVERY: prepared policy drifted"
+                "E_REMOTE_POLICY_RECOVERY: prepared pair drifted"
             )
+        journal["phase"] = "replacing_pair"
+        _atomic_policy_json(journal_path, journal)
+        try:
+            _atomic_bytes(policy_path, after_path.read_bytes())
+            _atomic_bytes(lock_path, lock_after_path.read_bytes())
+        except Exception:
+            _atomic_bytes(policy_path, backup_path.read_bytes())
+            _atomic_bytes(lock_path, lock_backup_path.read_bytes())
+            journal["phase"] = "prepared"
+            _atomic_policy_json(journal_path, journal)
+            raise
         if (
             f"sha256:{sha256(policy_path.read_bytes()).hexdigest()}"
             != draft.after_digest
             or validate_policy(load_policy(policy_path))
+            or f"sha256:{sha256(lock_path.read_bytes()).hexdigest()}"
+            != draft.lock_after_digest
+            or tomllib.loads(
+                lock_path.read_text(encoding="utf-8")
+            ).get("digests", {}).get("project_policy")
+            != draft.after_digest
         ):
+            _atomic_bytes(policy_path, backup_path.read_bytes())
+            _atomic_bytes(lock_path, lock_backup_path.read_bytes())
+            journal["phase"] = "prepared"
+            _atomic_policy_json(journal_path, journal)
             raise ValueError(
-                "E_REMOTE_POLICY_RECOVERY: resulting policy is invalid"
+                "E_REMOTE_POLICY_RECOVERY: resulting pair is invalid"
             )
-        journal["phase"] = "policy_replaced"
+        journal["phase"] = "pair_replaced"
         _atomic_policy_json(journal_path, journal)
-        phase = "policy_replaced"
-    if phase == "policy_replaced":
+        phase = "pair_replaced"
+    if phase == "pair_replaced":
         if (
             f"sha256:{sha256(policy_path.read_bytes()).hexdigest()}"
             != draft.after_digest
+            or f"sha256:{sha256(lock_path.read_bytes()).hexdigest()}"
+            != draft.lock_after_digest
         ):
             raise ValueError(
-                "E_REMOTE_POLICY_RECOVERY: replaced policy drifted"
+                "E_REMOTE_POLICY_RECOVERY: replaced pair drifted"
             )
         if (
             state.get("generation") == draft.generation
@@ -1005,6 +1292,8 @@ def _recover_policy_update_locked(
         phase == "committed"
         and f"sha256:{sha256(policy_path.read_bytes()).hexdigest()}"
         == draft.after_digest
+        and f"sha256:{sha256(lock_path.read_bytes()).hexdigest()}"
+        == draft.lock_after_digest
         and state.get("generation") == draft.generation + 1
         and state.get("remote_policy_update_digest")
         == draft.draft_digest
@@ -1064,6 +1353,7 @@ def apply_project_remote_policy_update(
     ):
         raise ValueError("E_REMOTE_POLICY_APPLY: bound draft and decision required")
     path = Path(draft.path)
+    lock_path = Path(draft.lock_path)
     worktree = Path(draft.worktree)
     state_dir = worktree_git_dir(worktree)
     state_path = (
@@ -1111,6 +1401,8 @@ def apply_project_remote_policy_update(
             if (
                 path.is_symlink()
                 or not path.is_file()
+                or lock_path.is_symlink()
+                or not lock_path.is_file()
                 or state.get("task_id") != draft.task_id
                 or state.get("task_digest") != draft.task_digest
                 or live_lease.get("task_id") != draft.task_id
@@ -1137,7 +1429,10 @@ def apply_project_remote_policy_update(
                 expected_branch=str(state.get("branch")),
                 expected_head=expected_head,
                 expected_subject_digest=draft.draft_digest,
-                expected_scope_paths=(".codex/project-policy.toml",),
+                expected_scope_paths=(
+                    ".codex/control-plane.lock",
+                    ".codex/project-policy.toml",
+                ),
                 expected_effect="local_write",
                 expected_operation_nonce=authorization.operation_nonce,
                 expected_invocation_id=remote_policy_decision.invocation_id,
@@ -1152,6 +1447,12 @@ def apply_project_remote_policy_update(
             journal_path = transaction_root / "journal.json"
             backup_path = transaction_root / "project-policy.before.toml"
             after_path = transaction_root / "project-policy.after.toml"
+            lock_backup_path = (
+                transaction_root / "control-plane.before.lock"
+            )
+            lock_after_path = (
+                transaction_root / "control-plane.after.lock"
+            )
             if transaction_root.is_symlink():
                 raise ValueError(
                     "E_REMOTE_POLICY_RECOVERY: transaction root is invalid"
@@ -1165,6 +1466,9 @@ def apply_project_remote_policy_update(
                     journal_path=journal_path,
                     backup_path=backup_path,
                     after_path=after_path,
+                    lock_path=lock_path,
+                    lock_backup_path=lock_backup_path,
+                    lock_after_path=lock_after_path,
                 )
                 if not _consume_runtime_host_object(
                     draft, "project_remote_policy_update_draft"
@@ -1181,7 +1485,12 @@ def apply_project_remote_policy_update(
                 remote_policy_decision._consumed = True
                 governing_runtime._consumed = True
                 return receipt
-            if backup_path.exists() or after_path.exists():
+            if (
+                backup_path.exists()
+                or after_path.exists()
+                or lock_backup_path.exists()
+                or lock_after_path.exists()
+            ):
                 raise ValueError(
                     "E_REMOTE_POLICY_RECOVERY: orphaned policy artifacts"
                 )
@@ -1190,14 +1499,19 @@ def apply_project_remote_policy_update(
                     "E_REMOTE_POLICY_APPLY: policy task generation drifted"
                 )
             before_bytes = path.read_bytes()
+            lock_before_bytes = lock_path.read_bytes()
             if (
                 f"sha256:{sha256(before_bytes).hexdigest()}"
                 != draft.before_digest
+                or f"sha256:{sha256(lock_before_bytes).hexdigest()}"
+                != draft.lock_before_digest
             ):
-                raise ValueError("E_REMOTE_POLICY_APPLY: policy bytes drifted")
+                raise ValueError(
+                    "E_REMOTE_POLICY_APPLY: policy/lock bytes drifted"
+                )
             transaction_root.mkdir(parents=True, exist_ok=True)
             journal = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "draft_digest": draft.draft_digest,
                 "task_id": draft.task_id,
                 "task_digest": draft.task_digest,
@@ -1206,6 +1520,8 @@ def apply_project_remote_policy_update(
                 "generation": expected_generation,
                 "before_digest": draft.before_digest,
                 "after_digest": draft.after_digest,
+                "lock_before_digest": draft.lock_before_digest,
+                "lock_after_digest": draft.lock_after_digest,
                 "phase": "allocating",
             }
             _atomic_policy_json(journal_path, journal)
@@ -1217,6 +1533,9 @@ def apply_project_remote_policy_update(
                 journal_path=journal_path,
                 backup_path=backup_path,
                 after_path=after_path,
+                lock_path=lock_path,
+                lock_backup_path=lock_backup_path,
+                lock_after_path=lock_after_path,
             )
             if not _consume_runtime_host_object(
                 draft, "project_remote_policy_update_draft"
