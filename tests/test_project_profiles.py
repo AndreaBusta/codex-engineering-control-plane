@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.router_test_support import task_envelope, validated_inventory
+
 
 ROOT = Path(__file__).parents[1]
 
@@ -142,7 +144,6 @@ class ProjectProfileTests(unittest.TestCase):
         from control_plane.resource_registry import load_registry
         from control_plane.routing import resolve_route
         from control_plane.contracts import contract_digest
-        from tests.router_test_support import task_envelope
 
         registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
         policy = load_policy(ROOT / ".codex" / "project-policy.toml")
@@ -177,11 +178,17 @@ class ProjectProfileTests(unittest.TestCase):
         }
         inventory["snapshot_digest"] = contract_digest(inventory)
 
+        task = task_envelope(domains=["mobile", "ios"])
         decision = resolve_route(
-            task_envelope(domains=["mobile", "ios"]),
+            task,
             policy,
             registry,
-            inventory,
+            validated_inventory(
+                inventory,
+                registry=registry,
+                task=task,
+                invocation_id="project-profile-route",
+            ),
             mode="audit",
         )
 

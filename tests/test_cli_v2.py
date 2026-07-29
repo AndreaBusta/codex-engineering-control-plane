@@ -79,6 +79,45 @@ class CliV2Tests(unittest.TestCase):
         self.assertEqual(payload["summary"]["tier"], "T2")
         self.assertIn("skill.verified-workflow", payload["summary"]["required"])
 
+    def test_route_rejects_serialized_inventory_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            task_path = Path(temporary) / "task.json"
+            inventory_path = Path(temporary) / "inventory.json"
+            task_path.write_text(json.dumps(task_envelope()), encoding="utf-8")
+            inventory_path.write_text("{}\n", encoding="utf-8")
+
+            result = run_cli(
+                "route",
+                "--repo",
+                str(ROOT),
+                "--task",
+                str(task_path),
+                "--inventory",
+                str(inventory_path),
+                "--json",
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized arguments: --inventory", result.stderr)
+
+    def test_verification_run_rejects_caller_selected_profile_or_command(
+        self,
+    ) -> None:
+        result = run_cli(
+            "verification-run",
+            "--repo",
+            str(ROOT),
+            "--task-id",
+            "TASK-VERIFY-CLI",
+            "--profile",
+            "control_plane_assurance",
+            "--command-id",
+            "doctor",
+            "--json",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized arguments", result.stderr)
+
     def test_human_route_output_surfaces_profile_and_mode_recommendation(
         self,
     ) -> None:
@@ -183,7 +222,30 @@ class CliV2Tests(unittest.TestCase):
         self.assertEqual(json.loads(status.stdout)["task"]["state"], "framed")
         self.assertFalse((scenario.repo / "TASK-CLI.json").exists())
 
-    def test_valid_task_lease_allows_dirty_continuation_only_for_same_identity(
+    def test_task_transition_rejects_serialized_evidence_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = Path(temporary) / "evidence.json"
+            evidence.write_text(
+                json.dumps({"remote_head": "a" * 40}), encoding="utf-8"
+            )
+            result = run_cli(
+                "task",
+                "transition",
+                "--repo",
+                str(ROOT),
+                "--task-id",
+                "TASK-FORGED-EVIDENCE",
+                "--state",
+                "pushed",
+                "--evidence",
+                str(evidence),
+                "--json",
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized arguments: --evidence", result.stderr)
+
+    def test_dirty_preflight_requires_exact_active_task_and_session(
         self,
     ) -> None:
         scenario = GitScenario()
@@ -245,15 +307,93 @@ class CliV2Tests(unittest.TestCase):
             "session-b",
             "--json",
         )
+        missing_task = run_cli(
+            "preflight",
+            "--mode",
+            "write",
+            "--repo",
+            str(scenario.repo),
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--session-id",
+            "session-a",
+            "--json",
+        )
+        missing_session = run_cli(
+            "preflight",
+            "--mode",
+            "write",
+            "--repo",
+            str(scenario.repo),
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--task-id",
+            "TASK-LEASE",
+            "--json",
+        )
 
         self.assertEqual(started.returncode, 0, started.stderr)
         self.assertEqual(valid.returncode, 0, valid.stderr)
         self.assertTrue(json.loads(valid.stdout)["facts"]["lease_continuation"])
         self.assertNotEqual(wrong.returncode, 0)
+        self.assertNotEqual(missing_task.returncode, 0)
+        self.assertNotEqual(missing_session.returncode, 0)
         self.assertIn(
             "E_LEASE_MISMATCH",
             {item["code"] for item in json.loads(wrong.stdout)["errors"]},
         )
+        for result in (missing_task, missing_session):
+            self.assertIn(
+                "E_GIT_DIRTY",
+                {
+                    item["code"]
+                    for item in json.loads(result.stdout)["errors"]
+                },
+            )
+
+    def test_task_lease_release_requires_exact_owner_bindings(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/lease-release")
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import TaskLease
+        from control_plane.policy import load_policy
+        from control_plane.repository import worktree_git_dir
+
+        policy_digest = contract_digest(load_policy(FIXTURE_POLICY))
+        state_dir = worktree_git_dir(scenario.repo)
+        lease = TaskLease.acquire(
+            state_dir,
+            task_id="TASK-CLI-RELEASE",
+            worktree=str(scenario.repo),
+            branch="codex/lease-release",
+            session_id="session-cli-release",
+            paths=["."],
+            policy_digest=policy_digest,
+        )
+
+        result = run_cli(
+            "task",
+            "lease-release",
+            "--repo",
+            str(scenario.repo),
+            "--task-id",
+            "TASK-CLI-RELEASE",
+            "--worktree",
+            str(scenario.repo),
+            "--branch",
+            "codex/lease-release",
+            "--session-id",
+            "session-cli-release",
+            "--policy-digest",
+            policy_digest,
+            "--lease-digest",
+            lease["lease_digest"],
+            "--json",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["ok"])
 
 
 if __name__ == "__main__":

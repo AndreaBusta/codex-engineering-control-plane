@@ -19,14 +19,38 @@ def _digest(path: Path) -> str:
     return f"sha256:{sha256(path.read_bytes()).hexdigest()}"
 
 
-def runtime_digest(root: Path, package: str | None = None) -> str:
+def runtime_digest(
+    root: Path,
+    package: str | None = None,
+    *,
+    runtime_layout: str | None = None,
+) -> str:
     selected = package or "control_plane"
-    if selected == "control_plane" and (root / "control_plane").is_dir():
-        runtime = root / "control_plane"
-    else:
-        runtime = root / ".codex" / "runtime" / selected
+    layout = runtime_layout or (
+        "source" if selected == "control_plane" else "isolated"
+    )
+    expected_package = {
+        "source": "control_plane",
+        "isolated": "codex_control_plane_runtime_v2",
+    }
+    if layout not in expected_package or selected != expected_package[layout]:
+        raise ValueError(
+            "L_RUNTIME_LAYOUT: runtime layout and package are inconsistent"
+        )
+    runtime = (
+        root / "control_plane"
+        if layout == "source"
+        else root / ".codex" / "runtime" / selected
+    )
+    if runtime.is_symlink() or not runtime.is_dir():
+        raise ValueError("L_RUNTIME_LAYOUT: selected runtime is unavailable")
+    modules = sorted(runtime.glob("*.py"))
+    if not modules:
+        raise ValueError("L_RUNTIME_LAYOUT: selected runtime is empty")
     hasher = sha256()
-    for path in sorted(runtime.glob("*.py")):
+    for path in modules:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("L_RUNTIME_LAYOUT: runtime module is invalid")
         hasher.update(path.name.encode("utf-8"))
         hasher.update(b"\0")
         hasher.update(path.read_bytes())
@@ -45,13 +69,33 @@ def validate_lock(root: Path) -> list[LockIssue]:
         issues.append(LockIssue("L_SCHEMA", "schema_version", "Only lock schema 1 is supported."))
     if lock.get("product_version") != "2.0.0":
         issues.append(LockIssue("L_VERSION", "product_version", "Lock does not select control-plane v2.0.0."))
+    layout = lock.get("runtime_layout")
     package = lock.get("runtime_package")
-    if package not in {"control_plane", "codex_control_plane_runtime_v2"}:
+    expected_package = {
+        "source": "control_plane",
+        "isolated": "codex_control_plane_runtime_v2",
+    }
+    if layout not in expected_package:
+        issues.append(
+            LockIssue(
+                "L_RUNTIME_LAYOUT",
+                "runtime_layout",
+                "Lock must select source or isolated runtime layout.",
+            )
+        )
+    if package != expected_package.get(layout):
+        issues.append(
+            LockIssue(
+                "L_RUNTIME_LAYOUT",
+                "runtime_layout",
+                "Runtime layout and package form an invalid closed pair.",
+            )
+        )
         issues.append(
             LockIssue(
                 "L_RUNTIME_PACKAGE",
                 "runtime_package",
-                "Lock must select an approved isolated runtime package.",
+                "Runtime package must match the selected closed layout.",
             )
         )
     expected = {
@@ -65,7 +109,23 @@ def validate_lock(root: Path) -> list[LockIssue]:
     for name, path in expected.items():
         if not path.is_file() or digests.get(name) != _digest(path):
             issues.append(LockIssue("L_DIGEST", name, f"Locked digest does not match {path.name}."))
-    if digests.get("runtime") != runtime_digest(root, str(package)):
+    try:
+        observed_runtime = runtime_digest(
+            root,
+            str(package),
+            runtime_layout=str(layout),
+        )
+    except ValueError:
+        observed_runtime = None
+        if layout in expected_package and package == expected_package.get(layout):
+            issues.append(
+                LockIssue(
+                    "L_RUNTIME_LAYOUT",
+                    "runtime_layout",
+                    "Selected runtime is missing, empty, symlinked, or invalid.",
+                )
+            )
+    if digests.get("runtime") != observed_runtime:
         issues.append(LockIssue("L_DIGEST", "runtime", "Locked runtime digest does not match."))
     if lock.get("hook_mode") != "audit":
         issues.append(LockIssue("L_HOOK_MODE", "hook_mode", "Initial v2 hook mode must remain audit."))

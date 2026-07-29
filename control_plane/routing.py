@@ -11,9 +11,15 @@ from control_plane.contracts import (
     TASK_EFFECTS,
     contract_digest,
     validate_task_id,
-    validate_authorization_grant,
 )
-from control_plane.resource_registry import validate_inventory
+from control_plane.host_bridge import (
+    ValidatedInventory,
+    authorization_effects_for_route,
+)
+from control_plane.resource_registry import (
+    registry_contract_digest,
+    validate_inventory,
+)
 
 
 CRITICAL_SIGNALS = frozenset(
@@ -316,26 +322,11 @@ def _unique_sorted(values: Iterable[str]) -> list[str]:
     return sorted(set(values))
 
 
-def _semantic_registry(registry: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize unordered registry collections before computing evidence."""
-
-    normalized = dict(registry)
-    normalized["resources"] = sorted(
-        (item for item in registry.get("resources", []) if isinstance(item, Mapping)),
-        key=lambda item: str(item.get("id", "")),
-    )
-    normalized["routes"] = sorted(
-        (item for item in registry.get("routes", []) if isinstance(item, Mapping)),
-        key=lambda item: str(item.get("id", "")),
-    )
-    return normalized
-
-
 def resolve_route(
     task: Mapping[str, Any],
     policy: Mapping[str, Any],
     registry: Mapping[str, Any],
-    inventory: Mapping[str, Any],
+    inventory: ValidatedInventory,
     *,
     mode: str,
     authorization_grant: Mapping[str, Any] | None = None,
@@ -345,6 +336,15 @@ def resolve_route(
     if mode not in {"audit", "enforce"}:
         raise ValueError("mode must be audit or enforce")
     task_digest = contract_digest(task)
+    if not isinstance(inventory, ValidatedInventory):
+        raise ValueError(
+            "E_INVENTORY_OBSERVATION: resolver requires ValidatedInventory"
+        )
+    inventory_snapshot = inventory._snapshot_for_router(
+        expected_task_digest=task_digest,
+        expected_registry_digest=registry_contract_digest(registry),
+    )
+    inventory = inventory_snapshot
     tier = _tier(task)
     workflow_mode = {"T0": "direct", "T1": "direct", "T2": "structured", "T3": "controlled"}[tier]
     resources = sorted(
@@ -371,27 +371,15 @@ def resolve_route(
     ]
     granted_effects: set[str] = set()
     if authorization_grant is not None:
-        grant_issues = validate_authorization_grant(
+        granted_effects = authorization_effects_for_route(
             authorization_grant,
-            task_digest=task_digest,
-            scope_paths=[
+            expected_task_digest=task_digest,
+            expected_scope_paths=tuple(
                 str(item)
                 for item in task.get("scope_paths", [])
                 if isinstance(item, str)
-            ],
+            ),
         )
-        errors.extend(
-            {
-                "code": issue.code,
-                "message": f"{issue.path}: {issue.message}".lstrip(": "),
-            }
-            for issue in grant_issues
-        )
-        if not grant_issues:
-            granted_effects = {
-                str(item)
-                for item in authorization_grant.get("allowed_effects", [])
-            }
     matched_routes = sorted(
         (
             route
@@ -653,7 +641,7 @@ def resolve_route(
     facts = {
         "task_digest": task_digest,
         "policy_digest": contract_digest(policy),
-        "registry_digest": contract_digest(_semantic_registry(registry)),
+        "registry_digest": registry_contract_digest(registry),
         "inventory_digest": (
             str(inventory.get("snapshot_digest"))
             if not inventory_issues

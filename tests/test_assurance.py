@@ -11,6 +11,7 @@ from tests.router_test_support import (
     VALID_REGISTRY,
     inventory_snapshot,
     task_envelope,
+    validated_inventory,
 )
 
 
@@ -31,7 +32,12 @@ class AssuranceTests(unittest.TestCase):
             task,
             self.policy,
             self.registry,
-            self.inventory,
+            validated_inventory(
+                self.inventory,
+                registry=self.registry,
+                task=task,
+                invocation_id="assurance-route",
+            ),
             mode=mode,
         )
 
@@ -243,15 +249,36 @@ class AssuranceTests(unittest.TestCase):
 
         inventory["snapshot_digest"] = contract_digest(inventory)
         times = []
+        task = task_envelope()
         for _ in range(5):
+            observed_inventory = validated_inventory(
+                inventory,
+                registry=registry,
+                task=task,
+                invocation_id="assurance-performance",
+            )
             started = time.perf_counter()
             decision = resolve_route(
-                task_envelope(), self.policy, registry, inventory, mode="audit"
+                task,
+                self.policy,
+                registry,
+                observed_inventory,
+                mode="audit",
             )
             times.append(time.perf_counter() - started)
         tracemalloc.start()
+        observed_inventory = validated_inventory(
+            inventory,
+            registry=registry,
+            task=task,
+            invocation_id="assurance-memory",
+        )
         resolve_route(
-            task_envelope(), self.policy, registry, inventory, mode="audit"
+            task,
+            self.policy,
+            registry,
+            observed_inventory,
+            mode="audit",
         )
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()

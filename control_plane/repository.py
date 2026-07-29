@@ -79,3 +79,27 @@ def worktree_git_dir(path: Path) -> Path:
             "E_GIT_DIR_UNKNOWN", "The worktree-specific Git dir is unavailable."
         )
     return Path(result.stdout.strip()).resolve()
+
+
+def git_common_dir(path: Path) -> Path:
+    """Return the canonical common Git dir shared by all registered worktrees."""
+
+    root = discover_repository(path)
+    result = _git(
+        root, "rev-parse", "--path-format=absolute", "--git-common-dir"
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RepositoryError(
+            "E_GIT_COMMON_DIR_UNKNOWN",
+            "The common Git dir is unavailable.",
+        )
+    common = Path(result.stdout.strip())
+    if not common.is_absolute():
+        common = root / common
+    common = common.resolve()
+    if common.is_symlink() or not common.is_dir():
+        raise RepositoryError(
+            "E_GIT_COMMON_DIR_UNKNOWN",
+            "The common Git dir is invalid.",
+        )
+    return common

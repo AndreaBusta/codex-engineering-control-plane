@@ -6,11 +6,41 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONSAFEPATH=1
-if [[ -f "$PROJECT_ROOT/.codex/runtime/codex_control_plane_runtime_v2/cli.py" ]]; then
-  export PYTHONPATH="$PROJECT_ROOT/.codex/runtime"
-  cd "$PROJECT_ROOT/.codex/runtime"
-  exec python3 -P -B -m codex_control_plane_runtime_v2.cli "$@"
-fi
+python3 -P -B - "$PROJECT_ROOT" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+import tomllib
+
+root = Path(sys.argv[1]).resolve()
+lock_path = root / ".codex" / "control-plane.lock"
+try:
+    lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+except Exception as error:
+    raise SystemExit(f"E_RUNTIME_BOOTSTRAP: invalid lock: {error}")
+if (
+    lock.get("runtime_layout") != "source"
+    or lock.get("runtime_package") != "control_plane"
+):
+    raise SystemExit("E_RUNTIME_LAYOUT: source launcher requires source runtime")
+runtime = root / "control_plane"
+if runtime.is_symlink() or not runtime.is_dir():
+    raise SystemExit("E_RUNTIME_LAYOUT: source runtime is unavailable")
+modules = sorted(runtime.glob("*.py"))
+if not modules:
+    raise SystemExit("E_RUNTIME_LAYOUT: source runtime is empty")
+hasher = sha256()
+for path in modules:
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit("E_RUNTIME_LAYOUT: invalid source runtime module")
+    hasher.update(path.name.encode())
+    hasher.update(b"\0")
+    hasher.update(path.read_bytes())
+    hasher.update(b"\0")
+observed = f"sha256:{hasher.hexdigest()}"
+if lock.get("digests", {}).get("runtime") != observed:
+    raise SystemExit("E_RUNTIME_DIGEST: source runtime does not match lock")
+PY
 export PYTHONPATH="$PROJECT_ROOT"
 cd "$PROJECT_ROOT"
 exec python3 -P -B -m control_plane.cli "$@"

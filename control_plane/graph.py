@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 import re
 from typing import Any, Mapping
+
+from control_plane.scopes import normalize_scope, scopes_overlap
 
 
 @dataclass(frozen=True)
@@ -21,18 +22,11 @@ NODE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,126}$", re.ASCII)
 
 
 def _path_safe(value: str) -> bool:
-    path = PurePosixPath(value)
-    return bool(value) and not path.is_absolute() and ".." not in path.parts
+    return normalize_scope(value) is not None
 
 
 def _overlap(left: str, right: str) -> bool:
-    left_path = left.rstrip("/*")
-    right_path = right.rstrip("/*")
-    return (
-        left_path == right_path
-        or left_path.startswith(right_path + "/")
-        or right_path.startswith(left_path + "/")
-    )
+    return scopes_overlap(left, right)
 
 
 def validate_graph(
