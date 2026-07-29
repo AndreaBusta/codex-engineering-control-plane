@@ -4,6 +4,29 @@ import unittest
 
 
 class GraphTests(unittest.TestCase):
+    def test_scope_normalization_is_idempotent_and_root_is_universal(self) -> None:
+        from control_plane.scopes import (
+            normalize_scope,
+            scope_owns,
+            scopes_overlap,
+        )
+
+        for raw, expected in (
+            (".", "."),
+            ("./", "."),
+            ("./**", "."),
+            ("src/", "src"),
+            ("src/**", "src"),
+        ):
+            with self.subTest(raw=raw):
+                normalized = normalize_scope(raw)
+                self.assertEqual(normalized, expected)
+                self.assertEqual(normalize_scope(normalized), normalized)
+
+        self.assertTrue(scope_owns(".", "src/module.py"))
+        self.assertTrue(scopes_overlap(".", "src/**"))
+        self.assertTrue(scopes_overlap("src/**", "."))
+
     def test_independent_readers_join_is_valid(self) -> None:
         from control_plane.graph import validate_graph
 
@@ -32,6 +55,72 @@ class GraphTests(unittest.TestCase):
         codes = {issue.code for issue in validate_graph(graph, max_workers=2)}
 
         self.assertIn("G_WRITER_OVERLAP", codes)
+
+    def test_repository_root_writer_overlaps_every_parallel_writer(self) -> None:
+        from control_plane.graph import validate_graph
+
+        for root_scope in (".", "./", "./**"):
+            with self.subTest(root_scope=root_scope, order="root-first"):
+                parallel = {
+                    "schema_version": 1,
+                    "nodes": [
+                        {
+                            "id": "root",
+                            "role": "writer",
+                            "allowed_paths": [root_scope],
+                            "depends_on": [],
+                        },
+                        {
+                            "id": "child",
+                            "role": "writer",
+                            "allowed_paths": ["src/**"],
+                            "depends_on": [],
+                        },
+                    ],
+                }
+                self.assertIn(
+                    "G_WRITER_OVERLAP",
+                    {
+                        issue.code
+                        for issue in validate_graph(parallel, max_workers=2)
+                    },
+                )
+
+            with self.subTest(root_scope=root_scope, order="child-first"):
+                parallel["nodes"].reverse()
+                self.assertIn(
+                    "G_WRITER_OVERLAP",
+                    {
+                        issue.code
+                        for issue in validate_graph(parallel, max_workers=2)
+                    },
+                )
+
+            with self.subTest(root_scope=root_scope, mode="sequential"):
+                sequential = {
+                    "schema_version": 1,
+                    "nodes": [
+                        {
+                            "id": "root",
+                            "role": "writer",
+                            "allowed_paths": [root_scope],
+                            "depends_on": [],
+                        },
+                        {
+                            "id": "child",
+                            "role": "writer",
+                            "allowed_paths": ["src/**"],
+                            "depends_on": ["root"],
+                        },
+                    ],
+                }
+                self.assertNotIn(
+                    "G_WRITER_OVERLAP",
+                    {
+                        issue.code
+                        for issue in validate_graph(sequential, max_workers=1)
+                    },
+                )
 
     def test_sequential_chain_does_not_count_as_three_concurrent_workers(
         self,

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
+from hashlib import sha256
 from pathlib import Path
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 from unittest.mock import patch
 
@@ -154,6 +158,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(before, after)
 
     def test_apply_fault_injection_restores_every_target_file(self) -> None:
+        import control_plane.adoption as adoption
         from control_plane.adoption import (
             adoption_apply,
             adoption_plan,
@@ -163,19 +168,35 @@ class AdoptionTests(unittest.TestCase):
         plan = adoption_plan(
             ROOT, self.scenario.repo, allow_dirty_source=True
         )
-        original = Path.write_bytes
+        original = adoption._durable_replace_bytes
         writes = 0
 
-        def fail_third_staged_write(path: Path, value: bytes) -> int:
+        def fail_third_staged_write(
+            destination: Path,
+            payload: bytes,
+            *,
+            suffix: str,
+            expected_digest: str | None,
+            mode: int,
+        ) -> None:
             nonlocal writes
-            if path.name.endswith(".codex-new"):
+            if suffix == ".codex-new":
                 writes += 1
                 if writes == 3:
                     raise OSError("injected write failure")
-            return original(path, value)
+            original(
+                destination,
+                payload,
+                suffix=suffix,
+                expected_digest=expected_digest,
+                mode=mode,
+            )
 
         with (
-            patch.object(Path, "write_bytes", fail_third_staged_write),
+            patch(
+                "control_plane.adoption._durable_replace_bytes",
+                side_effect=fail_third_staged_write,
+            ),
             self.assertRaisesRegex(OSError, "injected write failure"),
         ):
             adoption_apply(plan)
@@ -189,8 +210,326 @@ class AdoptionTests(unittest.TestCase):
             "failed_rolled_back",
         )
 
-    def test_plan_adapts_base_and_runtime_is_not_shadowed(self) -> None:
-        from control_plane.adoption import adoption_apply, adoption_plan
+    def test_installed_and_restored_files_are_durable_before_pointer_release(
+        self,
+    ) -> None:
+        import stat
+
+        import control_plane.adoption as adoption
+
+        plan = adoption.adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        original_fsync = os.fsync
+        original_replace = os.replace
+        original_unlink = adoption._unlink_and_fsync
+        synced_files: set[tuple[int, int]] = set()
+        pending_directories: set[tuple[int, int]] = set()
+
+        def tracked_fsync(descriptor: int) -> None:
+            observed = os.fstat(descriptor)
+            identity = (observed.st_dev, observed.st_ino)
+            if stat.S_ISREG(observed.st_mode):
+                synced_files.add(identity)
+            elif stat.S_ISDIR(observed.st_mode):
+                pending_directories.discard(identity)
+            original_fsync(descriptor)
+
+        def tracked_replace(source, destination) -> None:
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if source_path.name.endswith(
+                (".codex-new", ".codex-upgrade", ".codex-restore")
+            ):
+                observed = source_path.stat()
+                self.assertIn(
+                    (observed.st_dev, observed.st_ino),
+                    synced_files,
+                    f"{source_path.name} was replaced before fsync",
+                )
+                parent = destination_path.parent.stat()
+                pending_directories.add((parent.st_dev, parent.st_ino))
+            original_replace(source, destination)
+
+        def tracked_pointer_unlink(path: Path) -> None:
+            if path == adoption._owner_pointer_path(self.scenario.repo):
+                self.assertFalse(
+                    pending_directories,
+                    "owner pointer was released before destination dir fsync",
+                )
+            original_unlink(path)
+
+        with (
+            patch("control_plane.adoption.os.fsync", tracked_fsync),
+            patch("control_plane.adoption.os.replace", tracked_replace),
+            patch(
+                "control_plane.adoption._unlink_and_fsync",
+                tracked_pointer_unlink,
+            ),
+        ):
+            adoption.adoption_apply(plan)
+
+    def test_adoption_mutex_is_released_after_process_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / "adoption.lock"
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import time;"
+                        "from pathlib import Path;"
+                        "from control_plane.adoption import _ProcessLock;"
+                        f"p=Path({str(lock_path)!r});"
+                        "guard=_ProcessLock(p);guard.__enter__();"
+                        "print('LOCKED', flush=True);time.sleep(60)"
+                    ),
+                ],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(child.stdout.readline().strip(), "LOCKED")
+            child.send_signal(signal.SIGKILL)
+            child.wait(timeout=5)
+            child.stdout.close()
+            child.stderr.close()
+
+            from control_plane.adoption import _ProcessLock
+
+            with _ProcessLock(lock_path):
+                self.assertTrue(lock_path.exists())
+
+    def _recovery_scenario(
+        self, suffix: str
+    ) -> tuple[GitScenario, Path]:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature(f"codex/recovery-owner-{suffix}")
+        recovery_worktree = scenario.root / f"recovery-{suffix}"
+        subprocess.run(
+            [
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                f"codex/recovery-peer-{suffix}",
+                str(recovery_worktree),
+                "HEAD",
+            ],
+            cwd=scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return scenario, recovery_worktree
+
+    def _recovery_record(
+        self, scenario: GitScenario, suffix: str
+    ) -> tuple[dict[str, object], bytes]:
+        from control_plane.repository import worktree_git_dir
+
+        target = scenario.repo / "baseline.txt"
+        original = target.read_bytes()
+        backup_relative = (
+            f"codex-control-plane/backups/recovery-{suffix}/baseline.txt"
+        )
+        backup = worktree_git_dir(scenario.repo) / backup_relative
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(original)
+        digest = f"sha256:{sha256(original).hexdigest()}"
+        return (
+            {
+                "path": "baseline.txt",
+                "before_digest": digest,
+                "installed_digest": (
+                    "sha256:" + sha256(b"installed\n").hexdigest()
+                ),
+                "backup": backup_relative,
+            },
+            original,
+        )
+
+    def test_other_worktree_recovers_owner_transaction_after_each_crash_point(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            _advance_transaction,
+            _atomic_json,
+            _begin_transaction,
+            _owner_pointer_path,
+            _recover_owner_transaction,
+        )
+        from control_plane.contracts import contract_digest
+
+        for phase in ("pointer", "wal_and_config", "committed"):
+            with self.subTest(phase=phase):
+                scenario, peer = self._recovery_scenario(phase)
+                record, original = self._recovery_record(scenario, phase)
+                transaction = _begin_transaction(
+                    scenario.repo,
+                    operation="adopt",
+                    records=[record],
+                )
+                installed = b"installed\n"
+                (scenario.repo / "baseline.txt").write_bytes(installed)
+                state = {"schema_version": 2, "status": "preparing"}
+                if phase in {"wal_and_config", "committed"}:
+                    _atomic_json(
+                        transaction["manifest_path"].parents[2]
+                        / "adoption.json",
+                        state,
+                    )
+                    _advance_transaction(
+                        transaction,
+                        status="preparing",
+                        state=state,
+                    )
+                if phase == "committed":
+                    state = {"schema_version": 2, "status": "applied"}
+                    final = _advance_transaction(
+                        transaction,
+                        status="committed",
+                        state=state,
+                    )
+                    _atomic_json(
+                        transaction["manifest_path"].parent / "COMMITTED",
+                        {
+                            "schema_version": 1,
+                            "transaction_id": transaction["pointer"][
+                                "transaction_id"
+                            ],
+                            "final_generation": final["generation"],
+                            "final_generation_digest": final[
+                                "generation_digest"
+                            ],
+                            "state_digest": contract_digest(state),
+                        },
+                    )
+
+                _recover_owner_transaction(peer)
+
+                observed = (scenario.repo / "baseline.txt").read_bytes()
+                self.assertEqual(
+                    observed,
+                    installed if phase == "committed" else original,
+                )
+                self.assertFalse(_owner_pointer_path(peer).exists())
+
+    def test_owner_pointer_never_hashes_mutable_journal(self) -> None:
+        from control_plane.adoption import (
+            _advance_transaction,
+            _begin_transaction,
+            _digest,
+            _owner_pointer_path,
+            _recover_owner_transaction,
+        )
+
+        scenario, peer = self._recovery_scenario("stable-manifest")
+        transaction = _begin_transaction(
+            scenario.repo,
+            operation="upgrade",
+            records=[],
+            previous_state={"schema_version": 2, "status": "applied"},
+        )
+        pointer_path = _owner_pointer_path(peer)
+        pointer_before = json.loads(pointer_path.read_text(encoding="utf-8"))
+        manifest_digest = pointer_before["manifest_digest"]
+
+        for status in ("upgrading", "files_replaced", "state_written"):
+            _advance_transaction(
+                transaction,
+                status=status,
+                state={"schema_version": 2, "status": status},
+            )
+
+        pointer_after = json.loads(pointer_path.read_text(encoding="utf-8"))
+        self.assertEqual(pointer_after, pointer_before)
+        self.assertNotIn("journal", pointer_after)
+        self.assertNotIn("wal_digest", pointer_after)
+        self.assertEqual(
+            _digest(transaction["manifest_path"]), manifest_digest
+        )
+        _recover_owner_transaction(peer)
+
+    def test_broken_wal_chain_or_ambiguous_generation_fails_closed(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            _atomic_json,
+            _begin_transaction,
+            _owner_pointer_path,
+            _recover_owner_transaction,
+        )
+
+        for case in (
+            "broken_previous_digest",
+            "duplicate_generation",
+            "manifest_escape",
+            "unbound_committed",
+        ):
+            with self.subTest(case=case):
+                scenario, peer = self._recovery_scenario(case)
+                transaction = _begin_transaction(
+                    scenario.repo,
+                    operation="adopt",
+                    records=[],
+                )
+                pointer_path = _owner_pointer_path(peer)
+                if case == "broken_previous_digest":
+                    generation_path = (
+                        transaction["wal_root"] / "00000001.json"
+                    )
+                    generation = json.loads(
+                        generation_path.read_text(encoding="utf-8")
+                    )
+                    generation["previous_generation_digest"] = "sha256:bad"
+                    _atomic_json(generation_path, generation)
+                elif case == "duplicate_generation":
+                    generation = json.loads(
+                        (
+                            transaction["wal_root"] / "00000001.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                    _atomic_json(
+                        transaction["wal_root"] / "00000002.json",
+                        generation,
+                    )
+                elif case == "manifest_escape":
+                    pointer = json.loads(
+                        pointer_path.read_text(encoding="utf-8")
+                    )
+                    pointer["manifest_path"] = "../outside.json"
+                    _atomic_json(pointer_path, pointer)
+                else:
+                    _atomic_json(
+                        transaction["manifest_path"].parent / "COMMITTED",
+                        {
+                            "schema_version": 1,
+                            "transaction_id": transaction["pointer"][
+                                "transaction_id"
+                            ],
+                            "final_generation": 1,
+                            "final_generation_digest": "sha256:unbound",
+                            "state_digest": "sha256:unbound",
+                        },
+                    )
+                pointer_before = pointer_path.read_bytes()
+
+                with self.assertRaisesRegex(
+                    ValueError, "E_ADOPT_RECOVERY_UNKNOWN"
+                ):
+                    _recover_owner_transaction(peer)
+
+                self.assertEqual(pointer_path.read_bytes(), pointer_before)
+
+    def test_isolated_launcher_ignores_top_level_runtime_shadow(self) -> None:
+        from control_plane.adoption import (
+            RUNTIME_MODULES,
+            adoption_apply,
+            adoption_plan,
+        )
 
         plan = adoption_plan(
             ROOT,
@@ -201,7 +540,34 @@ class AdoptionTests(unittest.TestCase):
         adoption_apply(plan)
         shadow = self.scenario.repo / "control_plane"
         shadow.mkdir()
-        (shadow / "__init__.py").write_text("", encoding="utf-8")
+        (shadow / "__init__.py").write_text(
+            "raise RuntimeError('TOP_LEVEL_SHADOW_IMPORTED')\n",
+            encoding="utf-8",
+        )
+        (shadow / "cli.py").write_text(
+            "raise RuntimeError('TOP_LEVEL_SHADOW_IMPORTED')\n",
+            encoding="utf-8",
+        )
+        launcher_marker = (
+            self.scenario.repo / "isolated-launcher-stdlib-shadow-executed"
+        )
+        hook_marker = (
+            self.scenario.repo / "isolated-hook-stdlib-shadow-executed"
+        )
+        (self.scenario.repo / "argparse.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(launcher_marker)!r}).write_text('executed')\n"
+            "raise RuntimeError('ARGPARSE_SHADOW_EXECUTED')\n",
+            encoding="utf-8",
+        )
+        (self.scenario.repo / "json.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(hook_marker)!r}).write_text('executed')\n"
+            "raise RuntimeError('JSON_SHADOW_EXECUTED')\n",
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(self.scenario.repo)
 
         completed = subprocess.run(
             [
@@ -216,6 +582,7 @@ class AdoptionTests(unittest.TestCase):
                 "--json",
             ],
             cwd=self.scenario.repo,
+            env=environment,
             check=False,
             capture_output=True,
             text=True,
@@ -226,6 +593,8 @@ class AdoptionTests(unittest.TestCase):
         hook = subprocess.run(
             [
                 "python3",
+                "-I",
+                "-B",
                 str(
                     self.scenario.repo
                     / ".codex"
@@ -234,6 +603,7 @@ class AdoptionTests(unittest.TestCase):
                 ),
             ],
             cwd=self.scenario.repo,
+            env=environment,
             input=json.dumps(
                 {
                     "hook_event_name": "UserPromptSubmit",
@@ -246,6 +616,106 @@ class AdoptionTests(unittest.TestCase):
         )
         self.assertEqual(hook.returncode, 0, hook.stderr)
         self.assertIn("CONTROL_PLANE_AUDIT_V2", hook.stdout)
+        self.assertNotIn("TOP_LEVEL_SHADOW_IMPORTED", completed.stderr)
+        self.assertNotIn("TOP_LEVEL_SHADOW_IMPORTED", hook.stderr)
+        self.assertFalse(launcher_marker.exists())
+        self.assertFalse(hook_marker.exists())
+        self.assertNotIn("ARGPARSE_SHADOW_EXECUTED", completed.stderr)
+        self.assertNotIn("JSON_SHADOW_EXECUTED", hook.stderr)
+        for module in ("host_bridge.py", "scopes.py"):
+            self.assertIn(module, RUNTIME_MODULES)
+            self.assertTrue(
+                (
+                    self.scenario.repo
+                    / ".codex"
+                    / "runtime"
+                    / "codex_control_plane_runtime_v2"
+                    / module
+                ).is_file()
+            )
+
+    def test_pr_a_adopted_runtime_imports_host_bridge_and_scopes_without_source(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            RUNTIME_PACKAGE,
+            adoption_apply,
+            adoption_plan,
+        )
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption_apply(plan)
+        runtime_root = self.scenario.repo / ".codex" / "runtime"
+        package_root = runtime_root / RUNTIME_PACKAGE
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONPATH": str(runtime_root),
+            "PYTHONSAFEPATH": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        imported = subprocess.run(
+            [
+                sys.executable,
+                "-P",
+                "-B",
+                "-c",
+                (
+                    f"from {RUNTIME_PACKAGE} import host_bridge, scopes;"
+                    "from pathlib import Path;"
+                    f"root=Path({str(package_root)!r}).resolve();"
+                    "assert Path(host_bridge.__file__).resolve().is_relative_to(root);"
+                    "assert Path(scopes.__file__).resolve().is_relative_to(root);"
+                    "print('ISOLATED_IMPORT_OK')"
+                ),
+            ],
+            cwd=self.scenario.root,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        launcher = self.scenario.repo / "scripts" / "control-plane"
+        doctor = subprocess.run(
+            [
+                str(launcher),
+                "doctor",
+                "--repo",
+                str(self.scenario.repo),
+                "--json",
+            ],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        preflight = subprocess.run(
+            [
+                str(launcher),
+                "preflight",
+                "--mode",
+                "read",
+                "--repo",
+                str(self.scenario.repo),
+                "--json",
+            ],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(imported.returncode, 0, imported.stderr)
+        self.assertEqual(imported.stdout.strip(), "ISOLATED_IMPORT_OK")
+        self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+        self.assertIn('"ok": true', doctor.stdout.lower())
+        self.assertEqual(
+            preflight.returncode,
+            0,
+            preflight.stdout + preflight.stderr,
+        )
+        self.assertIn('"ok": true', preflight.stdout.lower())
 
     def test_upgrade_plan_applies_new_source_and_remains_reversible(self) -> None:
         from control_plane.adoption import (

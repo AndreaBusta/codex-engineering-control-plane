@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "command": "python3 -I -B \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
             "timeout": 3,
             "additionalContextLimit": 4096
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "command": "python3 -I -B \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
             "timeout": 3,
             "additionalContextLimit": 4096
           }
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "command": "python3 -I -B \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
             "timeout": 3
           }
         ]
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "command": "python3 -I -B \"$(git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
             "timeout": 3,
             "additionalContextLimit": 4096
           }

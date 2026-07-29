@@ -939,3 +939,26 @@ def build_inventory(
     }
     snapshot["snapshot_digest"] = contract_digest(snapshot)
     return snapshot
+
+
+def registry_contract_digest(registry: Mapping[str, Any]) -> str:
+    """Digest registry semantics independently of TOML collection order."""
+
+    normalized = dict(registry)
+    normalized["resources"] = sorted(
+        (
+            item
+            for item in registry.get("resources", [])
+            if isinstance(item, Mapping)
+        ),
+        key=lambda item: str(item.get("id", "")),
+    )
+    normalized["routes"] = sorted(
+        (
+            item
+            for item in registry.get("routes", [])
+            if isinstance(item, Mapping)
+        ),
+        key=lambda item: str(item.get("id", "")),
+    )
+    return contract_digest(normalized)

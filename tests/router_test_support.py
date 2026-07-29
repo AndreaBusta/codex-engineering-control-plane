@@ -143,5 +143,113 @@ def refresh_inventory_digest(inventory: dict[str, Any]) -> None:
     inventory["snapshot_digest"] = contract_digest(inventory)
 
 
+def inventory_observation(
+    snapshot: dict[str, Any],
+    *,
+    registry: dict[str, Any],
+    task: dict[str, Any],
+    invocation_id: str = "test-inventory-invocation",
+    observed_at: float = 100.0,
+    ttl_seconds: float = 30.0,
+):
+    import control_plane.host_bridge as bridge
+    from control_plane.resource_registry import registry_contract_digest
+
+    observation = object.__new__(bridge.InventoryObservation)
+    observation._consumed = False
+    observation.observation_id = f"test-{invocation_id}"
+    observation.invocation_id = invocation_id
+    observation.task_digest = contract_digest(task)
+    observation.repository_identity = str(ROOT.resolve())
+    observation.worktree_identity = str(ROOT.resolve())
+    observation.registry_digest = registry_contract_digest(registry)
+    observation.snapshot_digest = str(snapshot.get("snapshot_digest"))
+    observation.snapshot = copy.deepcopy(snapshot)
+    observation.observed_at_monotonic = observed_at
+    observation.freshness_deadline = observed_at + ttl_seconds
+    return observation
+
+
+def validated_inventory(
+    snapshot: dict[str, Any],
+    *,
+    registry: dict[str, Any],
+    task: dict[str, Any],
+    invocation_id: str = "test-inventory-invocation",
+):
+    from control_plane.host_bridge import validate_inventory_observation
+    from control_plane.resource_registry import registry_contract_digest
+
+    observation = inventory_observation(
+        snapshot,
+        registry=registry,
+        task=task,
+        invocation_id=invocation_id,
+    )
+    return validate_inventory_observation(
+        observation,
+        expected_repo=ROOT,
+        expected_worktree=ROOT,
+        expected_registry_digest=registry_contract_digest(registry),
+        expected_task_digest=contract_digest(task),
+        expected_invocation_id=invocation_id,
+        clock=lambda: 100.0,
+    )
+
+
+def trusted_authorization(
+    task: dict[str, Any],
+    *,
+    effect: str,
+    invocation_id: str = "test-authorization-invocation",
+):
+    import control_plane.host_bridge as bridge
+    from tests.host_adapter_test_support import (
+        native_session_event,
+        native_user_interaction_event,
+    )
+
+    session_id = "session-router-tests"
+    subject_digest = contract_digest({"effect": effect, "task": task["task_id"]})
+    session_event = native_session_event(
+        event_id=f"session-event-{effect}",
+        session_id=session_id,
+        invocation_id=invocation_id,
+        observed_at_monotonic=100.0,
+    )
+    capability = bridge.attest_host_adapter_capability(
+        session_event,
+        expected_session_id=session_id,
+        expected_invocation_id=invocation_id,
+        clock=lambda: 100.0,
+        ttl_seconds=30,
+    )
+    user_event = native_user_interaction_event(
+        event_id=f"user-event-{effect}",
+        session_id=session_id,
+        invocation_id=invocation_id,
+        task_digest=contract_digest(task),
+        subject_digest=subject_digest,
+        observed_at_monotonic=100.0,
+    )
+    return bridge.frame_effect_authorization(
+        user_event,
+        host_capability=capability,
+        task_digest=contract_digest(task),
+        session_id=session_id,
+        repository_identity=str(ROOT.resolve()),
+        worktree_identity=str(ROOT.resolve()),
+        branch="codex/test",
+        expected_head="a" * 40,
+        subject_digest=subject_digest,
+        scope_paths=tuple(task["scope_paths"]),
+        effect=effect,
+        operation_nonce=f"operation-{effect}",
+        invocation_id=invocation_id,
+        clock=lambda: 100.0,
+        ttl_seconds=30,
+    )
+
+
 def deep_copy(value: dict[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(value)

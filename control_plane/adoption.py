@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import fcntl
 from hashlib import sha256
 import json
 import os
@@ -24,6 +25,24 @@ from control_plane.resource_registry import load_registry
 
 
 RUNTIME_PACKAGE = "codex_control_plane_runtime_v2"
+RUNTIME_MODULES = (
+    "__init__.py",
+    "adoption.py",
+    "cli.py",
+    "contracts.py",
+    "git_state.py",
+    "graph.py",
+    "hooks.py",
+    "host_bridge.py",
+    "lifecycle.py",
+    "lockfile.py",
+    "policy.py",
+    "project_profiles.py",
+    "repository.py",
+    "resource_registry.py",
+    "routing.py",
+    "scopes.py",
+)
 MANAGED_FILES = (
     (".codex/project-policy.toml", ".codex/project-policy.toml"),
     (".codex/resource-registry.toml", ".codex/resource-registry.toml"),
@@ -71,22 +90,7 @@ MANAGED_FILES = (
             f"control_plane/{name}",
             f".codex/runtime/{RUNTIME_PACKAGE}/{name}",
         )
-        for name in (
-            "__init__.py",
-            "adoption.py",
-            "cli.py",
-            "contracts.py",
-            "git_state.py",
-            "graph.py",
-            "hooks.py",
-            "lifecycle.py",
-            "lockfile.py",
-            "policy.py",
-            "project_profiles.py",
-            "repository.py",
-            "resource_registry.py",
-            "routing.py",
-        )
+        for name in RUNTIME_MODULES
     ),
 )
 AGENTS_START = "<!-- BEGIN CODEX_CONTROL_PLANE_V2 -->"
@@ -105,11 +109,96 @@ def _digest(path: Path) -> str | None:
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
     )
-    temporary.replace(path)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_replace_bytes(
+    destination: Path,
+    payload: bytes,
+    *,
+    suffix: str,
+    expected_digest: str | None,
+    mode: int,
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + suffix)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, mode)
+    try:
+        os.fchmod(descriptor, mode)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if (
+            expected_digest is not None
+            and _digest(temporary) != expected_digest
+        ):
+            raise ValueError(
+                f"E_ADOPT_WRITE: staged digest mismatch: {destination}"
+            )
+        os.replace(temporary, destination)
+        destination.chmod(mode)
+        _fsync_directory(destination.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
+            _fsync_directory(temporary.parent)
+
+
+def _durable_copy(
+    source: Path,
+    destination: Path,
+    *,
+    suffix: str,
+    expected_digest: str | None,
+) -> None:
+    source_stat = source.stat()
+    _durable_replace_bytes(
+        destination,
+        source.read_bytes(),
+        suffix=suffix,
+        expected_digest=expected_digest,
+        mode=source_stat.st_mode & 0o777,
+    )
+
+
+def _unlink_if_present_and_fsync(path: Path) -> None:
+    if not path.exists():
+        return
+    path.unlink()
+    _fsync_directory(path.parent)
 
 
 def _safe_target(root: Path, relative: str) -> Path:
@@ -345,31 +434,124 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RUNTIME_ROOT="$PROJECT_ROOT/.codex/runtime"
+PYTHON_BIN="$(command -v python3)"
 
-export PYTHONDONTWRITEBYTECODE=1
-export PYTHONSAFEPATH=1
-export PYTHONPATH="$RUNTIME_ROOT"
-cd "$RUNTIME_ROOT"
-exec python3 -P -B -m {RUNTIME_PACKAGE}.cli "$@"
+exec "$PYTHON_BIN" -I -B -c '
+import importlib
+import importlib.util
+from hashlib import sha256
+from pathlib import Path
+import sys
+import tomllib
+
+root = Path(sys.argv[1]).resolve()
+try:
+    lock = tomllib.loads(
+        (root / ".codex" / "control-plane.lock").read_text(encoding="utf-8")
+    )
+except Exception as error:
+    raise SystemExit(f"E_RUNTIME_BOOTSTRAP: invalid lock: {{error}}")
+if (
+    lock.get("runtime_layout") != "isolated"
+    or lock.get("runtime_package") != "{RUNTIME_PACKAGE}"
+):
+    raise SystemExit("E_RUNTIME_LAYOUT: isolated launcher requires isolated runtime")
+runtime = root / ".codex" / "runtime" / "{RUNTIME_PACKAGE}"
+if runtime.is_symlink() or not runtime.is_dir():
+    raise SystemExit("E_RUNTIME_LAYOUT: isolated runtime is unavailable")
+modules = sorted(runtime.glob("*.py"))
+if not modules:
+    raise SystemExit("E_RUNTIME_LAYOUT: isolated runtime is empty")
+hasher = sha256()
+for path in modules:
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit("E_RUNTIME_LAYOUT: invalid isolated runtime module")
+    hasher.update(path.name.encode())
+    hasher.update(bytes((0,)))
+    hasher.update(path.read_bytes())
+    hasher.update(bytes((0,)))
+if lock.get("digests", {{}}).get("runtime") != f"sha256:{{hasher.hexdigest()}}":
+    raise SystemExit("E_RUNTIME_DIGEST: isolated runtime does not match lock")
+spec = importlib.util.spec_from_file_location(
+    "{RUNTIME_PACKAGE}",
+    runtime / "__init__.py",
+    submodule_search_locations=[str(runtime)],
+)
+if spec is None or spec.loader is None:
+    raise SystemExit("E_RUNTIME_LAYOUT: isolated runtime cannot be loaded")
+package = importlib.util.module_from_spec(spec)
+sys.modules["{RUNTIME_PACKAGE}"] = package
+spec.loader.exec_module(package)
+cli = importlib.import_module("{RUNTIME_PACKAGE}.cli")
+raise SystemExit(cli.main(sys.argv[2:]))
+' "$PROJECT_ROOT" "$@"
 """.encode("utf-8")
 
 
 def _render_hook_entrypoint(source_root: Path) -> bytes:
     del source_root
-    return f'''#!/usr/bin/env python3
+    return f'''#!/usr/bin/env -S python3 -I -B
 """Isolated project-local entrypoint for bounded Codex audit hooks."""
 from __future__ import annotations
-import importlib
-from pathlib import Path
 import sys
+
+if not sys.flags.isolated or not sys.flags.safe_path:
+    raise SystemExit("E_RUNTIME_BOOTSTRAP: hook requires python3 -I -B")
+
+import importlib
+import importlib.util
+from hashlib import sha256
+from pathlib import Path
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = ROOT / ".codex" / "runtime"
-sys.path[:] = [str(RUNTIME)] + [
-    item for item in sys.path
-    if item and Path(item).resolve() != ROOT.resolve()
-]
+
+def validate_runtime() -> None:
+    try:
+        lock = tomllib.loads(
+            (ROOT / ".codex" / "control-plane.lock").read_text(encoding="utf-8")
+        )
+    except Exception as error:
+        raise RuntimeError(f"E_RUNTIME_BOOTSTRAP: invalid lock: {{error}}") from error
+    if (
+        lock.get("runtime_layout") != "isolated"
+        or lock.get("runtime_package") != "{RUNTIME_PACKAGE}"
+    ):
+        raise RuntimeError(
+            "E_RUNTIME_LAYOUT: isolated hook requires isolated runtime"
+        )
+    package = RUNTIME / "{RUNTIME_PACKAGE}"
+    if package.is_symlink() or not package.is_dir():
+        raise RuntimeError("E_RUNTIME_LAYOUT: isolated runtime is unavailable")
+    modules = sorted(package.glob("*.py"))
+    if not modules:
+        raise RuntimeError("E_RUNTIME_LAYOUT: isolated runtime is empty")
+    hasher = sha256()
+    for path in modules:
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("E_RUNTIME_LAYOUT: invalid runtime module")
+        hasher.update(path.name.encode("utf-8"))
+        hasher.update(b"\\0")
+        hasher.update(path.read_bytes())
+        hasher.update(b"\\0")
+    if lock.get("digests", {{}}).get("runtime") != (
+        f"sha256:{{hasher.hexdigest()}}"
+    ):
+        raise RuntimeError("E_RUNTIME_DIGEST: isolated runtime does not match lock")
+
+validate_runtime()
+runtime = RUNTIME / "{RUNTIME_PACKAGE}"
+spec = importlib.util.spec_from_file_location(
+    "{RUNTIME_PACKAGE}",
+    runtime / "__init__.py",
+    submodule_search_locations=[str(runtime)],
+)
+if spec is None or spec.loader is None:
+    raise RuntimeError("E_RUNTIME_LAYOUT: isolated runtime cannot be loaded")
+package = importlib.util.module_from_spec(spec)
+sys.modules["{RUNTIME_PACKAGE}"] = package
+spec.loader.exec_module(package)
 run_hook = importlib.import_module("{RUNTIME_PACKAGE}.hooks").run_hook
 
 def main() -> int:
@@ -407,6 +589,7 @@ def _render_lock(rendered: Mapping[str, bytes]) -> bytes:
         'hook_mode = "audit"',
         'hook_trust = "pending_hook_trust"',
         f'runtime_package = "{RUNTIME_PACKAGE}"',
+        'runtime_layout = "isolated"',
         "",
         "[digests]",
         f'project_policy = "{digest(".codex/project-policy.toml")}"',
@@ -588,7 +771,16 @@ def _journal_path(target: Path) -> Path:
 
 
 def _lock_path(target: Path) -> Path:
-    return worktree_git_dir(target) / "codex-control-plane" / "adoption.lock"
+    root = discover_repository(target)
+    raw = _git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = Path(raw)
+    if not common.is_absolute():
+        common = (root / common).resolve()
+    else:
+        common = common.resolve()
+    if common.is_symlink() or not common.is_dir():
+        raise ValueError("E_ADOPT_RECOVERY_UNKNOWN: common Git dir unavailable")
+    return common / "codex-control-plane" / "locks" / "adoption.lock"
 
 
 class _ProcessLock:
@@ -598,19 +790,349 @@ class _ProcessLock:
 
     def __enter__(self) -> "_ProcessLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        self.fd = os.open(self.path, flags, 0o600)
         try:
-            self.fd = os.open(
-                self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-        except FileExistsError as error:
-            raise ValueError("E_ADOPT_BUSY: another adoption operation is active") from error
-        os.write(self.fd, str(os.getpid()).encode("ascii"))
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(self.fd)
+            self.fd = None
+            raise ValueError(
+                "E_ADOPT_BUSY: another adoption operation is active"
+            ) from error
         return self
 
     def __exit__(self, *_: object) -> None:
         if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
             os.close(self.fd)
-        self.path.unlink(missing_ok=True)
+            self.fd = None
+
+
+def _owner_pointer_path(target: Path) -> Path:
+    return _lock_path(target).parent.parent / "transactions" / "adoption-owner.json"
+
+
+def _registered_worktree_owners(target: Path) -> dict[str, Path]:
+    """Resolve every registered worktree to its exact worktree Git directory."""
+
+    root = discover_repository(target)
+    raw = _git(root, "worktree", "list", "--porcelain", "-z")
+    if len(raw.encode("utf-8")) > 1_048_576:
+        raise ValueError("E_ADOPT_RECOVERY_UNKNOWN: worktree inventory exceeds cap")
+    worktrees = [
+        Path(field.removeprefix("worktree ")).resolve()
+        for field in raw.split("\0")
+        if field.startswith("worktree ")
+    ]
+    if not worktrees or len(worktrees) > 4096 or len(set(worktrees)) != len(worktrees):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: worktree inventory is ambiguous"
+        )
+    owners: dict[str, Path] = {}
+    for worktree in worktrees:
+        if not worktree.is_dir() or worktree.is_symlink():
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: registered worktree is unavailable"
+            )
+        git_dir = worktree_git_dir(worktree)
+        identity = str(worktree)
+        if identity in owners:
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: duplicate worktree identity"
+            )
+        owners[identity] = git_dir
+    return owners
+
+
+def _unlink_and_fsync(path: Path) -> None:
+    path.unlink(missing_ok=False)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _transaction_owner_root(target: Path, transaction_id: str) -> Path:
+    return (
+        worktree_git_dir(target)
+        / "codex-control-plane"
+        / "transactions"
+        / transaction_id
+    )
+
+
+def _begin_transaction(
+    target: Path,
+    *,
+    operation: str,
+    records: list[Mapping[str, Any]],
+    previous_state: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    transaction_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        + f"-{os.getpid()}"
+    )
+    owner_git_dir = worktree_git_dir(target)
+    owner_root = _transaction_owner_root(target, transaction_id)
+    manifest_path = owner_root / "transaction-manifest.json"
+    wal_root = owner_root / "wal"
+    manifest = {
+        "schema_version": 1,
+        "transaction_id": transaction_id,
+        "operation": operation,
+        "target_identity": str(discover_repository(target)),
+        "owner_git_dir": str(owner_git_dir),
+        "wal_path": "wal",
+        "records": [dict(item) for item in records],
+        "previous_state": (
+            dict(previous_state) if previous_state is not None else None
+        ),
+    }
+    _atomic_json(manifest_path, manifest)
+    manifest_digest = _digest(manifest_path)
+    generation = {
+        "schema_version": 1,
+        "transaction_id": transaction_id,
+        "generation": 1,
+        "previous_generation_digest": None,
+        "status": "prepared",
+        "state_digest": contract_digest(manifest),
+    }
+    generation["generation_digest"] = contract_digest(generation)
+    _atomic_json(wal_root / "00000001.json", generation)
+    pointer = {
+        "schema_version": 1,
+        "transaction_id": transaction_id,
+        "target_identity": manifest["target_identity"],
+        "owner_git_dir": str(owner_git_dir),
+        "manifest_path": str(manifest_path.relative_to(owner_git_dir)),
+        "manifest_digest": manifest_digest,
+    }
+    _atomic_json(_owner_pointer_path(target), pointer)
+    return {
+        "pointer": pointer,
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "wal_root": wal_root,
+        "last_generation": generation,
+    }
+
+
+def _advance_transaction(
+    transaction: Mapping[str, Any], *, status: str, state: Mapping[str, Any]
+) -> dict[str, Any]:
+    previous = dict(transaction["last_generation"])
+    number = int(previous["generation"]) + 1
+    generation = {
+        "schema_version": 1,
+        "transaction_id": transaction["pointer"]["transaction_id"],
+        "generation": number,
+        "previous_generation_digest": previous["generation_digest"],
+        "status": status,
+        "state_digest": contract_digest(state),
+    }
+    generation["generation_digest"] = contract_digest(generation)
+    _atomic_json(
+        Path(transaction["wal_root"]) / f"{number:08d}.json",
+        generation,
+    )
+    transaction["last_generation"] = generation
+    return generation
+
+
+def _commit_transaction(
+    target: Path,
+    transaction: Mapping[str, Any],
+    *,
+    state: Mapping[str, Any],
+) -> None:
+    final = _advance_transaction(transaction, status="committed", state=state)
+    committed = {
+        "schema_version": 1,
+        "transaction_id": transaction["pointer"]["transaction_id"],
+        "final_generation": final["generation"],
+        "final_generation_digest": final["generation_digest"],
+        "state_digest": contract_digest(state),
+    }
+    _atomic_json(Path(transaction["wal_root"]).parent / "COMMITTED", committed)
+    pointer = _owner_pointer_path(target)
+    _unlink_and_fsync(pointer)
+
+
+def _recover_owner_transaction(target: Path) -> None:
+    pointer_path = _owner_pointer_path(target)
+    if not pointer_path.exists():
+        return
+    try:
+        registered_owners = _registered_worktree_owners(target)
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        if (
+            set(pointer)
+            != {
+                "schema_version",
+                "transaction_id",
+                "target_identity",
+                "owner_git_dir",
+                "manifest_path",
+                "manifest_digest",
+            }
+            or pointer.get("schema_version") != 1
+        ):
+            raise ValueError
+        owner_git_dir = Path(str(pointer["owner_git_dir"]))
+        relative = PurePosixPath(str(pointer["manifest_path"]))
+        target_identity = str(pointer["target_identity"])
+        if (
+            not owner_git_dir.is_absolute()
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or owner_git_dir.is_symlink()
+            or not owner_git_dir.is_dir()
+            or target_identity not in registered_owners
+            or registered_owners[target_identity] != owner_git_dir
+        ):
+            raise ValueError
+        manifest_path = owner_git_dir.joinpath(*relative.parts)
+        if (
+            manifest_path.is_symlink()
+            or not manifest_path.resolve().is_relative_to(owner_git_dir.resolve())
+            or _digest(manifest_path) != pointer["manifest_digest"]
+        ):
+            raise ValueError
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            set(manifest)
+            != {
+                "schema_version",
+                "transaction_id",
+                "operation",
+                "target_identity",
+                "owner_git_dir",
+                "wal_path",
+                "records",
+                "previous_state",
+            }
+            or manifest.get("schema_version") != 1
+            or manifest.get("transaction_id") != pointer["transaction_id"]
+            or manifest.get("owner_git_dir") != str(owner_git_dir)
+            or manifest.get("target_identity") != target_identity
+            or manifest.get("operation") not in {"adopt", "upgrade"}
+            or manifest.get("wal_path") != "wal"
+            or not isinstance(manifest.get("records"), list)
+        ):
+            raise ValueError
+        wal_root = manifest_path.parent / "wal"
+        if wal_root.is_symlink() or not wal_root.is_dir():
+            raise ValueError
+        generations = sorted(wal_root.glob("*.json"))
+        if not generations or len(generations) > 4096:
+            raise ValueError
+        previous_digest: str | None = None
+        last: dict[str, Any] | None = None
+        for number, path in enumerate(generations, start=1):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            supplied_digest = value.get("generation_digest")
+            semantic = dict(value)
+            semantic.pop("generation_digest", None)
+            if (
+                path.name != f"{number:08d}.json"
+                or path.is_symlink()
+                or set(value)
+                != {
+                    "schema_version",
+                    "transaction_id",
+                    "generation",
+                    "previous_generation_digest",
+                    "status",
+                    "state_digest",
+                    "generation_digest",
+                }
+                or value.get("schema_version") != 1
+                or value.get("transaction_id") != pointer["transaction_id"]
+                or value.get("generation") != number
+                or value.get("previous_generation_digest") != previous_digest
+                or supplied_digest != contract_digest(semantic)
+            ):
+                raise ValueError
+            previous_digest = str(supplied_digest)
+            last = value
+        committed_path = manifest_path.parent / "COMMITTED"
+        if committed_path.exists():
+            committed = json.loads(committed_path.read_text(encoding="utf-8"))
+            if (
+                committed_path.is_symlink()
+                or set(committed)
+                != {
+                    "schema_version",
+                    "transaction_id",
+                    "final_generation",
+                    "final_generation_digest",
+                    "state_digest",
+                }
+                or committed.get("schema_version") != 1
+                or last is None
+                or committed.get("transaction_id")
+                != pointer["transaction_id"]
+                or committed.get("final_generation")
+                != last.get("generation")
+                or committed.get("final_generation_digest")
+                != last.get("generation_digest")
+                or committed.get("state_digest")
+                != last.get("state_digest")
+                or last.get("status") != "committed"
+            ):
+                raise ValueError
+            _unlink_and_fsync(pointer_path)
+            return
+        recovery_target = Path(target_identity)
+        records = list(manifest["records"])
+        for record in records:
+            if (
+                not isinstance(record, Mapping)
+                or set(record)
+                != {"path", "before_digest", "installed_digest", "backup"}
+                or not isinstance(record.get("path"), str)
+                or not isinstance(record.get("installed_digest"), str)
+                or not str(record["installed_digest"]).startswith("sha256:")
+                or (
+                    record.get("before_digest") is not None
+                    and (
+                        not isinstance(record.get("before_digest"), str)
+                        or not str(record["before_digest"]).startswith("sha256:")
+                    )
+                )
+                or (
+                    record.get("before_digest") is None
+                    and record.get("backup") is not None
+                )
+            ):
+                raise ValueError
+            _safe_target(recovery_target, str(record["path"]))
+            backup = record.get("backup")
+            if backup is not None:
+                if not isinstance(backup, str):
+                    raise ValueError
+                backup_path = _safe_target(owner_git_dir, backup)
+                if (
+                    backup_path.is_symlink()
+                    or _digest(backup_path) != record["before_digest"]
+                ):
+                    raise ValueError
+        _restore_records(recovery_target, records)
+        previous_state = manifest.get("previous_state")
+        if isinstance(previous_state, Mapping):
+            _atomic_json(_journal_path(recovery_target), previous_state)
+        elif previous_state is not None:
+            raise ValueError
+        _unlink_and_fsync(pointer_path)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: adoption transaction is ambiguous"
+        ) from error
 
 
 def _validate_approved_plan(plan: Mapping[str, Any]) -> None:
@@ -649,12 +1171,14 @@ def _restore_records(root: Path, records: list[Mapping[str, Any]]) -> None:
             backup_path = _safe_target(
                 worktree_git_dir(root), str(backup)
             )
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(path.suffix + ".codex-restore")
-            shutil.copy2(backup_path, temporary)
-            temporary.replace(path)
+            _durable_copy(
+                backup_path,
+                path,
+                suffix=".codex-restore",
+                expected_digest=str(record["before_digest"]),
+            )
         else:
-            path.unlink(missing_ok=True)
+            _unlink_if_present_and_fsync(path)
 
 
 def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -664,6 +1188,7 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
     source_root = discover_repository(Path(str(plan["source"])))
     target_root = discover_repository(Path(str(plan["target"])))
     with _ProcessLock(_lock_path(target_root)):
+        _recover_owner_transaction(target_root)
         journal = _journal_path(target_root)
         if journal.exists():
             current = json.loads(journal.read_text(encoding="utf-8"))
@@ -706,8 +1231,12 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             if target_path.is_file():
                 backup_relative = f"codex-control-plane/backups/{stamp}/{relative}"
                 backup = _safe_target(worktree_git_dir(target_root), backup_relative)
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(target_path, backup)
+                _durable_copy(
+                    target_path,
+                    backup,
+                    suffix=".codex-backup",
+                    expected_digest=str(change["before_digest"]),
+                )
                 if _digest(backup) != change["before_digest"]:
                     raise ValueError(f"E_ADOPT_BACKUP: backup failed: {relative}")
             records.append(
@@ -726,20 +1255,29 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             "source_manifest_digest": plan["source_manifest_digest"],
             "records": records,
         }
+        transaction = _begin_transaction(
+            target_root,
+            operation="adopt",
+            records=records,
+        )
         _atomic_json(journal, state)
+        _advance_transaction(transaction, status="preparing", state=state)
         try:
             for record in records:
                 path = _safe_target(target_root, str(record["path"]))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = path.with_suffix(path.suffix + ".codex-new")
-                temporary.write_bytes(rendered[str(record["path"])])
-                if _digest(temporary) != record["installed_digest"]:
-                    raise ValueError(
-                        f"E_ADOPT_WRITE: staged digest mismatch: {record['path']}"
-                    )
-                temporary.replace(path)
-                if path.name in {"control-plane", "control_plane_hook.py"}:
-                    path.chmod(0o755)
+                mode = (
+                    0o755
+                    if path.name
+                    in {"control-plane", "control_plane_hook.py"}
+                    else 0o644
+                )
+                _durable_replace_bytes(
+                    path,
+                    rendered[str(record["path"])],
+                    suffix=".codex-new",
+                    expected_digest=str(record["installed_digest"]),
+                    mode=mode,
+                )
             if any(
                 _digest(_safe_target(target_root, str(record["path"])))
                 != record["installed_digest"]
@@ -750,14 +1288,16 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             _restore_records(target_root, records)
             for record in records:
                 path = _safe_target(target_root, str(record["path"]))
-                path.with_suffix(path.suffix + ".codex-new").unlink(
-                    missing_ok=True
+                _unlink_if_present_and_fsync(
+                    path.with_suffix(path.suffix + ".codex-new")
                 )
             state["status"] = "failed_rolled_back"
             _atomic_json(journal, state)
+            _commit_transaction(target_root, transaction, state=state)
             raise
         state["status"] = "applied"
         _atomic_json(journal, state)
+        _commit_transaction(target_root, transaction, state=state)
         return {
             "schema_version": 2,
             "command": "adopt-apply",
@@ -776,6 +1316,7 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
     target_root = discover_repository(Path(str(plan["target"])))
     journal = _journal_path(target_root)
     with _ProcessLock(_lock_path(target_root)):
+        _recover_owner_transaction(target_root)
         status = adoption_status(target_root)
         if status.get("status") == "upgrading":
             _restore_records(target_root, list(status.get("upgrade_records", [])))
@@ -828,8 +1369,12 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
                 backup = _safe_target(
                     worktree_git_dir(target_root), backup_relative
                 )
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, backup)
+                _durable_copy(
+                    path,
+                    backup,
+                    suffix=".codex-backup",
+                    expected_digest=str(change["before_digest"]),
+                )
                 if _digest(backup) != change["before_digest"]:
                     raise ValueError(f"E_UPGRADE_BACKUP: {relative}")
             upgrade_records.append(
@@ -852,28 +1397,43 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             "previous_state": previous_state,
             "upgrade_records": upgrade_records,
         }
+        transaction = _begin_transaction(
+            target_root,
+            operation="upgrade",
+            records=upgrade_records,
+            previous_state=previous_state,
+        )
         _atomic_json(journal, upgrading)
+        _advance_transaction(
+            transaction, status="upgrading", state=upgrading
+        )
         try:
             for record in upgrade_records:
                 path = _safe_target(target_root, str(record["path"]))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                temporary = path.with_suffix(path.suffix + ".codex-upgrade")
-                temporary.write_bytes(rendered[str(record["path"])])
-                if _digest(temporary) != record["installed_digest"]:
-                    raise ValueError(
-                        f"E_UPGRADE_WRITE: {record['path']}"
-                    )
-                temporary.replace(path)
-                if path.name in {"control-plane", "control_plane_hook.py"}:
-                    path.chmod(0o755)
+                mode = (
+                    0o755
+                    if path.name
+                    in {"control-plane", "control_plane_hook.py"}
+                    else 0o644
+                )
+                _durable_replace_bytes(
+                    path,
+                    rendered[str(record["path"])],
+                    suffix=".codex-upgrade",
+                    expected_digest=str(record["installed_digest"]),
+                    mode=mode,
+                )
         except Exception:
             _restore_records(target_root, upgrade_records)
             for record in upgrade_records:
                 path = _safe_target(target_root, str(record["path"]))
-                path.with_suffix(path.suffix + ".codex-upgrade").unlink(
-                    missing_ok=True
+                _unlink_if_present_and_fsync(
+                    path.with_suffix(path.suffix + ".codex-upgrade")
                 )
             _atomic_json(journal, previous_state)
+            _commit_transaction(
+                target_root, transaction, state=previous_state
+            )
             raise
         original_records = {
             str(record["path"]): dict(record)
@@ -911,6 +1471,7 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             ],
         }
         _atomic_json(journal, final)
+        _commit_transaction(target_root, transaction, state=final)
         return {
             "schema_version": 2,
             "command": "upgrade-apply",
@@ -982,6 +1543,7 @@ def adoption_verify(target: Path) -> dict[str, Any]:
 def adoption_rollback(target: Path) -> dict[str, Any]:
     root = discover_repository(target)
     with _ProcessLock(_lock_path(root)):
+        _recover_owner_transaction(root)
         status = adoption_status(root)
         if status.get("status") not in {"applied", "rolling_back"}:
             raise ValueError("E_ADOPT_NOT_APPLIED: no adoption to roll back")

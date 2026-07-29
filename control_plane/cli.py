@@ -9,6 +9,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
+from uuid import uuid4
 from typing import Any, Sequence
 
 from control_plane.adoption import (
@@ -22,12 +24,18 @@ from control_plane.adoption import (
 )
 from control_plane.contracts import contract_digest, validate_task_envelope
 from control_plane.git_state import GateError, evaluate_preflight
-from control_plane.lifecycle import TaskLease, TaskStore
+from control_plane.lifecycle import (
+    TaskLease,
+    TaskStore,
+    create_verification_execution_context,
+    run_verification_profile,
+)
 from control_plane.lockfile import validate_lock
 from control_plane.policy import PolicyError, load_policy, validate_policy
 from control_plane.repository import (
     RepositoryError,
     discover_repository,
+    git_common_dir,
     git_environment,
     worktree_git_dir,
 )
@@ -35,8 +43,13 @@ from control_plane.resource_registry import (
     RegistryError,
     build_inventory,
     load_registry,
+    registry_contract_digest,
     validate_policy_references,
     validate_registry,
+)
+from control_plane.host_bridge import (
+    observe_inventory,
+    validate_inventory_observation,
 )
 from control_plane.routing import resolve_route, verify_route
 
@@ -494,17 +507,25 @@ def command_route(arguments: argparse.Namespace) -> int:
                 "errors": [],
             }
             return _emit(payload, arguments.json)
-        inventory = (
-            _read_json(arguments.inventory)
-            if arguments.inventory
-            else build_inventory(registry, root)
+        invocation_id = f"route-{uuid4().hex}"
+        observation = observe_inventory(
+            registry,
+            root,
+            root,
+            contract_digest(task),
+            invocation_id,
+            clock=time.monotonic,
+            ttl_seconds=30,
         )
-        if arguments.inventory:
-            inventory = {
-                key: value
-                for key, value in inventory.items()
-                if key not in {"command", "ok"}
-            }
+        inventory = validate_inventory_observation(
+            observation,
+            expected_repo=root,
+            expected_worktree=root,
+            expected_registry_digest=registry_contract_digest(registry),
+            expected_task_digest=contract_digest(task),
+            expected_invocation_id=invocation_id,
+            clock=time.monotonic,
+        )
         payload = resolve_route(task, policy, registry, inventory, mode=arguments.mode)
         payload["command"] = "route"
         return _emit(payload, arguments.json)
@@ -553,7 +574,18 @@ def command_task(arguments: argparse.Namespace) -> int:
             if arguments.task_action != "status"
             else None
         )
-        if arguments.task_action == "start":
+        if arguments.task_action == "lease-release":
+            result = TaskLease.release(
+                git_common_dir(root),
+                state_dir,
+                task_id=arguments.task_id,
+                worktree=arguments.worktree,
+                branch=arguments.branch,
+                session_id=arguments.session_id,
+                policy_digest=arguments.policy_digest,
+                lease_digest=arguments.lease_digest,
+            )
+        elif arguments.task_action == "start":
             if arguments.branch != current_branch:
                 raise ValueError(
                     "E_STATE_BRANCH: declared branch differs from current branch"
@@ -587,11 +619,7 @@ def command_task(arguments: argparse.Namespace) -> int:
                 arguments.task_id,
                 arguments.state,
                 reason=arguments.reason,
-                evidence=(
-                    _read_json(arguments.evidence)
-                    if arguments.evidence
-                    else None
-                ),
+                evidence=None,
                 current_branch=str(current_branch),
             )
         else:
@@ -613,6 +641,74 @@ def command_task(arguments: argparse.Namespace) -> int:
             {
                 "schema_version": 1,
                 "command": f"task-{arguments.task_action}",
+                "ok": False,
+                "errors": [{"code": code, "message": str(error)}],
+            },
+            arguments.json,
+        )
+
+
+def command_verification_run(arguments: argparse.Namespace) -> int:
+    try:
+        root = discover_repository(arguments.repo)
+        state_dir = worktree_git_dir(root)
+        store = TaskStore(state_dir)
+        task = store.status(arguments.task_id)
+        lease_path = (
+            state_dir
+            / "codex-control-plane"
+            / "leases"
+            / f"{arguments.task_id}.json"
+        )
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_environment(),
+        ).stdout.strip()
+        context = create_verification_execution_context(
+            task_context=task,
+            lease=lease,
+            canonical_repo=root,
+            expected_head=head,
+            session_id=str(task.get("session_id", "")),
+            dedicated_temp_root=(
+                state_dir
+                / "codex-control-plane"
+                / "verification-temp"
+                / arguments.task_id
+            ),
+            clock=time.monotonic,
+        )
+        receipt = run_verification_profile(
+            context=context,
+            task_store=store,
+            expected_generation=int(task.get("generation", -1)),
+            clock=time.monotonic,
+        )
+        return _emit(
+            {
+                "schema_version": 1,
+                "command": "verification-run",
+                "ok": True,
+                "receipt": asdict(receipt),
+            },
+            arguments.json,
+        )
+    except (
+        RepositoryError,
+        ValueError,
+        OSError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+    ) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        return _emit(
+            {
+                "schema_version": 1,
+                "command": "verification-run",
                 "ok": False,
                 "errors": [{"code": code, "message": str(error)}],
             },
@@ -751,7 +847,6 @@ def build_parser() -> argparse.ArgumentParser:
     route_parser.add_argument("--task", type=Path, required=True)
     route_parser.add_argument("--policy", type=Path)
     route_parser.add_argument("--registry", type=Path)
-    route_parser.add_argument("--inventory", type=Path)
     route_parser.add_argument("--mode", choices=("audit", "enforce"), default="audit")
     _add_output_option(route_parser)
     route_parser.set_defaults(handler=command_route)
@@ -765,9 +860,27 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_option(verify_parser)
     verify_parser.set_defaults(handler=command_route_verify)
 
+    verification_parser = subparsers.add_parser(
+        "verification-run",
+        help="Run the complete profile already bound to a verifier task.",
+    )
+    verification_parser.add_argument(
+        "--repo", type=Path, default=Path.cwd()
+    )
+    verification_parser.add_argument("--task-id", required=True)
+    _add_output_option(verification_parser)
+    verification_parser.set_defaults(handler=command_verification_run)
+
     task_parser = subparsers.add_parser("task", help="Manage task lifecycle state.")
     task_subparsers = task_parser.add_subparsers(dest="task_action", required=True)
-    for action in ("start", "resume", "status", "transition", "close"):
+    for action in (
+        "start",
+        "resume",
+        "status",
+        "transition",
+        "close",
+        "lease-release",
+    ):
         action_parser = task_subparsers.add_parser(action)
         action_parser.add_argument("--repo", type=Path, default=Path.cwd())
         action_parser.add_argument("--task-id", required=True)
@@ -782,7 +895,12 @@ def build_parser() -> argparse.ArgumentParser:
         if action == "transition":
             action_parser.add_argument("--state", required=True)
             action_parser.add_argument("--reason")
-            action_parser.add_argument("--evidence", type=Path)
+        if action == "lease-release":
+            action_parser.add_argument("--worktree", required=True)
+            action_parser.add_argument("--branch", required=True)
+            action_parser.add_argument("--session-id", required=True)
+            action_parser.add_argument("--policy-digest", required=True)
+            action_parser.add_argument("--lease-digest", required=True)
         _add_output_option(action_parser)
         action_parser.set_defaults(handler=command_task)
 

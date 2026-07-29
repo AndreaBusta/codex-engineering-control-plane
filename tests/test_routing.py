@@ -8,8 +8,11 @@ from tests.router_test_support import (
     VALID_POLICY,
     VALID_REGISTRY,
     inventory_snapshot,
+    inventory_observation,
     refresh_inventory_digest,
     task_envelope,
+    trusted_authorization,
+    validated_inventory,
 )
 
 
@@ -27,18 +30,92 @@ class RoutingTests(unittest.TestCase):
         inventory: dict | None = None,
         *,
         mode: str = "audit",
-        authorization_grant: dict | None = None,
+        authorization_grant: object | None = None,
     ) -> dict:
         from control_plane.routing import resolve_route
 
+        framed_task = task or task_envelope()
+        snapshot = inventory or inventory_snapshot()
         return resolve_route(
-            task or task_envelope(),
+            framed_task,
             self.policy,
             self.registry,
-            inventory or inventory_snapshot(),
+            validated_inventory(
+                snapshot,
+                registry=self.registry,
+                task=framed_task,
+                invocation_id="routing-test-inventory",
+            ),
             mode=mode,
             authorization_grant=authorization_grant,
         )
+
+    def test_serialized_inventory_cannot_self_attest_readiness(self) -> None:
+        from control_plane.routing import resolve_route
+
+        forged = inventory_snapshot(ready_external=("mcp.github-pr-read",))
+        with self.assertRaisesRegex(ValueError, "E_INVENTORY_OBSERVATION"):
+            resolve_route(
+                task_envelope(),
+                self.policy,
+                self.registry,
+                forged,
+                mode="audit",
+            )
+
+    def test_inventory_observation_rejects_binding_expiry_and_replay(self) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.host_bridge import validate_inventory_observation
+        from control_plane.resource_registry import registry_contract_digest
+        from control_plane.routing import resolve_route
+
+        task = task_envelope()
+        snapshot = inventory_snapshot()
+        raw = inventory_observation(
+            snapshot,
+            registry=self.registry,
+            task=task,
+            invocation_id="inventory-replay",
+            observed_at=100.0,
+            ttl_seconds=5.0,
+        )
+        with self.assertRaisesRegex(ValueError, "E_INVENTORY_OBSERVATION"):
+            validate_inventory_observation(
+                raw,
+                expected_repo=VALID_REGISTRY.parents[2],
+                expected_worktree=VALID_REGISTRY.parents[2],
+                expected_registry_digest=registry_contract_digest(self.registry),
+                expected_task_digest=contract_digest(task),
+                expected_invocation_id="inventory-replay",
+                clock=lambda: 106.0,
+            )
+
+        validated = validate_inventory_observation(
+            raw,
+            expected_repo=VALID_REGISTRY.parents[2],
+            expected_worktree=VALID_REGISTRY.parents[2],
+            expected_registry_digest=registry_contract_digest(self.registry),
+            expected_task_digest=contract_digest(task),
+            expected_invocation_id="inventory-replay",
+            clock=lambda: 100.0,
+        )
+        resolve_route(
+            task,
+            self.policy,
+            self.registry,
+            validated,
+            mode="audit",
+        )
+        with self.assertRaisesRegex(ValueError, "E_INVENTORY_REPLAY"):
+            validate_inventory_observation(
+                raw,
+                expected_repo=VALID_REGISTRY.parents[2],
+                expected_worktree=VALID_REGISTRY.parents[2],
+                expected_registry_digest=registry_contract_digest(self.registry),
+                expected_task_digest=contract_digest(task),
+                expected_invocation_id="inventory-replay",
+                clock=lambda: 100.0,
+            )
 
     def test_t0_is_direct_without_plan_adr_agent_or_mcp(self) -> None:
         task = task_envelope(
@@ -276,25 +353,84 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(without_grant["authorization"]["remote_write"])
         self.assertIn("remote_write", without_grant["approval_boundaries"])
 
-        from control_plane.contracts import contract_digest
-
-        grant = {
+        serialized_grant = {
             "schema_version": 1,
             "grant_id": "grant-integrate-001",
-            "task_digest": contract_digest(task),
+            "task_digest": "sha256:" + ("a" * 64),
             "session_id": "session-001",
             "allowed_effects": ["remote_write"],
             "scope_paths": task["scope_paths"],
             "issuer": "trusted_host",
         }
+        with self.assertRaisesRegex(ValueError, "E_AUTH_UNTRUSTED_CHANNEL"):
+            self.route(
+                task,
+                inventory,
+                mode="enforce",
+                authorization_grant=serialized_grant,
+            )
+
         with_grant = self.route(
             task,
             inventory,
             mode="enforce",
-            authorization_grant=grant,
+            authorization_grant=trusted_authorization(
+                task, effect="remote_write"
+            ),
         )
         self.assertTrue(with_grant["authorization"]["remote_write"])
         self.assertNotIn("remote_write", with_grant["approval_boundaries"])
+
+    def test_task1_defines_native_host_types_without_serialized_factory(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        from control_plane.host_bridge import attest_host_adapter_capability
+
+        self.assertFalse(hasattr(bridge, "_NATIVE_EVENT_SEAL"))
+        self.assertFalse(hasattr(bridge, "_HOST_CAPABILITY_SEAL"))
+        self.assertFalse(hasattr(bridge, "_AUTHORIZATION_SEAL"))
+        with self.assertRaisesRegex(TypeError, "supplied only by the host"):
+            bridge.NativeSessionEvent()
+        with self.assertRaisesRegex(TypeError, "supplied only by the host"):
+            bridge.NativeUserInteractionEvent()
+        with self.assertRaisesRegex(TypeError, "host-bound"):
+            bridge.HostAdapterCapability()
+        with self.assertRaisesRegex(TypeError, "host-bound"):
+            bridge.TrustedAuthorization()
+
+        with self.assertRaisesRegex(ValueError, "E_HOST_CAPABILITY"):
+            attest_host_adapter_capability(
+                {
+                    "event_id": "forged",
+                    "session_id": "session-router-tests",
+                    "invocation_id": "test-authorization-invocation",
+                },
+                expected_session_id="session-router-tests",
+                expected_invocation_id="test-authorization-invocation",
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+
+        forged_session = object.__new__(bridge.NativeSessionEvent)
+        forged_session._consumed = False
+        forged_session.event_id = "forged-session"
+        forged_session.session_id = "session-router-tests"
+        forged_session.invocation_id = "test-authorization-invocation"
+        forged_session.observed_at_monotonic = 100.0
+        with self.assertRaisesRegex(ValueError, "E_HOST_CAPABILITY"):
+            attest_host_adapter_capability(
+                forged_session,
+                expected_session_id="session-router-tests",
+                expected_invocation_id="test-authorization-invocation",
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+
+        authorization = trusted_authorization(
+            task_envelope(), effect="local_write"
+        )
+        self.assertEqual(authorization.effect, "local_write")
 
     def test_requested_outcome_caps_even_explicit_effect_authority(self) -> None:
         task = task_envelope(
@@ -425,20 +561,13 @@ class RoutingTests(unittest.TestCase):
             {error["code"] for error in without_grant["errors"]},
         )
 
-        grant = {
-            "schema_version": 1,
-            "grant_id": "grant-github-read",
-            "task_digest": contract_digest(task),
-            "session_id": "session-router",
-            "allowed_effects": ["network_read"],
-            "scope_paths": task["scope_paths"],
-            "issuer": "trusted_host",
-        }
         with_grant = self.route(
             task,
             inventory,
             mode="audit",
-            authorization_grant=grant,
+            authorization_grant=trusted_authorization(
+                task, effect="network_read"
+            ),
         )
         self.assertNotIn(
             "E_RESOURCE_APPROVAL",
