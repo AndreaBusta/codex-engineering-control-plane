@@ -39,6 +39,20 @@ _GITHUB_HTTPS_REMOTE = re.compile(
     r"(?P<repository>[A-Za-z0-9_.-]+?)(?:\.git)?",
     re.ASCII,
 )
+_GITHUB_REPOSITORY_IDENTITY = re.compile(
+    r"(?P<owner>[A-Za-z0-9_.-]+)/"
+    r"(?P<repository>[A-Za-z0-9_.-]+)",
+    re.ASCII,
+)
+_GITHUB_PULL_REQUEST_HTTPS_URL = re.compile(
+    r"https://github\.com/"
+    r"(?P<owner>[A-Za-z0-9_.-]+)/"
+    r"(?P<repository>[A-Za-z0-9_.-]+)/"
+    r"pull/(?P<number>[1-9][0-9]*)",
+    re.ASCII,
+)
+_FEATURE_PUSH_CLAIM_LOCK = threading.Lock()
+_FEATURE_PUSH_OPERATIONS: dict[int, object] = {}
 _PR_MUTATION_CLAIM_LOCK = threading.Lock()
 
 
@@ -161,6 +175,8 @@ def _runtime_host_object_registry():
         ),
         "remote_effect_context": remote_context_bindings,
         "validated_remote_effect_context": remote_context_bindings,
+        "claimed_feature_push_context": remote_context_bindings,
+        "feature_push_unknown_context": remote_context_bindings,
         "pr_request_context": remote_context_bindings,
         "claimed_pr_request_context": remote_context_bindings,
         "github_pr_write_provider": (
@@ -1190,6 +1206,43 @@ def _canonical_github_repository_from_url(
         f"{match.group('owner').casefold()}/"
         f"{match.group('repository').casefold()}"
     )
+
+
+def _canonical_github_repository_identity(
+    value: object, *, code: str
+) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{code}: GitHub repository identity is invalid")
+    match = _GITHUB_REPOSITORY_IDENTITY.fullmatch(value)
+    if (
+        match is None
+        or match.group("owner") in {".", ".."}
+        or match.group("repository") in {".", ".."}
+    ):
+        raise ValueError(f"{code}: GitHub repository identity is invalid")
+    return (
+        f"{match.group('owner').casefold()}/"
+        f"{match.group('repository').casefold()}"
+    )
+
+
+def _github_pull_request_url_identity(
+    value: object, *, code: str
+) -> tuple[str, int]:
+    if not isinstance(value, str):
+        raise ValueError(f"{code}: GitHub pull request URL is invalid")
+    match = _GITHUB_PULL_REQUEST_HTTPS_URL.fullmatch(value)
+    if (
+        match is None
+        or match.group("owner") in {".", ".."}
+        or match.group("repository") in {".", ".."}
+    ):
+        raise ValueError(f"{code}: GitHub pull request URL is invalid")
+    repository = _canonical_github_repository_identity(
+        f"{match.group('owner')}/{match.group('repository')}",
+        code=code,
+    )
+    return repository, int(match.group("number"))
 
 
 def observe_local_git_state(
@@ -2853,6 +2906,12 @@ def _assert_remote_effect_context_live(
             or _runtime_host_object_is_live(
                 context, "claimed_pr_request_context"
             )
+            or _runtime_host_object_is_live(
+                context, "claimed_feature_push_context"
+            )
+            or _runtime_host_object_is_live(
+                context, "feature_push_unknown_context"
+            )
         )
         or _git_text(worktree, ["rev-parse", "HEAD"]) != context.head
         or _git_text(worktree, ["branch", "--show-current"])
@@ -3395,6 +3454,208 @@ def commit_staged_change(
     return observation
 
 
+@dataclass(frozen=True)
+class _FeaturePushEffectBindings:
+    repository_identity: str
+    worktree_identity: str
+    remote_repository: str
+    remote_name: str
+    push_url: str
+    branch: str
+    head: str
+    task_digest: str
+    session_id: str
+    invocation_id: str
+    context_digest: str
+
+
+@dataclass
+class _FeaturePushOperation:
+    context: ValidatedRemoteEffectContext
+    bindings: _FeaturePushEffectBindings
+    state: str
+    recovery_consumed: bool = False
+
+
+def _claim_feature_push_context(
+    context: ValidatedRemoteEffectContext,
+    *,
+    push_url: str,
+) -> _FeaturePushEffectBindings:
+    with _FEATURE_PUSH_CLAIM_LOCK:
+        if (
+            context._consumed
+            or id(context) in _FEATURE_PUSH_OPERATIONS
+            or not _runtime_host_object_is_live(
+                context, "validated_remote_effect_context"
+            )
+        ):
+            raise ValueError(
+                "E_REMOTE_EFFECT: unclaimed push context is required"
+            )
+        bindings = _FeaturePushEffectBindings(
+            repository_identity=context.repository_identity,
+            worktree_identity=context.worktree_identity,
+            remote_repository=context.remote_repository,
+            remote_name=context.remote_name,
+            push_url=push_url,
+            branch=context.branch,
+            head=context.head,
+            task_digest=context.task_digest,
+            session_id=context.session_id,
+            invocation_id=context.invocation_id,
+            context_digest=context.context_digest,
+        )
+        if not _consume_runtime_host_object(
+            context, "validated_remote_effect_context"
+        ):
+            raise ValueError(
+                "E_REMOTE_EFFECT: push context claim is unavailable"
+            )
+        context._consumed = True
+        _FEATURE_PUSH_OPERATIONS[id(context)] = _FeaturePushOperation(
+            context=context,
+            bindings=bindings,
+            state="claimed",
+        )
+        _register_runtime_host_object(
+            context, "claimed_feature_push_context"
+        )
+        return bindings
+
+
+def _set_feature_push_precondition_failed(
+    context: ValidatedRemoteEffectContext,
+) -> None:
+    with _FEATURE_PUSH_CLAIM_LOCK:
+        operation = _FEATURE_PUSH_OPERATIONS.get(id(context))
+        if (
+            type(operation) is _FeaturePushOperation
+            and operation.context is context
+            and operation.state == "claimed"
+        ):
+            _consume_runtime_host_object(
+                context, "claimed_feature_push_context"
+            )
+            operation.state = "precondition_failed"
+
+
+def _start_feature_push_effect(
+    context: ValidatedRemoteEffectContext,
+) -> _FeaturePushEffectBindings:
+    with _FEATURE_PUSH_CLAIM_LOCK:
+        operation = _FEATURE_PUSH_OPERATIONS.get(id(context))
+        if (
+            type(operation) is not _FeaturePushOperation
+            or operation.context is not context
+            or operation.state != "claimed"
+            or not _consume_runtime_host_object(
+                context, "claimed_feature_push_context"
+            )
+        ):
+            raise ValueError(
+                "E_REMOTE_EFFECT: claimed push context is unavailable"
+            )
+        operation.state = "effect_started"
+        return operation.bindings
+
+
+def _set_feature_push_outcome_unknown(
+    context: ValidatedRemoteEffectContext,
+) -> None:
+    with _FEATURE_PUSH_CLAIM_LOCK:
+        operation = _FEATURE_PUSH_OPERATIONS.get(id(context))
+        if (
+            type(operation) is not _FeaturePushOperation
+            or operation.context is not context
+            or operation.state
+            not in {"effect_started", "effect_acknowledged"}
+        ):
+            raise ValueError(
+                "E_REMOTE_EFFECT_OUTCOME_UNKNOWN: push state is invalid"
+            )
+        operation.state = "outcome_unknown"
+        _register_runtime_host_object(
+            context, "feature_push_unknown_context"
+        )
+
+
+def _observe_feature_push(
+    bindings: _FeaturePushEffectBindings,
+    *,
+    clock: Callable[[], float],
+) -> LocalGitObservation:
+    worktree = _canonical_directory(
+        bindings.worktree_identity, code="E_REMOTE_EFFECT"
+    )
+    live_push_url = _git_text(
+        worktree,
+        ["remote", "get-url", "--push", bindings.remote_name],
+    )
+    if (
+        live_push_url != bindings.push_url
+        or _canonical_github_repository_from_url(
+            live_push_url, code="E_REMOTE_EFFECT"
+        )
+        != bindings.remote_repository
+        or _git_text(worktree, ["rev-parse", "HEAD"])
+        != bindings.head
+        or _git_text(worktree, ["branch", "--show-current"])
+        != bindings.branch
+        or _git_text(
+            worktree,
+            ["status", "--porcelain=v2", "--untracked-files=all"],
+        )
+    ):
+        raise ValueError(
+            "E_REMOTE_EFFECT: feature push observation binding drifted"
+        )
+    _assert_no_unsafe_transport_config(worktree)
+    remote_returncode, remote_output = _execute_native_remote(
+        "git_feature_observe",
+        tuple(
+            _closed_git_argv(
+                worktree,
+                [
+                    "ls-remote",
+                    "--heads",
+                    bindings.push_url,
+                    f"refs/heads/{bindings.branch}",
+                ],
+            )
+        ),
+        max_output_bytes=4096,
+    )
+    expected_remote_line = (
+        f"{bindings.head}\trefs/heads/{bindings.branch}\n".encode("utf-8")
+    )
+    if (
+        remote_returncode != 0
+        or remote_output != expected_remote_line
+    ):
+        raise ValueError(
+            "E_REMOTE_EFFECT: feature push observation is inconclusive"
+        )
+    now = float(clock())
+    observation = object.__new__(LocalGitObservation)
+    observation.observation_id = f"push-{uuid4().hex}"
+    observation.invocation_id = bindings.invocation_id
+    observation.task_digest = bindings.task_digest
+    observation.repository_identity = bindings.repository_identity
+    observation.worktree_identity = bindings.worktree_identity
+    observation.branch = bindings.branch
+    observation.prior_head = bindings.head
+    observation.target_state = "pushed"
+    observation.session_id = bindings.session_id
+    observation.provider = "git"
+    observation.subject_digest = bindings.context_digest
+    observation.evidence = {"remote_head": bindings.head}
+    observation.observed_at_monotonic = now
+    observation.freshness_deadline = now + 30
+    _register_runtime_host_object(observation, "local_git_observation")
+    return observation
+
+
 def push_validated_feature(
     *,
     context: object,
@@ -3466,116 +3727,152 @@ def push_validated_feature(
             "E_REMOTE_EFFECT: push repository identity drifted"
         )
     _assert_no_unsafe_transport_config(Path(context.worktree_identity))
-    consume_authorization(
-        authorization,
-        expected_task_digest=context.task_digest,
-        expected_session_id=session_id,
-        expected_repository_identity=context.repository_identity,
-        expected_worktree_identity=context.worktree_identity,
-        expected_branch=context.branch,
-        expected_head=context.head,
-        expected_subject_digest=context.context_digest,
-        expected_scope_paths=(".",),
-        expected_effect="remote_write",
-        expected_operation_nonce=tool_use_id,
-        expected_invocation_id=invocation_id,
-        clock=clock,
+    bindings = _claim_feature_push_context(
+        context, push_url=push_url
     )
-    _consume_worktree_inventory(
-        inventory,
-        expected_common_git_dir=Path(inventory.common_git_dir),
-    )
-    revalidated_push_url = _git_text(
-        Path(context.worktree_identity),
-        ["remote", "get-url", "--push", remote],
-    )
-    if (
-        revalidated_push_url != push_url
-        or _canonical_github_repository_from_url(
-            revalidated_push_url, code="E_REMOTE_EFFECT"
+    try:
+        consume_authorization(
+            authorization,
+            expected_task_digest=context.task_digest,
+            expected_session_id=session_id,
+            expected_repository_identity=context.repository_identity,
+            expected_worktree_identity=context.worktree_identity,
+            expected_branch=context.branch,
+            expected_head=context.head,
+            expected_subject_digest=context.context_digest,
+            expected_scope_paths=(".",),
+            expected_effect="remote_write",
+            expected_operation_nonce=tool_use_id,
+            expected_invocation_id=invocation_id,
+            clock=clock,
         )
-        != context.remote_repository
-    ):
-        raise ValueError(
-            "E_REMOTE_EFFECT: push repository identity drifted"
+        _consume_worktree_inventory(
+            inventory,
+            expected_common_git_dir=Path(inventory.common_git_dir),
         )
-    push_returncode, _ = _execute_native_remote(
-        "git_feature_push",
-        tuple(
-            _closed_git_argv(
-                context.worktree_identity,
-                [
-                    "push",
-                    revalidated_push_url,
-                    (
-                        f"refs/heads/{context.branch}:"
-                        f"refs/heads/{context.branch}"
-                    ),
-                ],
+        if not _consume_governing_policy(
+            governing_policy
+        ) or not _consume_governing_runtime_observation(
+            governing_runtime
+        ):
+            raise ValueError(
+                "E_REMOTE_EFFECT: governing runtime or policy is not host-issued"
             )
-        ),
-        max_output_bytes=0,
-    )
-    remote_returncode, remote_output = _execute_native_remote(
-        "git_feature_observe",
-        tuple(
-            _closed_git_argv(
-                context.worktree_identity,
-                [
-                    "ls-remote",
-                    "--heads",
-                    revalidated_push_url,
-                    f"refs/heads/{context.branch}",
-                ],
+        governing_policy._consumed = True
+        governing_runtime._consumed = True
+        _assert_remote_effect_context_live(
+            context, code="E_REMOTE_EFFECT"
+        )
+        revalidated_push_url = _git_text(
+            Path(context.worktree_identity),
+            ["remote", "get-url", "--push", remote],
+        )
+        if (
+            revalidated_push_url != bindings.push_url
+            or _canonical_github_repository_from_url(
+                revalidated_push_url, code="E_REMOTE_EFFECT"
             )
-        ),
-        max_output_bytes=4096,
-    )
-    expected_remote_line = (
-        f"{context.head}\trefs/heads/{context.branch}\n".encode("utf-8")
-    )
-    if (
-        push_returncode != 0
-        or remote_returncode != 0
-        or remote_output != expected_remote_line
-        or _git_text(
-            Path(context.worktree_identity), ["rev-parse", "HEAD"]
+            != bindings.remote_repository
+        ):
+            raise ValueError(
+                "E_REMOTE_EFFECT: push repository identity drifted"
+            )
+        _assert_no_unsafe_transport_config(
+            Path(context.worktree_identity)
         )
-        != context.head
-    ):
-        raise ValueError("E_REMOTE_EFFECT: feature push was not exact")
-    if not _consume_governing_policy(
-        governing_policy
-    ) or not _consume_governing_runtime_observation(governing_runtime):
+        bindings = _start_feature_push_effect(context)
+    except Exception:
+        _set_feature_push_precondition_failed(context)
+        raise
+    try:
+        push_returncode, _ = _execute_native_remote(
+            "git_feature_push",
+            tuple(
+                _closed_git_argv(
+                    bindings.worktree_identity,
+                    [
+                        "push",
+                        bindings.push_url,
+                        (
+                            f"refs/heads/{bindings.branch}:"
+                            f"refs/heads/{bindings.branch}"
+                        ),
+                    ],
+                )
+            ),
+            max_output_bytes=0,
+        )
+    except Exception as error:
+        _set_feature_push_outcome_unknown(context)
         raise ValueError(
-            "E_REMOTE_EFFECT: governing runtime or policy is not host-issued"
-        )
-    governing_policy._consumed = True
-    governing_runtime._consumed = True
-    if not _consume_runtime_host_object(
-        context, "validated_remote_effect_context"
-    ):
+            "E_REMOTE_EFFECT_OUTCOME_UNKNOWN: context consumed; "
+            "observe the exact remote branch and never retry the push"
+        ) from error
+    if push_returncode != 0:
+        _set_feature_push_outcome_unknown(context)
         raise ValueError(
-            "E_REMOTE_EFFECT: remote effect context is not host-issued"
+            "E_REMOTE_EFFECT_OUTCOME_UNKNOWN: context consumed; "
+            "observe the exact remote branch and never retry the push"
         )
-    context._consumed = True
-    now = float(clock())
-    observation = object.__new__(LocalGitObservation)
-    observation.observation_id = f"push-{uuid4().hex}"
-    observation.invocation_id = invocation_id
-    observation.task_digest = context.task_digest
-    observation.repository_identity = context.repository_identity
-    observation.worktree_identity = context.worktree_identity
-    observation.branch = context.branch
-    observation.prior_head = context.head
-    observation.target_state = "pushed"
-    observation.session_id = session_id
-    observation.provider = "git"
-    observation.subject_digest = context.context_digest
-    observation.evidence = {"remote_head": context.head}
-    observation.observed_at_monotonic = now
-    observation.freshness_deadline = now + 30
-    _register_runtime_host_object(observation, "local_git_observation")
+    with _FEATURE_PUSH_CLAIM_LOCK:
+        operation = _FEATURE_PUSH_OPERATIONS[id(context)]
+        operation.state = "effect_acknowledged"
+    try:
+        observation = _observe_feature_push(
+            bindings, clock=clock
+        )
+    except Exception as error:
+        _set_feature_push_outcome_unknown(context)
+        raise ValueError(
+            "E_REMOTE_EFFECT_OUTCOME_UNKNOWN: effect acknowledged but "
+            "observation is inconclusive; never retry the push"
+        ) from error
+    with _FEATURE_PUSH_CLAIM_LOCK:
+        operation = _FEATURE_PUSH_OPERATIONS[id(context)]
+        operation.state = "completed"
+    return observation
+
+
+def recover_feature_push_outcome(
+    context: object, *, clock: Callable[[], float]
+) -> LocalGitObservation:
+    with _FEATURE_PUSH_CLAIM_LOCK:
+        operation = _FEATURE_PUSH_OPERATIONS.get(id(context))
+        if (
+            type(context) is not ValidatedRemoteEffectContext
+            or type(operation) is not _FeaturePushOperation
+            or operation.context is not context
+            or operation.state != "outcome_unknown"
+            or operation.recovery_consumed
+            or not _runtime_host_object_is_live(
+                context, "feature_push_unknown_context"
+            )
+        ):
+            raise ValueError(
+                "E_REMOTE_EFFECT_RECOVERY: unknown push outcome is required"
+            )
+        if not _consume_runtime_host_object(
+            context, "feature_push_unknown_context"
+        ):
+            raise ValueError(
+                "E_REMOTE_EFFECT_RECOVERY: push recovery claim failed"
+            )
+        operation.recovery_consumed = True
+        operation.state = "recovery_started"
+        bindings = operation.bindings
+    try:
+        observation = _observe_feature_push(
+            bindings, clock=clock
+        )
+    except Exception as error:
+        with _FEATURE_PUSH_CLAIM_LOCK:
+            operation.state = "recovery_pending"
+        raise ValueError(
+            "E_REMOTE_EFFECT_RECOVERY_PENDING: exact remote observation "
+            "is inconclusive; do not repeat the push"
+        ) from error
+    with _FEATURE_PUSH_CLAIM_LOCK:
+        operation.state = "recovered"
     return observation
 
 
@@ -3617,6 +3914,9 @@ def _assert_governing_pr_remote_live(
     governing_policy: object,
     expected_repository: str,
 ) -> None:
+    canonical_expected_repository = _canonical_github_repository_identity(
+        expected_repository, code="E_GITHUB_PR_PROVIDER"
+    )
     policy_git = governing_policy.policy.get("git", {})
     remote_name = policy_git.get("remote")
     if not isinstance(remote_name, str) or not remote_name:
@@ -3639,8 +3939,12 @@ def _assert_governing_pr_remote_live(
             "E_GITHUB_PR_PROVIDER: governing remote is unavailable"
         ) from error
     if (
-        live_repository != expected_repository
-        or governing_policy.remote_repository != expected_repository
+        live_repository != canonical_expected_repository
+        or _canonical_github_repository_identity(
+            governing_policy.remote_repository,
+            code="E_GITHUB_PR_PROVIDER",
+        )
+        != canonical_expected_repository
     ):
         raise ValueError(
             "E_GITHUB_PR_PROVIDER: governing remote identity drifted"
@@ -3666,6 +3970,32 @@ def approve_github_pr_write_provider(
 
     if (
         type(native_provider_event) is not NativeGitHubProviderEvent
+        or type(governing_runtime) is not GoverningRuntimeObservation
+        or type(governing_policy) is not GoverningPolicy
+    ):
+        raise ValueError(
+            "E_GITHUB_PR_PROVIDER: native preauthenticated provider required"
+        )
+    try:
+        canonical_expected_repository = (
+            _canonical_github_repository_identity(
+                expected_repository, code="E_GITHUB_PR_PROVIDER"
+            )
+        )
+        canonical_event_repository = _canonical_github_repository_identity(
+            native_provider_event.repository,
+            code="E_GITHUB_PR_PROVIDER",
+        )
+        canonical_policy_repository = _canonical_github_repository_identity(
+            governing_policy.remote_repository,
+            code="E_GITHUB_PR_PROVIDER",
+        )
+    except ValueError as error:
+        raise ValueError(
+            "E_GITHUB_PR_PROVIDER: native preauthenticated provider required"
+        ) from error
+    if (
+        type(native_provider_event) is not NativeGitHubProviderEvent
         or not _native_host_object_is_valid(
             native_provider_event, "github_provider"
         )
@@ -3678,8 +4008,8 @@ def approve_github_pr_write_provider(
         or not _governing_policy_is_live_for_runtime(
             governing_policy, governing_runtime, clock=clock
         )
-        or governing_policy.remote_repository != expected_repository
-        or native_provider_event.repository != expected_repository
+        or canonical_policy_repository != canonical_expected_repository
+        or canonical_event_repository != canonical_expected_repository
         or native_provider_event.session_id != session_id
         or native_provider_event.invocation_id != invocation_id
         or governing_runtime.session_id != session_id
@@ -3696,7 +4026,7 @@ def approve_github_pr_write_provider(
     _assert_governing_pr_remote_live(
         governing_runtime=governing_runtime,
         governing_policy=governing_policy,
-        expected_repository=expected_repository,
+        expected_repository=canonical_expected_repository,
     )
     auth_returncode, _ = _execute_native_remote(
         "github_auth_status",
@@ -3713,7 +4043,7 @@ def approve_github_pr_write_provider(
             "gh",
             "repo",
             "view",
-            expected_repository,
+            canonical_expected_repository,
             "--json",
             "nameWithOwner",
         ),
@@ -3723,9 +4053,18 @@ def approve_github_pr_write_provider(
         repository_payload = json.loads(raw_repository)
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
         repository_payload = {}
+    try:
+        canonical_provider_repository = (
+            _canonical_github_repository_identity(
+                repository_payload.get("nameWithOwner"),
+                code="E_GITHUB_PR_PROVIDER",
+            )
+        )
+    except ValueError:
+        canonical_provider_repository = None
     if (
         repository_returncode != 0
-        or repository_payload.get("nameWithOwner") != expected_repository
+        or canonical_provider_repository != canonical_expected_repository
     ):
         raise ValueError(
             "E_GITHUB_PR_PROVIDER: exact repository access is not ready"
@@ -3733,7 +4072,7 @@ def approve_github_pr_write_provider(
     _assert_governing_pr_remote_live(
         governing_runtime=governing_runtime,
         governing_policy=governing_policy,
-        expected_repository=expected_repository,
+        expected_repository=canonical_expected_repository,
     )
     if not _consume_governing_policy(
         governing_policy
@@ -3747,7 +4086,7 @@ def approve_github_pr_write_provider(
     provider = object.__new__(ValidatedGitHubPullRequestWriteProvider)
     provider._consumed = False
     provider.provider_id = f"github-pr-write-{uuid4().hex}"
-    provider.repository = native_provider_event.repository
+    provider.repository = canonical_expected_repository
     provider.base_branch = base_branch
     provider.session_id = native_provider_event.session_id
     provider.invocation_id = native_provider_event.invocation_id
@@ -4275,6 +4614,12 @@ def _observe_pull_request_mutation(
     number = payload.get("number") if isinstance(payload, Mapping) else None
     url = payload.get("url") if isinstance(payload, Mapping) else None
     draft = payload.get("isDraft") if isinstance(payload, Mapping) else None
+    try:
+        url_repository, url_number = _github_pull_request_url_identity(
+            url, code="E_PR_MUTATION"
+        )
+    except ValueError:
+        url_repository, url_number = None, None
     if (
         observed_returncode != 0
         or not isinstance(number, int)
@@ -4285,9 +4630,8 @@ def _observe_pull_request_mutation(
             and number != bindings.expected_pr_number
         )
         or not isinstance(url, str)
-        or not url.startswith(
-            f"https://github.com/{repository}/pull/"
-        )
+        or url_repository != repository
+        or url_number != number
         or not isinstance(draft, bool)
         or payload.get("baseRefName") != bindings.base_branch
         or payload.get("headRefName") != bindings.branch
@@ -4472,13 +4816,23 @@ def validate_pull_request_mutation(
     expected_invocation_id: str,
     clock: Callable[[], float],
 ) -> ValidatedPullRequestMutationObservation:
+    try:
+        canonical_expected_repository = (
+            _canonical_github_repository_identity(
+                expected_repository, code="E_PR_MUTATION"
+            )
+        )
+    except ValueError as error:
+        raise ValueError(
+            "E_PR_MUTATION: PR observation binding drifted"
+        ) from error
     if (
         type(observation) is not PullRequestMutationObservation
         or not _runtime_host_object_is_live(
             observation, "pull_request_mutation_observation"
         )
         or observation._consumed
-        or observation.repository != expected_repository
+        or observation.repository != canonical_expected_repository
         or observation.base != expected_base
         or observation.head_branch != expected_head_branch
         or observation.head_sha != expected_head_sha

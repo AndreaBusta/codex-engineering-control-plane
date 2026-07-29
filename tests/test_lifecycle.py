@@ -742,6 +742,139 @@ class LifecycleTests(unittest.TestCase):
         )
         return fixture
 
+    def _fresh_feature_push_bindings(
+        self,
+        fixture,
+        *,
+        context,
+        suffix: str,
+        tool_use_id: str,
+    ):
+        import control_plane.host_bridge as bridge
+        from tests.host_adapter_test_support import (
+            governing_policy,
+            governing_runtime_observation,
+            native_session_event,
+            native_user_interaction_event,
+        )
+
+        runtime = governing_runtime_observation(
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            policy_digest=self.digest,
+            attestor_worktree=str(fixture["repository"].resolve()),
+            target_worktree=str(fixture["repository"].resolve()),
+            governing_base_commit=fixture["head"],
+            runtime_layout="source",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            freshness_deadline=130.0,
+        )
+        policy = governing_policy(
+            policy={
+                "git": {
+                    "remote": "origin",
+                    "base_branch": "main",
+                }
+            },
+            policy_digest=self.digest,
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            governing_base_commit=fixture["head"],
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            freshness_deadline=130.0,
+        )
+        inventory_id = f"inventory-{suffix}"
+        raw_inventory = bridge.observe_worktree_inventory(
+            canonical_common_git_dir=fixture["common_dir"],
+            invocation_id=inventory_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+            max_output_bytes=1_000_000,
+        )
+        inventory = bridge.validate_worktree_inventory_observation(
+            raw_inventory,
+            expected_common_git_dir=fixture["common_dir"],
+            expected_invocation_id=inventory_id,
+            clock=lambda: 100.0,
+        )
+        capability = bridge.attest_host_adapter_capability(
+            native_session_event(
+                event_id=f"session-{suffix}",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=fixture["session_id"],
+            expected_invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        authorization = bridge.frame_effect_authorization(
+            native_user_interaction_event(
+                event_id=f"authorize-{suffix}",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                task_digest=fixture["task_digest"],
+                subject_digest=context.context_digest,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=capability,
+            task_digest=fixture["task_digest"],
+            session_id=fixture["session_id"],
+            repository_identity=fixture["repository"],
+            worktree_identity=fixture["repository"],
+            branch=fixture["branch"],
+            expected_head=fixture["head"],
+            subject_digest=context.context_digest,
+            scope_paths=(".",),
+            effect="remote_write",
+            operation_nonce=tool_use_id,
+            invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        return {
+            "runtime": runtime,
+            "policy": policy,
+            "inventory": inventory,
+            "authorization": authorization,
+            "tool_use_id": tool_use_id,
+        }
+
+    def _feature_push_fixture(self, *, task_id: str):
+        import control_plane.host_bridge as bridge
+
+        fixture = self._remote_effect_fixture(
+            task_id=task_id,
+            effect="remote_write",
+            outcome="pull_request",
+            branch=f"codex/{task_id.lower()}",
+        )
+        context = bridge.validate_remote_effect_context(
+            fixture["context"],
+            expected_task_digest=fixture["task_digest"],
+            expected_repo=fixture["repository"],
+            expected_worktree=fixture["repository"],
+            expected_branch=fixture["branch"],
+            expected_head=fixture["head"],
+            expected_session=fixture["session_id"],
+            expected_invocation_id=fixture["invocation_id"],
+            expected_effect="remote_write",
+            expected_pr_number=None,
+            expected_base_sha=None,
+            expected_checks_digest=None,
+        )
+        fixture["context"] = context
+        fixture["bindings"] = self._fresh_feature_push_bindings(
+            fixture,
+            context=context,
+            suffix=f"{task_id.lower()}-primary",
+            tool_use_id=f"tool-{task_id.lower()}-primary",
+        )
+        return fixture
+
     def test_all_declared_legal_transitions_and_illegal_pairs(self) -> None:
         from control_plane.lifecycle import (
             LEGAL_TRANSITIONS,
@@ -1065,15 +1198,15 @@ class LifecycleTests(unittest.TestCase):
                 clock=lambda: 100.0,
             )
 
-    def test_governing_runtime_publishes_supplemental_evidence_by_cas(
+    def test_task1_rejects_generic_supplemental_evidence_and_keeps_pending(
         self,
     ) -> None:
+        import json
+        import control_plane.lifecycle as lifecycle
         from control_plane.lifecycle import (
-            CompletedVerificationCommand,
             VERIFICATION_SUPPLEMENTAL_RECEIPTS,
             frame_verification_supplemental_evidence_set,
             publish_verification_supplemental_evidence,
-            run_verification_profile,
         )
         from tests.host_adapter_test_support import (
             governing_runtime_observation,
@@ -1090,18 +1223,6 @@ class LifecycleTests(unittest.TestCase):
             task_id="TASK-VERIFY-HOST-SUPPLEMENTAL",
             profile="control_plane_assurance",
         )
-        runtime = governing_runtime_observation(
-            runtime_digest=context.runtime_digest,
-            lock_digest=self.digest,
-            policy_digest=self.digest,
-            attestor_worktree=str(repository.resolve()),
-            target_worktree=str(repository.resolve()),
-            governing_base_commit=context.expected_head,
-            runtime_layout="source",
-            session_id=context.session_id,
-            invocation_id="host-supplemental",
-            freshness_deadline=130.0,
-        )
         specifications = {
             kind: {
                 "status": (
@@ -1115,55 +1236,111 @@ class LifecycleTests(unittest.TestCase):
                 context.profile
             ]
         }
-        evidence = frame_verification_supplemental_evidence_set(
-            governing_runtime=runtime,
-            context=context,
-            expected_generation=state["generation"] + 1,
-            specifications=specifications,
-            clock=lambda: 100.0,
+        serialized_specifications = json.loads(
+            json.dumps(specifications)
         )
-        published = publish_verification_supplemental_evidence(
-            task_store=store,
-            context=context,
-            evidence=evidence,
-            expected_generation=state["generation"],
-            clock=lambda: 100.0,
-        )
-
-        def completed(
-            *,
-            context,
-            command_id: str,
-            clock,
-        ) -> CompletedVerificationCommand:
-            del clock
-            return CompletedVerificationCommand(
-                command_id=command_id,
-                returncode=0,
-                status="PASS",
-                output_digest=self.digest,
-                output_truncated=False,
-                before_snapshot_digest=self.digest,
-                after_snapshot_digest=self.digest,
-                context_digest=context.context_digest,
-            )
-
-        with patch(
-            "control_plane.lifecycle._run_verification_command",
-            side_effect=completed,
+        for index, candidate in enumerate(
+            (specifications, serialized_specifications)
         ):
-            receipt = run_verification_profile(
-                context=context,
+            runtime = governing_runtime_observation(
+                runtime_digest=context.runtime_digest,
+                lock_digest=self.digest,
+                policy_digest=self.digest,
+                attestor_worktree=str(repository.resolve()),
+                target_worktree=str(repository.resolve()),
+                governing_base_commit=context.expected_head,
+                runtime_layout="source",
+                session_id=context.session_id,
+                invocation_id=f"host-supplemental-{index}",
+                freshness_deadline=130.0,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "E_VERIFICATION_EVIDENCE"
+            ):
+                frame_verification_supplemental_evidence_set(
+                    governing_runtime=runtime,
+                    context=context,
+                    expected_generation=state["generation"] + 1,
+                    specifications=candidate,
+                    clock=lambda: 100.0,
+                )
+            self.assertFalse(runtime._consumed)
+
+        generic_evidence = []
+        for kind in sorted(
+            VERIFICATION_SUPPLEMENTAL_RECEIPTS[context.profile]
+        ):
+            item = object.__new__(
+                lifecycle.HostBoundVerificationEvidence
+            )
+            values = {
+                "_consumed": False,
+                "observation_id": f"generic-{kind}",
+                "kind": kind,
+                "receipt_digest": self.digest,
+                "status": "PASS",
+                "subject_digest": self.digest,
+                "task_id": context.task_id,
+                "task_digest": context.task_digest,
+                "head": context.expected_head,
+                "profile": context.profile,
+                "profile_digest": context.profile_digest,
+                "generation": state["generation"] + 1,
+                "session_id": context.session_id,
+                "lease_digest": context.lease_digest,
+                "context_digest": context.context_digest,
+                "freshness_deadline": 130.0,
+            }
+            for name, value in values.items():
+                setattr(item, name, value)
+            lifecycle._register_runtime_host_object(
+                item, "verification_supplemental_evidence"
+            )
+            generic_evidence.append(item)
+        with self.assertRaisesRegex(
+            ValueError, "E_VERIFICATION_EVIDENCE"
+        ):
+            publish_verification_supplemental_evidence(
                 task_store=store,
-                expected_generation=published["generation"],
-                supplemental_evidence=evidence,
+                context=context,
+                evidence=tuple(generic_evidence),
+                expected_generation=state["generation"],
                 clock=lambda: 100.0,
             )
 
-        self.assertEqual(
-            len(receipt.supplemental_receipt_digests), 3
+        with self.assertRaisesRegex(
+            ValueError, "E_VERIFICATION_EVIDENCE"
+        ):
+            publish_verification_supplemental_evidence(
+                task_store=store,
+                context=context,
+                evidence=(),
+                expected_generation=state["generation"],
+                clock=lambda: 100.0,
+            )
+
+        self.assertFalse(
+            hasattr(lifecycle, "CompletedMacOSHookSmoke")
         )
-        self.assertEqual(store.status(context.task_id)["state"], "review_ready")
+        self.assertFalse(
+            hasattr(lifecycle, "CompletedSkillPressureEvaluation")
+        )
+        self.assertFalse(
+            hasattr(lifecycle, "ValidatedIndependentReviewObservation")
+        )
+        current = store.status(context.task_id)
+        self.assertEqual(current["state"], "verifying")
+        self.assertEqual(current["generation"], state["generation"])
+        self.assertNotIn(
+            "verification_supplemental_evidence", current
+        )
+        receipt_root = (
+            store.state_dir
+            / "codex-control-plane"
+            / "verification-receipts"
+            / context.task_id
+        )
+        self.assertFalse(receipt_root.exists())
 
     def test_bootstrap_state_is_owned_and_closed_by_immutable_base_runtime(
         self,
@@ -2161,6 +2338,279 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "host-bound"):
             bridge.GoverningRuntimeObservation()
         self.test_governing_git_effects_reject_serialized_authority()
+
+    def test_feature_push_context_claim_is_atomic_before_first_egress(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+
+        fixture = self._feature_push_fixture(
+            task_id="TASK-FEATURE-PUSH-ATOMIC"
+        )
+        second = self._fresh_feature_push_bindings(
+            fixture,
+            context=fixture["context"],
+            suffix="feature-push-atomic-second",
+            tool_use_id="tool-feature-push-atomic-second",
+        )
+        bundles = [fixture["bindings"], second]
+        push_started = threading.Event()
+        release_first_push = threading.Event()
+        push_calls: list[tuple[str, ...]] = []
+        results: list[object] = []
+        errors: list[Exception] = []
+
+        def remote_executor(operation, arguments, max_output_bytes):
+            del max_output_bytes
+            if operation == "git_feature_push":
+                push_calls.append(arguments)
+                if len(push_calls) == 1:
+                    push_started.set()
+                    if not release_first_push.wait(timeout=5):
+                        raise AssertionError("first push was not released")
+                return 0, b""
+            if operation == "git_feature_observe":
+                return (
+                    0,
+                    (
+                        f"{fixture['head']}\t"
+                        f"refs/heads/{fixture['branch']}\n"
+                    ).encode("utf-8"),
+                )
+            raise AssertionError(f"unexpected operation: {operation}")
+
+        def execute(bundle) -> None:
+            try:
+                results.append(
+                    bridge.push_validated_feature(
+                        context=fixture["context"],
+                        governing_runtime=bundle["runtime"],
+                        governing_policy=bundle["policy"],
+                        authorization=bundle["authorization"],
+                        inventory=bundle["inventory"],
+                        session_id=fixture["session_id"],
+                        invocation_id=fixture["invocation_id"],
+                        tool_use_id=bundle["tool_use_id"],
+                        clock=lambda: 100.0,
+                    )
+                )
+            except Exception as error:
+                errors.append(error)
+
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=remote_executor,
+        ):
+            first = threading.Thread(target=execute, args=(bundles[0],))
+            second_thread = threading.Thread(
+                target=execute, args=(bundles[1],)
+            )
+            first.start()
+            self.assertTrue(push_started.wait(timeout=5))
+            second_thread.start()
+            second_thread.join(timeout=5)
+            self.assertFalse(second_thread.is_alive())
+            release_first_push.set()
+            first.join(timeout=5)
+            self.assertFalse(first.is_alive())
+
+        self.assertEqual(len(push_calls), 1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertIs(type(results[0]), bridge.LocalGitObservation)
+        self.assertRegex(str(errors[0]), "E_REMOTE_EFFECT")
+        for bundle in bundles:
+            with self.assertRaisesRegex(ValueError, "E_REMOTE_EFFECT"):
+                bridge.push_validated_feature(
+                    context=fixture["context"],
+                    governing_runtime=bundle["runtime"],
+                    governing_policy=bundle["policy"],
+                    authorization=bundle["authorization"],
+                    inventory=bundle["inventory"],
+                    session_id=fixture["session_id"],
+                    invocation_id=fixture["invocation_id"],
+                    tool_use_id=bundle["tool_use_id"],
+                    clock=lambda: 100.0,
+                )
+        self.assertEqual(len(push_calls), 1)
+
+    def test_feature_push_failures_are_terminal_or_observation_only(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+
+        before = self._feature_push_fixture(
+            task_id="TASK-FEATURE-PUSH-BEFORE-EFFECT"
+        )
+        original_inventory_consume = bridge._consume_worktree_inventory
+
+        def drift_after_claim(*args, **kwargs):
+            result = original_inventory_consume(*args, **kwargs)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(before["repository"]),
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://github.com/attacker/exfiltration.git",
+                ],
+                check=True,
+            )
+            return result
+
+        with (
+            patch.object(
+                bridge,
+                "_consume_worktree_inventory",
+                side_effect=drift_after_claim,
+            ),
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=AssertionError(
+                    "pre-effect drift reached remote egress"
+                ),
+            ) as before_remote,
+            self.assertRaisesRegex(ValueError, "E_REMOTE_EFFECT"),
+        ):
+            bridge.push_validated_feature(
+                context=before["context"],
+                governing_runtime=before["bindings"]["runtime"],
+                governing_policy=before["bindings"]["policy"],
+                authorization=before["bindings"]["authorization"],
+                inventory=before["bindings"]["inventory"],
+                session_id=before["session_id"],
+                invocation_id=before["invocation_id"],
+                tool_use_id=before["bindings"]["tool_use_id"],
+                clock=lambda: 100.0,
+            )
+        before_remote.assert_not_called()
+        self.assertTrue(before["context"]._consumed)
+        with self.assertRaisesRegex(
+            ValueError, "E_REMOTE_EFFECT_RECOVERY"
+        ):
+            bridge.recover_feature_push_outcome(
+                before["context"], clock=lambda: 100.0
+            )
+
+        during = self._feature_push_fixture(
+            task_id="TASK-FEATURE-PUSH-DURING-EFFECT"
+        )
+        during_calls: list[str] = []
+
+        def fail_during_push(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            during_calls.append(operation)
+            if operation == "git_feature_push":
+                raise RuntimeError("transport outcome is unknown")
+            if operation == "git_feature_observe":
+                return (
+                    0,
+                    (
+                        f"{during['head']}\t"
+                        f"refs/heads/{during['branch']}\n"
+                    ).encode("utf-8"),
+                )
+            raise AssertionError(f"unexpected operation: {operation}")
+
+        with (
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=fail_during_push,
+            ),
+            self.assertRaisesRegex(
+                ValueError, "E_REMOTE_EFFECT_OUTCOME_UNKNOWN"
+            ),
+        ):
+            bridge.push_validated_feature(
+                context=during["context"],
+                governing_runtime=during["bindings"]["runtime"],
+                governing_policy=during["bindings"]["policy"],
+                authorization=during["bindings"]["authorization"],
+                inventory=during["bindings"]["inventory"],
+                session_id=during["session_id"],
+                invocation_id=during["invocation_id"],
+                tool_use_id=during["bindings"]["tool_use_id"],
+                clock=lambda: 100.0,
+            )
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=fail_during_push,
+        ):
+            recovered = bridge.recover_feature_push_outcome(
+                during["context"], clock=lambda: 100.0
+            )
+        self.assertEqual(
+            during_calls,
+            ["git_feature_push", "git_feature_observe"],
+        )
+        self.assertEqual(recovered.evidence["remote_head"], during["head"])
+        with self.assertRaisesRegex(
+            ValueError, "E_REMOTE_EFFECT_RECOVERY"
+        ):
+            bridge.recover_feature_push_outcome(
+                during["context"], clock=lambda: 100.0
+            )
+
+        after = self._feature_push_fixture(
+            task_id="TASK-FEATURE-PUSH-AFTER-EFFECT"
+        )
+        after_calls: list[str] = []
+
+        def fail_after_push(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            after_calls.append(operation)
+            if operation == "git_feature_push":
+                return 0, b""
+            if operation == "git_feature_observe":
+                if after_calls.count("git_feature_observe") == 1:
+                    raise RuntimeError("observation unavailable")
+                return (
+                    0,
+                    (
+                        f"{after['head']}\t"
+                        f"refs/heads/{after['branch']}\n"
+                    ).encode("utf-8"),
+                )
+            raise AssertionError(f"unexpected operation: {operation}")
+
+        with (
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=fail_after_push,
+            ),
+            self.assertRaisesRegex(
+                ValueError, "E_REMOTE_EFFECT_OUTCOME_UNKNOWN"
+            ),
+        ):
+            bridge.push_validated_feature(
+                context=after["context"],
+                governing_runtime=after["bindings"]["runtime"],
+                governing_policy=after["bindings"]["policy"],
+                authorization=after["bindings"]["authorization"],
+                inventory=after["bindings"]["inventory"],
+                session_id=after["session_id"],
+                invocation_id=after["invocation_id"],
+                tool_use_id=after["bindings"]["tool_use_id"],
+                clock=lambda: 100.0,
+            )
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=fail_after_push,
+        ):
+            recovered = bridge.recover_feature_push_outcome(
+                after["context"], clock=lambda: 100.0
+            )
+        self.assertEqual(after_calls.count("git_feature_push"), 1)
+        self.assertEqual(after_calls.count("git_feature_observe"), 2)
+        self.assertEqual(recovered.evidence["remote_head"], after["head"])
 
     def test_feature_push_rejects_remote_repository_swap_after_framing(
         self,
@@ -3222,6 +3672,262 @@ class LifecycleTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "secret-like"):
             bridge.validate_pull_request_body("token ghp_" + "x" * 40)
+
+    def test_pr_provider_type_gate_precedes_canonical_attribute_access(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        from tests.host_adapter_test_support import (
+            governing_runtime_observation,
+            native_github_provider_event,
+        )
+
+        fixture = self._remote_effect_fixture(
+            task_id="TASK-PR-PROVIDER-TYPE-GATE",
+            effect="pull_request",
+            outcome="pull_request",
+            branch="codex/pr-provider-type-gate",
+            expected_base_sha="a" * 40,
+        )
+        runtime = governing_runtime_observation(
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            policy_digest=self.digest,
+            attestor_worktree=str(fixture["repository"].resolve()),
+            target_worktree=str(fixture["repository"].resolve()),
+            governing_base_commit=fixture["head"],
+            runtime_layout="source",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            freshness_deadline=130.0,
+        )
+
+        class ForeignObject:
+            def __getattribute__(self, name):
+                raise AssertionError(
+                    f"foreign attribute accessed before type gate: {name}"
+                )
+
+        with self.assertRaisesRegex(
+            ValueError, "E_GITHUB_PR_PROVIDER"
+        ):
+            bridge.approve_github_pr_write_provider(
+                ForeignObject(),
+                governing_runtime=runtime,
+                governing_policy=fixture["governing_policy"],
+                expected_repository="example/control-plane",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+
+        event = native_github_provider_event(
+            event_id="provider-type-gate",
+            repository="example/control-plane",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+        )
+        with self.assertRaisesRegex(
+            ValueError, "E_GITHUB_PR_PROVIDER"
+        ):
+            bridge.approve_github_pr_write_provider(
+                event,
+                governing_runtime=runtime,
+                governing_policy=ForeignObject(),
+                expected_repository="example/control-plane",
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+
+    def test_github_repository_identity_accepts_real_casing_and_stays_exact(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        from tests.host_adapter_test_support import (
+            governing_policy,
+            governing_runtime_observation,
+            native_github_provider_event,
+        )
+
+        fixture = self._remote_effect_fixture(
+            task_id="TASK-PR-REPOSITORY-CASING",
+            effect="pull_request",
+            outcome="pull_request",
+            branch="codex/pr-repository-casing",
+            expected_base_sha="a" * 40,
+        )
+        canonical_repository = (
+            "andreabusta/codex-engineering-control-plane"
+        )
+        raw_repository = "AndreaBusta/codex-engineering-control-plane"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(fixture["repository"]),
+                "remote",
+                "set-url",
+                "origin",
+                (
+                    "https://github.com/AndreaBusta/"
+                    "codex-engineering-control-plane.git"
+                ),
+            ],
+            check=True,
+        )
+        runtime = governing_runtime_observation(
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            policy_digest=self.digest,
+            attestor_worktree=str(fixture["repository"].resolve()),
+            target_worktree=str(fixture["repository"].resolve()),
+            governing_base_commit=fixture["head"],
+            runtime_layout="source",
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            freshness_deadline=130.0,
+        )
+        policy = governing_policy(
+            policy={
+                "git": {
+                    "remote": "origin",
+                    "base_branch": "main",
+                }
+            },
+            policy_digest=self.digest,
+            runtime_digest=self.digest,
+            lock_digest=self.digest,
+            governing_base_commit=fixture["head"],
+            remote_repository=canonical_repository,
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            freshness_deadline=130.0,
+        )
+        event = native_github_provider_event(
+            event_id="provider-real-casing",
+            repository=raw_repository,
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+        )
+
+        def provider_preflight(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            if operation == "github_auth_status":
+                return 0, b""
+            if operation == "github_repository_access":
+                return (
+                    0,
+                    b'{"nameWithOwner":"AndreaBusta/'
+                    b'codex-engineering-control-plane"}',
+                )
+            raise AssertionError(
+                f"unexpected provider operation: {operation}"
+            )
+
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=provider_preflight,
+        ):
+            provider = bridge.approve_github_pr_write_provider(
+                event,
+                governing_runtime=runtime,
+                governing_policy=policy,
+                expected_repository=canonical_repository,
+                session_id=fixture["session_id"],
+                invocation_id=fixture["invocation_id"],
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+        self.assertEqual(provider.repository, canonical_repository)
+
+        bindings = bridge._PullRequestMutationEffectBindings(
+            repository=canonical_repository,
+            base_branch="main",
+            branch=fixture["branch"],
+            head=fixture["head"],
+            remote_repository=canonical_repository,
+            remote_name="origin",
+            expected_base_sha="a" * 40,
+            expected_checks_digest=None,
+            expected_pr_number=4,
+            title="Bounded casing regression",
+            body="Provider URL identity remains exact.",
+            draft=True,
+            session_id=fixture["session_id"],
+            invocation_id=fixture["invocation_id"],
+            provider_freshness_deadline=130.0,
+        )
+        raw_url = (
+            "https://github.com/AndreaBusta/"
+            "codex-engineering-control-plane/pull/4"
+        )
+
+        def observed_pr(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            if operation == "github_pull_request_observe":
+                return (
+                    0,
+                    (
+                        '{"number":4,"url":"'
+                        + raw_url
+                        + '","isDraft":true,"baseRefName":"main",'
+                        '"headRefName":"'
+                        + fixture["branch"]
+                        + '","headRefOid":"'
+                        + fixture["head"]
+                        + '"}'
+                    ).encode("utf-8"),
+                )
+            raise AssertionError(
+                f"unexpected provider operation: {operation}"
+            )
+
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=observed_pr,
+        ):
+            observation = bridge._observe_pull_request_mutation(
+                bindings, clock=lambda: 100.0
+            )
+        self.assertEqual(observation.repository, canonical_repository)
+        self.assertEqual(observation.url, raw_url)
+
+        def wrong_repository_pr(operation, arguments, max_output_bytes):
+            del arguments, max_output_bytes
+            if operation == "github_pull_request_observe":
+                return (
+                    0,
+                    (
+                        '{"number":4,"url":"https://github.com/'
+                        'AndreaBusta/other-repository/pull/4",'
+                        '"isDraft":true,"baseRefName":"main",'
+                        '"headRefName":"'
+                        + fixture["branch"]
+                        + '","headRefOid":"'
+                        + fixture["head"]
+                        + '"}'
+                    ).encode("utf-8"),
+                )
+            raise AssertionError(
+                f"unexpected provider operation: {operation}"
+            )
+
+        with (
+            patch.object(
+                bridge,
+                "_native_host_remote_executor",
+                side_effect=wrong_repository_pr,
+            ),
+            self.assertRaisesRegex(ValueError, "E_PR_MUTATION"),
+        ):
+            bridge._observe_pull_request_mutation(
+                bindings, clock=lambda: 100.0
+            )
 
     def test_pr_mutation_revalidates_remote_before_egress_and_effect(
         self,

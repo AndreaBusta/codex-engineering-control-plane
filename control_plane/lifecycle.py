@@ -942,105 +942,20 @@ def frame_verification_supplemental_evidence_set(
     governing_runtime: object,
     context: object,
     expected_generation: int,
-    specifications: Mapping[str, Mapping[str, object]],
+    specifications: object,
     clock: object,
 ) -> tuple[HostBoundVerificationEvidence, ...]:
-    if (
-        type(governing_runtime) is not GoverningRuntimeObservation
-        or not _governing_runtime_observation_is_live(governing_runtime)
-        or governing_runtime._consumed
-        or type(context) is not VerificationExecutionContext
-        or context._consumed
-        or not isinstance(expected_generation, int)
-        or isinstance(expected_generation, bool)
-        or expected_generation < 1
-        or not isinstance(specifications, Mapping)
-        or set(specifications)
-        != set(VERIFICATION_SUPPLEMENTAL_RECEIPTS[context.profile])
-        or governing_runtime.runtime_digest != context.runtime_digest
-        or governing_runtime.target_worktree != context.worktree
-        or governing_runtime.session_id != context.session_id
-        or float(clock()) > governing_runtime.freshness_deadline
-    ):
-        raise ValueError(
-            "E_VERIFICATION_EVIDENCE: governing runtime binding is required"
-        )
-    prepared: list[HostBoundVerificationEvidence] = []
-    for kind in sorted(specifications):
-        specification = specifications[kind]
-        status = (
-            specification.get("status")
-            if isinstance(specification, Mapping)
-            else None
-        )
-        subject_digest = (
-            specification.get("subject_digest")
-            if isinstance(specification, Mapping)
-            else None
-        )
-        if (
-            not isinstance(specification, Mapping)
-            or set(specification) != {"status", "subject_digest"}
-            or status not in {"PASS", "AUDIT", "PENDING"}
-            or not isinstance(subject_digest, str)
-            or SHA256_DIGEST.fullmatch(subject_digest) is None
-        ):
-            raise ValueError(
-                "E_VERIFICATION_EVIDENCE: supplemental specification "
-                "is invalid"
-            )
-        observation_id = f"verification-evidence-{uuid4().hex}"
-        semantic = {
-            "schema_version": 2,
-            "observation_id": observation_id,
-            "kind": kind,
-            "task_id": context.task_id,
-            "task_digest": context.task_digest,
-            "head": context.expected_head,
-            "profile": context.profile,
-            "profile_digest": context.profile_digest,
-            "generation": expected_generation,
-            "session_id": context.session_id,
-            "lease_digest": context.lease_digest,
-            "status": status,
-            "subject_digest": subject_digest,
-            "context_digest": context.context_digest,
-            "governing_runtime_digest": (
-                governing_runtime.observation_digest
-            ),
-        }
-        item = object.__new__(HostBoundVerificationEvidence)
-        item._consumed = False
-        values = {
-            "observation_id": observation_id,
-            "kind": kind,
-            "receipt_digest": contract_digest(semantic),
-            "status": status,
-            "subject_digest": subject_digest,
-            "task_id": context.task_id,
-            "task_digest": context.task_digest,
-            "head": context.expected_head,
-            "profile": context.profile,
-            "profile_digest": context.profile_digest,
-            "generation": expected_generation,
-            "session_id": context.session_id,
-            "lease_digest": context.lease_digest,
-            "context_digest": context.context_digest,
-            "freshness_deadline": governing_runtime.freshness_deadline,
-        }
-        for name, value in values.items():
-            setattr(item, name, value)
-        prepared.append(item)
-    if not _consume_governing_runtime_observation(governing_runtime):
-        raise ValueError(
-            "E_VERIFICATION_EVIDENCE: governing runtime is not host-issued"
-        )
-    governing_runtime._consumed = True
-    for item in prepared:
-        _register_runtime_host_object(
-            item, "verification_supplemental_evidence"
-        )
-    return tuple(prepared)
+    del (
+        governing_runtime,
+        context,
+        expected_generation,
+        specifications,
+        clock,
+    )
+    raise ValueError(
+        "E_VERIFICATION_EVIDENCE: Task 1 has no typed supplemental "
+        "publisher; mapping and JSON specifications are never host evidence"
+    )
 
 
 def publish_verification_supplemental_evidence(
@@ -1051,101 +966,11 @@ def publish_verification_supplemental_evidence(
     expected_generation: int,
     clock: object,
 ) -> dict[str, Any]:
-    if (
-        type(task_store) is not TaskStore
-        or type(context) is not VerificationExecutionContext
-        or context._consumed
-        or not isinstance(evidence, tuple)
-        or not isinstance(expected_generation, int)
-        or isinstance(expected_generation, bool)
-    ):
-        raise ValueError(
-            "E_VERIFICATION_EVIDENCE: typed publication inputs are required"
-        )
-    required = tuple(
-        sorted(VERIFICATION_SUPPLEMENTAL_RECEIPTS[context.profile])
+    del task_store, context, evidence, expected_generation, clock
+    raise ValueError(
+        "E_VERIFICATION_EVIDENCE: Task 1 cannot publish supplemental "
+        "receipts before their typed publishers exist"
     )
-    if tuple(item.kind for item in evidence) != required:
-        raise ValueError(
-            "E_VERIFICATION_EVIDENCE: supplemental evidence set is not exact"
-        )
-    target_generation = expected_generation + 1
-    registrations: dict[str, dict[str, object]] = {}
-    for item in evidence:
-        if (
-            type(item) is not HostBoundVerificationEvidence
-            or item._consumed
-            or not _runtime_host_object_is_live(
-                item, "verification_supplemental_evidence"
-            )
-            or float(clock()) > item.freshness_deadline
-            or item.task_id != context.task_id
-            or item.task_digest != context.task_digest
-            or item.head != context.expected_head
-            or item.profile != context.profile
-            or item.profile_digest != context.profile_digest
-            or item.generation != target_generation
-            or item.session_id != context.session_id
-            or item.lease_digest != context.lease_digest
-            or item.context_digest != context.context_digest
-        ):
-            raise ValueError(
-                "E_VERIFICATION_EVIDENCE: host evidence binding drifted"
-            )
-        registrations[item.kind] = {
-            "observation_id": item.observation_id,
-            "receipt_digest": item.receipt_digest,
-            "status": item.status,
-            "subject_digest": item.subject_digest,
-        }
-    receipt_root = (
-        task_store.state_dir
-        / "codex-control-plane"
-        / "verification-receipts"
-        / context.task_id
-    )
-    if receipt_root.exists() and (
-        receipt_root.is_symlink()
-        or not receipt_root.is_dir()
-        or any(receipt_root.iterdir())
-    ):
-        raise ValueError(
-            "E_VERIFICATION_EVIDENCE: candidate receipt files are forbidden"
-        )
-    common_dir = _common_git_dir(task_store.state_dir)
-    with _common_lease_lock(common_dir):
-        with _task_guard(task_store.state_dir, context.task_id):
-            state = task_store._read(context.task_id)
-            lease = task_store._read_owner_lease(context.task_id)
-            if (
-                state.get("state") != "verifying"
-                or state.get("generation") != expected_generation
-                or state.get("task_digest") != context.task_digest
-                or state.get("verification_profile") != context.profile
-                or state.get("verification_profile_digest")
-                != context.profile_digest
-                or state.get("session_id") != context.session_id
-                or lease is None
-                or lease.get("lease_digest") != context.lease_digest
-                or lease.get("session_id") != context.session_id
-                or _git_head(Path(context.repository))
-                != context.expected_head
-            ):
-                raise ValueError(
-                    "E_STATE_CAS: verification evidence publication drifted"
-                )
-            for item in evidence:
-                if not _consume_runtime_host_object(
-                    item, "verification_supplemental_evidence"
-                ):
-                    raise ValueError(
-                        "E_VERIFICATION_EVIDENCE: evidence claim failed"
-                    )
-            state["generation"] = target_generation
-            state["verification_supplemental_evidence"] = registrations
-            state["updated_at"] = _utc_now()
-            _atomic_json(task_store._path(context.task_id), state)
-    return state
 
 
 def _load_verification_supplemental_evidence(
