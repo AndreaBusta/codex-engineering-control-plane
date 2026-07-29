@@ -24,6 +24,91 @@ class AdoptionTests(unittest.TestCase):
         self.addCleanup(self.scenario.close)
         self.scenario.checkout_feature("codex/adopt-v2")
 
+    def _run_isolated_intake(
+        self, repository: Path
+    ) -> subprocess.CompletedProcess[str]:
+        from control_plane.adoption import RUNTIME_PACKAGE
+
+        runtime_root = repository / ".codex" / "runtime"
+        package_root = runtime_root / RUNTIME_PACKAGE
+        task = {
+            "schema_version": 1,
+            "task_id": "adopted-intake-render",
+            "objective": "Explain a bounded adopted-runtime task.",
+            "intent": "explain",
+            "phase": "frame",
+            "requested_outcome": "answer",
+            "goals": [
+                {
+                    "id": "explain",
+                    "summary": "Explain the task.",
+                    "domains": ["generic"],
+                    "depends_on": [],
+                }
+            ],
+            "domains": ["generic"],
+            "signals": [],
+            "scope_paths": ["baseline.txt"],
+            "risk": {
+                "uncertainty": 0,
+                "blast_radius": 0,
+                "irreversibility": 0,
+                "verification_complexity": 0,
+            },
+            "effects": [
+                {"name": "local_read", "source": "user_explicit"}
+            ],
+            "explicit_resources": [],
+            "excluded_resources": [],
+        }
+        code = (
+            f"from {RUNTIME_PACKAGE} import "
+            "contracts,host_bridge,intake,policy,resource_registry,routing,scopes;"
+            "from pathlib import Path;"
+            "import json;"
+            f"root=Path({str(repository)!r}).resolve();"
+            f"package=Path({str(package_root)!r}).resolve();"
+            f"task=json.loads({json.dumps(task)!r});"
+            "assert Path(host_bridge.__file__).resolve().is_relative_to(package);"
+            "assert Path(intake.__file__).resolve().is_relative_to(package);"
+            "assert Path(scopes.__file__).resolve().is_relative_to(package);"
+            "pol=policy.load_policy(root/'.codex'/'project-policy.toml');"
+            "reg=resource_registry.load_registry("
+            "root/'.codex'/'resource-registry.toml');"
+            "digest=contracts.contract_digest(task);"
+            "raw=host_bridge.observe_inventory("
+            "reg,root,root,digest,'adopted-intake',"
+            "clock=lambda:100.0,ttl_seconds=30.0);"
+            "inventory=host_bridge.validate_inventory_observation("
+            "raw,expected_repo=root,expected_worktree=root,"
+            "expected_registry_digest="
+            "resource_registry.registry_contract_digest(reg),"
+            "expected_task_digest=digest,"
+            "expected_invocation_id='adopted-intake',"
+            "clock=lambda:100.0);"
+            "decision=routing.resolve_route("
+            "task,pol,reg,inventory,mode='audit');"
+            "manifest=routing.compact_route_manifest(decision);"
+            "brief=intake.render_novice_brief(task,manifest);"
+            "assert 'Modo normal:' in brief;"
+            "assert 'automatic_change=false' in brief;"
+            "assert len(brief.encode('utf-8'))<=1024;"
+            "print('ISOLATED_INTAKE_OK')"
+        )
+        return subprocess.run(
+            [sys.executable, "-P", "-B", "-c", code],
+            cwd=self.scenario.root,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(runtime_root),
+                "PYTHONSAFEPATH": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
     def test_plan_is_read_only_apply_is_idempotent_and_rollback_recovers(self) -> None:
         from control_plane.adoption import (
             adoption_apply,
@@ -622,7 +707,7 @@ class AdoptionTests(unittest.TestCase):
         self.assertFalse(hook_marker.exists())
         self.assertNotIn("ARGPARSE_SHADOW_EXECUTED", completed.stderr)
         self.assertNotIn("JSON_SHADOW_EXECUTED", hook.stderr)
-        for module in ("host_bridge.py", "scopes.py"):
+        for module in ("host_bridge.py", "intake.py", "scopes.py"):
             self.assertIn(module, RUNTIME_MODULES)
             self.assertTrue(
                 (
@@ -634,11 +719,10 @@ class AdoptionTests(unittest.TestCase):
                 ).is_file()
             )
 
-    def test_pr_a_adopted_runtime_imports_host_bridge_and_scopes_without_source(
+    def test_pr_b_adopted_runtime_imports_and_renders_intake_without_source(
         self,
     ) -> None:
         from control_plane.adoption import (
-            RUNTIME_PACKAGE,
             adoption_apply,
             adoption_plan,
         )
@@ -647,35 +731,7 @@ class AdoptionTests(unittest.TestCase):
             ROOT, self.scenario.repo, allow_dirty_source=True
         )
         adoption_apply(plan)
-        runtime_root = self.scenario.repo / ".codex" / "runtime"
-        package_root = runtime_root / RUNTIME_PACKAGE
-        environment = {
-            "PATH": os.environ.get("PATH", ""),
-            "PYTHONPATH": str(runtime_root),
-            "PYTHONSAFEPATH": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        }
-        imported = subprocess.run(
-            [
-                sys.executable,
-                "-P",
-                "-B",
-                "-c",
-                (
-                    f"from {RUNTIME_PACKAGE} import host_bridge, scopes;"
-                    "from pathlib import Path;"
-                    f"root=Path({str(package_root)!r}).resolve();"
-                    "assert Path(host_bridge.__file__).resolve().is_relative_to(root);"
-                    "assert Path(scopes.__file__).resolve().is_relative_to(root);"
-                    "print('ISOLATED_IMPORT_OK')"
-                ),
-            ],
-            cwd=self.scenario.root,
-            env=environment,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        imported = self._run_isolated_intake(self.scenario.repo)
         launcher = self.scenario.repo / "scripts" / "control-plane"
         doctor = subprocess.run(
             [
@@ -707,7 +763,7 @@ class AdoptionTests(unittest.TestCase):
         )
 
         self.assertEqual(imported.returncode, 0, imported.stderr)
-        self.assertEqual(imported.stdout.strip(), "ISOLATED_IMPORT_OK")
+        self.assertEqual(imported.stdout.strip(), "ISOLATED_INTAKE_OK")
         self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
         self.assertIn('"ok": true', doctor.stdout.lower())
         self.assertEqual(
@@ -806,6 +862,19 @@ class AdoptionTests(unittest.TestCase):
             )
             self.assertIn(
                 "UPGRADE-EVIDENCE", installed.read_text(encoding="utf-8")
+            )
+            installed_intake = (
+                self.scenario.repo
+                / ".codex"
+                / "runtime"
+                / "codex_control_plane_runtime_v2"
+                / "intake.py"
+            )
+            self.assertTrue(installed_intake.is_file())
+            isolated = self._run_isolated_intake(self.scenario.repo)
+            self.assertEqual(isolated.returncode, 0, isolated.stderr)
+            self.assertEqual(
+                isolated.stdout.strip(), "ISOLATED_INTAKE_OK"
             )
             self.assertTrue(adoption_verify(self.scenario.repo)["ok"])
             self.assertTrue(adoption_rollback(self.scenario.repo)["ok"])

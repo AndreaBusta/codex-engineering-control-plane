@@ -34,6 +34,7 @@ RUNTIME_MODULES = (
     "graph.py",
     "hooks.py",
     "host_bridge.py",
+    "intake.py",
     "lifecycle.py",
     "lockfile.py",
     "policy.py",

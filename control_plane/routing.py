@@ -11,6 +11,7 @@ from control_plane.contracts import (
     TASK_EFFECTS,
     contract_digest,
     validate_task_id,
+    validate_task_envelope,
 )
 from control_plane.host_bridge import (
     ValidatedInventory,
@@ -335,6 +336,16 @@ def resolve_route(
 
     if mode not in {"audit", "enforce"}:
         raise ValueError("mode must be audit or enforce")
+    if not isinstance(task, Mapping):
+        raise ValueError(
+            "T_TASK_ENVELOPE: resolver requires a TaskEnvelope mapping"
+        )
+    task_issues = validate_task_envelope(task)
+    if task_issues:
+        issue = task_issues[0]
+        raise ValueError(
+            f"{issue.code}: {issue.path}: {issue.message}"
+        )
     task_digest = contract_digest(task)
     if not isinstance(inventory, ValidatedInventory):
         raise ValueError(
@@ -1064,6 +1075,7 @@ def compact_route_manifest(decision: Mapping[str, Any]) -> str:
     summary = decision.get("summary", {})
     compact = {
         "schema_version": 1,
+        "task_digest": decision.get("facts", {}).get("task_digest"),
         "decision_digest": decision.get("decision_digest"),
         "tier": summary.get("tier"),
         "workflow_mode": summary.get("workflow_mode"),
@@ -1082,8 +1094,9 @@ def compact_route_manifest(decision: Mapping[str, Any]) -> str:
         "project_profile": summary.get("project_profile"),
         "interaction": decision.get("interaction"),
     }
-    from control_plane.contracts import canonical_json
+    from control_plane.contracts import canonical_json, contract_digest
 
+    compact["manifest_digest"] = contract_digest(compact)
     rendered = canonical_json(compact)
     if len(rendered.encode("utf-8")) > 4096:
         raise ValueError("E_CONTEXT_BUDGET: compact route manifest exceeds 4 KiB")

@@ -29,6 +29,9 @@ release.
 
 - Antes de ingeniería sustancial, normaliza la petición como `TaskEnvelope` y
   resuélvela con `scripts/control-plane route`.
+- Si la ingeniería es vaga, amplia, riesgosa, subespecificada o multifrente,
+  usa el `task-framer` canónico; normaliza su Markdown y nunca crees otra skill
+  de intake.
 - Comunica si `RouteDecision.interaction` recomienda `/plan`, `/goal` o
   `/plan` seguido de `/goal`; no cambies el modo automáticamente.
 - Lee por completo cada recurso `required`; carga `recommended` solo dentro del

@@ -12,6 +12,54 @@ class ContractTestsV2(unittest.TestCase):
 
         self.assertEqual(validate_task_envelope(task_envelope()), [])
 
+    def test_unknown_dependency_raises_uncertainty_for_clarification(
+        self,
+    ) -> None:
+        from control_plane.contracts import validate_task_envelope
+
+        cases = {
+            "T_GOAL_REFERENCE": [
+                {
+                    "id": "build",
+                    "summary": "Build the feature.",
+                    "domains": ["generic"],
+                    "depends_on": ["missing"],
+                }
+            ],
+            "T_GOAL_SELF_DEPENDENCY": [
+                {
+                    "id": "build",
+                    "summary": "Build the feature.",
+                    "domains": ["generic"],
+                    "depends_on": ["build"],
+                }
+            ],
+            "T_GOAL_CYCLE": [
+                {
+                    "id": "build",
+                    "summary": "Build the feature.",
+                    "domains": ["generic"],
+                    "depends_on": ["verify"],
+                },
+                {
+                    "id": "verify",
+                    "summary": "Verify the feature.",
+                    "domains": ["generic"],
+                    "depends_on": ["build"],
+                },
+            ],
+        }
+
+        for expected_code, goals in cases.items():
+            with self.subTest(expected_code=expected_code):
+                codes = {
+                    issue.code
+                    for issue in validate_task_envelope(
+                        task_envelope(goals=goals)
+                    )
+                }
+                self.assertIn(expected_code, codes)
+
     def test_unknown_key_intent_and_provenance_fail_closed(self) -> None:
         from control_plane.contracts import validate_task_envelope
 
