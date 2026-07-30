@@ -78,6 +78,10 @@ class CliV2Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["summary"]["tier"], "T2")
         self.assertIn("skill.verified-workflow", payload["summary"]["required"])
+        self.assertEqual(
+            payload["interaction"]["clarification_gate"]["status"],
+            "pending_host_capability",
+        )
 
     def test_route_rejects_serialized_inventory_input(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -99,6 +103,56 @@ class CliV2Tests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unrecognized arguments: --inventory", result.stderr)
+
+    def test_route_has_no_serialized_clarification_or_authority_inputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            task_path = Path(temporary) / "task.json"
+            task_path.write_text(json.dumps(task_envelope()), encoding="utf-8")
+            for flag in (
+                "--clarification-request",
+                "--clarification-resolution",
+                "--assumption",
+                "--irreversible-confirmation",
+                "--authorization",
+            ):
+                with self.subTest(flag=flag):
+                    result = run_cli(
+                        "route",
+                        "--repo",
+                        str(ROOT),
+                        "--task",
+                        str(task_path),
+                        flag,
+                        str(task_path),
+                        "--json",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_serialized_resource_receipt_is_diagnostic_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            decision_path = Path(temporary) / "decision.json"
+            receipt_path = Path(temporary) / "receipt.json"
+            decision_path.write_text("{}\n", encoding="utf-8")
+            receipt_path.write_text("{}\n", encoding="utf-8")
+
+            result = run_cli(
+                "route-verify",
+                "--decision",
+                str(decision_path),
+                "--receipt",
+                str(receipt_path),
+                "--mode",
+                "audit",
+                "--json",
+            )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(payload["authoritative"])
+        self.assertEqual(payload["status"], "diagnostic")
 
     def test_verification_run_rejects_caller_selected_profile_or_command(
         self,
@@ -151,6 +205,15 @@ class CliV2Tests(unittest.TestCase):
         self.assertIn("project_profiles=generic", result.stdout)
         self.assertIn("interaction_recommended=plan_then_goal", result.stdout)
         self.assertIn("interaction_automatic_change=false", result.stdout)
+        self.assertIn("clarification_level=high", result.stdout)
+        self.assertIn(
+            "clarification_status=pending_host_capability", result.stdout
+        )
+        self.assertIn(
+            "clarification_next_action=wait_for_host_capability",
+            result.stdout,
+        )
+        self.assertIn("clarification_ready=false", result.stdout)
 
     def test_actual_registry_auto_selects_security_and_multidomain_guides(
         self,

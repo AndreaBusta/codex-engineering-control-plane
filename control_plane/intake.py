@@ -78,6 +78,7 @@ _MANIFEST_KEYS = frozenset(
         "required_gates",
         "project_profile",
         "interaction",
+        "clarification",
     }
 )
 _INTERACTION_KEYS = frozenset(
@@ -87,6 +88,46 @@ _INTERACTION_KEYS = frozenset(
         "user_action",
         "automatic_change",
         "confidence",
+    }
+)
+_CLARIFICATION_KEYS = frozenset(
+    {"level", "status", "decision_ready", "reason_codes"}
+)
+_CLARIFICATION_LEVELS = frozenset(
+    {"low", "medium", "high", "critical"}
+)
+_CLARIFICATION_STATUSES = frozenset(
+    {
+        "autonomous",
+        "assumption_required",
+        "inspect_repository",
+        "pending_host_capability",
+        "clarification_request_required",
+        "ask_user",
+        "authorization_required",
+        "confirmation_required",
+        "blocked",
+        "resolved",
+    }
+)
+_CLARIFICATION_REASON_CODES = frozenset(
+    {
+        "CLARIFY_LOW_AUTONOMOUS",
+        "CLARIFY_ASSUMPTION_REQUIRED",
+        "CLARIFY_ASSUMPTION_INVALID",
+        "CLARIFY_ASSUMPTION_ACCEPTED",
+        "CLARIFY_DECISION_APPROVAL_REQUIRED",
+        "CLARIFY_DECISION_APPROVED",
+        "CLARIFY_REPOSITORY_REQUIRED",
+        "CLARIFY_REPOSITORY_RESOLVED",
+        "CLARIFY_REPOSITORY_UNRESOLVED",
+        "CLARIFY_RESOLUTION_INVALID",
+        "CLARIFY_RESOLVED",
+        "CLARIFY_AUTHORIZATION_REQUIRED",
+        "CLARIFY_CONFIRMATION_REQUIRED",
+        "CLARIFY_REQUEST_REQUIRED",
+        "CLARIFY_HOST_CAPABILITY_PENDING",
+        "C_REFRAME_REQUIRED",
     }
 )
 _PROFILE_KEYS = frozenset(
@@ -365,6 +406,23 @@ def _parse_compact_manifest(
         view_mode,
         interaction.get("reason_codes"),
     )
+    clarification = manifest.get("clarification")
+    if (
+        not isinstance(clarification, Mapping)
+        or set(clarification) != _CLARIFICATION_KEYS
+        or clarification.get("level") not in _CLARIFICATION_LEVELS
+        or clarification.get("status") not in _CLARIFICATION_STATUSES
+        or not isinstance(clarification.get("decision_ready"), bool)
+        or not isinstance(clarification.get("reason_codes"), list)
+        or not 1 <= len(clarification["reason_codes"]) <= 4
+        or any(
+            reason not in _CLARIFICATION_REASON_CODES
+            for reason in clarification["reason_codes"]
+        )
+    ):
+        raise ValueError(
+            "E_INTAKE_MANIFEST_SCHEMA: clarification metadata is invalid"
+        )
     return manifest
 
 

@@ -140,6 +140,7 @@ class ProjectProfileTests(unittest.TestCase):
         self.assertEqual(profile["confidence"], "bounded_scan_incomplete")
 
     def test_router_loads_android_quality_profile_without_ios_profile(self) -> None:
+        from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
         from control_plane.policy import load_policy
         from control_plane.resource_registry import load_registry
         from control_plane.routing import resolve_route
@@ -190,6 +191,7 @@ class ProjectProfileTests(unittest.TestCase):
                 invocation_id="project-profile-route",
             ),
             mode="audit",
+            host_capability=HOST_ADAPTER_UNAVAILABLE,
         )
 
         self.assertIn("document.profile-android", decision["summary"]["required"])

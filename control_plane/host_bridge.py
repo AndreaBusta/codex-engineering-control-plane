@@ -16,10 +16,11 @@ import subprocess
 import tempfile
 import threading
 import tomllib
-from typing import Callable, Mapping
+from typing import Callable, Iterator, Mapping
 from uuid import uuid4
 
 from control_plane.contracts import (
+    RESOURCE_ID,
     SHA256_DIGEST,
     TASK_EFFECTS,
     contract_digest,
@@ -146,6 +147,28 @@ def _runtime_host_object_registry():
             "capability_nonce",
             "freshness_deadline",
         ),
+        "trusted_route_context": (
+            "task_digest",
+            "route_digest",
+            "inventory_digest",
+            "inventory_observation_id",
+            "registry_digest",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "head",
+            "session_id",
+            "invocation_id",
+            "required_resources",
+            "recommended_resources",
+            "forbidden_resources",
+            "resource_bindings",
+            "authorized_effects",
+            "clarification_status",
+            "context_nonce",
+            "issued_at_monotonic",
+            "freshness_deadline",
+        ),
         "trusted_authorization": (
             "authorization_id",
             "native_event_id",
@@ -257,6 +280,7 @@ def _runtime_host_object_registry():
         ),
     }
     payload_snapshotted_bindings = {
+        "trusted_route_decision": ("decision_digest",),
         "framed_clarification_issue": (
             "payload_digest",
             "provenance",
@@ -311,6 +335,40 @@ def _runtime_host_object_registry():
             "subject_digest",
             "freshness_deadline",
         ),
+        "resource_use_observation": (
+            "payload_digest",
+            "task_digest",
+            "route_digest",
+            "inventory_observation_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "head",
+            "session_id",
+            "invocation_id",
+            "tool_use_id",
+            "context_nonce",
+            "operation_nonce",
+            "_clock",
+            "freshness_deadline",
+        ),
+        "validated_resource_use_observation": (
+            "payload_digest",
+            "task_digest",
+            "route_digest",
+            "inventory_observation_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "head",
+            "session_id",
+            "invocation_id",
+            "tool_use_id",
+            "context_nonce",
+            "operation_nonce",
+            "_clock",
+            "freshness_deadline",
+        ),
     }
     issued: dict[
         int, tuple[object, str, tuple[object, ...] | None]
@@ -318,6 +376,22 @@ def _runtime_host_object_registry():
     registry_lock = threading.RLock()
 
     def snapshot(value: object, kind: str) -> tuple[object, ...] | None:
+        if kind == "validated_inventory":
+            try:
+                return (
+                    contract_digest(value._snapshot),
+                    value.observation_id,
+                    value.invocation_id,
+                    value.task_digest,
+                    value.repository_identity,
+                    value.worktree_identity,
+                    value.registry_digest,
+                    value.snapshot_digest,
+                    value.observed_at_monotonic,
+                    value.freshness_deadline,
+                )
+            except (AttributeError, TypeError, ValueError):
+                return ()
         payload_names = payload_snapshotted_bindings.get(kind)
         if payload_names is not None:
             try:
@@ -741,6 +815,8 @@ class ValidatedInventory:
         "worktree_identity",
         "registry_digest",
         "snapshot_digest",
+        "observed_at_monotonic",
+        "freshness_deadline",
     )
 
     def __new__(cls, *_: object, **__: object) -> "ValidatedInventory":
@@ -753,6 +829,9 @@ class ValidatedInventory:
             self.task_digest != expected_task_digest
             or self.registry_digest != expected_registry_digest
             or self.snapshot_digest != self._snapshot.get("snapshot_digest")
+            or not _runtime_host_object_is_live(
+                self, "validated_inventory"
+            )
         ):
             raise ValueError(
                 "E_INVENTORY_OBSERVATION: validated inventory binding mismatch"
@@ -805,6 +884,216 @@ class HostAdapterCapability:
 
     def __new__(cls, *_: object, **__: object) -> "HostAdapterCapability":
         raise TypeError("HostAdapterCapability is host-bound")
+
+
+class HostAdapterUnavailable:
+    __slots__ = ()
+
+    def __new__(cls, *_: object, **__: object) -> "HostAdapterUnavailable":
+        raise TypeError("HostAdapterUnavailable is a closed singleton")
+
+
+HOST_ADAPTER_UNAVAILABLE = object.__new__(HostAdapterUnavailable)
+
+
+class TrustedRouteDecision(Mapping[str, object]):
+    """Opaque, immutable view of one decision emitted by the router."""
+
+    __slots__ = ("_payload", "decision_digest")
+
+    def __new__(cls, *_: object, **__: object) -> "TrustedRouteDecision":
+        raise TypeError("TrustedRouteDecision is emitted only by the router")
+
+    def __getitem__(self, key: str) -> object:
+        return copy.deepcopy(self._payload[key])
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._payload)
+
+    def __len__(self) -> int:
+        return len(self._payload)
+
+    @property
+    def payload(self) -> dict[str, object]:
+        return copy.deepcopy(self._payload)
+
+    def _payload_for_authority(self) -> dict[str, object]:
+        supplied = self._payload.get("decision_digest")
+        unsigned = {
+            key: value
+            for key, value in self._payload.items()
+            if key not in {"decision_digest", "command"}
+        }
+        if (
+            type(self) is not TrustedRouteDecision
+            or not _runtime_host_object_is_live(
+                self, "trusted_route_decision"
+            )
+            or supplied != self.decision_digest
+            or not isinstance(supplied, str)
+            or SHA256_DIGEST.fullmatch(supplied) is None
+            or supplied != contract_digest(unsigned)
+        ):
+            raise ValueError(
+                "R_UNTRUSTED_ROUTE_DECISION: router-issued decision is required"
+            )
+        return copy.deepcopy(self._payload)
+
+
+def _seal_trusted_route_decision(
+    payload: Mapping[str, object],
+) -> TrustedRouteDecision:
+    """Internal router seam; serialized callers cannot reconstruct the result."""
+
+    copied = copy.deepcopy(dict(payload))
+    supplied = copied.get("decision_digest")
+    unsigned = {
+        key: value
+        for key, value in copied.items()
+        if key not in {"decision_digest", "command"}
+    }
+    if (
+        not isinstance(supplied, str)
+        or SHA256_DIGEST.fullmatch(supplied) is None
+        or supplied != contract_digest(unsigned)
+    ):
+        raise ValueError(
+            "R_ROUTE_DECISION: router attempted to seal an invalid decision"
+        )
+    decision = object.__new__(TrustedRouteDecision)
+    decision._payload = copied
+    decision.decision_digest = supplied
+    _register_runtime_host_object(decision, "trusted_route_decision")
+    return decision
+
+
+def _host_adapter_capability_is_live(value: object) -> bool:
+    return bool(
+        type(value) is HostAdapterCapability
+        and not value._consumed
+        and _runtime_host_object_is_live(value, "host_capability")
+    )
+
+
+class NativeResourceUseEvent:
+    __slots__ = (
+        "_consumed",
+        "event_id",
+        "resource_id",
+        "locator_digest",
+        "operation",
+        "ordinal",
+        "observed_effects",
+        "tool_use_id",
+        "task_digest",
+        "route_digest",
+        "repository_identity",
+        "worktree_identity",
+        "branch",
+        "head",
+        "session_id",
+        "invocation_id",
+        "context_nonce",
+        "observed_at_monotonic",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "NativeResourceUseEvent":
+        raise TypeError("NativeResourceUseEvent is supplied only by the host")
+
+
+class TrustedRouteContext:
+    __slots__ = (
+        "_consumed",
+        "task_digest",
+        "route_digest",
+        "inventory_digest",
+        "inventory_observation_id",
+        "registry_digest",
+        "repository_identity",
+        "worktree_identity",
+        "branch",
+        "head",
+        "session_id",
+        "invocation_id",
+        "required_resources",
+        "recommended_resources",
+        "forbidden_resources",
+        "resource_bindings",
+        "authorized_effects",
+        "clarification_status",
+        "context_nonce",
+        "issued_at_monotonic",
+        "freshness_deadline",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "TrustedRouteContext":
+        raise TypeError("TrustedRouteContext is host-bound")
+
+
+class ResourceUseObservation:
+    __slots__ = (
+        "_consumed",
+        "payload",
+        "payload_digest",
+        "task_digest",
+        "route_digest",
+        "inventory_observation_id",
+        "repository_identity",
+        "worktree_identity",
+        "branch",
+        "head",
+        "session_id",
+        "invocation_id",
+        "tool_use_id",
+        "context_nonce",
+        "operation_nonce",
+        "_clock",
+        "freshness_deadline",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "ResourceUseObservation":
+        raise TypeError("ResourceUseObservation is host-bound")
+
+
+class ValidatedResourceUseObservation(ResourceUseObservation):
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedResourceUseObservation":
+        raise TypeError("ValidatedResourceUseObservation is host-bound")
+
+    def _payload_for_verifier(
+        self, *, expected_route_digest: str
+    ) -> dict[str, object]:
+        try:
+            now = float(self._clock())
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "R_RESOURCE_OBSERVATION_BINDING: clock is invalid"
+            ) from error
+        if not math.isfinite(now):
+            raise ValueError(
+                "R_RESOURCE_OBSERVATION_BINDING: clock is invalid"
+            )
+        if now > self.freshness_deadline:
+            raise ValueError(
+                "R_RESOURCE_OBSERVATION_STALE: observation expired"
+            )
+        if (
+            self._consumed
+            or self.payload.get("route_digest") != expected_route_digest
+            or contract_digest(self.payload) != self.payload_digest
+        ):
+            raise ValueError(
+                "R_RESOURCE_OBSERVATION_REPLAY: observation is consumed or drifted"
+            )
+        if not _consume_runtime_host_object(
+            self, "validated_resource_use_observation"
+        ):
+            raise ValueError(
+                "R_RESOURCE_OBSERVATION_REPLAY: observation is not live"
+            )
+        self._consumed = True
+        return copy.deepcopy(self.payload)
 
 
 class TrustedAuthorization:
@@ -2894,6 +3183,597 @@ def validate_inventory_observation(
     validated.worktree_identity = observation.worktree_identity
     validated.registry_digest = observation.registry_digest
     validated.snapshot_digest = observation.snapshot_digest
+    validated.observed_at_monotonic = observation.observed_at_monotonic
+    validated.freshness_deadline = observation.freshness_deadline
+    _register_runtime_host_object(validated, "validated_inventory")
+    return validated
+
+
+def _validated_route_payload(
+    decision: TrustedRouteDecision,
+) -> dict[str, object]:
+    if type(decision) is not TrustedRouteDecision:
+        raise ValueError(
+            "R_UNTRUSTED_ROUTE_DECISION: router-issued decision is required"
+        )
+    payload = decision._payload_for_authority()
+    required = {
+        "schema_version",
+        "task_id",
+        "mode",
+        "ok",
+        "decision_ready",
+        "summary",
+        "documentation",
+        "interaction",
+        "approval_boundaries",
+        "authorization",
+        "required_gates",
+        "selected_resource_digests",
+        "matched_routes",
+        "facts",
+        "errors",
+        "decision_digest",
+    }
+    supplied = payload.get("decision_digest")
+    facts = payload.get("facts")
+    interaction = payload.get("interaction")
+    if (
+        set(payload).difference(required.union({"command"}))
+        or not required.issubset(payload)
+        or payload.get("schema_version") != 1
+        or not validate_task_id(payload.get("task_id"))
+        or payload.get("mode") not in {"audit", "enforce"}
+        or not isinstance(payload.get("ok"), bool)
+        or not isinstance(payload.get("decision_ready"), bool)
+        or not isinstance(payload.get("summary"), Mapping)
+        or not isinstance(payload.get("documentation"), Mapping)
+        or not isinstance(interaction, Mapping)
+        or not isinstance(
+            interaction.get("clarification_gate"), Mapping
+        )
+        or not isinstance(payload.get("authorization"), Mapping)
+        or not isinstance(
+            payload.get("selected_resource_digests"), Mapping
+        )
+        or not isinstance(facts, Mapping)
+        or set(facts)
+        != {
+            "task_digest",
+            "policy_digest",
+            "registry_digest",
+            "inventory_digest",
+        }
+        or any(
+            not isinstance(value, str)
+            or SHA256_DIGEST.fullmatch(value) is None
+            for value in facts.values()
+        )
+        or not isinstance(supplied, str)
+        or SHA256_DIGEST.fullmatch(supplied) is None
+        or supplied
+        != contract_digest(
+            {
+                key: value
+                for key, value in payload.items()
+                if key not in {"decision_digest", "command"}
+            }
+        )
+    ):
+        raise ValueError("R_ROUTE_CONTEXT: route digest is invalid")
+    return payload
+
+
+def build_trusted_route_context(
+    *,
+    task: Mapping[str, object],
+    decision: TrustedRouteDecision,
+    inventory: ValidatedInventory,
+    expected_repository: Path | str,
+    expected_worktree: Path | str,
+    expected_branch: str,
+    expected_head: str,
+    session_id: str,
+    invocation_id: str,
+    host_capability: HostAdapterCapability,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> TrustedRouteContext:
+    """Bind one route and inventory to a host-issued verification context."""
+
+    try:
+        now = float(clock())
+    except (TypeError, ValueError) as error:
+        raise ValueError("R_ROUTE_CONTEXT: clock is invalid") from error
+    if not math.isfinite(now):
+        raise ValueError("R_ROUTE_CONTEXT: clock is invalid")
+    try:
+        repository = _canonical_directory(
+            expected_repository, code="R_ROUTE_CONTEXT"
+        )
+        worktree = _canonical_directory(
+            expected_worktree, code="R_ROUTE_CONTEXT"
+        )
+    except ValueError as error:
+        raise ValueError(
+            "R_ROUTE_CONTEXT: repository or worktree is invalid"
+        ) from error
+    task_issues = validate_task_envelope(task)
+    task_digest = contract_digest(task)
+    route_payload = _validated_route_payload(decision)
+    route_digest = str(route_payload["decision_digest"])
+    facts = route_payload.get("facts")
+    summary = route_payload.get("summary")
+    interaction = route_payload.get("interaction")
+    if (
+        task_issues
+        or type(inventory) is not ValidatedInventory
+        or not _runtime_host_object_is_live(
+            inventory, "validated_inventory"
+        )
+        or not isinstance(facts, Mapping)
+        or not isinstance(summary, Mapping)
+        or not isinstance(interaction, Mapping)
+        or route_payload.get("task_id") != task.get("task_id")
+        or facts.get("task_digest") != task_digest
+        or facts.get("inventory_digest") != inventory.snapshot_digest
+        or facts.get("registry_digest") != inventory.registry_digest
+        or inventory.task_digest != task_digest
+        or inventory.invocation_id != invocation_id
+        or inventory.repository_identity != str(repository)
+        or inventory.worktree_identity != str(worktree)
+        or now > inventory.freshness_deadline
+        or type(host_capability) is not HostAdapterCapability
+        or not _runtime_host_object_is_live(
+            host_capability, "host_capability"
+        )
+        or host_capability._consumed
+        or host_capability.session_id != session_id
+        or host_capability.invocation_id != invocation_id
+        or now > host_capability.freshness_deadline
+        or not isinstance(expected_branch, str)
+        or not expected_branch
+        or _GIT_OBJECT_ID.fullmatch(expected_head) is None
+        or not validate_task_id(session_id)
+        or not isinstance(invocation_id, str)
+        or not invocation_id
+        or not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not 0 < float(ttl_seconds) <= 300
+    ):
+        raise ValueError(
+            "R_ROUTE_CONTEXT: task, route, inventory, or host binding is invalid"
+        )
+    selected = route_payload.get("selected_resource_digests")
+    required = summary.get("required")
+    recommended = summary.get("recommended")
+    forbidden = summary.get("forbidden")
+    authorization = route_payload.get("authorization")
+    gate = interaction.get("clarification_gate")
+    if (
+        not isinstance(selected, Mapping)
+        or not isinstance(required, list)
+        or not isinstance(recommended, list)
+        or not isinstance(forbidden, list)
+        or not isinstance(authorization, Mapping)
+        or not isinstance(gate, Mapping)
+        or any(
+            not isinstance(identifier, str)
+            for identifier in [*required, *recommended, *forbidden]
+        )
+        or any(
+            not isinstance(identifier, str)
+            or RESOURCE_ID.fullmatch(identifier) is None
+            or not isinstance(digest, str)
+            or SHA256_DIGEST.fullmatch(digest) is None
+            for identifier, digest in selected.items()
+        )
+        or any(identifier not in selected for identifier in required)
+    ):
+        raise ValueError("R_ROUTE_CONTEXT: route resource bindings are invalid")
+    if not _consume_runtime_host_object(
+        host_capability, "host_capability"
+    ):
+        raise ValueError("R_ROUTE_CONTEXT: host capability is not issued")
+    host_capability._consumed = True
+    context = object.__new__(TrustedRouteContext)
+    context._consumed = False
+    context.task_digest = task_digest
+    context.route_digest = route_digest
+    context.inventory_digest = inventory.snapshot_digest
+    context.inventory_observation_id = inventory.observation_id
+    context.registry_digest = inventory.registry_digest
+    context.repository_identity = inventory.repository_identity
+    context.worktree_identity = inventory.worktree_identity
+    context.branch = expected_branch
+    context.head = expected_head
+    context.session_id = session_id
+    context.invocation_id = invocation_id
+    context.required_resources = tuple(required)
+    context.recommended_resources = tuple(recommended)
+    context.forbidden_resources = tuple(forbidden)
+    context.resource_bindings = tuple(
+        sorted((str(key), str(value)) for key, value in selected.items())
+    )
+    context.authorized_effects = tuple(
+        sorted(
+            str(effect)
+            for effect, authorized in authorization.items()
+            if authorized is True
+        )
+    )
+    context.clarification_status = str(gate.get("status"))
+    context.context_nonce = f"route-context-{uuid4().hex}"
+    context.issued_at_monotonic = now
+    context.freshness_deadline = min(
+        now + float(ttl_seconds),
+        float(host_capability.freshness_deadline),
+        float(inventory.freshness_deadline),
+    )
+    _register_runtime_host_object(context, "trusted_route_context")
+    return context
+
+
+def observe_resource_use(
+    *,
+    native_resource_events: object,
+    task_context: TrustedRouteContext,
+    route_decision: TrustedRouteDecision,
+    expected_repository: Path | str,
+    expected_worktree: Path | str,
+    expected_branch: str,
+    expected_head: str,
+    session_id: str,
+    invocation_id: str,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> ResourceUseObservation:
+    """Consume native resource events into one exact, compact observation."""
+
+    try:
+        now = float(clock())
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: clock is invalid"
+        ) from error
+    if not math.isfinite(now):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: clock is invalid"
+        )
+    try:
+        repository = _canonical_directory(
+            expected_repository, code="R_RESOURCE_OBSERVATION_BINDING"
+        )
+        worktree = _canonical_directory(
+            expected_worktree, code="R_RESOURCE_OBSERVATION_BINDING"
+        )
+    except ValueError as error:
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: repository is invalid"
+        ) from error
+    route_payload = _validated_route_payload(route_decision)
+    if (
+        type(task_context) is not TrustedRouteContext
+        or not _runtime_host_object_is_live(
+            task_context, "trusted_route_context"
+        )
+        or task_context._consumed
+        or now > task_context.freshness_deadline
+        or task_context.route_digest
+        != route_payload.get("decision_digest")
+        or task_context.repository_identity != str(repository)
+        or task_context.worktree_identity != str(worktree)
+        or task_context.branch != expected_branch
+        or task_context.head != expected_head
+        or task_context.session_id != session_id
+        or task_context.invocation_id != invocation_id
+        or not isinstance(expected_branch, str)
+        or not expected_branch
+        or _GIT_OBJECT_ID.fullmatch(expected_head) is None
+        or not isinstance(native_resource_events, (tuple, list))
+        or not native_resource_events
+        or not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not 0 < float(ttl_seconds) <= 300
+    ):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: route context is invalid"
+        )
+    selected = dict(task_context.resource_bindings)
+    required = set(task_context.required_resources)
+    recommended = set(task_context.recommended_resources)
+    forbidden = set(task_context.forbidden_resources)
+    entries: list[dict[str, object]] = []
+    observed_effects: set[str] = set()
+    tool_use_ids: set[str] = set()
+    seen_resources: set[str] = set()
+    for expected_ordinal, event in enumerate(native_resource_events):
+        if (
+            type(event) is not NativeResourceUseEvent
+            or not _native_host_object_is_valid(event, "resource_use")
+            or event._consumed
+            or not isinstance(event.event_id, str)
+            or not event.event_id
+            or not isinstance(event.resource_id, str)
+            or event.resource_id not in selected
+            or event.resource_id in forbidden
+            or event.resource_id in seen_resources
+            or event.locator_digest != selected.get(event.resource_id)
+            or event.operation not in {"read", "invoke", "verify", "execute"}
+            or not isinstance(event.ordinal, int)
+            or isinstance(event.ordinal, bool)
+            or event.ordinal != expected_ordinal
+            or not isinstance(event.observed_effects, (tuple, list))
+            or any(effect not in TASK_EFFECTS for effect in event.observed_effects)
+            or not isinstance(event.tool_use_id, str)
+            or not event.tool_use_id
+            or event.task_digest != task_context.task_digest
+            or event.route_digest != task_context.route_digest
+            or event.repository_identity
+            != task_context.repository_identity
+            or event.worktree_identity != task_context.worktree_identity
+            or event.branch != task_context.branch
+            or event.head != task_context.head
+            or event.session_id != task_context.session_id
+            or event.invocation_id != task_context.invocation_id
+            or event.context_nonce != task_context.context_nonce
+            or not isinstance(event.observed_at_monotonic, (int, float))
+            or isinstance(event.observed_at_monotonic, bool)
+            or not math.isfinite(float(event.observed_at_monotonic))
+            or float(event.observed_at_monotonic) > now
+            or float(event.observed_at_monotonic)
+            < task_context.issued_at_monotonic
+            or now - float(event.observed_at_monotonic)
+            > float(ttl_seconds)
+        ):
+            raise ValueError(
+                "R_RESOURCE_OBSERVATION_BINDING: native event is invalid"
+            )
+        seen_resources.add(event.resource_id)
+        observed_effects.update(str(item) for item in event.observed_effects)
+        tool_use_ids.add(event.tool_use_id)
+        entries.append(
+            {
+                "resource_id": event.resource_id,
+                "locator_digest": event.locator_digest,
+                "operation": event.operation,
+                "ordinal": event.ordinal,
+                "effects": sorted(set(event.observed_effects)),
+                "event_digest": contract_digest(
+                    {
+                        "event_id": event.event_id,
+                        "resource_id": event.resource_id,
+                        "locator_digest": event.locator_digest,
+                        "operation": event.operation,
+                        "ordinal": event.ordinal,
+                        "effects": sorted(set(event.observed_effects)),
+                        "tool_use_id": event.tool_use_id,
+                        "task_digest": event.task_digest,
+                        "route_digest": event.route_digest,
+                        "repository_identity": event.repository_identity,
+                        "worktree_identity": event.worktree_identity,
+                        "branch": event.branch,
+                        "head": event.head,
+                        "session_id": event.session_id,
+                        "invocation_id": event.invocation_id,
+                        "context_nonce": event.context_nonce,
+                    }
+                ),
+            }
+        )
+    if (
+        not required.issubset(seen_resources)
+        or not seen_resources.issubset(required.union(recommended))
+        or len(tool_use_ids) != 1
+    ):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_CLOSURE: resource closure is incomplete"
+        )
+    with _CAPABILITY_CONSUMPTION_LOCK:
+        if any(event._consumed for event in native_resource_events):
+            raise ValueError(
+                "R_RESOURCE_OBSERVATION_REPLAY: native event was consumed"
+            )
+        if not _consume_runtime_host_object(
+            task_context, "trusted_route_context"
+        ):
+            raise ValueError(
+                "R_RESOURCE_OBSERVATION_REPLAY: route context was consumed"
+            )
+        for event in native_resource_events:
+            event._consumed = True
+        task_context._consumed = True
+    payload = {
+        "schema_version": 1,
+        "task_digest": task_context.task_digest,
+        "route_digest": task_context.route_digest,
+        "inventory_digest": task_context.inventory_digest,
+        "inventory_observation_id": task_context.inventory_observation_id,
+        "registry_digest": task_context.registry_digest,
+        "required_resources": list(task_context.required_resources),
+        "recommended_resources": list(task_context.recommended_resources),
+        "forbidden_resources": list(task_context.forbidden_resources),
+        "resource_bindings": dict(task_context.resource_bindings),
+        "resource_uses": entries,
+        "observed_effects": sorted(observed_effects),
+        "authorized_effects": list(task_context.authorized_effects),
+        "clarification_status": task_context.clarification_status,
+        "repository_identity": task_context.repository_identity,
+        "worktree_identity": task_context.worktree_identity,
+        "branch": task_context.branch,
+        "head": task_context.head,
+        "session_id": task_context.session_id,
+        "invocation_id": task_context.invocation_id,
+        "context_nonce": task_context.context_nonce,
+    }
+    observation = object.__new__(ResourceUseObservation)
+    observation._consumed = False
+    observation.payload = payload
+    observation.payload_digest = contract_digest(payload)
+    observation.task_digest = task_context.task_digest
+    observation.route_digest = task_context.route_digest
+    observation.inventory_observation_id = (
+        task_context.inventory_observation_id
+    )
+    observation.repository_identity = str(repository)
+    observation.worktree_identity = str(worktree)
+    observation.branch = expected_branch
+    observation.head = expected_head
+    observation.session_id = session_id
+    observation.invocation_id = invocation_id
+    observation.tool_use_id = next(iter(tool_use_ids))
+    observation.context_nonce = task_context.context_nonce
+    observation.operation_nonce = f"resource-use-{uuid4().hex}"
+    observation._clock = clock
+    observation.freshness_deadline = min(
+        now + float(ttl_seconds),
+        float(task_context.freshness_deadline),
+    )
+    _register_runtime_host_object(observation, "resource_use_observation")
+    return observation
+
+
+def validate_resource_use_observation(
+    observation: ResourceUseObservation,
+    *,
+    expected_task_digest: str,
+    expected_route_digest: str,
+    expected_resource_bindings: Mapping[str, str],
+    expected_repository: Path | str,
+    expected_worktree: Path | str,
+    expected_branch: str,
+    expected_head: str,
+    expected_session_id: str,
+    expected_invocation_id: str,
+    clock: Callable[[], float],
+) -> ValidatedResourceUseObservation:
+    """Validate exact bindings once; mappings and prior receipts are inert."""
+
+    try:
+        repository = _canonical_directory(
+            expected_repository, code="R_RESOURCE_OBSERVATION_BINDING"
+        )
+        worktree = _canonical_directory(
+            expected_worktree, code="R_RESOURCE_OBSERVATION_BINDING"
+        )
+    except ValueError as error:
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: repository is invalid"
+        ) from error
+    if type(observation) is not ResourceUseObservation:
+        raise ValueError(
+            "R_UNTRUSTED_RESOURCE_OBSERVATION: host observation is required"
+        )
+    if observation._consumed:
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_REPLAY: observation was consumed"
+        )
+    try:
+        now = float(clock())
+        observation_now = float(observation._clock())
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: clock is invalid"
+        ) from error
+    if not math.isfinite(now) or not math.isfinite(observation_now):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: clock is invalid"
+        )
+    if max(now, observation_now) > observation.freshness_deadline:
+        raise ValueError("R_RESOURCE_OBSERVATION_STALE: observation expired")
+    if (
+        not isinstance(expected_resource_bindings, Mapping)
+        or any(
+            not isinstance(identifier, str)
+            or RESOURCE_ID.fullmatch(identifier) is None
+            or not isinstance(digest, str)
+            or SHA256_DIGEST.fullmatch(digest) is None
+            for identifier, digest in expected_resource_bindings.items()
+        )
+    ):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: expected bindings are invalid"
+        )
+    normalized_bindings = {
+        str(identifier): str(digest)
+        for identifier, digest in expected_resource_bindings.items()
+    }
+    if (
+        not _runtime_host_object_is_live(
+            observation, "resource_use_observation"
+        )
+        or contract_digest(observation.payload) != observation.payload_digest
+        or observation.payload.get("task_digest") != expected_task_digest
+        or observation.payload.get("route_digest") != expected_route_digest
+        or observation.payload.get("resource_bindings") != normalized_bindings
+        or observation.payload.get("inventory_observation_id")
+        != observation.inventory_observation_id
+        or observation.payload.get("repository_identity")
+        != observation.repository_identity
+        or observation.payload.get("worktree_identity")
+        != observation.worktree_identity
+        or observation.payload.get("branch") != observation.branch
+        or observation.payload.get("head") != observation.head
+        or observation.payload.get("session_id") != observation.session_id
+        or observation.payload.get("invocation_id")
+        != observation.invocation_id
+        or observation.payload.get("context_nonce")
+        != observation.context_nonce
+        or observation.repository_identity != str(repository)
+        or observation.worktree_identity != str(worktree)
+        or observation.branch != expected_branch
+        or observation.head != expected_head
+        or observation.session_id != expected_session_id
+        or observation.invocation_id != expected_invocation_id
+    ):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_BINDING: observation binding drifted"
+        )
+    uses = observation.payload.get("resource_uses")
+    required = set(observation.payload.get("required_resources", []))
+    recommended = set(observation.payload.get("recommended_resources", []))
+    forbidden = set(observation.payload.get("forbidden_resources", []))
+    if not isinstance(uses, list):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_CLOSURE: resource uses are invalid"
+        )
+    used_ids = {
+        str(item.get("resource_id"))
+        for item in uses
+        if isinstance(item, Mapping)
+    }
+    if (
+        len(used_ids) != len(uses)
+        or not required.issubset(used_ids)
+        or not used_ids.issubset(required.union(recommended))
+        or used_ids.intersection(forbidden)
+        or any(
+            not isinstance(item, Mapping)
+            or item.get("ordinal") != ordinal
+            or normalized_bindings.get(str(item.get("resource_id")))
+            != item.get("locator_digest")
+            for ordinal, item in enumerate(uses)
+        )
+    ):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_CLOSURE: resource closure drifted"
+        )
+    if not _consume_runtime_host_object(
+        observation, "resource_use_observation"
+    ):
+        raise ValueError(
+            "R_RESOURCE_OBSERVATION_REPLAY: observation is not host-issued"
+        )
+    observation._consumed = True
+    validated = object.__new__(ValidatedResourceUseObservation)
+    validated._consumed = False
+    for name in ResourceUseObservation.__slots__:
+        if name != "_consumed":
+            setattr(validated, name, copy.deepcopy(getattr(observation, name)))
+    validated._clock = observation._clock
+    _register_runtime_host_object(
+        validated, "validated_resource_use_observation"
+    )
     return validated
 
 

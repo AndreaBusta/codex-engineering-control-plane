@@ -48,10 +48,15 @@ from control_plane.resource_registry import (
     validate_registry,
 )
 from control_plane.host_bridge import (
+    HOST_ADAPTER_UNAVAILABLE,
     observe_inventory,
     validate_inventory_observation,
 )
-from control_plane.routing import resolve_route, verify_route
+from control_plane.routing import (
+    compact_route_manifest,
+    diagnose_serialized_route_receipt,
+    resolve_route,
+)
 
 
 def _policy_path(repo: Path, explicit_path: Path | None) -> Path:
@@ -104,9 +109,18 @@ def _load_validated_policy(path: Path) -> tuple[dict[str, Any] | None, dict[str,
 def _render_human(payload: dict[str, Any]) -> str:
     command = str(payload.get("command", "control-plane"))
     diagnostic = (
-        command == "preflight"
-        and payload.get("mode") == "read"
-        and any(not check.get("ok", False) for check in payload.get("checks", []))
+        (
+            command == "preflight"
+            and payload.get("mode") == "read"
+            and any(
+                not check.get("ok", False)
+                for check in payload.get("checks", [])
+            )
+        )
+        or (
+            command == "route-verify"
+            and payload.get("authoritative") is False
+        )
     )
     status = (
         "DIAGNOSTIC"
@@ -157,6 +171,24 @@ def _render_human(payload: dict[str, Any]) -> str:
                 "interaction_automatic_change="
                 f"{str(bool(interaction.get('automatic_change'))).lower()}"
             )
+            clarification = interaction.get("clarification_gate", {})
+            if isinstance(clarification, dict):
+                lines.append(
+                    "clarification_level="
+                    f"{clarification.get('level', 'unknown')}"
+                )
+                lines.append(
+                    "clarification_status="
+                    f"{clarification.get('status', 'unknown')}"
+                )
+                lines.append(
+                    "clarification_next_action="
+                    f"{clarification.get('next_action', '')}"
+                )
+                lines.append(
+                    "clarification_ready="
+                    f"{str(bool(clarification.get('decision_ready'))).lower()}"
+                )
 
     facts = payload.get("facts")
     if isinstance(facts, dict):
@@ -526,7 +558,79 @@ def command_route(arguments: argparse.Namespace) -> int:
             expected_invocation_id=invocation_id,
             clock=time.monotonic,
         )
-        payload = resolve_route(task, policy, registry, inventory, mode=arguments.mode)
+        trusted_decision = resolve_route(
+            task,
+            policy,
+            registry,
+            inventory,
+            mode=arguments.mode,
+            host_capability=HOST_ADAPTER_UNAVAILABLE,
+        )
+        manifest = compact_route_manifest(trusted_decision)
+        payload = dict(trusted_decision)
+        state_dir = worktree_git_dir(root)
+        task_id = str(task["task_id"])
+        task_state_path = (
+            state_dir
+            / "codex-control-plane"
+            / "tasks"
+            / f"{task_id}.json"
+        )
+        lease_path = (
+            state_dir
+            / "codex-control-plane"
+            / "leases"
+            / f"{task_id}.json"
+        )
+        if task_state_path.is_file() and lease_path.is_file():
+            store = TaskStore(state_dir)
+            try:
+                state = store.status(task_id)
+            except ValueError as error:
+                if not str(error).startswith("E_FOREIGN_RUNTIME_STATE:"):
+                    raise
+            else:
+                if lease_path.is_symlink():
+                    raise ValueError(
+                        "M_METRIC_BINDING: active lease path is unsafe"
+                    )
+                lease = _read_json(lease_path)
+                lease_semantic = {
+                    key: value
+                    for key, value in lease.items()
+                    if key != "lease_digest"
+                }
+                if (
+                    state.get("task_digest")
+                    != payload["facts"]["task_digest"]
+                    or lease.get("task_id") != task_id
+                    or lease.get("worktree") != str(root)
+                    or lease.get("session_id") is None
+                    or lease.get("lease_digest")
+                    != contract_digest(lease_semantic)
+                ):
+                    raise ValueError(
+                        "M_METRIC_BINDING: active task does not match route"
+                    )
+                store.record_context_metrics(
+                    task_id,
+                    task_digest=payload["facts"]["task_digest"],
+                    session_id=str(lease["session_id"]),
+                    invocation_id=invocation_id,
+                    subject_digest=payload["decision_digest"],
+                    runtime_metrics={
+                        "router_manifest_bytes": len(
+                            manifest.encode("utf-8")
+                        ),
+                        "context_units_selected": int(
+                            payload["summary"][
+                                "selected_context_units"
+                            ]
+                        ),
+                        "tool_use_id": None,
+                    },
+                    host_metrics=None,
+                )
         payload["command"] = "route"
         return _emit(payload, arguments.json)
     except (RepositoryError, PolicyError, RegistryError, ValueError) as error:
@@ -546,7 +650,7 @@ def command_route(arguments: argparse.Namespace) -> int:
 
 def command_route_verify(arguments: argparse.Namespace) -> int:
     try:
-        payload = verify_route(
+        payload = diagnose_serialized_route_receipt(
             _read_json(arguments.decision),
             _read_json(arguments.receipt),
             mode=arguments.mode,

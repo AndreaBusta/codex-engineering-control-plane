@@ -419,8 +419,11 @@ class IntakeTests(unittest.TestCase):
             mode="audit",
         )
 
-        self.assertTrue(decision["decision_ready"])
-        self.assertEqual(decision["errors"], [])
+        self.assertFalse(decision["decision_ready"])
+        self.assertEqual(
+            {error["code"] for error in decision["errors"]},
+            {"R_CLARIFICATION_PENDING"},
+        )
         self.assertGreater(len(decision["summary"]["required"]), 64)
         manifest = compact_route_manifest(decision)
         self.assertLessEqual(len(manifest.encode("utf-8")), 4096)
@@ -429,7 +432,7 @@ class IntakeTests(unittest.TestCase):
             render_novice_brief(task, manifest),
         )
 
-    def test_surrogateescaped_profile_evidence_fails_with_stable_code(
+    def test_compact_manifest_omits_surrogateescaped_profile_evidence(
         self,
     ) -> None:
         from control_plane.intake import render_novice_brief
@@ -465,13 +468,15 @@ class IntakeTests(unittest.TestCase):
         )
         manifest = compact_route_manifest(decision)
 
-        self.assertTrue(decision["decision_ready"])
+        self.assertFalse(decision["decision_ready"])
         self.assertLessEqual(len(manifest.encode("utf-8")), 4096)
-        with self.assertRaisesRegex(
-            ValueError,
-            "E_INTAKE_MANIFEST_SCHEMA",
-        ):
-            render_novice_brief(task, manifest)
+        self.assertEqual(
+            json.loads(manifest)["project_profile"]["evidence"], []
+        )
+        self.assertIn(
+            "Qué he entendido:",
+            render_novice_brief(task, manifest),
+        )
 
     def test_renderer_rejects_alternate_mappings_unknown_text_and_oversize(
         self,
