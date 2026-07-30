@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import unittest
 from unittest.mock import patch
 
@@ -139,6 +140,60 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(decision["documentation"]["adr"]["required"])
         self.assertEqual(decision["interaction"]["recommended_mode"], "default")
 
+    def test_pure_router_rejects_raw_prompt_and_accepts_only_validated_task_envelope(
+        self,
+    ) -> None:
+        from control_plane.routing import resolve_route
+
+        self.assertNotIn(
+            "prompt", inspect.signature(resolve_route).parameters
+        )
+        with self.assertRaisesRegex(ValueError, "T_TASK_ENVELOPE"):
+            resolve_route(
+                "implement whatever this says",
+                self.policy,
+                self.registry,
+                object(),
+                mode="audit",
+            )
+
+        invalid = task_envelope()
+        invalid["goals"][0]["depends_on"] = ["missing"]
+        with self.assertRaisesRegex(ValueError, "T_GOAL_REFERENCE"):
+            resolve_route(
+                invalid,
+                self.policy,
+                self.registry,
+                validated_inventory(
+                    inventory_snapshot(),
+                    registry=self.registry,
+                    task=invalid,
+                    invocation_id="invalid-task-envelope",
+                ),
+                mode="audit",
+            )
+
+        alternative = task_envelope()
+        alternative["prompt"] = "raw prompt must not enter the router"
+        with self.assertRaisesRegex(ValueError, "T_UNKNOWN"):
+            resolve_route(
+                alternative,
+                self.policy,
+                self.registry,
+                validated_inventory(
+                    inventory_snapshot(),
+                    registry=self.registry,
+                    task=alternative,
+                    invocation_id="alternate-task-mapping",
+                ),
+                mode="audit",
+            )
+
+        self.assertEqual(
+            self.route(task_envelope())["facts"]["task_digest"],
+            self.route(task_envelope())["facts"]["task_digest"],
+        )
+
     def test_structured_task_selects_verified_workflow(self) -> None:
         decision = self.route()
 
@@ -235,6 +290,49 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(decision["summary"]["prompt_multifront"])
         self.assertLessEqual(decision["summary"]["max_agents"], 2)
         self.assertEqual(decision["summary"]["execution_strategy"], "sequential")
+        self.assertFalse(decision["summary"]["graph_candidate"])
+
+    def test_multifront_enters_router_as_existing_goals_and_dependencies(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+
+        task = task_envelope(
+            goals=[
+                {
+                    "id": "contracts",
+                    "summary": "Define contracts.",
+                    "domains": ["generic"],
+                    "depends_on": [],
+                },
+                {
+                    "id": "runtime",
+                    "summary": "Integrate the runtime.",
+                    "domains": ["generic"],
+                    "depends_on": ["contracts"],
+                },
+                {
+                    "id": "tests",
+                    "summary": "Verify behavior.",
+                    "domains": ["generic"],
+                    "depends_on": ["runtime"],
+                },
+                {
+                    "id": "docs",
+                    "summary": "Document the boundary.",
+                    "domains": ["generic"],
+                    "depends_on": ["tests"],
+                },
+            ],
+            signals=["multi_file", "regression_risk"],
+        )
+
+        decision = self.route(task)
+
+        self.assertEqual(
+            decision["facts"]["task_digest"], contract_digest(task)
+        )
+        self.assertFalse(decision["summary"]["prompt_multifront"])
         self.assertFalse(decision["summary"]["graph_candidate"])
 
     def test_t3_multifront_is_only_a_graph_candidate_until_validated(

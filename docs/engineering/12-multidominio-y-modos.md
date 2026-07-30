@@ -58,6 +58,29 @@ Swift, Kotlin, TypeScript, Python, Go u otro stack. Cambian las comprobaciones:
 Un perfil de release solo se activa si el resultado solicitado incluye release.
 TestFlight nunca aparece en un proyecto Android o SaaS por defecto.
 
+## Pre-encuadre veraz
+
+Para una petición vaga, amplia, riesgosa, subespecificada o multifrente, el host
+usa exclusivamente `skill.task-framer`. La skill produce Markdown estructurado;
+el host lo normaliza a `TaskEnvelope` schema 1, ejecuta
+`validate_task_envelope()` y solo entonces llama al resolver puro:
+
+```text
+prompt → task-framer → Markdown → normalización host
+→ TaskEnvelope validado → resolver puro
+```
+
+El prompt crudo y el brief educativo no entran en el resolver ni en receipts.
+Las dependencias multifrente deben referenciar goals existentes, no pueden ser
+auto-dependencias y deben formar un grafo acíclico. Una referencia ausente,
+auto-dependencia o ciclo vuelve al host con `T_GOAL_REFERENCE`,
+`T_GOAL_SELF_DEPENDENCY` o `T_GOAL_CYCLE`; el router no inventa relaciones.
+
+Después de decidir la ruta, `render_novice_brief()` puede explicar el objetivo,
+orden, gates y autorización en hasta 1 KiB. Consume únicamente el JSON canónico
+de `compact_route_manifest()`, es efímero y no cambia task/route digests, tier,
+recursos, efectos, autoridad ni modo.
+
 ## Recomendación de interacción
 
 `RouteDecision.interaction` avisa qué modo conviene:
@@ -80,6 +103,10 @@ persistente. Si el objetivo aún no está claro, se usa `/plan` y después
 
 Goal mode no amplía sandbox, permisos ni autoridad. Commit, push, PR, merge y
 release siguen teniendo límites independientes.
+
+La vista educativa conserva el contrato estable `default` del router, pero lo
+presenta como `normal`; los otros tres nombres coinciden. El alias es cerrado y
+no cambia la decisión ni su digest.
 
 ## Ejemplos
 

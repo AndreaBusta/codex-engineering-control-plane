@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import heapq
 import json
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -302,10 +303,17 @@ def validate_task_envelope(task: Mapping[str, Any]) -> list[ContractIssue]:
             )
         )
     objective = task.get("objective")
+    objective_size: int | None = None
+    if isinstance(objective, str):
+        try:
+            objective_size = len(objective.encode("utf-8"))
+        except UnicodeEncodeError:
+            objective_size = None
     if (
         not isinstance(objective, str)
         or not objective.strip()
-        or len(objective.encode("utf-8")) > 8192
+        or objective_size is None
+        or objective_size > 8192
     ):
         issues.append(
             ContractIssue(
@@ -334,6 +342,8 @@ def validate_task_envelope(task: Mapping[str, Any]) -> list[ContractIssue]:
             ContractIssue("T_GOAL", "goals", "At least one goal is required.")
         )
     else:
+        dependency_graph: dict[str, tuple[str, ...]] = {}
+        dependency_paths: dict[tuple[str, str], str] = {}
         for index, goal in enumerate(goals):
             if not isinstance(goal, Mapping) or set(goal) != GOAL_KEYS:
                 issues.append(
@@ -366,6 +376,81 @@ def validate_task_envelope(task: Mapping[str, Any]) -> list[ContractIssue]:
                         "Goal identifiers, summary, domains, or dependencies are invalid.",
                     )
                 )
+                continue
+            goal_id = str(goal["id"])
+            if goal_id in dependency_graph:
+                issues.append(
+                    ContractIssue(
+                        "T_GOAL",
+                        f"goals.{index}.id",
+                        "Goal identifiers must be unique.",
+                    )
+                )
+                continue
+            dependency_graph[goal_id] = tuple(str(item) for item in dependencies)
+            for dependency_index, dependency in enumerate(dependencies):
+                dependency_paths[(goal_id, str(dependency))] = (
+                    f"goals.{index}.depends_on.{dependency_index}"
+                )
+
+        goal_ids = set(dependency_graph)
+        graph: dict[str, set[str]] = {
+            goal_id: set() for goal_id in dependency_graph
+        }
+        for goal_id, dependencies in dependency_graph.items():
+            for dependency in dependencies:
+                path = dependency_paths[(goal_id, dependency)]
+                if dependency == goal_id:
+                    issues.append(
+                        ContractIssue(
+                            "T_GOAL_SELF_DEPENDENCY",
+                            path,
+                            "A goal cannot depend on itself.",
+                        )
+                    )
+                elif dependency not in goal_ids:
+                    issues.append(
+                        ContractIssue(
+                            "T_GOAL_REFERENCE",
+                            path,
+                            "Goal dependency must reference an existing goal.",
+                        )
+                    )
+                else:
+                    graph[goal_id].add(dependency)
+
+        dependents: dict[str, set[str]] = {
+            goal_id: set() for goal_id in graph
+        }
+        remaining_dependencies = {
+            goal_id: len(dependencies)
+            for goal_id, dependencies in graph.items()
+        }
+        for goal_id, dependencies in graph.items():
+            for dependency in dependencies:
+                dependents[dependency].add(goal_id)
+        ready = [
+            goal_id
+            for goal_id, count in remaining_dependencies.items()
+            if count == 0
+        ]
+        heapq.heapify(ready)
+        visited = 0
+        while ready:
+            goal_id = heapq.heappop(ready)
+            visited += 1
+            for dependent in sorted(dependents[goal_id]):
+                remaining_dependencies[dependent] -= 1
+                if remaining_dependencies[dependent] == 0:
+                    heapq.heappush(ready, dependent)
+        if visited != len(graph):
+            issues.append(
+                ContractIssue(
+                    "T_GOAL_CYCLE",
+                    "goals",
+                    "Goal dependency graph must be acyclic.",
+                )
+            )
 
     domains = task.get("domains")
     if not isinstance(domains, list) or not domains or not all(

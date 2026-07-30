@@ -9,7 +9,29 @@ from pathlib import Path
 from tests.router_test_support import VALID_POLICY, VALID_REGISTRY
 
 
+ROOT = Path(__file__).parents[1]
+
+
 class ResourceRegistryTests(unittest.TestCase):
+    def test_task_framer_registry_declares_its_real_markdown_output(
+        self,
+    ) -> None:
+        from control_plane.resource_registry import load_registry
+
+        registry = load_registry(
+            ROOT / ".codex" / "resource-registry.toml"
+        )
+        resource = next(
+            item
+            for item in registry["resources"]
+            if item["id"] == "skill.task-framer"
+        )
+
+        self.assertEqual(resource["locator"], "user-skill://task-framer")
+        self.assertEqual(resource["capabilities"], ["task.framing"])
+        self.assertTrue(resource["canonical"])
+        self.assertEqual(resource["output_contract"], "markdown")
+
     def test_valid_registry_loads_and_validates(self) -> None:
         from control_plane.resource_registry import load_registry, validate_registry
 

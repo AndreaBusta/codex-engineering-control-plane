@@ -13,6 +13,14 @@ ROOT = Path(__file__).parents[1]
 
 
 class LockfileTests(unittest.TestCase):
+    def test_source_and_distributed_runtime_include_intake_module(
+        self,
+    ) -> None:
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("intake.py", RUNTIME_MODULES)
+        self.assertTrue((ROOT / "control_plane" / "intake.py").is_file())
+
     def _source_runtime_fixture(self, root: Path) -> None:
         shutil.copytree(ROOT / ".codex", root / ".codex")
         shutil.copytree(ROOT / "control_plane", root / "control_plane")

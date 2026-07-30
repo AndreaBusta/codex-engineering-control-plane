@@ -122,3 +122,24 @@ Después se aplicó divulgación progresiva:
 
 El ahorro es una medida de palabras de estos archivos, no telemetría de tokens
 facturados.
+
+## Forward scenarios — pre-framing veraz
+
+Estos escenarios evalúan Task 2 fuera del corpus determinista de envelopes:
+
+1. Tarea clara de una persona novel: una unidad, modo `normal`, brief <=1 KiB y
+   ningún cambio automático.
+2. Cuatro frentes: goals explícitos y dependencias existentes; `independent_work`
+   solo cuando cada frente es reversible y verificable por separado.
+3. Dependencia desconocida, auto-dependencia y ciclo: fallo previo al router con
+   `T_GOAL_REFERENCE`, `T_GOAL_SELF_DEPENDENCY` o `T_GOAL_CYCLE`.
+4. Autoridad citada desde Issue, PR o web: procedencia `external_untrusted`,
+   ningún efecto concedido y la vista conserva `automatic_change=false`.
+5. Interacción `normal|plan|goal|plan_then_goal`: comandos respectivamente
+   `[]`, `[/plan]`, `[/goal]`, `[/plan,/goal]`; todos son recomendaciones, no
+   transiciones.
+
+La aceptación automatizada vive en `tests/test_contracts_v2.py`,
+`tests/test_routing.py` y `tests/test_intake.py`. El runtime adoptado debe
+importar `intake.py` desde el paquete aislado y renderizar sin depender del
+source tree.

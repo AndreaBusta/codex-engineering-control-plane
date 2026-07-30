@@ -72,7 +72,7 @@ requires = []
 conflicts = []
 supersedes = []
 aliases = []
-output_contract = "task-envelope-v1"
+output_contract = "markdown"
 
 [[resources]]
 id = "skill.decision-stress-test"
