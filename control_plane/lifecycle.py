@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,6 +35,7 @@ from control_plane.contracts import (
 from control_plane.scopes import normalize_scope, scope_owns, scopes_overlap
 from control_plane.host_bridge import (
     GoverningRuntimeObservation,
+    HostContextMetrics,
     ValidatedCandidateWorktreeObservation,
     ValidatedGitHubObservation,
     ValidatedGoverningBaseWorktreeObservation,
@@ -1676,6 +1679,636 @@ class TaskStore:
 
     def status(self, task_id: str) -> dict[str, Any]:
         return self._read(task_id)
+
+    def _metrics_dir(self, task_id: str) -> Path:
+        if not validate_task_id(task_id):
+            raise ValueError("E_TASK_ID: unsafe task ID")
+        return (
+            self.state_dir
+            / "codex-control-plane"
+            / "metrics"
+            / task_id
+        )
+
+    def record_context_metrics(
+        self,
+        task_id: str,
+        *,
+        task_digest: str,
+        session_id: str,
+        invocation_id: str,
+        subject_digest: str,
+        runtime_metrics: Mapping[str, Any],
+        host_metrics: object | None,
+    ) -> dict[str, Any]:
+        """Record deduplicated runtime and host metrics under the task flock."""
+
+        runtime_metric_keys = {
+            "router_manifest_bytes",
+            "novice_brief_bytes",
+            "hook_output_bytes",
+            "context_units_selected",
+        }
+        runtime_context_keys = {"tool_use_id"}
+        if (
+            not validate_task_id(task_id)
+            or SHA256_DIGEST.fullmatch(task_digest) is None
+            or not validate_task_id(session_id)
+            or not validate_task_id(invocation_id)
+            or SHA256_DIGEST.fullmatch(subject_digest) is None
+            or not isinstance(runtime_metrics, Mapping)
+            or not set(runtime_metrics).issubset(
+                runtime_metric_keys | runtime_context_keys
+            )
+        ):
+            raise ValueError("M_METRIC_BINDING: metric identity is invalid")
+        for key in runtime_metric_keys.intersection(runtime_metrics):
+            value = runtime_metrics[key]
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError("M_METRIC_BINDING: runtime metric is invalid")
+        for key in runtime_context_keys.intersection(runtime_metrics):
+            value = runtime_metrics[key]
+            if value is not None and not validate_task_id(value):
+                raise ValueError("M_METRIC_BINDING: runtime identity is invalid")
+
+        host_payload: dict[str, Any] | None = None
+        host_metrics_consumed = False
+        if host_metrics is not None:
+            if (
+                type(host_metrics) is not HostContextMetrics
+                or host_metrics.task_digest != task_digest
+                or host_metrics.session_id != session_id
+                or host_metrics.invocation_id != invocation_id
+                or host_metrics.subject_digest != subject_digest
+                or contract_digest(host_metrics.payload)
+                != host_metrics.payload_digest
+            ):
+                raise ValueError(
+                    "M_METRIC_UNTRUSTED_CHANNEL: host metrics wrapper required"
+                )
+            host_metrics_consumed = host_metrics._consumed
+            if (
+                not host_metrics_consumed
+                and not _runtime_host_object_is_live(
+                    host_metrics, "host_context_metrics"
+                )
+            ):
+                raise ValueError(
+                    "M_METRIC_UNTRUSTED_CHANNEL: host metrics wrapper required"
+                )
+            host_payload = copy.deepcopy(host_metrics.payload)
+
+        def metric_observation(
+            *, source: str, metric: str, tool_use_id: object, value: object
+        ) -> dict[str, Any]:
+            observation = {
+                "schema_version": 1,
+                "source": source,
+                "metric": metric,
+                "task_digest": task_digest,
+                "session_id": session_id,
+                "invocation_id": invocation_id,
+                "subject_digest": subject_digest,
+                "tool_use_id": tool_use_id,
+                "value": copy.deepcopy(value),
+            }
+            observation["observation_digest"] = contract_digest(
+                observation
+            )
+            return observation
+
+        runtime_observations = [
+            metric_observation(
+                source="runtime",
+                metric=metric,
+                tool_use_id=runtime_metrics.get("tool_use_id"),
+                value=runtime_metrics[metric],
+            )
+            for metric in sorted(
+                runtime_metric_keys.intersection(runtime_metrics)
+            )
+        ]
+        host_observations: list[dict[str, Any]] = []
+        if host_payload is not None:
+            host_values = {
+                "required_resource_bytes": host_payload[
+                    "required_resource_bytes"
+                ],
+                "recommended_resource_bytes": host_payload[
+                    "recommended_resource_bytes"
+                ],
+                "worker_id": host_payload["worker_id"],
+                "retry_count": host_payload["retry_count"],
+                "worker_interval": {
+                    "started_at_monotonic": host_payload[
+                        "started_at_monotonic"
+                    ],
+                    "ended_at_monotonic": host_payload[
+                        "ended_at_monotonic"
+                    ],
+                },
+            }
+            rows: list[dict[str, Any]] = []
+            for metric, value in sorted(host_values.items()):
+                row = {
+                    "source": "host",
+                    "metric": metric,
+                    "task_digest": task_digest,
+                    "session_id": session_id,
+                    "invocation_id": invocation_id,
+                    "subject_digest": subject_digest,
+                    "tool_use_id": host_payload["tool_use_id"],
+                    "value": copy.deepcopy(value),
+                }
+                row["row_digest"] = contract_digest(row)
+                rows.append(row)
+            host_observations = [
+                metric_observation(
+                    source="host",
+                    metric="host_metric_batch",
+                    tool_use_id=host_payload["tool_use_id"],
+                    value={
+                        "rows": rows,
+                        "rows_digest": contract_digest(rows),
+                    },
+                )
+            ]
+
+        with _task_guard(self.state_dir, task_id):
+            directory = self._metrics_dir(task_id)
+            directory.mkdir(parents=True, exist_ok=True)
+            observations = runtime_observations + host_observations
+            prepared: list[tuple[dict[str, Any], Path, bool]] = []
+            for observation in observations:
+                identity = contract_digest(
+                    {
+                        "source": observation["source"],
+                        "invocation_id": invocation_id,
+                        "tool_use_id": observation["tool_use_id"],
+                        "metric": observation["metric"],
+                        "subject_digest": observation["subject_digest"],
+                    }
+                ).removeprefix("sha256:")
+                path = directory / f"{observation['source']}-{identity}.json"
+                exists_identically = False
+                if path.exists():
+                    if path.is_symlink():
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric path is unsafe"
+                        )
+                    try:
+                        existing = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as error:
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric record is invalid"
+                        ) from error
+                    if existing != observation:
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: observation identity changed"
+                        )
+                    exists_identically = True
+                prepared.append((observation, path, exists_identically))
+            if host_metrics is not None:
+                prepared_host = [
+                    exists_identically
+                    for observation, _, exists_identically in prepared
+                    if observation["source"] == "host"
+                ]
+                host_already_recorded = bool(prepared_host) and all(
+                    prepared_host
+                )
+                if host_metrics_consumed and not host_already_recorded:
+                    raise ValueError(
+                        "M_METRIC_UNTRUSTED_CHANNEL: host metrics were consumed"
+                    )
+            for observation, path, exists_identically in prepared:
+                if not exists_identically:
+                    _atomic_json(path, observation)
+            if (
+                host_metrics is not None
+                and not host_metrics_consumed
+            ):
+                if not _consume_runtime_host_object(
+                    host_metrics, "host_context_metrics"
+                ):
+                    raise ValueError(
+                        "M_METRIC_UNTRUSTED_CHANNEL: host metrics were consumed"
+                    )
+                host_metrics._consumed = True
+        return self.context_metrics(task_id)
+
+    def context_metrics(self, task_id: str) -> dict[str, Any]:
+        """Aggregate unique metric observations independently of arrival order."""
+
+        observation_keys = {
+            "schema_version",
+            "source",
+            "metric",
+            "task_digest",
+            "session_id",
+            "invocation_id",
+            "subject_digest",
+            "tool_use_id",
+            "value",
+            "observation_digest",
+        }
+        runtime_metric_keys = {
+            "router_manifest_bytes",
+            "novice_brief_bytes",
+            "hook_output_bytes",
+            "context_units_selected",
+        }
+        host_metric_keys = {
+            "required_resource_bytes",
+            "recommended_resource_bytes",
+            "worker_id",
+            "retry_count",
+            "worker_interval",
+        }
+        host_row_keys = {
+            "source",
+            "metric",
+            "task_digest",
+            "session_id",
+            "invocation_id",
+            "subject_digest",
+            "tool_use_id",
+            "value",
+            "row_digest",
+        }
+
+        def valid_observation(observation: Mapping[str, Any]) -> bool:
+            if (
+                set(observation) != observation_keys
+                or observation.get("schema_version") != 1
+                or SHA256_DIGEST.fullmatch(
+                    str(observation.get("task_digest"))
+                )
+                is None
+                or not validate_task_id(observation.get("session_id"))
+                or not validate_task_id(observation.get("invocation_id"))
+                or SHA256_DIGEST.fullmatch(
+                    str(observation.get("subject_digest"))
+                )
+                is None
+                or (
+                    observation.get("tool_use_id") is not None
+                    and not validate_task_id(
+                        observation.get("tool_use_id")
+                    )
+                )
+            ):
+                return False
+            source = observation.get("source")
+            metric = observation.get("metric")
+            value = observation.get("value")
+            if source == "runtime":
+                return bool(
+                    metric in runtime_metric_keys
+                    and isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                )
+            if (
+                source != "host"
+                or metric != "host_metric_batch"
+                or not isinstance(value, Mapping)
+                or set(value) != {"rows", "rows_digest"}
+                or not isinstance(value.get("rows"), list)
+                or len(value["rows"]) != len(host_metric_keys)
+                or value.get("rows_digest")
+                != contract_digest(value["rows"])
+            ):
+                return False
+            seen_metrics: set[str] = set()
+            for row in value["rows"]:
+                if not isinstance(row, Mapping) or set(row) != host_row_keys:
+                    return False
+                semantic_row = {
+                    key: item
+                    for key, item in row.items()
+                    if key != "row_digest"
+                }
+                row_metric = row.get("metric")
+                row_value = row.get("value")
+                if (
+                    row.get("row_digest") != contract_digest(semantic_row)
+                    or row.get("source") != "host"
+                    or row_metric not in host_metric_keys
+                    or row_metric in seen_metrics
+                    or row.get("task_digest")
+                    != observation.get("task_digest")
+                    or row.get("session_id")
+                    != observation.get("session_id")
+                    or row.get("invocation_id")
+                    != observation.get("invocation_id")
+                    or row.get("subject_digest")
+                    != observation.get("subject_digest")
+                    or row.get("tool_use_id")
+                    != observation.get("tool_use_id")
+                ):
+                    return False
+                seen_metrics.add(str(row_metric))
+                if row_metric in {
+                    "required_resource_bytes",
+                    "recommended_resource_bytes",
+                }:
+                    if not (
+                        row_value is None
+                        or (
+                            isinstance(row_value, int)
+                            and not isinstance(row_value, bool)
+                            and row_value >= 0
+                        )
+                    ):
+                        return False
+                elif row_metric == "worker_id":
+                    if not validate_task_id(row_value):
+                        return False
+                elif row_metric == "retry_count":
+                    if not (
+                        isinstance(row_value, int)
+                        and not isinstance(row_value, bool)
+                        and row_value >= 0
+                    ):
+                        return False
+                elif not (
+                    isinstance(row_value, Mapping)
+                    and set(row_value)
+                    == {
+                        "started_at_monotonic",
+                        "ended_at_monotonic",
+                    }
+                    and isinstance(
+                        row_value.get("started_at_monotonic"),
+                        (int, float),
+                    )
+                    and not isinstance(
+                        row_value.get("started_at_monotonic"), bool
+                    )
+                    and math.isfinite(
+                        float(row_value["started_at_monotonic"])
+                    )
+                    and float(row_value["started_at_monotonic"]) >= 0
+                    and isinstance(
+                        row_value.get("ended_at_monotonic"),
+                        (int, float),
+                    )
+                    and not isinstance(
+                        row_value.get("ended_at_monotonic"), bool
+                    )
+                    and math.isfinite(
+                        float(row_value["ended_at_monotonic"])
+                    )
+                    and float(row_value["ended_at_monotonic"])
+                    >= float(row_value["started_at_monotonic"])
+                ):
+                    return False
+            return seen_metrics == host_metric_keys
+
+        with _task_guard(self.state_dir, task_id):
+            directory = self._metrics_dir(task_id)
+            observations: list[dict[str, Any]] = []
+            if directory.exists():
+                if directory.is_symlink():
+                    raise ValueError(
+                        "M_METRIC_REPLAY_CONFLICT: metric directory is unsafe"
+                    )
+                paths = sorted(directory.glob("*.json"))
+                if len(paths) > 10000:
+                    raise ValueError(
+                        "M_METRIC_REPLAY_CONFLICT: metric record cap exceeded"
+                    )
+                for path in paths:
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric record is unsafe"
+                        )
+                    try:
+                        observation = json.loads(
+                            path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, json.JSONDecodeError) as error:
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric record is invalid"
+                        ) from error
+                    semantic = {
+                        key: value
+                        for key, value in observation.items()
+                        if key != "observation_digest"
+                    }
+                    if observation.get("observation_digest") != contract_digest(
+                        semantic
+                    ):
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric digest mismatch"
+                        )
+                    if not valid_observation(observation):
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric schema mismatch"
+                        )
+                    observations.append(observation)
+
+        runtime = [
+            item for item in observations if item.get("source") == "runtime"
+        ]
+        host: list[dict[str, Any]] = []
+        for item in observations:
+            if item.get("source") != "host":
+                continue
+            for row in item["value"]["rows"]:
+                host.append(
+                    {
+                        **item,
+                        "metric": row["metric"],
+                        "value": row["value"],
+                    }
+                )
+
+        def metric_values(
+            source: list[dict[str, Any]], metric: str
+        ) -> list[object]:
+            return [
+                item.get("value")
+                for item in source
+                if item.get("metric") == metric
+            ]
+
+        def numeric_values(
+            source: list[dict[str, Any]], metric: str
+        ) -> list[int]:
+            return [
+                int(value)
+                for value in metric_values(source, metric)
+                if isinstance(value, int) and not isinstance(value, bool)
+            ]
+
+        def metric_values_by_invocation(
+            source: list[dict[str, Any]], metric: str
+        ) -> list[object]:
+            grouped: dict[str, object] = {}
+            for item in source:
+                if item.get("metric") != metric:
+                    continue
+                invocation = str(item.get("invocation_id"))
+                value = item.get("value")
+                if invocation in grouped and grouped[invocation] != value:
+                    raise ValueError(
+                        "M_METRIC_REPLAY_CONFLICT: "
+                        "per-invocation metric changed across tools"
+                    )
+                grouped[invocation] = value
+            return [grouped[key] for key in sorted(grouped)]
+
+        def numeric_values_by_invocation(
+            source: list[dict[str, Any]], metric: str
+        ) -> list[int]:
+            return [
+                int(value)
+                for value in metric_values_by_invocation(source, metric)
+                if isinstance(value, int) and not isinstance(value, bool)
+            ]
+
+        def total_and_max(metric: str) -> tuple[int, int]:
+            collected = numeric_values(runtime, metric)
+            return sum(collected), max(collected, default=0)
+
+        router_total, router_max = total_and_max("router_manifest_bytes")
+        brief_total, brief_max = total_and_max("novice_brief_bytes")
+        hook_total, hook_max = total_and_max("hook_output_bytes")
+        units = numeric_values_by_invocation(
+            runtime, "context_units_selected"
+        )
+        units_total, units_max = sum(units), max(units, default=0)
+        required = numeric_values(host, "required_resource_bytes")
+        recommended = numeric_values(
+            host, "recommended_resource_bytes"
+        )
+        workers = {
+            str(value)
+            for value in metric_values(host, "worker_id")
+            if validate_task_id(value)
+        }
+        retries = numeric_values_by_invocation(host, "retry_count")
+        intervals = [
+            (
+                float(value["started_at_monotonic"]),
+                float(value["ended_at_monotonic"]),
+            )
+            for value in metric_values_by_invocation(
+                host, "worker_interval"
+            )
+            if isinstance(value, Mapping)
+            and isinstance(
+                value.get("started_at_monotonic"), (int, float)
+            )
+            and not isinstance(value.get("started_at_monotonic"), bool)
+            and isinstance(
+                value.get("ended_at_monotonic"), (int, float)
+            )
+            and not isinstance(value.get("ended_at_monotonic"), bool)
+            and float(value["ended_at_monotonic"])
+            >= float(value["started_at_monotonic"])
+        ]
+        runtime_identities = {
+            (str(item.get("invocation_id")), item.get("tool_use_id"))
+            for item in runtime
+        }
+        host_identities = {
+            (str(item.get("invocation_id")), item.get("tool_use_id"))
+            for item in host
+        }
+        host_invocations = {
+            invocation_id for invocation_id, _ in host_identities
+        }
+        required_host_metrics = {
+            "required_resource_bytes",
+            "recommended_resource_bytes",
+            "worker_id",
+            "retry_count",
+            "worker_interval",
+        }
+        host_complete = bool(runtime_identities) and (
+            runtime_identities == host_identities
+            and all(
+                sum(
+                    1
+                    for item in host
+                    if (
+                        str(item.get("invocation_id")),
+                        item.get("tool_use_id"),
+                    )
+                    == identity
+                    and item.get("metric") == metric
+                )
+                == 1
+                for identity in host_identities
+                for metric in required_host_metrics
+            )
+            and len(required) == len(host_identities)
+            and len(recommended) == len(host_identities)
+            and len(metric_values_by_invocation(host, "worker_id"))
+            == len(host_invocations)
+            and len(retries) == len(host_invocations)
+            and len(intervals) == len(host_invocations)
+        )
+        invocations = {
+            str(item.get("invocation_id")) for item in observations
+        }
+        hook_invocations = {
+            str(item["tool_use_id"])
+            for item in observations
+            if item.get("tool_use_id") is not None
+        }
+        return {
+            "schema_version": 1,
+            "task_id": task_id,
+            "metrics_status": "complete" if host_complete else "partial",
+            "router_manifest_bytes_total": router_total,
+            "router_manifest_bytes_max": router_max,
+            "novice_brief_bytes_total": brief_total,
+            "novice_brief_bytes_max": brief_max,
+            "hook_output_bytes_total": hook_total,
+            "hook_output_bytes_max": hook_max,
+            "required_resource_bytes_total": (
+                sum(required) if host_complete else None
+            ),
+            "required_resource_bytes_max": (
+                max(required, default=0) if host_complete else None
+            ),
+            "recommended_resource_bytes_total": (
+                sum(recommended) if host_complete else None
+            ),
+            "recommended_resource_bytes_max": (
+                max(recommended, default=0) if host_complete else None
+            ),
+            "invocation_count_unique": len(invocations),
+            "hook_invocation_count_unique": len(hook_invocations),
+            "context_units_selected_total": units_total,
+            "context_units_selected_max": units_max,
+            "workers_unique": len(workers) if host_complete else None,
+            "retry_count_total": sum(retries) if host_complete else None,
+            "worker_time_ms_total": (
+                round(sum(end - start for start, end in intervals) * 1000)
+                if host_complete
+                else None
+            ),
+            "task_elapsed_ms": (
+                round(
+                    (
+                        max(end for _, end in intervals)
+                        - min(start for start, _ in intervals)
+                    )
+                    * 1000
+                )
+                if host_complete and intervals
+                else None
+            ),
+        }
 
     def transition(
         self,

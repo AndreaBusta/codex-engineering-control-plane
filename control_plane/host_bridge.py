@@ -6,10 +6,12 @@ from dataclasses import dataclass
 import copy
 from hashlib import sha256
 import json
+import math
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
 import re
+import stat
 import subprocess
 import tempfile
 import threading
@@ -54,6 +56,7 @@ _GITHUB_PULL_REQUEST_HTTPS_URL = re.compile(
 _FEATURE_PUSH_CLAIM_LOCK = threading.Lock()
 _FEATURE_PUSH_OPERATIONS: dict[int, object] = {}
 _PR_MUTATION_CLAIM_LOCK = threading.Lock()
+_CAPABILITY_CONSUMPTION_LOCK = threading.Lock()
 
 
 def _native_host_adapter_unavailable(_: object, __: str) -> bool:
@@ -76,6 +79,9 @@ def _native_remote_executor_unavailable(
 _native_host_remote_executor: Callable[
     [str, tuple[str, ...], int], tuple[int, bytes]
 ] = _native_remote_executor_unavailable
+_clarification_repository_inspector_validator: Callable[[object], bool] = (
+    lambda _: False
+)
 
 
 def _execute_native_remote(
@@ -132,6 +138,60 @@ def _runtime_host_object_registry():
         "context_digest",
     )
     snapshotted_bindings = {
+        "host_capability": (
+            "_clock",
+            "event_id",
+            "session_id",
+            "invocation_id",
+            "capability_nonce",
+            "freshness_deadline",
+        ),
+        "trusted_authorization": (
+            "authorization_id",
+            "native_event_id",
+            "task_digest",
+            "session_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "expected_head",
+            "subject_digest",
+            "scope_paths",
+            "effect",
+            "operation_nonce",
+            "invocation_id",
+            "issued_at_monotonic",
+            "expires_at_monotonic",
+            "freshness_deadline",
+        ),
+        "clarification_repository_observation": (
+            "observation_id",
+            "task_digest",
+            "session_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "head",
+            "question_digest",
+            "invocation_id",
+            "status",
+            "evidence_digest",
+            "freshness_deadline",
+        ),
+        "validated_clarification_repository_observation": (
+            "observation_id",
+            "task_digest",
+            "session_id",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "head",
+            "question_digest",
+            "invocation_id",
+            "status",
+            "evidence_digest",
+            "freshness_deadline",
+        ),
         "verification_supplemental_evidence": (
             "observation_id",
             "kind",
@@ -196,12 +256,77 @@ def _runtime_host_object_registry():
             "freshness_deadline",
         ),
     }
+    payload_snapshotted_bindings = {
+        "framed_clarification_issue": (
+            "payload_digest",
+            "provenance",
+            "task_digest",
+            "session_id",
+            "invocation_id",
+        ),
+        "framed_clarification_prompt_view": (
+            "payload_digest",
+            "presentation_digest",
+            "issue_id",
+            "task_digest",
+            "session_id",
+            "question_digest",
+            "invocation_id",
+            "freshness_deadline",
+        ),
+        "validated_clarification_request": (
+            "request_digest",
+            "task_digest",
+            "session_id",
+            "invocation_id",
+            "provenance",
+        ),
+        "validated_assumption": ("provenance",),
+        "trusted_interaction": (
+            "request_digest",
+            "task_digest",
+            "session_id",
+            "invocation_id",
+            "freshness_deadline",
+        ),
+        "trusted_irreversible_confirmation": (
+            "payload_digest",
+            "authorization_id",
+            "operation_nonce",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "expected_head",
+            "subject_digest",
+            "invocation_id",
+            "issued_at_monotonic",
+            "expires_at_monotonic",
+            "freshness_deadline",
+        ),
+        "host_context_metrics": (
+            "payload_digest",
+            "task_digest",
+            "session_id",
+            "invocation_id",
+            "subject_digest",
+            "freshness_deadline",
+        ),
+    }
     issued: dict[
         int, tuple[object, str, tuple[object, ...] | None]
     ] = {}
     registry_lock = threading.RLock()
 
     def snapshot(value: object, kind: str) -> tuple[object, ...] | None:
+        payload_names = payload_snapshotted_bindings.get(kind)
+        if payload_names is not None:
+            try:
+                return (
+                    contract_digest(value.payload),
+                    *(getattr(value, name) for name in payload_names),
+                )
+            except (AttributeError, TypeError, ValueError):
+                return ()
         if kind in {
             "pr_mutation_request",
             "pr_mutation_unknown_request",
@@ -698,11 +823,161 @@ class TrustedAuthorization:
         "effect",
         "operation_nonce",
         "invocation_id",
+        "issued_at_monotonic",
+        "expires_at_monotonic",
         "freshness_deadline",
     )
 
     def __new__(cls, *_: object, **__: object) -> "TrustedAuthorization":
         raise TypeError("TrustedAuthorization is host-bound")
+
+
+class FramedClarificationIssue:
+    __slots__ = (
+        "_consumed",
+        "payload",
+        "payload_digest",
+        "provenance",
+        "task_digest",
+        "session_id",
+        "invocation_id",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "FramedClarificationIssue":
+        raise TypeError("FramedClarificationIssue is host-bound")
+
+
+class FramedClarificationPromptView:
+    __slots__ = (
+        "_consumed",
+        "payload",
+        "payload_digest",
+        "presentation_digest",
+        "issue_id",
+        "task_digest",
+        "session_id",
+        "question_digest",
+        "invocation_id",
+        "freshness_deadline",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "FramedClarificationPromptView":
+        raise TypeError("FramedClarificationPromptView is host-bound")
+
+
+class ClarificationRepositoryObservation:
+    __slots__ = (
+        "_consumed",
+        "observation_id",
+        "task_digest",
+        "session_id",
+        "repository_identity",
+        "worktree_identity",
+        "branch",
+        "head",
+        "question_digest",
+        "invocation_id",
+        "status",
+        "evidence_digest",
+        "freshness_deadline",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ClarificationRepositoryObservation":
+        raise TypeError("ClarificationRepositoryObservation is host-bound")
+
+
+class ValidatedClarificationRepositoryObservation(
+    ClarificationRepositoryObservation
+):
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedClarificationRepositoryObservation":
+        raise TypeError(
+            "ValidatedClarificationRepositoryObservation is host-bound"
+        )
+
+
+class ValidatedClarificationRequest:
+    __slots__ = (
+        "_consumed",
+        "payload",
+        "request_digest",
+        "task_digest",
+        "session_id",
+        "invocation_id",
+        "provenance",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedClarificationRequest":
+        raise TypeError("ValidatedClarificationRequest is host-bound")
+
+
+class ValidatedAssumption:
+    __slots__ = ("payload", "provenance")
+
+    def __new__(cls, *_: object, **__: object) -> "ValidatedAssumption":
+        raise TypeError("ValidatedAssumption is host-bound")
+
+
+class TrustedInteraction:
+    __slots__ = (
+        "_consumed",
+        "payload",
+        "request_digest",
+        "task_digest",
+        "session_id",
+        "invocation_id",
+        "freshness_deadline",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "TrustedInteraction":
+        raise TypeError("TrustedInteraction is host-bound")
+
+
+class TrustedIrreversibleConfirmation:
+    __slots__ = (
+        "_consumed",
+        "payload",
+        "payload_digest",
+        "authorization_id",
+        "operation_nonce",
+        "repository_identity",
+        "worktree_identity",
+        "branch",
+        "expected_head",
+        "subject_digest",
+        "invocation_id",
+        "issued_at_monotonic",
+        "expires_at_monotonic",
+        "freshness_deadline",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "TrustedIrreversibleConfirmation":
+        raise TypeError("TrustedIrreversibleConfirmation is host-bound")
+
+
+class HostContextMetrics:
+    __slots__ = (
+        "_consumed",
+        "payload",
+        "payload_digest",
+        "task_digest",
+        "session_id",
+        "invocation_id",
+        "subject_digest",
+        "freshness_deadline",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "HostContextMetrics":
+        raise TypeError("HostContextMetrics is host-bound")
 
 
 class TrustedLeaseRecoveryAuthorization:
@@ -1384,6 +1659,73 @@ class ConsumedAuthorization:
     operation_nonce: str
 
 
+@dataclass(frozen=True)
+class ConsumedEffectCapabilities:
+    authorization_id: str
+    confirmation_id: str
+    task_digest: str
+    effect: str
+    operation_nonce: str
+
+
+def _claim_capability_consumption(
+    *,
+    worktree: Path,
+    authorization_id: str,
+    operation_nonce: str,
+    confirmation_id: str | None,
+) -> Path:
+    git_dir = _git_dir_for_worktree(worktree)
+    directory = (
+        git_dir / "codex-control-plane" / "capability-consumption"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    identity = contract_digest(
+        {
+            "authorization_id": authorization_id,
+            "operation_nonce": operation_nonce,
+        }
+    ).removeprefix("sha256:")
+    path = directory / f"{identity}.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "authorization_id": authorization_id,
+            "confirmation_id": confirmation_id,
+            "operation_nonce": operation_nonce,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8") + b"\n"
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as error:
+        raise ValueError(
+            "Z_REPLAY: capability operation was already consumed"
+        ) from error
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def attest_host_adapter_capability(
     native_session_event: object,
     *,
@@ -1423,6 +1765,569 @@ def attest_host_adapter_capability(
     capability.freshness_deadline = now + float(ttl_seconds)
     _register_runtime_host_object(capability, "host_capability")
     return capability
+
+
+def _assert_live_clarification_capability(
+    capability: object,
+    *,
+    task_digest: str,
+    session_id: str,
+    invocation_id: str,
+) -> HostAdapterCapability:
+    if (
+        type(capability) is not HostAdapterCapability
+        or not _runtime_host_object_is_live(capability, "host_capability")
+        or capability._consumed
+        or float(capability._clock()) > capability.freshness_deadline
+        or capability.session_id != session_id
+        or capability.invocation_id != invocation_id
+        or SHA256_DIGEST.fullmatch(task_digest) is None
+        or not validate_task_id(session_id)
+        or not validate_task_id(invocation_id)
+    ):
+        raise ValueError(
+            "C_UNTRUSTED_REQUEST: live host capability binding is required"
+        )
+    return capability
+
+
+def frame_clarification_issue(
+    issue_draft: Mapping[str, object],
+    *,
+    task_digest: str,
+    session_id: str,
+    invocation_id: str,
+    host_capability: object,
+    native_user_event: object | None = None,
+) -> FramedClarificationIssue:
+    """Frame one closed issue while deriving provenance outside its payload."""
+
+    from control_plane.clarification import validate_clarification_issue_draft
+
+    _assert_live_clarification_capability(
+        host_capability,
+        task_digest=task_digest,
+        session_id=session_id,
+        invocation_id=invocation_id,
+    )
+    issues = validate_clarification_issue_draft(issue_draft)
+    if issues:
+        raise ValueError(f"{issues[0].code}: invalid clarification issue")
+    provenance = "model_inference"
+    if native_user_event is not None:
+        if (
+            type(native_user_event) is not NativeUserInteractionEvent
+            or not _native_host_object_is_valid(
+                native_user_event, "user_interaction"
+            )
+            or native_user_event._consumed
+            or native_user_event.session_id != session_id
+            or native_user_event.invocation_id != invocation_id
+            or native_user_event.task_digest != task_digest
+            or native_user_event.subject_digest
+            != issue_draft.get("question_digest")
+        ):
+            raise ValueError(
+                "C_UNTRUSTED_ISSUE: native user issue binding is invalid"
+            )
+        native_user_event._consumed = True
+        provenance = "user_explicit"
+    framed = object.__new__(FramedClarificationIssue)
+    framed._consumed = False
+    framed.payload = copy.deepcopy(dict(issue_draft))
+    framed.payload_digest = contract_digest(framed.payload)
+    framed.provenance = provenance
+    framed.task_digest = task_digest
+    framed.session_id = session_id
+    framed.invocation_id = invocation_id
+    _register_runtime_host_object(framed, "framed_clarification_issue")
+    return framed
+
+
+def frame_clarification_prompt_view(
+    draft: Mapping[str, object],
+    *,
+    issue: object,
+    task_digest: str,
+    session_id: str,
+    invocation_id: str,
+    host_capability: object,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> FramedClarificationPromptView:
+    """Sanitize and bind one display-only prompt view for the current callback."""
+
+    from control_plane.clarification import (
+        _request_id,
+        validate_clarification_prompt_view_draft,
+    )
+
+    _assert_live_clarification_capability(
+        host_capability,
+        task_digest=task_digest,
+        session_id=session_id,
+        invocation_id=invocation_id,
+    )
+    if (
+        type(issue) is not FramedClarificationIssue
+        or not _runtime_host_object_is_live(
+            issue, "framed_clarification_issue"
+        )
+        or issue._consumed
+        or issue.task_digest != task_digest
+        or issue.session_id != session_id
+        or issue.invocation_id != invocation_id
+        or contract_digest(issue.payload) != issue.payload_digest
+    ):
+        raise ValueError("C_UNTRUSTED_ISSUE: framed issue is required")
+    issues = validate_clarification_prompt_view_draft(
+        draft, issue=issue.payload
+    )
+    if issues:
+        raise ValueError(f"{issues[0].code}: invalid prompt view")
+    if (
+        not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not 0 < float(ttl_seconds) <= 300
+    ):
+        raise ValueError("C_PRESENTATION_UNAVAILABLE: invalid prompt TTL")
+    payload = {
+        "schema_version": 1,
+        "request_id": _request_id(
+            task_digest=task_digest,
+            session_id=session_id,
+            issue_id=str(issue.payload["issue_id"]),
+            question_digest=str(issue.payload["question_digest"]),
+        ),
+        "question_text": str(draft["question_text"]),
+        "options": copy.deepcopy(draft["options"]),
+        "recommended_option_id": str(draft["recommended_option_id"]),
+        "consequence_text": str(draft["consequence_text"]),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    if len(encoded) > 1024:
+        raise ValueError(
+            "C_PRESENTATION_UNAVAILABLE: prompt view exceeds 1 KiB"
+        )
+    framed = object.__new__(FramedClarificationPromptView)
+    framed._consumed = False
+    framed.payload = payload
+    framed.payload_digest = contract_digest(payload)
+    framed.presentation_digest = framed.payload_digest
+    framed.issue_id = str(issue.payload["issue_id"])
+    framed.task_digest = task_digest
+    framed.session_id = session_id
+    framed.question_digest = str(issue.payload["question_digest"])
+    framed.invocation_id = invocation_id
+    framed.freshness_deadline = float(clock()) + float(ttl_seconds)
+    _register_runtime_host_object(
+        framed, "framed_clarification_prompt_view"
+    )
+    return framed
+
+
+def observe_clarification_repository(
+    *,
+    task_digest: str,
+    session_id: str,
+    repository_identity: Path | str,
+    worktree_identity: Path | str,
+    branch: str,
+    head: str,
+    question_digest: str,
+    invocation_id: str,
+    inspector: object,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> ClarificationRepositoryObservation:
+    """Run the host-selected, bounded, no-egress repository inspector."""
+
+    from control_plane.clarification import RepositoryEvidenceFacts
+
+    repository = _canonical_directory(
+        repository_identity, code="C_REPOSITORY_OBSERVATION_UNTRUSTED"
+    )
+    worktree = _canonical_directory(
+        worktree_identity, code="C_REPOSITORY_OBSERVATION_UNTRUSTED"
+    )
+    if (
+        not _clarification_repository_inspector_validator(inspector)
+        or SHA256_DIGEST.fullmatch(task_digest) is None
+        or SHA256_DIGEST.fullmatch(question_digest) is None
+        or not validate_task_id(session_id)
+        or not validate_task_id(invocation_id)
+        or not isinstance(branch, str)
+        or not branch
+        or _GIT_OBJECT_ID.fullmatch(head) is None
+        or not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not 0 < float(ttl_seconds) <= 300
+    ):
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_UNTRUSTED: inspector binding is invalid"
+        )
+    try:
+        facts = inspector.inspect(
+            canonical_root=repository,
+            question_digest=question_digest,
+            max_files=32,
+            max_bytes=65536,
+        )
+    except Exception as error:
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_UNTRUSTED: inspector failed"
+        ) from error
+    if (
+        type(facts) is not RepositoryEvidenceFacts
+        or facts.status not in {"resolved", "unresolved", "conflicting"}
+        or not isinstance(facts.evidence_items, tuple)
+        or not facts.evidence_items
+        or len(facts.evidence_items) > 32
+    ):
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_UNTRUSTED: inspector output is invalid"
+        )
+    total_bytes = 0
+    evidence_items: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for item in facts.evidence_items:
+        if not isinstance(item, str) or not item or item in seen_paths:
+            raise ValueError(
+                "C_REPOSITORY_OBSERVATION_UNTRUSTED: evidence path is invalid"
+            )
+        try:
+            candidate = (repository / item).resolve(strict=True)
+            candidate.relative_to(repository)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError(
+                "C_REPOSITORY_OBSERVATION_UNTRUSTED: evidence escaped root"
+            ) from error
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(candidate, flags)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise ValueError(
+                        "C_REPOSITORY_OBSERVATION_UNTRUSTED: "
+                        "evidence must be a regular file"
+                    )
+                remaining = 65536 - total_bytes
+                chunks: list[bytes] = []
+                bytes_left = remaining + 1
+                while bytes_left:
+                    chunk = os.read(descriptor, min(bytes_left, 65536))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    bytes_left -= len(chunk)
+                content = b"".join(chunks)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            raise ValueError(
+                "C_REPOSITORY_OBSERVATION_UNTRUSTED: evidence file is unsafe"
+            ) from error
+        if len(content) > remaining:
+            raise ValueError(
+                "C_REPOSITORY_OBSERVATION_UNTRUSTED: evidence exceeded limit"
+            )
+        total_bytes += len(content)
+        seen_paths.add(item)
+        evidence_items.append(
+            {
+                "path": item,
+                "content_digest": f"sha256:{sha256(content).hexdigest()}",
+            }
+        )
+    evidence_digest = contract_digest(
+        {
+            "status": facts.status,
+            "evidence_items": sorted(
+                evidence_items, key=lambda evidence: evidence["path"]
+            ),
+            "question_digest": question_digest,
+        }
+    )
+    observation = object.__new__(ClarificationRepositoryObservation)
+    observation._consumed = False
+    observation.observation_id = f"clarification-repository-{uuid4().hex}"
+    observation.task_digest = task_digest
+    observation.session_id = session_id
+    observation.repository_identity = str(repository)
+    observation.worktree_identity = str(worktree)
+    observation.branch = branch
+    observation.head = head
+    observation.question_digest = question_digest
+    observation.invocation_id = invocation_id
+    observation.status = facts.status
+    observation.evidence_digest = evidence_digest
+    observation.freshness_deadline = float(clock()) + float(ttl_seconds)
+    _register_runtime_host_object(
+        observation, "clarification_repository_observation"
+    )
+    return observation
+
+
+def validate_clarification_repository_observation(
+    observation: object,
+    *,
+    expected_task_digest: str,
+    expected_session_id: str,
+    expected_repository_identity: Path | str,
+    expected_worktree_identity: Path | str,
+    expected_branch: str,
+    expected_head: str,
+    expected_question_digest: str,
+    expected_invocation_id: str,
+    clock: Callable[[], float],
+) -> ValidatedClarificationRepositoryObservation:
+    """Consume a fresh repository observation and return its opaque validation."""
+
+    if type(observation) is not ClarificationRepositoryObservation:
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_UNTRUSTED: host observation required"
+        )
+    if observation._consumed:
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_REPLAY: observation was consumed"
+        )
+    if not _runtime_host_object_is_live(
+        observation, "clarification_repository_observation"
+    ):
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_UNTRUSTED: host observation required"
+        )
+    if float(clock()) > observation.freshness_deadline:
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_STALE: observation expired"
+        )
+    repository = _canonical_directory(
+        expected_repository_identity, code="C_REPOSITORY_OBSERVATION_BINDING"
+    )
+    worktree = _canonical_directory(
+        expected_worktree_identity, code="C_REPOSITORY_OBSERVATION_BINDING"
+    )
+    if (
+        observation.task_digest != expected_task_digest
+        or observation.session_id != expected_session_id
+        or observation.repository_identity != str(repository)
+        or observation.worktree_identity != str(worktree)
+        or observation.branch != expected_branch
+        or observation.head != expected_head
+        or observation.question_digest != expected_question_digest
+        or observation.invocation_id != expected_invocation_id
+    ):
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_BINDING: observation binding mismatch"
+        )
+    if not _consume_runtime_host_object(
+        observation, "clarification_repository_observation"
+    ):
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_REPLAY: observation was consumed"
+        )
+    observation._consumed = True
+    validated = object.__new__(ValidatedClarificationRepositoryObservation)
+    for name in ClarificationRepositoryObservation.__slots__:
+        setattr(validated, name, getattr(observation, name))
+    validated._consumed = False
+    _register_runtime_host_object(
+        validated, "validated_clarification_repository_observation"
+    )
+    return validated
+
+
+def frame_irreversible_confirmation(
+    confirmation_request: Mapping[str, object],
+    *,
+    native_user_event: object,
+    host_capability: object,
+    repository_identity: Path | str,
+    worktree_identity: Path | str,
+    branch: str,
+    expected_head: str,
+    subject_digest: str,
+    authorization_id: str,
+    operation_nonce: str,
+    invocation_id: str,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> TrustedIrreversibleConfirmation:
+    """Wrap one exact irreversible consequence without granting authority."""
+
+    from control_plane.clarification import _CONFIRMATION_KEYS
+
+    task_digest = confirmation_request.get("task_digest")
+    session_id = confirmation_request.get("session_id")
+    if not isinstance(task_digest, str) or not isinstance(session_id, str):
+        raise ValueError("I_SCHEMA: invalid confirmation request")
+    _assert_live_clarification_capability(
+        host_capability,
+        task_digest=task_digest,
+        session_id=session_id,
+        invocation_id=invocation_id,
+    )
+    repository = _canonical_directory(
+        repository_identity, code="I_UNTRUSTED_CHANNEL"
+    )
+    worktree = _canonical_directory(
+        worktree_identity, code="I_UNTRUSTED_CHANNEL"
+    )
+    scope_paths = confirmation_request.get("scope_paths")
+    normalized = (
+        tuple(normalize_scope(item) for item in scope_paths)
+        if isinstance(scope_paths, list)
+        else ()
+    )
+    if (
+        set(confirmation_request) != _CONFIRMATION_KEYS
+        or confirmation_request.get("schema_version") != 1
+        or not validate_task_id(confirmation_request.get("confirmation_id"))
+        or SHA256_DIGEST.fullmatch(
+            str(confirmation_request.get("request_digest"))
+        )
+        is None
+        or SHA256_DIGEST.fullmatch(task_digest) is None
+        or not validate_task_id(session_id)
+        or any(item is None for item in normalized)
+        or not normalized
+        or len(set(normalized)) != len(normalized)
+        or confirmation_request.get("effect") not in TASK_EFFECTS
+        or SHA256_DIGEST.fullmatch(
+            str(confirmation_request.get("consequence_digest"))
+        )
+        is None
+        or type(native_user_event) is not NativeUserInteractionEvent
+        or not _native_host_object_is_valid(
+            native_user_event, "user_interaction"
+        )
+        or native_user_event._consumed
+        or native_user_event.session_id != session_id
+        or native_user_event.invocation_id != invocation_id
+        or native_user_event.task_digest != task_digest
+        or native_user_event.subject_digest != subject_digest
+        or _GIT_OBJECT_ID.fullmatch(expected_head) is None
+        or not validate_task_id(authorization_id)
+        or not validate_task_id(operation_nonce)
+        or not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not 0 < float(ttl_seconds) <= 300
+    ):
+        raise ValueError("I_UNTRUSTED_CHANNEL: confirmation binding is invalid")
+    if not _consume_runtime_host_object(
+        host_capability, "host_capability"
+    ):
+        raise ValueError("I_UNTRUSTED_CHANNEL: host capability is not issued")
+    host_capability._consumed = True
+    native_user_event._consumed = True
+    payload = copy.deepcopy(dict(confirmation_request))
+    payload["scope_paths"] = [str(item) for item in normalized]
+    confirmation = object.__new__(TrustedIrreversibleConfirmation)
+    confirmation._consumed = False
+    confirmation.payload = payload
+    confirmation.payload_digest = contract_digest(payload)
+    confirmation.authorization_id = authorization_id
+    confirmation.operation_nonce = operation_nonce
+    confirmation.repository_identity = str(repository)
+    confirmation.worktree_identity = str(worktree)
+    confirmation.branch = branch
+    confirmation.expected_head = expected_head
+    confirmation.subject_digest = subject_digest
+    confirmation.invocation_id = invocation_id
+    confirmation.issued_at_monotonic = float(clock())
+    confirmation.expires_at_monotonic = (
+        confirmation.issued_at_monotonic + float(ttl_seconds)
+    )
+    confirmation.freshness_deadline = confirmation.expires_at_monotonic
+    _register_runtime_host_object(
+        confirmation, "trusted_irreversible_confirmation"
+    )
+    return confirmation
+
+
+def frame_host_context_metrics(
+    *,
+    task_digest: str,
+    session_id: str,
+    invocation_id: str,
+    subject_digest: str,
+    required_resource_bytes: int | None,
+    recommended_resource_bytes: int | None,
+    worker_id: str,
+    retry_count: int,
+    started_at_monotonic: float,
+    ended_at_monotonic: float,
+    tool_use_id: str | None,
+    host_capability: object,
+) -> HostContextMetrics:
+    """Frame host-only resource, worker, retry and timing measurements."""
+
+    _assert_live_clarification_capability(
+        host_capability,
+        task_digest=task_digest,
+        session_id=session_id,
+        invocation_id=invocation_id,
+    )
+    numeric_bytes = (required_resource_bytes, recommended_resource_bytes)
+    if (
+        SHA256_DIGEST.fullmatch(subject_digest) is None
+        or any(
+            value is not None
+            and (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            )
+            for value in numeric_bytes
+        )
+        or not validate_task_id(worker_id)
+        or not isinstance(retry_count, int)
+        or isinstance(retry_count, bool)
+        or retry_count < 0
+        or not isinstance(started_at_monotonic, (int, float))
+        or isinstance(started_at_monotonic, bool)
+        or not isinstance(ended_at_monotonic, (int, float))
+        or isinstance(ended_at_monotonic, bool)
+        or not math.isfinite(float(started_at_monotonic))
+        or not math.isfinite(float(ended_at_monotonic))
+        or float(started_at_monotonic) < 0
+        or float(ended_at_monotonic) < float(started_at_monotonic)
+        or (tool_use_id is not None and not validate_task_id(tool_use_id))
+    ):
+        raise ValueError("M_METRIC_BINDING: host metrics are invalid")
+    if not _consume_runtime_host_object(
+        host_capability, "host_capability"
+    ):
+        raise ValueError(
+            "M_METRIC_UNTRUSTED_CHANNEL: host capability is not issued"
+        )
+    host_capability._consumed = True
+    payload = {
+        "required_resource_bytes": required_resource_bytes,
+        "recommended_resource_bytes": recommended_resource_bytes,
+        "worker_id": worker_id,
+        "retry_count": retry_count,
+        "started_at_monotonic": float(started_at_monotonic),
+        "ended_at_monotonic": float(ended_at_monotonic),
+        "tool_use_id": tool_use_id,
+    }
+    metrics = object.__new__(HostContextMetrics)
+    metrics._consumed = False
+    metrics.payload = payload
+    metrics.payload_digest = contract_digest(payload)
+    metrics.task_digest = task_digest
+    metrics.session_id = session_id
+    metrics.invocation_id = invocation_id
+    metrics.subject_digest = subject_digest
+    metrics.freshness_deadline = host_capability.freshness_deadline
+    _register_runtime_host_object(metrics, "host_context_metrics")
+    return metrics
 
 
 def frame_effect_authorization(
@@ -1516,7 +2421,9 @@ def frame_effect_authorization(
     framed.effect = effect
     framed.operation_nonce = operation_nonce
     framed.invocation_id = invocation_id
-    framed.freshness_deadline = now + float(ttl_seconds)
+    framed.issued_at_monotonic = now
+    framed.expires_at_monotonic = now + float(ttl_seconds)
+    framed.freshness_deadline = framed.expires_at_monotonic
     _register_runtime_host_object(framed, "trusted_authorization")
     return framed
 
@@ -1579,39 +2486,149 @@ def consume_authorization(
         expected_worktree_identity, code="E_AUTH_UNTRUSTED_CHANNEL"
     )
     normalized = tuple(normalize_scope(item) for item in expected_scope_paths)
-    if authorization._consumed:
-        raise ValueError("E_AUTH_REPLAY: authorization was already consumed")
-    if (
-        type(authorization) is not TrustedAuthorization
-        or not _runtime_host_object_is_live(
+    with _CAPABILITY_CONSUMPTION_LOCK:
+        if authorization._consumed:
+            raise ValueError("E_AUTH_REPLAY: authorization was already consumed")
+        if (
+            type(authorization) is not TrustedAuthorization
+            or not _runtime_host_object_is_live(
+                authorization, "trusted_authorization"
+            )
+            or float(clock()) > authorization.freshness_deadline
+            or authorization.task_digest != expected_task_digest
+            or authorization.session_id != expected_session_id
+            or authorization.repository_identity != str(repository)
+            or authorization.worktree_identity != str(worktree)
+            or authorization.branch != expected_branch
+            or authorization.expected_head != expected_head
+            or authorization.subject_digest != expected_subject_digest
+            or any(item is None for item in normalized)
+            or authorization.scope_paths
+            != tuple(str(item) for item in normalized)
+            or authorization.effect != expected_effect
+            or authorization.operation_nonce != expected_operation_nonce
+            or authorization.invocation_id != expected_invocation_id
+        ):
+            raise ValueError(
+                "E_AUTH_UNTRUSTED_CHANNEL: authorization binding is invalid or stale"
+            )
+        _claim_capability_consumption(
+            worktree=worktree,
+            authorization_id=authorization.authorization_id,
+            operation_nonce=authorization.operation_nonce,
+            confirmation_id=None,
+        )
+        if not _consume_runtime_host_object(
             authorization, "trusted_authorization"
-        )
-        or float(clock()) > authorization.freshness_deadline
-        or authorization.task_digest != expected_task_digest
-        or authorization.session_id != expected_session_id
-        or authorization.repository_identity != str(repository)
-        or authorization.worktree_identity != str(worktree)
-        or authorization.branch != expected_branch
-        or authorization.expected_head != expected_head
-        or authorization.subject_digest != expected_subject_digest
-        or any(item is None for item in normalized)
-        or authorization.scope_paths != tuple(str(item) for item in normalized)
-        or authorization.effect != expected_effect
-        or authorization.operation_nonce != expected_operation_nonce
-        or authorization.invocation_id != expected_invocation_id
-    ):
-        raise ValueError(
-            "E_AUTH_UNTRUSTED_CHANNEL: authorization binding is invalid or stale"
-        )
-    if not _consume_runtime_host_object(
-        authorization, "trusted_authorization"
-    ):
-        raise ValueError(
-            "E_AUTH_UNTRUSTED_CHANNEL: authorization is not host-issued"
-        )
-    authorization._consumed = True
+        ):
+            raise ValueError(
+                "E_AUTH_UNTRUSTED_CHANNEL: authorization is not host-issued"
+            )
+        authorization._consumed = True
     return ConsumedAuthorization(
         authorization_id=authorization.authorization_id,
+        task_digest=authorization.task_digest,
+        effect=authorization.effect,
+        operation_nonce=authorization.operation_nonce,
+    )
+
+
+def consume_effect_capabilities(
+    authorization: object,
+    confirmation: object,
+    *,
+    expected_task_digest: str,
+    expected_session_id: str,
+    expected_repository_identity: Path | str,
+    expected_worktree_identity: Path | str,
+    expected_branch: str,
+    expected_head: str,
+    expected_subject_digest: str,
+    expected_scope_paths: tuple[str, ...],
+    expected_effect: str,
+    expected_consequence_digest: str,
+    expected_operation_nonce: str,
+    expected_invocation_id: str,
+    clock: Callable[[], float],
+) -> ConsumedEffectCapabilities:
+    """Validate and consume authorization plus confirmation as one operation."""
+
+    from control_plane.clarification import (
+        validate_authorization,
+        validate_irreversible_confirmation,
+    )
+
+    repository = _canonical_directory(
+        expected_repository_identity, code="Z_BINDING"
+    )
+    worktree = _canonical_directory(
+        expected_worktree_identity, code="Z_BINDING"
+    )
+    with _CAPABILITY_CONSUMPTION_LOCK:
+        authorization_issues = validate_authorization(
+            authorization,
+            task_digest=expected_task_digest,
+            session_id=expected_session_id,
+            repository_identity=repository,
+            worktree_identity=worktree,
+            branch=expected_branch,
+            expected_head=expected_head,
+            subject_digest=expected_subject_digest,
+            scope_paths=expected_scope_paths,
+            effect=expected_effect,
+            operation_nonce=expected_operation_nonce,
+            invocation_id=expected_invocation_id,
+            now_monotonic=float(clock()),
+        )
+        if authorization_issues:
+            raise ValueError(
+                f"{authorization_issues[0].code}: "
+                f"{authorization_issues[0].message}"
+            )
+        confirmation_issues = validate_irreversible_confirmation(
+            confirmation,
+            request_digest=expected_subject_digest,
+            task_digest=expected_task_digest,
+            session_id=expected_session_id,
+            repository_identity=repository,
+            worktree_identity=worktree,
+            branch=expected_branch,
+            expected_head=expected_head,
+            subject_digest=expected_subject_digest,
+            scope_paths=expected_scope_paths,
+            effect=expected_effect,
+            expected_consequence_digest=expected_consequence_digest,
+            authorization_id=authorization.authorization_id,
+            operation_nonce=expected_operation_nonce,
+            invocation_id=expected_invocation_id,
+            now_monotonic=float(clock()),
+        )
+        if confirmation_issues:
+            raise ValueError(
+                f"{confirmation_issues[0].code}: "
+                f"{confirmation_issues[0].message}"
+            )
+        _claim_capability_consumption(
+            worktree=worktree,
+            authorization_id=authorization.authorization_id,
+            operation_nonce=expected_operation_nonce,
+            confirmation_id=str(
+                confirmation.payload["confirmation_id"]
+            ),
+        )
+        if not _consume_runtime_host_object(
+            authorization, "trusted_authorization"
+        ) or not _consume_runtime_host_object(
+            confirmation, "trusted_irreversible_confirmation"
+        ):
+            raise ValueError(
+                "Z_REPLAY: effect capabilities were already consumed"
+            )
+        authorization._consumed = True
+        confirmation._consumed = True
+    return ConsumedEffectCapabilities(
+        authorization_id=authorization.authorization_id,
+        confirmation_id=str(confirmation.payload["confirmation_id"]),
         task_digest=authorization.task_digest,
         effect=authorization.effect,
         operation_nonce=authorization.operation_nonce,

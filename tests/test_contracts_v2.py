@@ -117,44 +117,59 @@ class ContractTestsV2(unittest.TestCase):
         self.assertEqual(contract_digest(first), contract_digest(second))
         self.assertNotEqual(contract_digest(first), contract_digest(changed))
 
-    def test_authorization_grant_is_separate_task_bound_and_scope_bound(
+    def test_authorization_request_is_inert_task_bound_and_scope_bound(
         self,
     ) -> None:
         from control_plane.contracts import (
             contract_digest,
-            validate_authorization_grant,
+            safe_scope_path,
+            validate_authorization_request,
         )
 
         task = task_envelope()
         digest = contract_digest(task)
-        grant = {
+        request = {
             "schema_version": 1,
             "grant_id": "grant-001",
             "task_digest": digest,
             "session_id": "session-001",
             "allowed_effects": ["commit"],
             "scope_paths": task["scope_paths"],
-            "issuer": "trusted_host",
         }
 
+        self.assertTrue(safe_scope_path("control_plane/"))
+        self.assertFalse(safe_scope_path("../outside"))
         self.assertEqual(
-            validate_authorization_grant(
-                grant,
+            validate_authorization_request(
+                request,
                 task_digest=digest,
                 scope_paths=task["scope_paths"],
             ),
             [],
         )
-        grant["task_digest"] = "sha256:" + ("0" * 64)
+        request["issuer"] = "trusted_host"
+        self.assertIn(
+            "Z_SCHEMA",
+            {
+                issue.code
+                for issue in validate_authorization_request(
+                    request,
+                    task_digest=digest,
+                    scope_paths=task["scope_paths"],
+                )
+            },
+        )
+        request.pop("issuer")
+        request["task_digest"] = "sha256:" + ("0" * 64)
         codes = {
             issue.code
-            for issue in validate_authorization_grant(
-                grant,
+            for issue in validate_authorization_request(
+                request,
                 task_digest=digest,
                 scope_paths=task["scope_paths"],
             )
         }
-        self.assertIn("A_TASK_DIGEST", codes)
+        self.assertIn("Z_TASK_DIGEST", codes)
 
 
 if __name__ == "__main__":

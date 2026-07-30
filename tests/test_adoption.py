@@ -63,13 +63,15 @@ class AdoptionTests(unittest.TestCase):
         }
         code = (
             f"from {RUNTIME_PACKAGE} import "
-            "contracts,host_bridge,intake,policy,resource_registry,routing,scopes;"
+            "clarification,contracts,host_bridge,intake,policy,"
+            "resource_registry,routing,scopes;"
             "from pathlib import Path;"
             "import json;"
             f"root=Path({str(repository)!r}).resolve();"
             f"package=Path({str(package_root)!r}).resolve();"
             f"task=json.loads({json.dumps(task)!r});"
             "assert Path(host_bridge.__file__).resolve().is_relative_to(package);"
+            "assert Path(clarification.__file__).resolve().is_relative_to(package);"
             "assert Path(intake.__file__).resolve().is_relative_to(package);"
             "assert Path(scopes.__file__).resolve().is_relative_to(package);"
             "pol=policy.load_policy(root/'.codex'/'project-policy.toml');"
@@ -93,6 +95,7 @@ class AdoptionTests(unittest.TestCase):
             "assert 'Modo normal:' in brief;"
             "assert 'automatic_change=false' in brief;"
             "assert len(brief.encode('utf-8'))<=1024;"
+            "assert clarification.clarification_level(task)=='low';"
             "print('ISOLATED_INTAKE_OK')"
         )
         return subprocess.run(

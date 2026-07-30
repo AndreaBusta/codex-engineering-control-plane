@@ -6878,6 +6878,176 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(recovered["state"], "blocked")
         self.assertTrue(recovered["verification_aborted"])
 
+    def test_authorization_and_irreversible_confirmation_consume_atomically(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.host_bridge import (
+            attest_host_adapter_capability,
+            consume_effect_capabilities,
+            frame_effect_authorization,
+            frame_irreversible_confirmation,
+        )
+        from tests.host_adapter_test_support import (
+            native_session_event,
+            native_user_interaction_event,
+        )
+
+        repository, _, common_dir, _ = self._two_worktree_repository(
+            "effect-capabilities"
+        )
+        head = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        task_digest = contract_digest({"task": "effect-capabilities"})
+        request_digest = contract_digest({"request": "irreversible"})
+        consequence_digest = contract_digest({"consequence": "delete"})
+        session_id = "session-effect-capabilities"
+        invocation_id = "invocation-effect-capabilities"
+        operation_nonce = "operation-effect-capabilities"
+        scope_paths = ("tracked.txt",)
+
+        authorization_capability = attest_host_adapter_capability(
+            native_session_event(
+                event_id="session-authorization",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=session_id,
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        authorization = frame_effect_authorization(
+            native_user_interaction_event(
+                event_id="user-authorization",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                task_digest=task_digest,
+                subject_digest=request_digest,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=authorization_capability,
+            task_digest=task_digest,
+            session_id=session_id,
+            repository_identity=repository,
+            worktree_identity=repository,
+            branch="main",
+            expected_head=head,
+            subject_digest=request_digest,
+            scope_paths=scope_paths,
+            effect="destructive",
+            operation_nonce=operation_nonce,
+            invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        confirmation_capability = attest_host_adapter_capability(
+            native_session_event(
+                event_id="session-confirmation",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=session_id,
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        confirmation = frame_irreversible_confirmation(
+            {
+                "schema_version": 1,
+                "confirmation_id": "confirmation-effect-capabilities",
+                "request_digest": request_digest,
+                "task_digest": task_digest,
+                "session_id": session_id,
+                "scope_paths": list(scope_paths),
+                "effect": "destructive",
+                "consequence_digest": consequence_digest,
+            },
+            native_user_event=native_user_interaction_event(
+                event_id="user-confirmation",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                task_digest=task_digest,
+                subject_digest=request_digest,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=confirmation_capability,
+            repository_identity=repository,
+            worktree_identity=repository,
+            branch="main",
+            expected_head=head,
+            subject_digest=request_digest,
+            authorization_id=authorization.authorization_id,
+            operation_nonce=operation_nonce,
+            invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+
+        consumed = consume_effect_capabilities(
+            authorization,
+            confirmation,
+            expected_task_digest=task_digest,
+            expected_session_id=session_id,
+            expected_repository_identity=repository,
+            expected_worktree_identity=repository,
+            expected_branch="main",
+            expected_head=head,
+            expected_subject_digest=request_digest,
+            expected_scope_paths=scope_paths,
+            expected_effect="destructive",
+            expected_consequence_digest=consequence_digest,
+            expected_operation_nonce=operation_nonce,
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+        )
+
+        self.assertEqual(
+            consumed.authorization_id, authorization.authorization_id
+        )
+        self.assertEqual(
+            consumed.confirmation_id,
+            "confirmation-effect-capabilities",
+        )
+        self.assertTrue(authorization._consumed)
+        self.assertTrue(confirmation._consumed)
+        self.assertEqual(
+            len(
+                list(
+                    (
+                        common_dir
+                        / "codex-control-plane"
+                        / "capability-consumption"
+                    ).glob("*.json")
+                )
+            ),
+            1,
+        )
+        with self.assertRaisesRegex(ValueError, "Z_REPLAY|I_REPLAY"):
+            consume_effect_capabilities(
+                authorization,
+                confirmation,
+                expected_task_digest=task_digest,
+                expected_session_id=session_id,
+                expected_repository_identity=repository,
+                expected_worktree_identity=repository,
+                expected_branch="main",
+                expected_head=head,
+                expected_subject_digest=request_digest,
+                expected_scope_paths=scope_paths,
+                expected_effect="destructive",
+                expected_consequence_digest=consequence_digest,
+                expected_operation_nonce=operation_nonce,
+                expected_invocation_id=invocation_id,
+                clock=lambda: 100.0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

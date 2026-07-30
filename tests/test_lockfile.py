@@ -21,6 +21,16 @@ class LockfileTests(unittest.TestCase):
         self.assertIn("intake.py", RUNTIME_MODULES)
         self.assertTrue((ROOT / "control_plane" / "intake.py").is_file())
 
+    def test_source_and_distributed_runtime_include_clarification_module(
+        self,
+    ) -> None:
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("clarification.py", RUNTIME_MODULES)
+        self.assertTrue(
+            (ROOT / "control_plane" / "clarification.py").is_file()
+        )
+
     def _source_runtime_fixture(self, root: Path) -> None:
         shutil.copytree(ROOT / ".codex", root / ".codex")
         shutil.copytree(ROOT / "control_plane", root / "control_plane")

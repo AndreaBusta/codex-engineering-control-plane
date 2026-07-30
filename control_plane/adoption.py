@@ -28,6 +28,7 @@ RUNTIME_PACKAGE = "codex_control_plane_runtime_v2"
 RUNTIME_MODULES = (
     "__init__.py",
     "adoption.py",
+    "clarification.py",
     "cli.py",
     "contracts.py",
     "git_state.py",
