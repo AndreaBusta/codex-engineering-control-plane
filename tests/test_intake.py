@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import json
 import unittest
 
+from control_plane.contracts import contract_digest
 from tests.router_test_support import (
     VALID_POLICY,
     VALID_REGISTRY,
@@ -350,6 +352,126 @@ class IntakeTests(unittest.TestCase):
             self.route(invalid_task)
         with self.assertRaisesRegex(ValueError, "T_OBJECTIVE"):
             render_novice_brief(invalid_task, valid_manifest)
+
+    def test_valid_compact_manifest_accepts_more_than_64_required_resources(
+        self,
+    ) -> None:
+        from control_plane.intake import render_novice_brief
+        from control_plane.resource_registry import validate_registry
+        from control_plane.routing import (
+            compact_route_manifest,
+            resolve_route,
+        )
+
+        task = task_envelope(task_id="many-required-resources")
+        registry = copy.deepcopy(self.registry)
+        template = next(
+            resource
+            for resource in registry["resources"]
+            if resource["id"] == "gate.targeted-validation"
+        )
+        snapshot = inventory_snapshot()
+        for index in range(60):
+            resource = copy.deepcopy(template)
+            resource_id = f"gate.intake-contract-{index:02d}"
+            resource["id"] = resource_id
+            resource["locator"] = (
+                f"builtin://gate/intake-contract-{index:02d}"
+            )
+            resource["capabilities"] = [
+                f"gate.intake_contract_{index:02d}"
+            ]
+            resource["selection"] = "required"
+            resource["aliases"] = []
+            registry["resources"].append(resource)
+            snapshot["resources"].append(
+                {
+                    "id": resource_id,
+                    "availability": "available",
+                    "discovered": True,
+                    "enabled": True,
+                    "trusted": True,
+                    "authenticated": "not_applicable",
+                    "healthy": "available",
+                    "authorized_for_task": False,
+                    "ready": True,
+                    "locator_digest": contract_digest(
+                        {"resource_id": resource_id}
+                    ),
+                    "size_bytes": 1,
+                    "reason_codes": [],
+                }
+            )
+        self.assertEqual(validate_registry(registry), [])
+        snapshot.pop("snapshot_digest", None)
+        snapshot["snapshot_digest"] = contract_digest(snapshot)
+        invocation_id = "many-required-resources"
+        decision = resolve_route(
+            task,
+            self.policy,
+            registry,
+            validated_inventory(
+                snapshot,
+                registry=registry,
+                task=task,
+                invocation_id=invocation_id,
+            ),
+            mode="audit",
+        )
+
+        self.assertTrue(decision["decision_ready"])
+        self.assertEqual(decision["errors"], [])
+        self.assertGreater(len(decision["summary"]["required"]), 64)
+        manifest = compact_route_manifest(decision)
+        self.assertLessEqual(len(manifest.encode("utf-8")), 4096)
+        self.assertIn(
+            "Qué he entendido:",
+            render_novice_brief(task, manifest),
+        )
+
+    def test_surrogateescaped_profile_evidence_fails_with_stable_code(
+        self,
+    ) -> None:
+        from control_plane.intake import render_novice_brief
+        from control_plane.routing import (
+            compact_route_manifest,
+            resolve_route,
+        )
+
+        task = task_envelope(task_id="surrogate-profile-evidence")
+        snapshot = inventory_snapshot()
+        snapshot["project_profile"] = {
+            "schema_version": 1,
+            "kind": "ios",
+            "profiles": ["ios"],
+            "evidence": ["bad-\udc80.xcodeproj"],
+            "confidence": "high",
+            "truncated": False,
+        }
+        snapshot.pop("snapshot_digest", None)
+        snapshot["snapshot_digest"] = contract_digest(snapshot)
+        invocation_id = "surrogate-profile-evidence"
+        decision = resolve_route(
+            task,
+            self.policy,
+            self.registry,
+            validated_inventory(
+                snapshot,
+                registry=self.registry,
+                task=task,
+                invocation_id=invocation_id,
+            ),
+            mode="audit",
+        )
+        manifest = compact_route_manifest(decision)
+
+        self.assertTrue(decision["decision_ready"])
+        self.assertLessEqual(len(manifest.encode("utf-8")), 4096)
+        with self.assertRaisesRegex(
+            ValueError,
+            "E_INTAKE_MANIFEST_SCHEMA",
+        ):
+            render_novice_brief(task, manifest)
 
     def test_renderer_rejects_alternate_mappings_unknown_text_and_oversize(
         self,

@@ -190,7 +190,13 @@ def render_interaction_recommendation(
 
 
 def _safe_relative_path(value: object) -> bool:
-    if not isinstance(value, str) or not value or len(value.encode()) > 512:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    if len(encoded) > 512:
         return False
     parsed = PurePosixPath(value)
     return (
@@ -202,11 +208,11 @@ def _safe_relative_path(value: object) -> bool:
 
 
 def _route_tokens(
-    value: object, *, max_items: int = 64
+    value: object, *, max_items: int | None = None
 ) -> tuple[str, ...]:
     if (
         not isinstance(value, list)
-        or len(value) > max_items
+        or (max_items is not None and len(value) > max_items)
         or any(
             not isinstance(item, str)
             or _SAFE_ROUTE_TOKEN.fullmatch(item) is None
