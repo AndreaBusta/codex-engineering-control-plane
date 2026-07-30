@@ -13,6 +13,19 @@ ROOT = Path(__file__).parents[1]
 
 
 class LockfileTests(unittest.TestCase):
+    def test_source_and_distributed_runtime_include_risk_sentinel(
+        self,
+    ) -> None:
+        import control_plane.risk_sentinel as sentinel
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("risk_sentinel.py", RUNTIME_MODULES)
+        self.assertTrue(
+            (ROOT / "control_plane" / "risk_sentinel.py").is_file()
+        )
+        self.assertTrue(callable(sentinel.aggregate_status))
+        self.assertTrue(callable(sentinel.evaluate_risk_status))
+
     def test_source_runtime_exposes_resumable_clarification_lifecycle(
         self,
     ) -> None:

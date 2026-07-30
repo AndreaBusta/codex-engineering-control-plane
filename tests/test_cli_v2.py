@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import subprocess
 import sys
@@ -153,6 +155,186 @@ class CliV2Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(payload["authoritative"])
         self.assertEqual(payload["status"], "diagnostic")
+
+    def test_risk_status_without_host_anchor_is_unknown_exit_two(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/risk-cli")
+        with tempfile.TemporaryDirectory() as temporary:
+            decision_path = Path(temporary) / "decision.json"
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        "interaction": {
+                            "recommended_mode": "plan",
+                            "reason_codes": ["MODE_COMPLEX_OR_UNCERTAIN"],
+                        },
+                        "authorization": {"local_write": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_cli(
+                "risk-status",
+                "--repo",
+                str(scenario.repo),
+                "--policy",
+                str(ROOT / ".codex" / "project-policy.toml"),
+                "--task-id",
+                "TASK-RISK-MISSING",
+                "--decision",
+                str(decision_path),
+                "--json",
+            )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(payload["status"], "UNKNOWN")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["dimensions"]["local"]["status"], "UNKNOWN")
+        self.assertEqual(payload["dimensions"]["remote"]["status"], "UNKNOWN")
+        self.assertEqual(
+            payload["facts"]["governing_policy_source"],
+            "unavailable_pending_installed_manifest",
+        )
+        self.assertEqual(
+            payload["facts"]["candidate_policy_status"], "valid_hint"
+        )
+        self.assertFalse(
+            payload["facts"]["serialized_decision_authoritative"]
+        )
+        checks = payload["dimensions"]["local"]["checks"]
+        self.assertEqual(
+            next(
+                item["status"]
+                for item in checks
+                if item["code"] == "RS_AUTHORITY_REQUIRED"
+            ),
+            "UNKNOWN",
+        )
+
+    def test_risk_status_human_uses_closed_interaction_view(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/risk-human")
+        with tempfile.TemporaryDirectory() as temporary:
+            decision_path = Path(temporary) / "decision.json"
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        "interaction": {
+                            "recommended_mode": "plan_then_goal",
+                            "reason_codes": [
+                                "MODE_LONG_RUNNING",
+                                "MODE_REQUIRES_PLAN",
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_cli(
+                "risk-status",
+                "--repo",
+                str(scenario.repo),
+                "--decision",
+                str(decision_path),
+            )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(result.stdout.startswith("UNKNOWN risk-status\n"))
+        self.assertIn("local=UNKNOWN", result.stdout)
+        self.assertIn("remote=UNKNOWN", result.stdout)
+        self.assertIn(
+            "interaction_recommended=plan_then_goal", result.stdout
+        )
+        self.assertIn("interaction_commands=/plan,/goal", result.stdout)
+        self.assertIn("automatic_change=false", result.stdout)
+        self.assertIn("RS_REMOTE_NOT_OBSERVED ", result.stdout)
+
+    def test_risk_emit_contract_uses_exit_zero_one_two_in_both_formats(
+        self,
+    ) -> None:
+        from control_plane.cli import _emit
+
+        for status, expected in (("PASS", 0), ("FAIL", 1), ("UNKNOWN", 2)):
+            payload = {
+                "schema_version": 1,
+                "command": "risk-status",
+                "ok": status == "PASS",
+                "status": status,
+                "dimensions": {
+                    "local": {"status": status, "checks": [], "errors": []},
+                    "remote": {"status": "PASS", "checks": [], "errors": []},
+                },
+                "facts": {
+                    "interaction": {
+                        "mode": "normal",
+                        "commands": [],
+                        "human_message": "continue",
+                        "automatic_change": False,
+                    },
+                    "project_profile": {"profiles": ["generic"]},
+                },
+                "errors": [],
+            }
+            for as_json in (False, True):
+                with self.subTest(status=status, as_json=as_json):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        code = _emit(payload, as_json)
+                    self.assertEqual(code, expected)
+                    self.assertTrue(output.getvalue())
+
+    def test_risk_json_and_human_share_all_closed_interaction_modes(
+        self,
+    ) -> None:
+        from control_plane.cli import _render_human
+        from control_plane.intake import render_interaction_recommendation
+        from control_plane.risk_sentinel import evaluate_risk_status
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/risk-interaction")
+        cases = (
+            ("default", "normal", ["MODE_BOUNDED"]),
+            ("plan", "plan", ["MODE_COMPLEX_OR_UNCERTAIN"]),
+            ("goal", "goal", ["MODE_LONG_RUNNING"]),
+            (
+                "plan_then_goal",
+                "plan_then_goal",
+                ["MODE_LONG_RUNNING", "MODE_REQUIRES_PLAN"],
+            ),
+        )
+        for route_mode, view_mode, reasons in cases:
+            with self.subTest(mode=route_mode):
+                status = evaluate_risk_status(
+                    scenario.repo,
+                    None,
+                    route_decision_hint={
+                        "interaction": {
+                            "recommended_mode": route_mode,
+                            "reason_codes": reasons,
+                        }
+                    },
+                )
+                payload = status.to_dict()
+                expected = render_interaction_recommendation(
+                    view_mode, reasons
+                ).as_dict()
+                self.assertEqual(payload["facts"]["interaction"], expected)
+                human = _render_human(payload)
+                self.assertIn(
+                    f"interaction_recommended={view_mode}", human
+                )
+                self.assertIn(
+                    "interaction_commands=" + ",".join(expected["commands"]),
+                    human,
+                )
+                self.assertIn(
+                    f"interaction_message={expected['human_message']}", human
+                )
+                self.assertIn("automatic_change=false", human)
 
     def test_verification_run_rejects_caller_selected_profile_or_command(
         self,

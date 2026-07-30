@@ -710,7 +710,12 @@ class AdoptionTests(unittest.TestCase):
         self.assertFalse(hook_marker.exists())
         self.assertNotIn("ARGPARSE_SHADOW_EXECUTED", completed.stderr)
         self.assertNotIn("JSON_SHADOW_EXECUTED", hook.stderr)
-        for module in ("host_bridge.py", "intake.py", "scopes.py"):
+        for module in (
+            "host_bridge.py",
+            "intake.py",
+            "risk_sentinel.py",
+            "scopes.py",
+        ):
             self.assertIn(module, RUNTIME_MODULES)
             self.assertTrue(
                 (
@@ -721,6 +726,36 @@ class AdoptionTests(unittest.TestCase):
                     / module
                 ).is_file()
             )
+
+        risk = subprocess.run(
+            [
+                str(self.scenario.repo / "scripts" / "control-plane"),
+                "risk-status",
+                "--repo",
+                str(self.scenario.repo),
+                "--json",
+            ],
+            cwd=self.scenario.repo,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(risk.returncode, 1, risk.stderr)
+        risk_payload = json.loads(risk.stdout)
+        self.assertEqual(risk_payload["status"], "FAIL")
+        self.assertEqual(
+            next(
+                item["status"]
+                for item in risk_payload["dimensions"]["local"]["checks"]
+                if item["code"] == "RS_LOCAL_DIRTY"
+            ),
+            "FAIL",
+        )
+        self.assertEqual(
+            risk_payload["facts"]["governing_policy_source"],
+            "unavailable_pending_installed_manifest",
+        )
 
     def test_pr_b_adopted_runtime_imports_and_renders_intake_without_source(
         self,

@@ -42,6 +42,7 @@ RUNTIME_MODULES = (
     "project_profiles.py",
     "repository.py",
     "resource_registry.py",
+    "risk_sentinel.py",
     "routing.py",
     "scopes.py",
 )

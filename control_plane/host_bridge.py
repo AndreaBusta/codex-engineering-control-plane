@@ -195,6 +195,100 @@ def _runtime_host_object_registry():
             "expires_at_monotonic",
             "freshness_deadline",
         ),
+        "local_base_policy_observation": (
+            "_clock",
+            "native_event_id",
+            "registered_context_id",
+            "canonical_repository",
+            "attestor_worktree",
+            "target_worktree",
+            "repository_identity",
+            "remote",
+            "base_branch",
+            "base_ref",
+            "base_commit",
+            "policy_blob_digest",
+            "policy_blob_size",
+            "policy_eof",
+            "runtime_layout",
+            "session_id",
+            "invocation_id",
+            "observation_nonce",
+            "freshness_deadline",
+            "_governing_runtime",
+        ),
+        "validated_local_base_observation": (
+            "_clock",
+            "native_event_id",
+            "registered_context_id",
+            "canonical_repository",
+            "attestor_worktree",
+            "target_worktree",
+            "repository_identity",
+            "remote",
+            "base_branch",
+            "base_ref",
+            "base_commit",
+            "policy_blob_digest",
+            "policy_blob_size",
+            "policy_eof",
+            "runtime_layout",
+            "session_id",
+            "invocation_id",
+            "observation_nonce",
+            "freshness_deadline",
+            "_governing_runtime",
+        ),
+        "host_risk_context_observation": (
+            "_clock",
+            "native_event_id",
+            "task_id",
+            "task_digest",
+            "task_state_digest",
+            "lease_digest",
+            "decision_digest",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "head",
+            "session_id",
+            "invocation_id",
+            "clarification_status",
+            "protected_effect_requested",
+            "effect",
+            "subject_digest",
+            "authorization_status",
+            "context_nonce",
+            "freshness_deadline",
+            "_route_context",
+            "_clarification_resolution",
+            "_authorization",
+        ),
+        "validated_host_risk_context": (
+            "_clock",
+            "native_event_id",
+            "task_id",
+            "task_digest",
+            "task_state_digest",
+            "lease_digest",
+            "decision_digest",
+            "repository_identity",
+            "worktree_identity",
+            "branch",
+            "head",
+            "session_id",
+            "invocation_id",
+            "clarification_status",
+            "protected_effect_requested",
+            "effect",
+            "subject_digest",
+            "authorization_status",
+            "context_nonce",
+            "freshness_deadline",
+            "_route_context",
+            "_clarification_resolution",
+            "_authorization",
+        ),
         "clarification_repository_observation": (
             "observation_id",
             "task_digest",
@@ -866,6 +960,114 @@ class NativeSessionEvent:
         raise TypeError("NativeSessionEvent is supplied only by the host")
 
 
+class NativeTaskEvent:
+    __slots__ = (
+        "_consumed",
+        "event_id",
+        "task_id",
+        "task_digest",
+        "task_state_digest",
+        "lease_digest",
+        "repository_identity",
+        "worktree_identity",
+        "branch",
+        "head",
+        "session_id",
+        "invocation_id",
+        "observed_at_monotonic",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "NativeTaskEvent":
+        raise TypeError("NativeTaskEvent is supplied only by the host")
+
+
+class NativeGitBaseEvent:
+    __slots__ = (
+        "_consumed",
+        "event_id",
+        "repository_identity",
+        "remote",
+        "base_branch",
+        "base_ref",
+        "base_commit",
+        "policy_blob",
+        "policy_blob_digest",
+        "policy_eof",
+        "partial_clone",
+        "session_id",
+        "invocation_id",
+        "observed_at_monotonic",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "NativeGitBaseEvent":
+        raise TypeError("NativeGitBaseEvent is supplied only by the host")
+
+
+class RegisteredGoverningBaseContext:
+    __slots__ = (
+        "_consumed",
+        "context_id",
+        "canonical_repository",
+        "attestor_worktree",
+        "target_worktree",
+        "repository_identity",
+        "remote",
+        "base_branch",
+        "base_ref",
+        "base_commit",
+        "policy_blob_digest",
+        "runtime_layout",
+        "session_id",
+        "invocation_id",
+        "freshness_deadline",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "RegisteredGoverningBaseContext":
+        raise TypeError(
+            "RegisteredGoverningBaseContext is supplied only by the host"
+        )
+
+
+class LocalBasePolicyObservation:
+    __slots__ = (
+        "_consumed",
+        "_clock",
+        "native_event_id",
+        "registered_context_id",
+        "canonical_repository",
+        "attestor_worktree",
+        "target_worktree",
+        "repository_identity",
+        "remote",
+        "base_branch",
+        "base_ref",
+        "base_commit",
+        "policy_blob_digest",
+        "policy_blob_size",
+        "policy_eof",
+        "runtime_layout",
+        "session_id",
+        "invocation_id",
+        "observation_nonce",
+        "freshness_deadline",
+        "_governing_runtime",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "LocalBasePolicyObservation":
+        raise TypeError("LocalBasePolicyObservation is host-bound")
+
+
+class ValidatedLocalBaseObservation(LocalBasePolicyObservation):
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedLocalBaseObservation":
+        raise TypeError("ValidatedLocalBaseObservation is host-bound")
+
+
 class NativeUserInteractionEvent:
     __slots__ = (
         "_consumed",
@@ -909,6 +1111,47 @@ class HostAdapterUnavailable:
 
 
 HOST_ADAPTER_UNAVAILABLE = object.__new__(HostAdapterUnavailable)
+
+
+class HostRiskContextObservation:
+    __slots__ = (
+        "_consumed",
+        "_clock",
+        "native_event_id",
+        "task_id",
+        "task_digest",
+        "task_state_digest",
+        "lease_digest",
+        "decision_digest",
+        "repository_identity",
+        "worktree_identity",
+        "branch",
+        "head",
+        "session_id",
+        "invocation_id",
+        "clarification_status",
+        "protected_effect_requested",
+        "effect",
+        "subject_digest",
+        "authorization_status",
+        "context_nonce",
+        "freshness_deadline",
+        "_route_context",
+        "_clarification_resolution",
+        "_authorization",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "HostRiskContextObservation":
+        raise TypeError("HostRiskContextObservation is host-bound")
+
+
+class ValidatedHostRiskContext(HostRiskContextObservation):
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedHostRiskContext":
+        raise TypeError("ValidatedHostRiskContext is host-bound")
 
 
 class TrustedRouteDecision(Mapping[str, object]):
@@ -2079,6 +2322,747 @@ def attest_host_adapter_capability(
     capability.freshness_deadline = now + float(ttl_seconds)
     _register_runtime_host_object(capability, "host_capability")
     return capability
+
+
+def frame_local_base_policy_source(
+    native_git_base_event: object,
+    *,
+    host_capability: HostAdapterCapability,
+    registered_base: RegisteredGoverningBaseContext,
+    session_id: str,
+    invocation_id: str,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> LocalBasePolicyObservation:
+    """Frame one immutable, no-fetch base-policy observation from the host."""
+
+    try:
+        now = float(clock())
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: base observation clock is invalid"
+        ) from error
+    if (
+        not math.isfinite(now)
+        or type(native_git_base_event) is not NativeGitBaseEvent
+        or not _native_host_object_is_valid(
+            native_git_base_event, "git_base"
+        )
+        or native_git_base_event._consumed
+        or type(registered_base) is not RegisteredGoverningBaseContext
+        or not _native_host_object_is_valid(
+            registered_base, "governing_base_context"
+        )
+        or registered_base._consumed
+        or type(host_capability) is not HostAdapterCapability
+        or not _runtime_host_object_is_live(
+            host_capability, "host_capability"
+        )
+        or host_capability._consumed
+        or not validate_task_id(session_id)
+        or not invocation_id
+        or host_capability.session_id != session_id
+        or host_capability.invocation_id != invocation_id
+        or native_git_base_event.session_id != session_id
+        or native_git_base_event.invocation_id != invocation_id
+        or not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not 0 < float(ttl_seconds) <= 300
+        or not isinstance(
+            native_git_base_event.observed_at_monotonic, (int, float)
+        )
+        or isinstance(native_git_base_event.observed_at_monotonic, bool)
+        or not math.isfinite(
+            float(native_git_base_event.observed_at_monotonic)
+        )
+        or float(native_git_base_event.observed_at_monotonic) > now
+        or now - float(native_git_base_event.observed_at_monotonic)
+        > float(ttl_seconds)
+        or registered_base.session_id != session_id
+        or registered_base.invocation_id != invocation_id
+        or now > host_capability.freshness_deadline
+        or now > registered_base.freshness_deadline
+    ):
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: native base bindings are invalid"
+        )
+    try:
+        canonical_repository = _canonical_directory(
+            registered_base.canonical_repository,
+            code="RS_LOCAL_BASE_UNKNOWN",
+        )
+        attestor = _canonical_directory(
+            registered_base.attestor_worktree,
+            code="RS_LOCAL_BASE_UNKNOWN",
+        )
+        target = _canonical_directory(
+            registered_base.target_worktree,
+            code="RS_LOCAL_BASE_UNKNOWN",
+        )
+    except ValueError as error:
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: registered base paths are invalid"
+        ) from error
+    expected_ref = (
+        f"refs/remotes/{registered_base.remote}/"
+        f"{registered_base.base_branch}"
+    )
+    event_blob = native_git_base_event.policy_blob
+    if (
+        canonical_repository != target
+        or native_git_base_event.repository_identity
+        != registered_base.repository_identity
+        or native_git_base_event.remote != registered_base.remote
+        or native_git_base_event.base_branch
+        != registered_base.base_branch
+        or native_git_base_event.base_ref != expected_ref
+        or registered_base.base_ref != expected_ref
+        or native_git_base_event.base_commit
+        != registered_base.base_commit
+        or _GIT_OBJECT_ID.fullmatch(registered_base.base_commit) is None
+        or not isinstance(event_blob, bytes)
+        or not 0 < len(event_blob) <= 131_072
+        or native_git_base_event.policy_eof is not True
+        or native_git_base_event.partial_clone is not False
+        or native_git_base_event.policy_blob_digest
+        != f"sha256:{sha256(event_blob).hexdigest()}"
+        or native_git_base_event.policy_blob_digest
+        != registered_base.policy_blob_digest
+        or registered_base.runtime_layout not in {"source", "isolated"}
+    ):
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: base event is incomplete or mismatched"
+        )
+    try:
+        live_ref = _git_text(attestor, ["rev-parse", "--verify", expected_ref])
+        live_blob = _governing_regular_blob(
+            attestor,
+            registered_base.base_commit,
+            ".codex/project-policy.toml",
+            max_output_bytes=131_072,
+        )
+    except ValueError as error:
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: immutable base object is unavailable"
+        ) from error
+    if (
+        live_ref != registered_base.base_commit
+        or live_blob != event_blob
+        or f"sha256:{sha256(live_blob).hexdigest()}"
+        != registered_base.policy_blob_digest
+    ):
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: base ref or policy blob drifted"
+        )
+    runtime = attest_verification_governing_runtime(
+        attestor_worktree=attestor,
+        governing_base_commit=registered_base.base_commit,
+        target_worktree=target,
+        expected_runtime_layout=registered_base.runtime_layout,
+        session_id=session_id,
+        invocation_id=invocation_id,
+        clock=clock,
+        ttl_seconds=ttl_seconds,
+    )
+    with _CAPABILITY_CONSUMPTION_LOCK:
+        if (
+            native_git_base_event._consumed
+            or registered_base._consumed
+            or host_capability._consumed
+            or not _consume_runtime_host_object(
+                host_capability, "host_capability"
+            )
+        ):
+            _consume_governing_runtime_observation(runtime)
+            raise ValueError(
+                "RS_LOCAL_BASE_UNKNOWN: base observation binding was consumed"
+            )
+        native_git_base_event._consumed = True
+        registered_base._consumed = True
+        host_capability._consumed = True
+    observation = object.__new__(LocalBasePolicyObservation)
+    observation._consumed = False
+    observation._clock = clock
+    observation.native_event_id = native_git_base_event.event_id
+    observation.registered_context_id = registered_base.context_id
+    observation.canonical_repository = str(canonical_repository)
+    observation.attestor_worktree = str(attestor)
+    observation.target_worktree = str(target)
+    observation.repository_identity = registered_base.repository_identity
+    observation.remote = registered_base.remote
+    observation.base_branch = registered_base.base_branch
+    observation.base_ref = registered_base.base_ref
+    observation.base_commit = registered_base.base_commit
+    observation.policy_blob_digest = registered_base.policy_blob_digest
+    observation.policy_blob_size = len(event_blob)
+    observation.policy_eof = True
+    observation.runtime_layout = registered_base.runtime_layout
+    observation.session_id = session_id
+    observation.invocation_id = invocation_id
+    observation.observation_nonce = f"local-base-{uuid4().hex}"
+    observation.freshness_deadline = min(
+        now + float(ttl_seconds),
+        float(runtime.freshness_deadline),
+    )
+    observation._governing_runtime = runtime
+    _register_runtime_host_object(
+        observation, "local_base_policy_observation"
+    )
+    return observation
+
+
+def validate_local_base_policy_source(
+    observation: LocalBasePolicyObservation,
+    *,
+    expected_registered_base: RegisteredGoverningBaseContext,
+    expected_invocation_id: str,
+    clock: Callable[[], float],
+) -> ValidatedLocalBaseObservation:
+    """Validate and consume one exact base observation without lazy fetch."""
+
+    if (
+        type(observation) is not LocalBasePolicyObservation
+        or type(expected_registered_base)
+        is not RegisteredGoverningBaseContext
+        or not _native_host_object_is_valid(
+            expected_registered_base, "governing_base_context"
+        )
+        or not _runtime_host_object_is_live(
+            observation, "local_base_policy_observation"
+        )
+        or observation._consumed
+        or observation.registered_context_id
+        != expected_registered_base.context_id
+        or observation.invocation_id != expected_invocation_id
+        or float(clock()) > observation.freshness_deadline
+        or not _governing_runtime_observation_is_live(
+            observation._governing_runtime
+        )
+    ):
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: base observation is invalid or replayed"
+        )
+    try:
+        attestor = _canonical_directory(
+            observation.attestor_worktree, code="RS_LOCAL_BASE_UNKNOWN"
+        )
+        live_ref = _git_text(
+            attestor, ["rev-parse", "--verify", observation.base_ref]
+        )
+        live_blob = _governing_regular_blob(
+            attestor,
+            observation.base_commit,
+            ".codex/project-policy.toml",
+            max_output_bytes=131_072,
+        )
+    except ValueError as error:
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: base ref or blob is unavailable"
+        ) from error
+    if (
+        live_ref != observation.base_commit
+        or len(live_blob) != observation.policy_blob_size
+        or f"sha256:{sha256(live_blob).hexdigest()}"
+        != observation.policy_blob_digest
+    ):
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: base ref or policy blob changed"
+        )
+    if not _consume_runtime_host_object(
+        observation, "local_base_policy_observation"
+    ):
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: base observation is not host-issued"
+        )
+    observation._consumed = True
+    validated = object.__new__(ValidatedLocalBaseObservation)
+    for slot in LocalBasePolicyObservation.__slots__:
+        setattr(validated, slot, getattr(observation, slot))
+    validated._consumed = False
+    _register_runtime_host_object(
+        validated, "validated_local_base_observation"
+    )
+    return validated
+
+
+def load_governing_local_policy(
+    *,
+    canonical_repo: Path | str,
+    governing_base_observation: ValidatedLocalBaseObservation,
+    expected_invocation_id: str,
+    clock: Callable[[], float],
+):
+    """Load GoverningPolicy only from the validated Task-6 base source."""
+
+    from control_plane.policy import load_governing_policy_from_runtime
+
+    try:
+        canonical = _canonical_directory(
+            canonical_repo, code="RS_LOCAL_BASE_UNKNOWN"
+        )
+        now = float(clock())
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: canonical repository is invalid"
+        ) from error
+    if (
+        type(governing_base_observation) is not ValidatedLocalBaseObservation
+        or not _runtime_host_object_is_live(
+            governing_base_observation,
+            "validated_local_base_observation",
+        )
+        or governing_base_observation._consumed
+        or governing_base_observation.target_worktree != str(canonical)
+        or governing_base_observation.canonical_repository != str(canonical)
+        or governing_base_observation.invocation_id
+        != expected_invocation_id
+        or now > governing_base_observation.freshness_deadline
+        or not _governing_runtime_observation_is_live(
+            governing_base_observation._governing_runtime
+        )
+    ):
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: validated base observation is required"
+        )
+    remaining = min(
+        float(governing_base_observation.freshness_deadline) - now,
+        float(
+            governing_base_observation._governing_runtime.freshness_deadline
+        )
+        - now,
+        30.0,
+    )
+    if remaining <= 0:
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: validated base observation expired"
+        )
+    if not _consume_runtime_host_object(
+        governing_base_observation, "validated_local_base_observation"
+    ):
+        raise ValueError(
+            "RS_LOCAL_BASE_UNKNOWN: validated base observation was replayed"
+        )
+    governing_base_observation._consumed = True
+    return load_governing_policy_from_runtime(
+        governing_base_observation._governing_runtime,
+        session_id=governing_base_observation.session_id,
+        invocation_id=expected_invocation_id,
+        clock=clock,
+        ttl_seconds=remaining,
+    )
+
+
+def observe_host_risk_context(
+    *,
+    native_task_event: object,
+    trusted_route_context: TrustedRouteContext,
+    clarification_resolution: TrustedInteraction | None,
+    authorization: TrustedAuthorization | None,
+    repository_identity: Path | str,
+    worktree_identity: Path | str,
+    branch: str,
+    head: str,
+    session_id: str,
+    invocation_id: str,
+    host_capability: HostAdapterCapability,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> HostRiskContextObservation:
+    """Frame current task/route/clarification/authority without serializing it."""
+
+    try:
+        repository = _canonical_directory(
+            repository_identity, code="RS_HOST_CONTEXT"
+        )
+        worktree = _canonical_directory(
+            worktree_identity, code="RS_HOST_CONTEXT"
+        )
+        now = float(clock())
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "RS_HOST_CONTEXT: repository or clock binding is invalid"
+        ) from error
+    if (
+        type(native_task_event) is not NativeTaskEvent
+        or not _native_host_object_is_valid(native_task_event, "task")
+        or native_task_event._consumed
+        or not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not 0 < float(ttl_seconds) <= 300
+        or not isinstance(
+            native_task_event.observed_at_monotonic, (int, float)
+        )
+        or isinstance(native_task_event.observed_at_monotonic, bool)
+        or not math.isfinite(float(native_task_event.observed_at_monotonic))
+        or not validate_task_id(native_task_event.task_id)
+        or SHA256_DIGEST.fullmatch(native_task_event.task_digest) is None
+        or SHA256_DIGEST.fullmatch(
+            native_task_event.task_state_digest
+        )
+        is None
+        or (
+            native_task_event.lease_digest is not None
+            and (
+                not isinstance(native_task_event.lease_digest, str)
+                or SHA256_DIGEST.fullmatch(
+                    native_task_event.lease_digest
+                )
+                is None
+            )
+        )
+        or type(trusted_route_context) is not TrustedRouteContext
+        or not _runtime_host_object_is_live(
+            trusted_route_context, "trusted_route_context"
+        )
+        or trusted_route_context._consumed
+        or type(host_capability) is not HostAdapterCapability
+        or not _runtime_host_object_is_live(
+            host_capability, "host_capability"
+        )
+        or host_capability._consumed
+        or not math.isfinite(now)
+        or now > trusted_route_context.freshness_deadline
+        or now > host_capability.freshness_deadline
+        or _GIT_OBJECT_ID.fullmatch(head) is None
+        or not branch
+        or not validate_task_id(session_id)
+        or not invocation_id
+        or float(native_task_event.observed_at_monotonic) > now
+        or now - float(native_task_event.observed_at_monotonic)
+        > float(ttl_seconds)
+    ):
+        raise ValueError(
+            "RS_HOST_CONTEXT: native task or route context is invalid"
+        )
+    exact = (
+        native_task_event.task_digest,
+        native_task_event.repository_identity,
+        native_task_event.worktree_identity,
+        native_task_event.branch,
+        native_task_event.head,
+        native_task_event.session_id,
+        native_task_event.invocation_id,
+    )
+    expected = (
+        trusted_route_context.task_digest,
+        str(repository),
+        str(worktree),
+        branch,
+        head,
+        session_id,
+        invocation_id,
+    )
+    if (
+        exact != expected
+        or trusted_route_context.repository_identity != str(repository)
+        or trusted_route_context.worktree_identity != str(worktree)
+        or trusted_route_context.branch != branch
+        or trusted_route_context.head != head
+        or trusted_route_context.session_id != session_id
+        or trusted_route_context.invocation_id != invocation_id
+        or host_capability.session_id != session_id
+        or host_capability.invocation_id != invocation_id
+    ):
+        raise ValueError(
+            "RS_HOST_CONTEXT: task, route, and Git bindings differ"
+        )
+    if clarification_resolution is not None and (
+        type(clarification_resolution) is not TrustedInteraction
+        or not _runtime_host_object_is_live(
+            clarification_resolution, "trusted_interaction"
+        )
+        or clarification_resolution._consumed
+        or clarification_resolution.task_digest
+        != trusted_route_context.task_digest
+        or clarification_resolution.session_id != session_id
+        or clarification_resolution.invocation_id != invocation_id
+        or now > clarification_resolution.freshness_deadline
+    ):
+        raise ValueError(
+            "RS_HOST_CONTEXT: clarification resolution is invalid"
+        )
+    protected = tuple(
+        sorted(
+            {
+                *trusted_route_context.authorized_effects,
+                *trusted_route_context.blocked_effects,
+            }
+            - {"local_read"}
+        )
+    )
+    if len(protected) > 1:
+        raise ValueError(
+            "RS_HOST_CONTEXT: protected route effect is ambiguous"
+        )
+    effect = protected[0] if protected else None
+    subject_digest = (
+        authorization.subject_digest if authorization is not None else None
+    )
+    if authorization is not None and (
+        type(authorization) is not TrustedAuthorization
+        or not _runtime_host_object_is_live(
+            authorization, "trusted_authorization"
+        )
+        or authorization._consumed
+        or authorization.task_digest != trusted_route_context.task_digest
+        or authorization.repository_identity != str(repository)
+        or authorization.worktree_identity != str(worktree)
+        or authorization.branch != branch
+        or authorization.expected_head != head
+        or authorization.session_id != session_id
+        or authorization.invocation_id != invocation_id
+        or now > authorization.freshness_deadline
+        or authorization.effect != effect
+    ):
+        raise ValueError(
+            "RS_HOST_CONTEXT: protected-effect authorization is invalid"
+        )
+    pending_statuses = {
+        "pending_host_capability",
+        "clarification_request_required",
+        "ask_user",
+        "authorization_required",
+        "confirmation_required",
+        "blocked",
+    }
+    clarification_status = (
+        "resolved"
+        if clarification_resolution is not None
+        or trusted_route_context.clarification_status
+        in {"autonomous", "resolved"}
+        else (
+            "pending"
+            if trusted_route_context.clarification_status
+            in pending_statuses
+            else "unknown"
+        )
+    )
+    with _CAPABILITY_CONSUMPTION_LOCK:
+        if (
+            host_capability._consumed
+            or native_task_event._consumed
+            or not _consume_runtime_host_object(
+                host_capability, "host_capability"
+            )
+        ):
+            raise ValueError("RS_HOST_CONTEXT: host capability was replayed")
+        host_capability._consumed = True
+        native_task_event._consumed = True
+    observation = object.__new__(HostRiskContextObservation)
+    observation._consumed = False
+    observation._clock = clock
+    observation.native_event_id = native_task_event.event_id
+    observation.task_id = native_task_event.task_id
+    observation.task_digest = trusted_route_context.task_digest
+    observation.task_state_digest = native_task_event.task_state_digest
+    observation.lease_digest = native_task_event.lease_digest
+    observation.decision_digest = trusted_route_context.route_digest
+    observation.repository_identity = str(repository)
+    observation.worktree_identity = str(worktree)
+    observation.branch = branch
+    observation.head = head
+    observation.session_id = session_id
+    observation.invocation_id = invocation_id
+    observation.clarification_status = clarification_status
+    observation.protected_effect_requested = bool(protected)
+    observation.effect = effect
+    observation.subject_digest = subject_digest
+    observation.authorization_status = (
+        "granted"
+        if authorization is not None
+        else ("absent" if protected else "not_requested")
+    )
+    observation.context_nonce = f"risk-context-{uuid4().hex}"
+    deadlines = [
+        now + float(ttl_seconds),
+        float(trusted_route_context.freshness_deadline),
+        float(host_capability.freshness_deadline),
+    ]
+    if clarification_resolution is not None:
+        deadlines.append(float(clarification_resolution.freshness_deadline))
+    if authorization is not None:
+        deadlines.append(float(authorization.freshness_deadline))
+    observation.freshness_deadline = min(deadlines)
+    observation._route_context = trusted_route_context
+    observation._clarification_resolution = clarification_resolution
+    observation._authorization = authorization
+    _register_runtime_host_object(
+        observation, "host_risk_context_observation"
+    )
+    return observation
+
+
+def validate_host_risk_context(
+    observation: HostRiskContextObservation,
+    *,
+    expected_task_digest: str,
+    expected_decision_digest: str,
+    expected_repository_identity: Path | str,
+    expected_worktree_identity: Path | str,
+    expected_branch: str,
+    expected_head: str,
+    expected_session_id: str,
+    expected_invocation_id: str,
+    expected_effect: str | None,
+    expected_subject_digest: str | None,
+    clock: Callable[[], float],
+) -> ValidatedHostRiskContext:
+    """Validate exact host risk bindings and make the result one-shot."""
+
+    try:
+        repository = _canonical_directory(
+            expected_repository_identity, code="RS_HOST_CONTEXT"
+        )
+        worktree = _canonical_directory(
+            expected_worktree_identity, code="RS_HOST_CONTEXT"
+        )
+        now = float(clock())
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "RS_HOST_CONTEXT: expected bindings are invalid"
+        ) from error
+    if (
+        type(observation) is not HostRiskContextObservation
+        or not _runtime_host_object_is_live(
+            observation, "host_risk_context_observation"
+        )
+        or observation._consumed
+        or observation.task_digest != expected_task_digest
+        or observation.decision_digest != expected_decision_digest
+        or observation.repository_identity != str(repository)
+        or observation.worktree_identity != str(worktree)
+        or observation.branch != expected_branch
+        or observation.head != expected_head
+        or observation.session_id != expected_session_id
+        or observation.invocation_id != expected_invocation_id
+        or observation.effect != expected_effect
+        or observation.subject_digest != expected_subject_digest
+        or now > observation.freshness_deadline
+        or not _runtime_host_object_is_live(
+            observation._route_context, "trusted_route_context"
+        )
+        or (
+            observation._clarification_resolution is not None
+            and not _runtime_host_object_is_live(
+                observation._clarification_resolution,
+                "trusted_interaction",
+            )
+        )
+        or (
+            observation._authorization is not None
+            and (
+                not _runtime_host_object_is_live(
+                    observation._authorization, "trusted_authorization"
+                )
+                or now > observation._authorization.freshness_deadline
+            )
+        )
+    ):
+        raise ValueError(
+            "RS_HOST_CONTEXT: observation is invalid, stale, or mismatched"
+        )
+    if not _consume_runtime_host_object(
+        observation, "host_risk_context_observation"
+    ):
+        raise ValueError("RS_HOST_CONTEXT: observation was replayed")
+    observation._consumed = True
+    validated = object.__new__(ValidatedHostRiskContext)
+    for slot in HostRiskContextObservation.__slots__:
+        setattr(validated, slot, getattr(observation, slot))
+    validated._consumed = False
+    _register_runtime_host_object(validated, "validated_host_risk_context")
+    return validated
+
+
+def consume_validated_host_risk_context(
+    context: object,
+    *,
+    expected_repository_identity: Path | str | None = None,
+    expected_worktree_identity: Path | str | None = None,
+    expected_branch: str | None = None,
+    expected_head: str | None = None,
+    expected_session_id: str | None = None,
+    expected_invocation_id: str | None = None,
+    expected_task_id: str | None = None,
+    expected_task_digest: str | None = None,
+    expected_task_state_digest: str | None = None,
+) -> dict[str, object]:
+    """Reobserve exact current bindings and consume one validated context."""
+
+    try:
+        repository = _canonical_directory(
+            expected_repository_identity, code="RS_HOST_CONTEXT"
+        )
+        worktree = _canonical_directory(
+            expected_worktree_identity, code="RS_HOST_CONTEXT"
+        )
+        live_root = Path(
+            _git_text(worktree, ["rev-parse", "--show-toplevel"])
+        ).resolve()
+        live_branch = _git_text(worktree, ["branch", "--show-current"])
+        live_head = _git_text(worktree, ["rev-parse", "HEAD"])
+        now = float(context._clock())
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise ValueError(
+            "RS_HOST_CONTEXT: current bindings are unavailable"
+        ) from error
+    if (
+        type(context) is not ValidatedHostRiskContext
+        or context._consumed
+        or not _runtime_host_object_is_live(
+            context, "validated_host_risk_context"
+        )
+        or not validate_task_id(expected_task_id)
+        or not isinstance(expected_branch, str)
+        or not expected_branch
+        or _GIT_OBJECT_ID.fullmatch(expected_head or "") is None
+        or not validate_task_id(expected_session_id)
+        or not isinstance(expected_invocation_id, str)
+        or not expected_invocation_id
+        or SHA256_DIGEST.fullmatch(expected_task_digest or "") is None
+        or SHA256_DIGEST.fullmatch(expected_task_state_digest or "") is None
+        or now > context.freshness_deadline
+        or repository != worktree
+        or live_root != worktree
+        or live_branch != expected_branch
+        or live_head != expected_head
+        or context.repository_identity != str(repository)
+        or context.worktree_identity != str(worktree)
+        or context.branch != expected_branch
+        or context.head != expected_head
+        or context.session_id != expected_session_id
+        or context.invocation_id != expected_invocation_id
+        or context.task_id != expected_task_id
+        or context.task_digest != expected_task_digest
+        or context.task_state_digest != expected_task_state_digest
+    ):
+        raise ValueError(
+            "RS_HOST_CONTEXT: validated context drifted from current state"
+        )
+    if not _consume_runtime_host_object(
+        context, "validated_host_risk_context"
+    ):
+        raise ValueError(
+            "RS_HOST_CONTEXT: validated context is invalid, stale, or replayed"
+        )
+    context._consumed = True
+    return {
+        "task_id": context.task_id,
+        "task_digest": context.task_digest,
+        "task_state_digest": context.task_state_digest,
+        "lease_digest": context.lease_digest,
+        "decision_digest": context.decision_digest,
+        "repository_identity": context.repository_identity,
+        "worktree_identity": context.worktree_identity,
+        "branch": context.branch,
+        "head": context.head,
+        "session_id": context.session_id,
+        "invocation_id": context.invocation_id,
+        "clarification_status": context.clarification_status,
+        "protected_effect_requested": context.protected_effect_requested,
+        "effect": context.effect,
+        "authorization_status": context.authorization_status,
+    }
 
 
 def _assert_live_clarification_capability(

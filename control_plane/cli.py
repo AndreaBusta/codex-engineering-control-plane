@@ -47,6 +47,7 @@ from control_plane.resource_registry import (
     validate_policy_references,
     validate_registry,
 )
+from control_plane.risk_sentinel import evaluate_risk_status
 from control_plane.host_bridge import (
     HOST_ADAPTER_UNAVAILABLE,
     observe_inventory,
@@ -108,6 +109,86 @@ def _load_validated_policy(path: Path) -> tuple[dict[str, Any] | None, dict[str,
 
 def _render_human(payload: dict[str, Any]) -> str:
     command = str(payload.get("command", "control-plane"))
+    if command == "risk-status" and payload.get("status") in {
+        "PASS",
+        "FAIL",
+        "UNKNOWN",
+    }:
+        status = str(payload["status"])
+        dimensions = payload.get("dimensions", {})
+        local = (
+            dimensions.get("local", {})
+            if isinstance(dimensions, dict)
+            else {}
+        )
+        remote = (
+            dimensions.get("remote", {})
+            if isinstance(dimensions, dict)
+            else {}
+        )
+        facts = payload.get("facts", {})
+        interaction = (
+            facts.get("interaction", {}) if isinstance(facts, dict) else {}
+        )
+        profile = (
+            facts.get("project_profile", {})
+            if isinstance(facts, dict)
+            else {}
+        )
+        commands = (
+            interaction.get("commands", [])
+            if isinstance(interaction, dict)
+            else []
+        )
+        profiles = (
+            profile.get("profiles", [])
+            if isinstance(profile, dict)
+            else []
+        )
+        lines = [
+            f"{status} risk-status",
+            f"local={local.get('status', 'UNKNOWN')}",
+            f"remote={remote.get('status', 'UNKNOWN')}",
+            "interaction_recommended="
+            f"{interaction.get('mode', 'normal')}",
+            "interaction_commands="
+            + (
+                ",".join(str(item) for item in commands)
+                if isinstance(commands, list)
+                else ""
+            ),
+            "interaction_message="
+            f"{interaction.get('human_message', '')}",
+            "automatic_change="
+            f"{str(bool(interaction.get('automatic_change'))).lower()}",
+            "project_profiles="
+            + (
+                ",".join(str(item) for item in profiles)
+                if isinstance(profiles, list)
+                else "unknown"
+            ),
+        ]
+        if isinstance(dimensions, dict):
+            for name in ("local", "remote"):
+                dimension = dimensions.get(name, {})
+                if not isinstance(dimension, dict):
+                    continue
+                for check in dimension.get("checks", []):
+                    lines.append(
+                        f"{check.get('code', 'UNKNOWN')} "
+                        f"{check.get('message', '')}"
+                    )
+                for error in dimension.get("errors", []):
+                    lines.append(
+                        f"{error.get('code', 'UNKNOWN')} "
+                        f"{error.get('message', '')}"
+                    )
+        for error in payload.get("errors", []):
+            lines.append(
+                f"{error.get('code', 'UNKNOWN')} "
+                f"{error.get('message', '')}"
+            )
+        return "\n".join(lines)
     diagnostic = (
         (
             command == "preflight"
@@ -213,6 +294,11 @@ def _emit(payload: dict[str, Any], as_json: bool) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print(_render_human(payload))
+    if (
+        payload.get("command") == "risk-status"
+        and payload.get("status") == "UNKNOWN"
+    ):
+        return 2
     return 0 if payload.get("ok") else 1
 
 
@@ -668,6 +754,74 @@ def command_route_verify(arguments: argparse.Namespace) -> int:
         )
 
 
+def command_risk_status(arguments: argparse.Namespace) -> int:
+    """Render local risk without fabricating a governing host anchor."""
+
+    try:
+        root = discover_repository(arguments.repo)
+        decision_hint = (
+            _read_json(arguments.decision)
+            if arguments.decision is not None
+            else None
+        )
+        task_state: dict[str, Any] | None = None
+        if arguments.task_id is not None:
+            try:
+                task_state = TaskStore(worktree_git_dir(root)).status(
+                    arguments.task_id
+                )
+            except ValueError:
+                task_state = {
+                    "task_id": arguments.task_id,
+                    "_unobserved": True,
+                }
+        candidate_status = "not_provided"
+        candidate_digest = None
+        if arguments.policy is not None:
+            candidate, candidate_payload = _load_validated_policy(
+                arguments.policy
+            )
+            candidate_status = (
+                "valid_hint"
+                if candidate is not None and candidate_payload["ok"]
+                else "invalid_hint"
+            )
+            if candidate is not None:
+                candidate_digest = contract_digest(candidate)
+        status = evaluate_risk_status(
+            root,
+            None,
+            task_state=task_state,
+            route_decision_hint=decision_hint,
+            host_context=None,
+            remote=None,
+        )
+        payload = status.to_dict()
+        payload["facts"]["governing_policy_source"] = (
+            "unavailable_pending_installed_manifest"
+        )
+        payload["facts"]["candidate_policy_status"] = candidate_status
+        payload["facts"]["candidate_policy_digest"] = candidate_digest
+        payload["facts"]["serialized_decision_authoritative"] = False
+        payload["facts"]["automatic_change"] = False
+        return _emit(payload, arguments.json)
+    except (RepositoryError, ValueError, OSError) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        payload = {
+            "schema_version": 1,
+            "command": "risk-status",
+            "ok": False,
+            "status": "FAIL",
+            "dimensions": {
+                "local": {"status": "FAIL", "checks": [], "errors": []},
+                "remote": {"status": "UNKNOWN", "checks": [], "errors": []},
+            },
+            "facts": {},
+            "errors": [{"code": code, "message": str(error)}],
+        }
+        return _emit(payload, arguments.json)
+
+
 def command_task(arguments: argparse.Namespace) -> int:
     try:
         root = discover_repository(arguments.repo)
@@ -966,6 +1120,25 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--mode", choices=("audit", "enforce"), default="audit")
     _add_output_option(verify_parser)
     verify_parser.set_defaults(handler=command_route_verify)
+
+    risk_parser = subparsers.add_parser(
+        "risk-status",
+        help="Evaluate tri-state local and remote engineering risk.",
+    )
+    risk_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    risk_parser.add_argument(
+        "--policy",
+        type=Path,
+        help="Candidate policy hint only; never a governing policy source.",
+    )
+    risk_parser.add_argument("--task-id")
+    risk_parser.add_argument(
+        "--decision",
+        type=Path,
+        help="Serialized route hint only; never native authority.",
+    )
+    _add_output_option(risk_parser)
+    risk_parser.set_defaults(handler=command_risk_status)
 
     verification_parser = subparsers.add_parser(
         "verification-run",
