@@ -58,6 +58,10 @@ _FEATURE_PUSH_CLAIM_LOCK = threading.Lock()
 _FEATURE_PUSH_OPERATIONS: dict[int, object] = {}
 _PR_MUTATION_CLAIM_LOCK = threading.Lock()
 _CAPABILITY_CONSUMPTION_LOCK = threading.Lock()
+_CLARIFICATION_PROMPT_VIEW_LOCK = threading.RLock()
+_CLARIFICATION_PROMPT_VIEWS: dict[
+    tuple[str, str, str, str], dict[str, object]
+] = {}
 
 
 def _native_host_adapter_unavailable(_: object, __: str) -> bool:
@@ -145,11 +149,14 @@ def _runtime_host_object_registry():
             "session_id",
             "invocation_id",
             "capability_nonce",
+            "issued_at_monotonic",
             "freshness_deadline",
         ),
         "trusted_route_context": (
+            "_clock",
             "task_digest",
             "route_digest",
+            "route_material_digest",
             "inventory_digest",
             "inventory_observation_id",
             "registry_digest",
@@ -164,6 +171,7 @@ def _runtime_host_object_registry():
             "forbidden_resources",
             "resource_bindings",
             "authorized_effects",
+            "blocked_effects",
             "clarification_status",
             "context_nonce",
             "issued_at_monotonic",
@@ -307,10 +315,16 @@ def _runtime_host_object_registry():
         ),
         "validated_assumption": ("provenance",),
         "trusted_interaction": (
+            "_clock",
+            "native_event_id",
+            "subject_digest",
+            "interaction_nonce",
+            "capability_nonce",
             "request_digest",
             "task_digest",
             "session_id",
             "invocation_id",
+            "issued_at_monotonic",
             "freshness_deadline",
         ),
         "trusted_irreversible_confirmation": (
@@ -879,6 +893,7 @@ class HostAdapterCapability:
         "session_id",
         "invocation_id",
         "capability_nonce",
+        "issued_at_monotonic",
         "freshness_deadline",
     )
 
@@ -1004,8 +1019,10 @@ class NativeResourceUseEvent:
 class TrustedRouteContext:
     __slots__ = (
         "_consumed",
+        "_clock",
         "task_digest",
         "route_digest",
+        "route_material_digest",
         "inventory_digest",
         "inventory_observation_id",
         "registry_digest",
@@ -1020,6 +1037,7 @@ class TrustedRouteContext:
         "forbidden_resources",
         "resource_bindings",
         "authorized_effects",
+        "blocked_effects",
         "clarification_status",
         "context_nonce",
         "issued_at_monotonic",
@@ -1217,11 +1235,17 @@ class ValidatedAssumption:
 class TrustedInteraction:
     __slots__ = (
         "_consumed",
+        "_clock",
         "payload",
+        "native_event_id",
+        "subject_digest",
+        "interaction_nonce",
+        "capability_nonce",
         "request_digest",
         "task_digest",
         "session_id",
         "invocation_id",
+        "issued_at_monotonic",
         "freshness_deadline",
     )
 
@@ -2051,6 +2075,7 @@ def attest_host_adapter_capability(
     capability.session_id = native_session_event.session_id
     capability.invocation_id = native_session_event.invocation_id
     capability.capability_nonce = f"host-capability-{uuid4().hex}"
+    capability.issued_at_monotonic = now
     capability.freshness_deadline = now + float(ttl_seconds)
     _register_runtime_host_object(capability, "host_capability")
     return capability
@@ -2214,7 +2239,540 @@ def frame_clarification_prompt_view(
     _register_runtime_host_object(
         framed, "framed_clarification_prompt_view"
     )
+    cache_key = (
+        framed.presentation_digest,
+        framed.task_digest,
+        framed.session_id,
+        framed.invocation_id,
+    )
+    with _CLARIFICATION_PROMPT_VIEW_LOCK:
+        _CLARIFICATION_PROMPT_VIEWS[cache_key] = copy.deepcopy(
+            framed.payload
+        )
     return framed
+
+
+def clarification_route_context_digest(
+    context: object,
+) -> str:
+    """Return the stable semantic digest of one live clarification route."""
+
+    if (
+        type(context) is not TrustedRouteContext
+        or not _runtime_host_object_is_live(
+            context, "trusted_route_context"
+        )
+        or context._consumed
+    ):
+        raise ValueError(
+            "C_ROUTE_CONTEXT_UNTRUSTED: live route context is required"
+        )
+    try:
+        now = float(context._clock())
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "C_ROUTE_CONTEXT_UNTRUSTED: route clock is invalid"
+        ) from error
+    if (
+        not math.isfinite(now)
+        or now > context.freshness_deadline
+        or SHA256_DIGEST.fullmatch(context.task_digest) is None
+        or SHA256_DIGEST.fullmatch(context.route_digest) is None
+        or SHA256_DIGEST.fullmatch(context.route_material_digest) is None
+        or SHA256_DIGEST.fullmatch(context.inventory_digest) is None
+        or SHA256_DIGEST.fullmatch(context.registry_digest) is None
+        or any(
+            effect not in TASK_EFFECTS
+            for effect in (
+                *context.authorized_effects,
+                *context.blocked_effects,
+            )
+        )
+        or context.clarification_status not in {"ask_user", "resolved"}
+    ):
+        raise ValueError(
+            "C_ROUTE_CONTEXT_UNTRUSTED: route context is stale or invalid"
+        )
+    return contract_digest(
+        {
+            "task_digest": context.task_digest,
+            "route_material_digest": context.route_material_digest,
+            "inventory_digest": context.inventory_digest,
+            "registry_digest": context.registry_digest,
+            "repository_identity": context.repository_identity,
+            "worktree_identity": context.worktree_identity,
+            "branch": context.branch,
+            "head": context.head,
+            "required_resources": list(context.required_resources),
+            "recommended_resources": list(
+                context.recommended_resources
+            ),
+            "forbidden_resources": list(context.forbidden_resources),
+            "resource_bindings": [
+                list(item) for item in context.resource_bindings
+            ],
+            "authorized_effects": list(context.authorized_effects),
+        }
+    )
+
+
+def consume_clarification_entry_bindings(
+    *,
+    request: object,
+    route_context: object,
+    expected_task_digest: str,
+    expected_decision_digest: str,
+    expected_branch: str,
+) -> dict[str, object]:
+    """Consume one route context and expose the already-framed safe view."""
+
+    from control_plane.clarification import (
+        require_validated_clarification_request,
+        validate_clarification_prompt_view_draft,
+    )
+
+    validated = require_validated_clarification_request(request)
+    context_digest = clarification_route_context_digest(route_context)
+    if (
+        validated.task_digest != expected_task_digest
+        or validated.payload.get("task_digest") != expected_task_digest
+        or route_context.task_digest != expected_task_digest
+        or route_context.route_digest != expected_decision_digest
+        or route_context.clarification_status != "ask_user"
+        or route_context.branch != expected_branch
+        or route_context.session_id != validated.session_id
+        or route_context.invocation_id != validated.invocation_id
+        or route_context.head is None
+    ):
+        raise ValueError(
+            "C_ROUTE_CONTEXT_UNTRUSTED: request and route binding mismatch"
+        )
+    presentation_digest = validated.payload.get("presentation_digest")
+    cache_key = (
+        str(presentation_digest),
+        validated.task_digest,
+        validated.session_id,
+        validated.invocation_id,
+    )
+    with _CLARIFICATION_PROMPT_VIEW_LOCK:
+        prompt_view = copy.deepcopy(
+            _CLARIFICATION_PROMPT_VIEWS.get(cache_key)
+        )
+    if (
+        not isinstance(prompt_view, dict)
+        or contract_digest(prompt_view) != presentation_digest
+        or prompt_view.get("request_id")
+        != validated.payload.get("request_id")
+        or validate_clarification_prompt_view_draft(
+            {
+                "schema_version": prompt_view.get("schema_version"),
+                "question_text": prompt_view.get("question_text"),
+                "options": prompt_view.get("options"),
+                "recommended_option_id": prompt_view.get(
+                    "recommended_option_id"
+                ),
+                "consequence_text": prompt_view.get("consequence_text"),
+            },
+            issue={
+                "schema_version": 1,
+                "issue_id": "durable-request",
+                "issue_kind": validated.payload.get("issue_kind"),
+                "severity": validated.payload.get("severity"),
+                "question_digest": validated.payload.get(
+                    "question_digest"
+                ),
+                "option_ids": validated.payload.get("option_ids"),
+                "recommended_option_id": validated.payload.get(
+                    "recommended_option_id"
+                ),
+            },
+        )
+    ):
+        raise ValueError(
+            "C_PRESENTATION_UNAVAILABLE: framed prompt view is unavailable"
+        )
+    with _CAPABILITY_CONSUMPTION_LOCK:
+        if (
+            not _runtime_host_object_is_live(
+                route_context, "trusted_route_context"
+            )
+            or route_context._consumed
+            or not _consume_runtime_host_object(
+                route_context, "trusted_route_context"
+            )
+        ):
+            raise ValueError(
+                "C_ROUTE_CONTEXT_UNTRUSTED: route context was consumed"
+            )
+        route_context._consumed = True
+    repository_check = validated.payload.get("repository_check")
+    if not isinstance(repository_check, Mapping):
+        raise ValueError(
+            "C_REPOSITORY_OBSERVATION_UNTRUSTED: request evidence is invalid"
+        )
+    return {
+        "request": copy.deepcopy(validated.payload),
+        "request_digest": validated.request_digest,
+        "prompt_view": prompt_view,
+        "context_digest": context_digest,
+        "repository_identity": route_context.repository_identity,
+        "worktree_identity": route_context.worktree_identity,
+        "branch": route_context.branch,
+        "head": route_context.head,
+        "session_id": route_context.session_id,
+        "invocation_id": route_context.invocation_id,
+        "repository_status": repository_check.get("status"),
+        "repository_evidence_digest": repository_check.get(
+            "evidence_digest"
+        ),
+        "blocked_effects": tuple(route_context.blocked_effects),
+    }
+
+
+def clarification_interaction_subject_digest(
+    *,
+    request_digest: str,
+    task_digest: str,
+    session_id: str,
+    invocation_id: str,
+    selected_option_id: str,
+    response_digest: str,
+) -> str:
+    """Bind the exact native answer, not merely the request it answers."""
+
+    if (
+        SHA256_DIGEST.fullmatch(request_digest) is None
+        or SHA256_DIGEST.fullmatch(task_digest) is None
+        or SHA256_DIGEST.fullmatch(response_digest) is None
+        or not validate_task_id(session_id)
+        or not validate_task_id(invocation_id)
+        or not isinstance(selected_option_id, str)
+        or not selected_option_id
+    ):
+        raise ValueError(
+            "C_UNTRUSTED_CHANNEL: interaction subject is invalid"
+        )
+    return contract_digest(
+        {
+            "kind": "clarification_resolution",
+            "request_digest": request_digest,
+            "task_digest": task_digest,
+            "session_id": session_id,
+            "invocation_id": invocation_id,
+            "selected_option_id": selected_option_id,
+            "response_digest": response_digest,
+        }
+    )
+
+
+def frame_trusted_interaction(
+    *,
+    native_event: NativeUserInteractionEvent,
+    request: ValidatedClarificationRequest,
+    selected_option_id: str,
+    response_digest: str,
+    session_id: str,
+    invocation_id: str,
+    host_capability: HostAdapterCapability,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> TrustedInteraction:
+    """Frame one native user response without granting any effect."""
+
+    from control_plane.clarification import (
+        require_validated_clarification_request,
+        validate_clarification_resolution,
+    )
+
+    validated = require_validated_clarification_request(request)
+    _assert_live_clarification_capability(
+        host_capability,
+        task_digest=validated.task_digest,
+        session_id=session_id,
+        invocation_id=invocation_id,
+    )
+    expected_subject_digest = clarification_interaction_subject_digest(
+        request_digest=validated.request_digest,
+        task_digest=validated.task_digest,
+        session_id=session_id,
+        invocation_id=invocation_id,
+        selected_option_id=selected_option_id,
+        response_digest=response_digest,
+    )
+    if (
+        type(native_event) is not NativeUserInteractionEvent
+        or not _native_host_object_is_valid(
+            native_event, "user_interaction"
+        )
+        or native_event._consumed
+        or not isinstance(native_event.event_id, str)
+        or not native_event.event_id
+        or native_event.session_id != session_id
+        or native_event.invocation_id != invocation_id
+        or native_event.task_digest != validated.task_digest
+        or native_event.subject_digest != expected_subject_digest
+        or selected_option_id not in validated.payload.get(
+            "option_ids", []
+        )
+        or SHA256_DIGEST.fullmatch(response_digest) is None
+        or not validate_task_id(session_id)
+        or not validate_task_id(invocation_id)
+        or not isinstance(ttl_seconds, (int, float))
+        or isinstance(ttl_seconds, bool)
+        or not 0 < float(ttl_seconds) <= 300
+        or not isinstance(
+            native_event.observed_at_monotonic, (int, float)
+        )
+        or isinstance(native_event.observed_at_monotonic, bool)
+        or not math.isfinite(
+            float(native_event.observed_at_monotonic)
+        )
+    ):
+        raise ValueError(
+            "C_UNTRUSTED_CHANNEL: native interaction binding is invalid"
+        )
+    try:
+        now = float(clock())
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "C_UNTRUSTED_CHANNEL: interaction clock is invalid"
+        ) from error
+    if (
+        not math.isfinite(now)
+        or float(native_event.observed_at_monotonic) > now
+        or float(native_event.observed_at_monotonic)
+        < float(host_capability.issued_at_monotonic)
+        or now - float(native_event.observed_at_monotonic)
+        > float(ttl_seconds)
+    ):
+        raise ValueError(
+            "C_UNTRUSTED_CHANNEL: interaction clock is invalid"
+        )
+    payload = {
+        "schema_version": 1,
+        "resolution_id": (
+            "resolution-"
+            + contract_digest(
+                {
+                    "request_digest": validated.request_digest,
+                    "session_id": session_id,
+                    "selected_option_id": selected_option_id,
+                    "response_digest": response_digest,
+                    "invocation_id": invocation_id,
+                }
+            ).removeprefix("sha256:")[:24]
+        ),
+        "request_digest": validated.request_digest,
+        "task_digest": validated.task_digest,
+        "session_id": session_id,
+        "selected_option_id": selected_option_id,
+        "response_digest": response_digest,
+    }
+    interaction = object.__new__(TrustedInteraction)
+    interaction._consumed = False
+    interaction._clock = clock
+    interaction.payload = payload
+    interaction.native_event_id = native_event.event_id
+    interaction.subject_digest = expected_subject_digest
+    interaction.interaction_nonce = f"interaction-{uuid4().hex}"
+    interaction.capability_nonce = host_capability.capability_nonce
+    interaction.request_digest = validated.request_digest
+    interaction.task_digest = validated.task_digest
+    interaction.session_id = session_id
+    interaction.invocation_id = invocation_id
+    interaction.issued_at_monotonic = now
+    interaction.freshness_deadline = min(
+        now + float(ttl_seconds),
+        float(host_capability.freshness_deadline),
+    )
+    _register_runtime_host_object(interaction, "trusted_interaction")
+    issues = validate_clarification_resolution(
+        payload,
+        request=validated.payload,
+        task_digest=validated.task_digest,
+        session_id=session_id,
+        trusted_interaction=interaction,
+    )
+    if issues:
+        _consume_runtime_host_object(interaction, "trusted_interaction")
+        raise ValueError(
+            f"{issues[0].code}: native interaction is invalid"
+        )
+    with _CAPABILITY_CONSUMPTION_LOCK:
+        if (
+            native_event._consumed
+            or host_capability._consumed
+            or validated._consumed
+            or not _consume_runtime_host_object(
+                host_capability, "host_capability"
+            )
+        ):
+            _consume_runtime_host_object(
+                interaction, "trusted_interaction"
+            )
+            raise ValueError(
+                "C_UNTRUSTED_CHANNEL: interaction binding was consumed"
+            )
+        native_event._consumed = True
+        host_capability._consumed = True
+    return interaction
+
+
+def consume_clarification_resolution_bindings(
+    *,
+    interaction: object,
+    route_context: object,
+    repository_context: object,
+    durable_request: Mapping[str, object],
+    expected_request_digest: str,
+    expected_original_task_digest: str,
+    expected_current_task_digest: str,
+    expected_decision_digest: str,
+    expected_repository_identity: Path | str,
+    expected_worktree_identity: Path | str,
+    expected_branch: str,
+    expected_head: str,
+    current_question_digest: str,
+) -> dict[str, object]:
+    """Validate and consume all one-shot resolution evidence atomically."""
+
+    from control_plane.clarification import (
+        REPOSITORY_EVIDENCE_NOT_CHECKED,
+        validate_clarification_resolution,
+    )
+
+    context_digest = clarification_route_context_digest(route_context)
+    repository = _canonical_directory(
+        expected_repository_identity,
+        code="C_ROUTE_CONTEXT_UNTRUSTED",
+    )
+    worktree = _canonical_directory(
+        expected_worktree_identity,
+        code="C_ROUTE_CONTEXT_UNTRUSTED",
+    )
+    if (
+        route_context.task_digest != expected_current_task_digest
+        or route_context.route_digest != expected_decision_digest
+        or route_context.clarification_status != "resolved"
+        or route_context.repository_identity != str(repository)
+        or route_context.worktree_identity != str(worktree)
+        or route_context.branch != expected_branch
+        or route_context.head != expected_head
+        or SHA256_DIGEST.fullmatch(current_question_digest) is None
+    ):
+        raise ValueError(
+            "C_ROUTE_CONTEXT_UNTRUSTED: resolution route binding mismatch"
+        )
+    if (
+        type(interaction) is not TrustedInteraction
+        or not _runtime_host_object_is_live(
+            interaction, "trusted_interaction"
+        )
+        or interaction._consumed
+        or interaction.request_digest != expected_request_digest
+        or interaction.task_digest != expected_original_task_digest
+        or interaction.session_id != route_context.session_id
+        or interaction.invocation_id != route_context.invocation_id
+    ):
+        raise ValueError(
+            "C_UNTRUSTED_CHANNEL: trusted interaction is required"
+        )
+    try:
+        now = float(interaction._clock())
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            "C_UNTRUSTED_CHANNEL: interaction clock is invalid"
+        ) from error
+    if (
+        not math.isfinite(now)
+        or now > interaction.freshness_deadline
+        or validate_clarification_resolution(
+            interaction.payload,
+            request=durable_request,
+            task_digest=expected_original_task_digest,
+            session_id=interaction.session_id,
+            trusted_interaction=interaction,
+        )
+    ):
+        raise ValueError(
+            "C_UNTRUSTED_CHANNEL: interaction is stale or invalid"
+        )
+    repository_status: str
+    repository_evidence_digest: str | None
+    if repository_context is REPOSITORY_EVIDENCE_NOT_CHECKED:
+        repository_check = durable_request.get("repository_check")
+        if (
+            not isinstance(repository_check, Mapping)
+            or repository_check.get("status") != "not_checked"
+            or repository_check.get("evidence_digest") is not None
+            or durable_request.get("issue_kind") != "decision_approval"
+        ):
+            raise ValueError(
+                "C_REPOSITORY_CHECK_REQUIRED: repository evidence is required"
+            )
+        repository_status = "not_checked"
+        repository_evidence_digest = None
+    else:
+        if (
+            type(repository_context)
+            is not ValidatedClarificationRepositoryObservation
+            or not _runtime_host_object_is_live(
+                repository_context,
+                "validated_clarification_repository_observation",
+            )
+            or repository_context._consumed
+            or repository_context.task_digest
+            != expected_current_task_digest
+            or repository_context.session_id != route_context.session_id
+            or repository_context.repository_identity != str(repository)
+            or repository_context.worktree_identity != str(worktree)
+            or repository_context.branch != expected_branch
+            or repository_context.head != expected_head
+            or repository_context.question_digest
+            != current_question_digest
+            or repository_context.freshness_deadline < now
+        ):
+            raise ValueError(
+                "C_REPOSITORY_OBSERVATION_UNTRUSTED: fresh evidence is required"
+            )
+        repository_status = repository_context.status
+        repository_evidence_digest = repository_context.evidence_digest
+    with _CAPABILITY_CONSUMPTION_LOCK:
+        if (
+            route_context._consumed
+            or interaction._consumed
+            or not _consume_runtime_host_object(
+                route_context, "trusted_route_context"
+            )
+            or not _consume_runtime_host_object(
+                interaction, "trusted_interaction"
+            )
+        ):
+            raise ValueError(
+                "C_INTERACTION_REPLAY: resolution binding was consumed"
+            )
+        if repository_context is not REPOSITORY_EVIDENCE_NOT_CHECKED:
+            if (
+                repository_context._consumed
+                or not _consume_runtime_host_object(
+                    repository_context,
+                    "validated_clarification_repository_observation",
+                )
+            ):
+                raise ValueError(
+                    "C_REPOSITORY_OBSERVATION_REPLAY: evidence was consumed"
+                )
+            repository_context._consumed = True
+        route_context._consumed = True
+        interaction._consumed = True
+    return {
+        "resolution": copy.deepcopy(interaction.payload),
+        "resolution_digest": contract_digest(interaction.payload),
+        "context_digest": context_digest,
+        "repository_status": repository_status,
+        "repository_evidence_digest": repository_evidence_digest,
+        "session_id": interaction.session_id,
+    }
 
 
 def observe_clarification_repository(
@@ -3264,6 +3822,46 @@ def _validated_route_payload(
     return payload
 
 
+def _clarification_route_material_digest(
+    route_payload: Mapping[str, object],
+) -> str:
+    """Exclude only the expected ask-user to resolved route delta."""
+
+    normalized = copy.deepcopy(dict(route_payload))
+    normalized.pop("command", None)
+    normalized.pop("decision_digest", None)
+    normalized.pop("decision_ready", None)
+    normalized.pop("ok", None)
+    errors = normalized.get("errors")
+    if isinstance(errors, list):
+        normalized["errors"] = [
+            item
+            for item in errors
+            if not (
+                isinstance(item, Mapping)
+                and item.get("code") == "R_CLARIFICATION_PENDING"
+            )
+        ]
+    interaction = normalized.get("interaction")
+    if isinstance(interaction, Mapping):
+        normalized_interaction = copy.deepcopy(dict(interaction))
+        gate = normalized_interaction.get("clarification_gate")
+        if isinstance(gate, Mapping):
+            normalized_gate = copy.deepcopy(dict(gate))
+            for key in (
+                "status",
+                "decision_ready",
+                "next_action",
+                "blocked_effects",
+                "context_digest",
+                "reason_codes",
+            ):
+                normalized_gate.pop(key, None)
+            normalized_interaction["clarification_gate"] = normalized_gate
+        normalized["interaction"] = normalized_interaction
+    return contract_digest(normalized)
+
+
 def build_trusted_route_context(
     *,
     task: Mapping[str, object],
@@ -3350,6 +3948,9 @@ def build_trusted_route_context(
     forbidden = summary.get("forbidden")
     authorization = route_payload.get("authorization")
     gate = interaction.get("clarification_gate")
+    blocked_effects = (
+        gate.get("blocked_effects") if isinstance(gate, Mapping) else None
+    )
     if (
         not isinstance(selected, Mapping)
         or not isinstance(required, list)
@@ -3357,6 +3958,13 @@ def build_trusted_route_context(
         or not isinstance(forbidden, list)
         or not isinstance(authorization, Mapping)
         or not isinstance(gate, Mapping)
+        or not isinstance(blocked_effects, list)
+        or any(
+            not isinstance(effect, str)
+            or effect not in TASK_EFFECTS
+            or effect == "local_read"
+            for effect in blocked_effects
+        )
         or any(
             not isinstance(identifier, str)
             for identifier in [*required, *recommended, *forbidden]
@@ -3378,8 +3986,12 @@ def build_trusted_route_context(
     host_capability._consumed = True
     context = object.__new__(TrustedRouteContext)
     context._consumed = False
+    context._clock = clock
     context.task_digest = task_digest
     context.route_digest = route_digest
+    context.route_material_digest = _clarification_route_material_digest(
+        route_payload
+    )
     context.inventory_digest = inventory.snapshot_digest
     context.inventory_observation_id = inventory.observation_id
     context.registry_digest = inventory.registry_digest
@@ -3402,6 +4014,7 @@ def build_trusted_route_context(
             if authorized is True
         )
     )
+    context.blocked_effects = tuple(sorted(set(blocked_effects)))
     context.clarification_status = str(gate.get("status"))
     context.context_nonce = f"route-context-{uuid4().hex}"
     context.issued_at_monotonic = now

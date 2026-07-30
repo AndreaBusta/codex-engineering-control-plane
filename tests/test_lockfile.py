@@ -13,6 +13,25 @@ ROOT = Path(__file__).parents[1]
 
 
 class LockfileTests(unittest.TestCase):
+    def test_source_runtime_exposes_resumable_clarification_lifecycle(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        from control_plane.adoption import RUNTIME_MODULES
+        from control_plane.lifecycle import TaskStore
+
+        self.assertIn("host_bridge.py", RUNTIME_MODULES)
+        self.assertIn("lifecycle.py", RUNTIME_MODULES)
+        self.assertTrue(callable(bridge.frame_trusted_interaction))
+        self.assertTrue(callable(TaskStore.require_clarification))
+        self.assertTrue(
+            callable(TaskStore.resolve_and_resume_clarification)
+        )
+        self.assertTrue(callable(TaskStore.clarification_status))
+        self.assertTrue(
+            callable(TaskStore.gc_clarification_prompt_views)
+        )
+
     def test_source_and_distributed_runtime_include_intake_module(
         self,
     ) -> None:

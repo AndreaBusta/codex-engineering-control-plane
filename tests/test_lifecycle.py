@@ -7048,6 +7048,116 @@ class LifecycleTests(unittest.TestCase):
                 clock=lambda: 100.0,
             )
 
+    def test_clear_task_can_transition_from_framed_to_planned(self) -> None:
+        from control_plane.lifecycle import TaskStore
+
+        store = TaskStore(self.state_dir)
+        store.start(
+            "TASK-CLEAR-ORDINAL",
+            outcome="answer",
+            branch="codex/clear-ordinal",
+            task_digest=self.digest,
+            decision_digest=self.digest,
+        )
+
+        state = store.transition(
+            "TASK-CLEAR-ORDINAL",
+            "planned",
+            current_branch="codex/clear-ordinal",
+        )
+
+        self.assertEqual(state["state"], "planned")
+        self.assertEqual(state["generation"], 1)
+
+    def test_generic_transition_cannot_enter_or_resolve_clarification_states(
+        self,
+    ) -> None:
+        from control_plane.lifecycle import TaskStore
+
+        branch = "codex/no-generic-clarification"
+        store = TaskStore(self.state_dir)
+        store.start(
+            "TASK-NO-GENERIC-CLARIFICATION",
+            outcome="local_change",
+            branch=branch,
+            task_digest=self.digest,
+            decision_digest=self.digest,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "E_STATE_TRANSITION|E_STATE_LATERAL"
+        ):
+            store.transition(
+                "TASK-NO-GENERIC-CLARIFICATION",
+                "clarification_required",
+                current_branch=branch,
+            )
+
+        state_path = (
+            self.state_dir
+            / "codex-control-plane"
+            / "tasks"
+            / "TASK-NO-GENERIC-CLARIFICATION.json"
+        )
+        state = store.status("TASK-NO-GENERIC-CLARIFICATION")
+        state.update(
+            {
+                "state": "clarification_required",
+                "clarification_resume_state": "framed",
+                "generation": 1,
+            }
+        )
+        from control_plane.lifecycle import _atomic_json
+
+        _atomic_json(state_path, state)
+        with self.assertRaisesRegex(
+            ValueError, "E_STATE_TRANSITION|E_STATE_LATERAL"
+        ):
+            store.transition(
+                "TASK-NO-GENERIC-CLARIFICATION",
+                "planned",
+                current_branch=branch,
+            )
+
+    def test_clarification_required_cannot_use_generic_resume(self) -> None:
+        from control_plane.lifecycle import TaskStore, _atomic_json
+
+        branch = "codex/no-generic-resume"
+        task_id = "TASK-NO-GENERIC-RESUME"
+        store = TaskStore(self.state_dir)
+        store.start(
+            task_id,
+            outcome="local_change",
+            branch=branch,
+            task_digest=self.digest,
+            decision_digest=self.digest,
+        )
+        state = store.status(task_id)
+        state.update(
+            {
+                "state": "clarification_required",
+                "clarification_resume_state": "framed",
+                "generation": 1,
+            }
+        )
+        _atomic_json(store._path(task_id), state)
+
+        with self.assertRaisesRegex(ValueError, "E_STATE_RESUME"):
+            store.resume(task_id, current_branch=branch)
+
+    def test_outcome_limits_ignore_lateral_states(self) -> None:
+        from control_plane.lifecycle import (
+            LATERAL_STATES,
+            ORDERED_STATES,
+            OUTCOME_LIMITS,
+        )
+
+        self.assertEqual(
+            LATERAL_STATES, frozenset({"clarification_required", "blocked"})
+        )
+        self.assertTrue(LATERAL_STATES.isdisjoint(ORDERED_STATES))
+        for terminal in OUTCOME_LIMITS.values():
+            self.assertIn(terminal, ORDERED_STATES)
+
 
 if __name__ == "__main__":
     unittest.main()

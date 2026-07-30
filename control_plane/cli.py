@@ -675,7 +675,8 @@ def command_task(arguments: argparse.Namespace) -> int:
         store = TaskStore(state_dir)
         current_branch = (
             _git_current_branch(root)
-            if arguments.task_action != "status"
+            if arguments.task_action
+            not in {"status", "clarification-status"}
             else None
         )
         if arguments.task_action == "lease-release":
@@ -714,6 +715,8 @@ def command_task(arguments: argparse.Namespace) -> int:
                 )
         elif arguments.task_action == "status":
             result = store.status(arguments.task_id)
+        elif arguments.task_action == "clarification-status":
+            result = store.clarification_status(arguments.task_id)
         elif arguments.task_action == "resume":
             result = store.resume(
                 arguments.task_id, current_branch=str(current_branch)
@@ -981,6 +984,7 @@ def build_parser() -> argparse.ArgumentParser:
         "start",
         "resume",
         "status",
+        "clarification-status",
         "transition",
         "close",
         "lease-release",
