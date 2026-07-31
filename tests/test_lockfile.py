@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,27 @@ ROOT = Path(__file__).parents[1]
 
 
 class LockfileTests(unittest.TestCase):
+    def test_task8_runtime_and_git_guard_sources_are_locked(self) -> None:
+        from hashlib import sha256
+
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("git_guards.py", RUNTIME_MODULES)
+        lock = tomllib.loads(
+            (ROOT / ".codex" / "control-plane.lock").read_text(
+                encoding="utf-8"
+            )
+        )
+        for key, relative in (
+            ("git_pre_commit", ".codex/git-hooks/pre-commit"),
+            ("git_pre_push", ".codex/git-hooks/pre-push"),
+        ):
+            payload = (ROOT / relative).read_bytes()
+            self.assertEqual(
+                lock["digests"][key],
+                f"sha256:{sha256(payload).hexdigest()}",
+            )
+
     def test_source_and_distributed_runtime_expose_task7_hook_contracts(
         self,
     ) -> None:

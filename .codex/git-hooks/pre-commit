@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+repo=$(/usr/bin/git rev-parse --show-toplevel)
+exec "__CONTROL_PLANE_ENTRYPOINT__" git-guard pre-commit --repo "$repo"

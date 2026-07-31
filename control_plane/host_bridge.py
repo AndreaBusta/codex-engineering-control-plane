@@ -2662,9 +2662,18 @@ def load_governing_local_policy(
     expected_invocation_id: str,
     clock: Callable[[], float],
 ):
-    """Load GoverningPolicy only from the validated Task-6 base source."""
+    """Load GoverningPolicy from one validated local or installed source."""
 
-    from control_plane.policy import load_governing_policy_from_runtime
+    from control_plane.git_guards import (
+        ValidatedInstalledPolicyObservation,
+        _consume_validated_installed_policy,
+        _validated_installed_policy_is_live,
+    )
+    from control_plane.policy import (
+        GoverningPolicy,
+        _register_governing_policy,
+        load_governing_policy_from_runtime,
+    )
 
     try:
         canonical = _canonical_directory(
@@ -2675,6 +2684,56 @@ def load_governing_local_policy(
         raise ValueError(
             "RS_LOCAL_BASE_UNKNOWN: canonical repository is invalid"
         ) from error
+    if type(governing_base_observation) is ValidatedInstalledPolicyObservation:
+        if (
+            not _validated_installed_policy_is_live(
+                governing_base_observation, clock=clock
+            )
+            or governing_base_observation.repository_identity != str(canonical)
+            or governing_base_observation.invocation_id
+            != expected_invocation_id
+            or now > governing_base_observation.freshness_deadline
+        ):
+            raise ValueError(
+                "RS_LOCAL_BASE_UNKNOWN: validated installed observation "
+                "is required"
+            )
+        if not _consume_validated_installed_policy(
+            governing_base_observation
+        ):
+            raise ValueError(
+                "RS_LOCAL_BASE_UNKNOWN: installed observation was replayed"
+            )
+        result = object.__new__(GoverningPolicy)
+        result._consumed = False
+        result.policy = copy.deepcopy(governing_base_observation.policy)
+        result.policy_digest = governing_base_observation.policy_digest
+        result.runtime_digest = governing_base_observation.runtime_digest
+        result.lock_digest = governing_base_observation.lock_digest
+        result.governing_base_commit = (
+            governing_base_observation.governing_base_commit
+        )
+        result.remote_repository = (
+            governing_base_observation.remote_repository
+        )
+        result.session_id = governing_base_observation.session_id
+        result.invocation_id = expected_invocation_id
+        result.freshness_deadline = min(
+            governing_base_observation.freshness_deadline, now + 30.0
+        )
+        result.binding_digest = contract_digest(
+            {
+                "policy_digest": result.policy_digest,
+                "runtime_digest": result.runtime_digest,
+                "lock_digest": result.lock_digest,
+                "governing_base_commit": result.governing_base_commit,
+                "remote_repository": result.remote_repository,
+                "session_id": result.session_id,
+                "invocation_id": result.invocation_id,
+            }
+        )
+        _register_governing_policy(result)
+        return result
     if (
         type(governing_base_observation) is not ValidatedLocalBaseObservation
         or not _runtime_host_object_is_live(
@@ -6705,6 +6764,29 @@ def _assert_no_unsafe_transport_config(worktree: Path) -> None:
         )
 
 
+def _governing_policy_contract_digest(
+    governing_runtime: GoverningRuntimeObservation,
+) -> str:
+    policy_bytes = _governing_regular_blob(
+        Path(governing_runtime.attestor_worktree),
+        governing_runtime.governing_base_commit,
+        ".codex/project-policy.toml",
+        max_output_bytes=131_072,
+    )
+    if (
+        f"sha256:{sha256(policy_bytes).hexdigest()}"
+        != governing_runtime.policy_digest
+    ):
+        raise ValueError("E_GIT_EFFECT: governing policy blob drifted")
+    try:
+        policy = tomllib.loads(policy_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(
+            "E_GIT_EFFECT: governing policy blob is invalid"
+        ) from error
+    return contract_digest(policy)
+
+
 def _validate_governing_git_effect(
     *,
     governing_runtime: object,
@@ -6783,6 +6865,12 @@ def _validate_governing_git_effect(
         for key, value in live_lease.items()
         if key != "lease_digest"
     }
+    live_policy_digest = live_lease.get("policy_digest")
+    governing_policy_contract_digest = (
+        governing_runtime.policy_digest
+        if live_policy_digest == governing_runtime.policy_digest
+        else _governing_policy_contract_digest(governing_runtime)
+    )
     if (
         task_path.is_symlink()
         or lease_path.is_symlink()
@@ -6797,8 +6885,7 @@ def _validate_governing_git_effect(
         or live_lease.get("lease_digest") != contract_digest(lease_semantic)
         or live_lease.get("lease_digest")
         != task_context.get("lease_digest")
-        or live_lease.get("policy_digest")
-        != governing_runtime.policy_digest
+        or live_policy_digest != governing_policy_contract_digest
     ):
         raise ValueError(
             "E_GIT_EFFECT: live task or writer lease binding drifted"

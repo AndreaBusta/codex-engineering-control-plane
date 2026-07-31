@@ -29,6 +29,7 @@ from control_plane.project_profiles import detect_project_profile
 from control_plane.repository import (
     RepositoryError,
     discover_repository,
+    git_common_dir,
     git_environment,
     worktree_git_dir,
 )
@@ -432,6 +433,49 @@ def _file_matches_digest(
     except OSError:
         return UNKNOWN
     return PASS if actual == expected else FAIL
+
+
+def _installed_guard_snapshot(
+    repo: Path,
+    hook_paths: tuple[str, ...],
+    policy: GoverningPolicy,
+) -> tuple[str | None, str]:
+    if len(hook_paths) != 1:
+        return None, FAIL
+    hooks_path = Path(hook_paths[0])
+    if (
+        not hooks_path.is_absolute()
+        or hooks_path.name != "git-hooks"
+        or hooks_path.parent.name.startswith("sha256:") is False
+    ):
+        return None, FAIL
+    try:
+        from control_plane.git_guards import (
+            _runtime_digest,
+            _validate_snapshot,
+        )
+
+        observed = _validate_snapshot(
+            canonical_repo=repo,
+            common_git_dir=git_common_dir(repo),
+            manifest_digest=hooks_path.parent.name,
+        )
+        records = observed["artifacts"]
+        if (
+            str(observed["install_root"] / "git-hooks")
+            != str(hooks_path)
+            or records["policy"]["digest"] != policy.policy_digest
+            or records["lock"]["digest"] != policy.lock_digest
+            or _runtime_digest(records) != policy.runtime_digest
+            or observed["manifest"]["governing_base_commit"]
+            != policy.governing_base_commit
+            or observed["manifest"]["git"]["remote_repository"]
+            != policy.remote_repository
+        ):
+            return None, FAIL
+    except (OSError, TypeError, ValueError):
+        return None, FAIL
+    return str(hooks_path), PASS
 
 
 def _task_check(
@@ -1025,12 +1069,16 @@ def evaluate_local_risk(
     )
 
     config_rc, hook_paths = _git_config_values(root, "core.hooksPath")
-    managed_hook_path = (
+    locked_hook_path = (
         str(lock.get("managed_hooks_path"))
         if isinstance(lock, Mapping)
         and isinstance(lock.get("managed_hooks_path"), str)
         else None
     )
+    installed_hook_path, installed_hook_status = _installed_guard_snapshot(
+        root, hook_paths, policy
+    )
+    managed_hook_path = locked_hook_path or installed_hook_path
     if config_rc not in {0, 1}:
         hook_path_status = UNKNOWN
     elif (
@@ -1071,6 +1119,7 @@ def evaluate_local_risk(
             digests.get("hook_entrypoint") if isinstance(digests, Mapping) else None,
             executable=True,
         ),
+        installed_hook_status,
     )
     hook_digest_status = aggregate_status(hook_statuses)
     checks.append(

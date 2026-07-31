@@ -299,6 +299,11 @@ def _render_human(payload: dict[str, Any]) -> str:
         lines.append(
             f"ERROR {error.get('code', 'UNKNOWN')}: {error.get('message', '')}"
         )
+    for warning in payload.get("warnings", []):
+        lines.append(
+            f"WARNING {warning.get('code', 'UNKNOWN')}: "
+            f"{warning.get('message', '')}"
+        )
 
     return "\n".join(lines)
 
@@ -769,7 +774,7 @@ def command_route_verify(arguments: argparse.Namespace) -> int:
 
 
 def command_risk_status(arguments: argparse.Namespace) -> int:
-    """Render local risk without fabricating a governing host anchor."""
+    """Render local risk from a validated installed anchor when available."""
 
     try:
         root = discover_repository(arguments.repo)
@@ -802,9 +807,64 @@ def command_risk_status(arguments: argparse.Namespace) -> int:
             )
             if candidate is not None:
                 candidate_digest = contract_digest(candidate)
+        governing_policy = None
+        governing_source = "unavailable_pending_installed_manifest"
+        try:
+            manifest_digest = _installed_runtime_manifest_digest()
+        except ValueError:
+            try:
+                manifest_digest = _configured_installed_manifest_digest(root)
+            except ValueError:
+                manifest_digest = None
+        if manifest_digest is not None:
+            invocation_id = f"risk-installed-{uuid4().hex}"
+            session_id = f"risk-session-{uuid4().hex}"
+            try:
+                from control_plane.git_guards import (
+                    load_protected_git_policy,
+                    observe_installed_policy_source,
+                    validate_installed_policy_source,
+                )
+                from control_plane.host_bridge import (
+                    load_governing_local_policy,
+                )
+
+                protected = load_protected_git_policy(
+                    canonical_repo=root,
+                    common_git_dir=git_common_dir(root),
+                    installed_manifest_digest=manifest_digest,
+                    invocation_id=invocation_id,
+                    clock=time.monotonic,
+                )
+                observation = observe_installed_policy_source(
+                    protected_policy=protected,
+                    canonical_repo=root,
+                    expected_manifest_digest=manifest_digest,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    clock=time.monotonic,
+                    ttl_seconds=30.0,
+                )
+                validated = validate_installed_policy_source(
+                    observation,
+                    expected_repository_identity=root,
+                    expected_manifest_digest=manifest_digest,
+                    expected_session_id=session_id,
+                    expected_invocation_id=invocation_id,
+                    clock=time.monotonic,
+                )
+                governing_policy = load_governing_local_policy(
+                    canonical_repo=root,
+                    governing_base_observation=validated,
+                    expected_invocation_id=invocation_id,
+                    clock=time.monotonic,
+                )
+                governing_source = "installed_manifest"
+            except (OSError, TypeError, ValueError):
+                governing_source = "installed_manifest_invalid"
         status = evaluate_risk_status(
             root,
-            None,
+            governing_policy,
             task_state=task_state,
             route_decision_hint=decision_hint,
             host_context=None,
@@ -812,7 +872,7 @@ def command_risk_status(arguments: argparse.Namespace) -> int:
         )
         payload = status.to_dict()
         payload["facts"]["governing_policy_source"] = (
-            "unavailable_pending_installed_manifest"
+            governing_source
         )
         payload["facts"]["candidate_policy_status"] = candidate_status
         payload["facts"]["candidate_policy_digest"] = candidate_digest
@@ -1194,6 +1254,146 @@ def command_upgrade(arguments: argparse.Namespace) -> int:
         )
 
 
+def _read_pre_push_updates(
+    stream: Any, *, limit: int = 1_048_576
+) -> list[tuple[str, str, str, str]]:
+    """Read one complete, bounded pre-push input stream."""
+
+    try:
+        payload = stream.read(limit + 1)
+    except (AttributeError, OSError, ValueError) as error:
+        raise ValueError(
+            "GG_INPUT_INVALID: pre-push input could not be read"
+        ) from error
+    if not isinstance(payload, bytes) or len(payload) > limit:
+        raise ValueError(
+            "GG_INPUT_INVALID: pre-push input exceeds the 1 MiB limit"
+        )
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            "GG_INPUT_INVALID: pre-push input must be UTF-8"
+        ) from error
+    updates: list[tuple[str, str, str, str]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 4:
+            raise ValueError(
+                "GG_INPUT_INVALID: each pre-push line requires four fields"
+            )
+        updates.append((fields[0], fields[1], fields[2], fields[3]))
+    return updates
+
+
+def _installed_runtime_manifest_digest() -> str:
+    install_root = Path(__file__).resolve(strict=True).parent.parent
+    digest = install_root.name
+    if (
+        not digest.startswith("sha256:")
+        or len(digest) != 71
+        or any(character not in "0123456789abcdef" for character in digest[7:])
+    ):
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: CLI is not running from an "
+            "installed digest snapshot"
+        )
+    return digest
+
+
+def _configured_installed_manifest_digest(repo: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", "config", "--get-all", "core.hooksPath"],
+            cwd=repo,
+            env=git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5.0,
+            check=False,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: hook config is not observable"
+        ) from error
+    values = [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    ]
+    if completed.returncode != 0 or len(values) != 1:
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: one managed hook path is required"
+        )
+    hooks_path = Path(values[0])
+    expected_parent = (
+        git_common_dir(repo) / "codex-control-plane" / "installs"
+    )
+    if (
+        not hooks_path.is_absolute()
+        or hooks_path.name != "git-hooks"
+        or hooks_path.parent.parent != expected_parent
+    ):
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: managed hook path is invalid"
+        )
+    digest = hooks_path.parent.name
+    if (
+        not digest.startswith("sha256:")
+        or len(digest) != 71
+        or any(character not in "0123456789abcdef" for character in digest[7:])
+    ):
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: managed manifest digest is invalid"
+        )
+    return digest
+
+
+def command_git_guard(arguments: argparse.Namespace) -> int:
+    from control_plane.git_guards import (
+        guard_pre_commit,
+        guard_pre_push,
+        load_protected_git_policy,
+    )
+
+    event = arguments.guard_action
+    try:
+        repo = discover_repository(arguments.repo)
+        protected = load_protected_git_policy(
+            canonical_repo=repo,
+            common_git_dir=git_common_dir(repo),
+            installed_manifest_digest=_installed_runtime_manifest_digest(),
+            invocation_id=f"git-guard-{uuid4().hex}",
+            clock=time.monotonic,
+        )
+        if event == "pre-commit":
+            payload = guard_pre_commit(repo, protected)
+        else:
+            updates = _read_pre_push_updates(sys.stdin.buffer)
+            payload = guard_pre_push(
+                repo,
+                protected,
+                remote_name=arguments.remote_name,
+                remote_url=arguments.remote_url,
+                updates=updates,
+            )
+    except (RepositoryError, ValueError, OSError) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        payload = {
+            "schema_version": 1,
+            "command": "git-guard",
+            "ok": False,
+            "event": event,
+            "errors": [{"code": code, "message": str(error)}],
+            "warnings": [],
+        }
+    return _emit(payload, arguments.json)
+
+
 def _add_output_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--json", action="store_true", help="Emit the stable JSON contract."
@@ -1334,6 +1534,23 @@ def build_parser() -> argparse.ArgumentParser:
     hook_smoke_parser.add_argument("--task-id", required=True)
     _add_output_option(hook_smoke_parser)
     hook_smoke_parser.set_defaults(handler=command_hook_smoke)
+
+    guard_parser = subparsers.add_parser(
+        "git-guard", help="Enforce the installed protected Git policy."
+    )
+    guard_subparsers = guard_parser.add_subparsers(
+        dest="guard_action", required=True
+    )
+    pre_commit_parser = guard_subparsers.add_parser("pre-commit")
+    pre_commit_parser.add_argument("--repo", type=Path, required=True)
+    _add_output_option(pre_commit_parser)
+    pre_commit_parser.set_defaults(handler=command_git_guard)
+    pre_push_parser = guard_subparsers.add_parser("pre-push")
+    pre_push_parser.add_argument("--repo", type=Path, required=True)
+    pre_push_parser.add_argument("--remote-name", required=True)
+    pre_push_parser.add_argument("--remote-url", required=True)
+    _add_output_option(pre_push_parser)
+    pre_push_parser.set_defaults(handler=command_git_guard)
 
     task_parser = subparsers.add_parser("task", help="Manage task lifecycle state.")
     task_subparsers = task_parser.add_subparsers(dest="task_action", required=True)

@@ -12,7 +12,7 @@ import sys
 import tempfile
 from unittest.mock import patch
 
-from tests.git_test_support import GitScenario
+from tests.git_test_support import GitScenario, git
 
 
 ROOT = Path(__file__).parents[1]
@@ -111,6 +111,643 @@ class AdoptionTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def test_adoption_installs_external_git_guards_and_rolls_back_config(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            adoption_apply,
+            adoption_plan,
+            adoption_rollback,
+            adoption_verify,
+        )
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        self.assertTrue(plan["ok"], plan)
+        config_change = plan["git_config_changes"][0]
+        self.assertEqual(config_change["key"], "core.hooksPath")
+        self.assertEqual(config_change["observed_records"], [])
+        self.assertEqual(config_change["previous_local_values"], [])
+        self.assertTrue(Path(config_change["planned_value"]).is_absolute())
+        snapshot = plan["installed_snapshot"]
+        self.assertTrue(
+            Path(snapshot["path"]).is_relative_to(
+                Path(snapshot["common_git_dir"])
+                / "codex-control-plane"
+                / "installs"
+            )
+        )
+
+        adoption_apply(plan)
+
+        configured = subprocess.run(
+            ["git", "config", "--local", "--get-all", "core.hooksPath"],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(configured.returncode, 0, configured.stderr)
+        self.assertEqual(
+            configured.stdout.strip(), snapshot["hooks_path"]
+        )
+        install = Path(snapshot["path"])
+        self.assertTrue((install / "manifest.json").is_file())
+        manifest = json.loads(
+            (install / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["source_commit"], plan["source_commit"])
+        self.assertEqual(
+            manifest["governing_base_commit"],
+            subprocess.run(
+                ["git", "rev-parse", "refs/remotes/origin/main"],
+                cwd=self.scenario.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+        )
+        self.assertEqual(
+            (install / "manifest.json").stat().st_mode & 0o777, 0o600
+        )
+        for hook in ("pre-commit", "pre-push"):
+            self.assertEqual(
+                (install / "git-hooks" / hook).stat().st_mode & 0o777,
+                0o700,
+            )
+            self.assertNotIn(
+                "__CONTROL_PLANE_ENTRYPOINT__",
+                (install / "git-hooks" / hook).read_text(encoding="utf-8"),
+            )
+        self.assertTrue(adoption_verify(self.scenario.repo)["ok"])
+
+        feature_commit = subprocess.run(
+            [str(install / "git-hooks" / "pre-commit")],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            feature_commit.returncode,
+            0,
+            feature_commit.stdout + feature_commit.stderr,
+        )
+        subprocess.run(
+            ["git", "switch", "main"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        base_commit = subprocess.run(
+            [str(install / "git-hooks" / "pre-commit")],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(base_commit.returncode, 1)
+        self.assertIn("GG_BASE_COMMIT", base_commit.stdout)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        feature = subprocess.run(
+            ["git", "rev-parse", "codex/adopt-v2"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        remote_url = subprocess.run(
+            ["git", "remote", "get-url", "--push", "origin"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        base_push = subprocess.run(
+            [
+                str(install / "git-hooks" / "pre-push"),
+                "origin",
+                remote_url,
+            ],
+            cwd=self.scenario.repo,
+            input=f"refs/heads/main {head} refs/heads/main {head}\n",
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(base_push.returncode, 1)
+        self.assertIn("GG_BASE_PUSH", base_push.stdout)
+        feature_push = subprocess.run(
+            [
+                str(install / "git-hooks" / "pre-push"),
+                "origin",
+                remote_url,
+            ],
+            cwd=self.scenario.repo,
+            input=(
+                "refs/heads/codex/adopt-v2 "
+                f"{feature} refs/heads/codex/adopt-v2 {head}\n"
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            feature_push.returncode,
+            0,
+            feature_push.stdout + feature_push.stderr,
+        )
+        for bad_input in (
+            "only three fields\n",
+            "x" * (1_048_576 + 1),
+        ):
+            with self.subTest(bad_input_size=len(bad_input)):
+                rejected = subprocess.run(
+                    [
+                        str(install / "git-hooks" / "pre-push"),
+                        "origin",
+                        remote_url,
+                    ],
+                    cwd=self.scenario.repo,
+                    input=bad_input,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(rejected.returncode, 1)
+                self.assertIn("GG_INPUT_INVALID", rejected.stdout)
+
+        self.assertTrue(adoption_rollback(self.scenario.repo)["ok"])
+        absent = subprocess.run(
+            ["git", "config", "--local", "--get-all", "core.hooksPath"],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(absent.returncode, 1)
+        self.assertFalse(install.exists())
+
+    def test_installed_guard_ignores_coordinated_candidate_authority_drift(
+        self,
+    ) -> None:
+        from control_plane.adoption import adoption_apply, adoption_plan
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption_apply(plan)
+        install = Path(plan["installed_snapshot"]["path"])
+        installed_hook = install / "git-hooks" / "pre-push"
+        installed_hook_before = installed_hook.read_bytes()
+
+        candidate_policy = (
+            self.scenario.repo / ".codex" / "project-policy.toml"
+        )
+        policy_text = (
+            candidate_policy.read_text(encoding="utf-8")
+            .replace('remote = "origin"', 'remote = "fork"')
+            .replace('base_branch = "main"', 'base_branch = "trunk"')
+        )
+        self.assertIn('remote = "fork"', policy_text)
+        self.assertIn('base_branch = "trunk"', policy_text)
+        policy_bytes = policy_text.encode("utf-8")
+        candidate_policy.write_bytes(policy_bytes)
+
+        candidate_hook = (
+            self.scenario.repo / ".codex" / "git-hooks" / "pre-push"
+        )
+        hook_bytes = b"#!/bin/sh\nexit 0\n"
+        candidate_hook.write_bytes(hook_bytes)
+        candidate_hook.chmod(0o755)
+
+        candidate_lock = (
+            self.scenario.repo / ".codex" / "control-plane.lock"
+        )
+        lock_lines = candidate_lock.read_text(encoding="utf-8").splitlines()
+        coordinated_digests = {
+            "project_policy": (
+                f"sha256:{sha256(policy_bytes).hexdigest()}"
+            ),
+            "git_pre_push": f"sha256:{sha256(hook_bytes).hexdigest()}",
+        }
+        rewritten: list[str] = []
+        replaced: set[str] = set()
+        for line in lock_lines:
+            key = line.partition(" = ")[0]
+            if key in coordinated_digests:
+                rewritten.append(f'{key} = "{coordinated_digests[key]}"')
+                replaced.add(key)
+            else:
+                rewritten.append(line)
+        self.assertEqual(replaced, set(coordinated_digests))
+        candidate_lock.write_text(
+            "\n".join(rewritten) + "\n", encoding="utf-8"
+        )
+
+        head = git(self.scenario.repo, "rev-parse", "HEAD")
+        remote_url = git(
+            self.scenario.repo, "remote", "get-url", "--push", "origin"
+        )
+        result = subprocess.run(
+            [str(installed_hook), "origin", remote_url],
+            cwd=self.scenario.repo,
+            input=(
+                f"refs/heads/main {head} refs/heads/main {head}\n"
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("GG_BASE_PUSH", result.stdout)
+        self.assertIn("GG_CANDIDATE_POLICY_DRIFT", result.stdout)
+        self.assertNotIn("GG_REMOTE_UNVERIFIED", result.stdout)
+        self.assertEqual(installed_hook.read_bytes(), installed_hook_before)
+
+    def test_adoption_refuses_unmanaged_hook_config_or_default_hook(
+        self,
+    ) -> None:
+        from control_plane.adoption import adoption_plan
+
+        subprocess.run(
+            ["git", "config", "--local", "core.hooksPath", "custom-hooks"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        conflict = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        self.assertFalse(conflict["ok"])
+        self.assertIn(
+            "E_ADOPT_HOOK_PATH_CONFLICT", conflict["preflight_errors"]
+        )
+        subprocess.run(
+            ["git", "config", "--local", "--unset-all", "core.hooksPath"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        default_hook = (
+            Path(
+                subprocess.run(
+                    ["git", "rev-parse", "--git-common-dir"],
+                    cwd=self.scenario.repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            )
+            / "hooks"
+            / "pre-commit"
+        )
+        if not default_hook.is_absolute():
+            default_hook = self.scenario.repo / default_hook
+        default_hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        default_hook.chmod(0o755)
+
+        existing = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+
+        self.assertFalse(existing["ok"])
+        self.assertIn(
+            "E_ADOPT_EXISTING_HOOKS", existing["preflight_errors"]
+        )
+
+    def test_installed_launcher_rejects_unmanifested_runtime_entry(
+        self,
+    ) -> None:
+        from control_plane.adoption import adoption_apply, adoption_plan
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption_apply(plan)
+        install = Path(plan["installed_snapshot"]["path"])
+        cache = (
+            install
+            / "codex_control_plane_runtime_v2"
+            / "__pycache__"
+        )
+        cache.mkdir()
+        (cache / "cli.cpython-311.pyc").write_bytes(
+            b"untrusted-bytecode"
+        )
+
+        completed = subprocess.run(
+            [
+                str(install / "scripts" / "control-plane"),
+                "policy-check",
+                "--policy",
+                str(
+                    self.scenario.repo
+                    / ".codex"
+                    / "project-policy.toml"
+                ),
+                "--json",
+            ],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(
+            "GG_INSTALLED_POLICY_INVALID: unmanifested artifact",
+            completed.stderr,
+        )
+
+    def test_installed_launcher_and_hook_ignore_caller_path(self) -> None:
+        from control_plane.adoption import adoption_apply, adoption_plan
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption_apply(plan)
+        install = Path(plan["installed_snapshot"]["path"])
+        with tempfile.TemporaryDirectory() as temporary:
+            shim_root = Path(temporary)
+            marker = shim_root / "dirname-invoked"
+            dirname = shim_root / "dirname"
+            dirname.write_text(
+                "#!/bin/sh\n"
+                '/usr/bin/touch "$CONTROL_PLANE_PATH_MARKER"\n'
+                'exec /usr/bin/dirname "$@"\n',
+                encoding="utf-8",
+            )
+            dirname.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = str(shim_root)
+            environment["CONTROL_PLANE_PATH_MARKER"] = str(marker)
+            commands = (
+                [
+                    str(install / "scripts" / "control-plane"),
+                    "git-guard",
+                    "pre-commit",
+                    "--repo",
+                    str(self.scenario.repo),
+                ],
+                [str(install / "git-hooks" / "pre-commit")],
+            )
+            for command in commands:
+                with self.subTest(command=command[0]):
+                    marker.unlink(missing_ok=True)
+                    completed = subprocess.run(
+                        command,
+                        cwd=self.scenario.repo,
+                        env=environment,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertIn(completed.returncode, {0, 1, 2})
+                    self.assertFalse(marker.exists())
+
+    def test_adoption_reports_shared_common_hook_scope(self) -> None:
+        from control_plane.adoption import (
+            adoption_apply,
+            adoption_plan,
+            adoption_rollback,
+            adoption_status,
+        )
+
+        peer = self.scenario.root / "peer"
+        subprocess.run(
+            [
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                "codex/adopt-peer",
+                str(peer),
+                "HEAD",
+            ],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+
+        self.assertIn(
+            "W_ADOPT_SHARED_COMMON_HOOK_PATH", plan["warnings"]
+        )
+        adoption_apply(plan)
+        self.assertIn(
+            "W_ADOPT_SHARED_COMMON_HOOK_PATH",
+            adoption_status(self.scenario.repo)["warnings"],
+        )
+        peer_hook = (
+            Path(plan["installed_snapshot"]["hooks_path"]) / "pre-commit"
+        )
+        peer_guard = subprocess.run(
+            [str(peer_hook)],
+            cwd=peer,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(peer_guard.returncode, 0, peer_guard.stderr)
+        adoption_rollback(self.scenario.repo)
+
+    def test_global_include_and_worktree_hook_paths_block_without_mutation(
+        self,
+    ) -> None:
+        from control_plane.adoption import adoption_plan
+
+        with tempfile.TemporaryDirectory() as temporary:
+            global_config = Path(temporary) / "global.gitconfig"
+            included = Path(temporary) / "included.gitconfig"
+            included.write_text(
+                "[core]\n\thooksPath = inherited-hooks\n",
+                encoding="utf-8",
+            )
+            global_config.write_text(
+                f"[include]\n\tpath = {included}\n", encoding="utf-8"
+            )
+            with patch.dict(
+                os.environ,
+                {"GIT_CONFIG_GLOBAL": str(global_config)},
+                clear=False,
+            ):
+                inherited = adoption_plan(
+                    ROOT, self.scenario.repo, allow_dirty_source=True
+                )
+            self.assertFalse(inherited["ok"])
+            self.assertIn(
+                "E_ADOPT_HOOK_PATH_CONFLICT",
+                inherited["preflight_errors"],
+            )
+            configured = subprocess.run(
+                ["git", "config", "--local", "--get-all", "core.hooksPath"],
+                cwd=self.scenario.repo,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(configured.returncode, 1)
+
+        subprocess.run(
+            ["git", "config", "--local", "extensions.worktreeConfig", "true"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "--worktree", "core.hooksPath", "worktree-hooks"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        worktree = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        self.assertFalse(worktree["ok"])
+        self.assertIn(
+            "E_ADOPT_HOOK_PATH_CONFLICT", worktree["preflight_errors"]
+        )
+        local = subprocess.run(
+            ["git", "config", "--local", "--get-all", "core.hooksPath"],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(local.returncode, 1)
+
+    def test_adoption_rejects_remote_url_with_embedded_credentials(
+        self,
+    ) -> None:
+        from control_plane.adoption import adoption_plan
+
+        for remote_url in (
+            "https://placeholder-user:placeholder-token@example.invalid/repo.git",
+            "https://example.invalid/repo.git?temporary-marker",
+            "https://example.invalid/repo.git#temporary-marker",
+        ):
+            with self.subTest(shape=remote_url.split("example", 1)[0]):
+                git(
+                    self.scenario.repo,
+                    "remote",
+                    "set-url",
+                    "--push",
+                    "origin",
+                    remote_url,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "E_ADOPT_REMOTE_CREDENTIALS"
+                ):
+                    adoption_plan(
+                        ROOT,
+                        self.scenario.repo,
+                        allow_dirty_source=True,
+                    )
+
+    def test_config_fault_restores_files_snapshot_and_absent_local_value(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        plan = adoption.adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        original = adoption._set_local_hooks_path
+
+        def set_then_fail(root: Path, value: str) -> None:
+            original(root, value)
+            raise OSError("injected config failure")
+
+        with (
+            patch(
+                "control_plane.adoption._set_local_hooks_path",
+                side_effect=set_then_fail,
+            ),
+            self.assertRaisesRegex(OSError, "injected config failure"),
+        ):
+            adoption.adoption_apply(plan)
+
+        configured = subprocess.run(
+            ["git", "config", "--local", "--get-all", "core.hooksPath"],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(configured.returncode, 1)
+        self.assertFalse(Path(plan["installed_snapshot"]["path"]).exists())
+        for change in plan["changes"]:
+            if change["before_digest"] is None:
+                self.assertFalse(
+                    (self.scenario.repo / change["path"]).exists()
+                )
+
+    def test_snapshot_cleanup_fault_does_not_skip_other_compensations(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        plan = adoption.adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        original = adoption._set_local_hooks_path
+
+        def set_then_fail(root: Path, value: str) -> None:
+            original(root, value)
+            raise OSError("injected config failure")
+
+        with (
+            patch(
+                "control_plane.adoption._set_local_hooks_path",
+                side_effect=set_then_fail,
+            ),
+            patch(
+                "control_plane.adoption._remove_snapshot_tree",
+                side_effect=OSError("injected snapshot removal failure"),
+            ),
+            self.assertRaises(Exception) as raised,
+        ):
+            adoption.adoption_apply(plan)
+
+        self.assertIn("E_ADOPT_RECOVERY_FAILED", str(raised.exception))
+        self.assertIsInstance(raised.exception.__cause__, ExceptionGroup)
+        self.assertIn(
+            "injected config failure",
+            repr(raised.exception.__cause__.exceptions[0]),
+        )
+        configured = subprocess.run(
+            ["git", "config", "--local", "--get-all", "core.hooksPath"],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(configured.returncode, 1)
+        for change in plan["changes"]:
+            if change["before_digest"] is None:
+                self.assertFalse(
+                    (self.scenario.repo / change["path"]).exists(),
+                    change["path"],
+                )
+        self.assertTrue(adoption._owner_pointer_path(self.scenario.repo).exists())
 
     def test_plan_is_read_only_apply_is_idempotent_and_rollback_recovers(self) -> None:
         from control_plane.adoption import (
@@ -213,6 +850,162 @@ class AdoptionTests(unittest.TestCase):
 
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside\n")
 
+    def test_snapshot_parent_symlink_is_rejected_before_external_write(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        plan = adoption.adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        common = Path(plan["installed_snapshot"]["common_git_dir"])
+        control_root = common / "codex-control-plane"
+        control_root.mkdir()
+        with tempfile.TemporaryDirectory() as temporary:
+            external = Path(temporary).resolve()
+            (control_root / "installs").symlink_to(
+                external, target_is_directory=True
+            )
+            original = adoption._durable_replace_bytes
+            escaped: list[Path] = []
+
+            def reject_external_write(
+                destination: Path,
+                payload: bytes,
+                *,
+                suffix: str,
+                expected_digest: str | None,
+                mode: int,
+            ) -> None:
+                if destination.resolve().is_relative_to(external):
+                    escaped.append(destination)
+                    raise AssertionError("external snapshot write attempted")
+                original(
+                    destination,
+                    payload,
+                    suffix=suffix,
+                    expected_digest=expected_digest,
+                    mode=mode,
+                )
+
+            with (
+                patch(
+                    "control_plane.adoption._durable_replace_bytes",
+                    side_effect=reject_external_write,
+                ),
+                self.assertRaisesRegex(
+                    ValueError, "E_ADOPT_SNAPSHOT_DRIFT"
+                ),
+            ):
+                adoption.adoption_apply(plan)
+
+            self.assertEqual(escaped, [])
+
+    def test_control_state_root_symlink_is_rejected_before_lock_write(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        plan = adoption.adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        common = Path(plan["installed_snapshot"]["common_git_dir"])
+        with tempfile.TemporaryDirectory() as temporary:
+            external = Path(temporary).resolve()
+            (common / "codex-control-plane").symlink_to(
+                external, target_is_directory=True
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "E_ADOPT_RECOVERY_UNKNOWN"
+            ):
+                adoption.adoption_apply(plan)
+
+            self.assertEqual(list(external.iterdir()), [])
+
+    def test_linked_worktree_state_symlink_is_rejected_before_wal_write(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+        from control_plane.repository import worktree_git_dir
+
+        peer = self.scenario.root / "state-peer"
+        subprocess.run(
+            [
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                "codex/state-peer",
+                str(peer),
+                "HEAD",
+            ],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        owner_git_dir = worktree_git_dir(peer)
+        with tempfile.TemporaryDirectory() as temporary:
+            external = Path(temporary).resolve()
+            (owner_git_dir / "codex-control-plane").symlink_to(
+                external, target_is_directory=True
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "E_ADOPT_RECOVERY_UNKNOWN"
+            ):
+                adoption._begin_transaction(
+                    peer, operation="adopt", records=[]
+                )
+
+            self.assertEqual(list(external.iterdir()), [])
+
+    def test_linked_worktree_journal_symlink_is_rejected_before_read_or_write(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+        from control_plane.repository import worktree_git_dir
+
+        peer = self.scenario.root / "journal-peer"
+        subprocess.run(
+            [
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                "codex/journal-peer",
+                str(peer),
+                "HEAD",
+            ],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plan = adoption.adoption_plan(
+            ROOT, peer, allow_dirty_source=True
+        )
+        owner_git_dir = worktree_git_dir(peer)
+        with tempfile.TemporaryDirectory() as temporary:
+            external = Path(temporary).resolve()
+            external_journal = external / "adoption.json"
+            external_journal.write_text(
+                '{"status":"preparing","records":[]}\n',
+                encoding="utf-8",
+            )
+            before = external_journal.read_bytes()
+            (owner_git_dir / "codex-control-plane").symlink_to(
+                external, target_is_directory=True
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "E_ADOPT_RECOVERY_UNKNOWN"
+            ):
+                adoption.adoption_apply(plan)
+
+            self.assertEqual(external_journal.read_bytes(), before)
+
     def test_rollback_drift_preflight_makes_zero_mutations(self) -> None:
         from control_plane.adoption import (
             adoption_apply,
@@ -244,6 +1037,52 @@ class AdoptionTests(unittest.TestCase):
             for path in before
         }
         self.assertEqual(before, after)
+
+    def test_rollback_config_drift_preflight_makes_zero_mutations(self) -> None:
+        from control_plane.adoption import (
+            adoption_apply,
+            adoption_plan,
+            adoption_rollback,
+        )
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption_apply(plan)
+        subprocess.run(
+            ["git", "config", "--local", "core.hooksPath", "tampered-hooks"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        before = {
+            item["path"]: (
+                self.scenario.repo / item["path"]
+            ).read_bytes()
+            for item in plan["changes"]
+            if (self.scenario.repo / item["path"]).is_file()
+        }
+
+        with self.assertRaisesRegex(ValueError, "E_ADOPT_DRIFT"):
+            adoption_rollback(self.scenario.repo)
+
+        self.assertEqual(
+            before,
+            {
+                path: (self.scenario.repo / path).read_bytes()
+                for path in before
+            },
+        )
+        self.assertTrue(Path(plan["installed_snapshot"]["path"]).is_dir())
+        configured = subprocess.run(
+            ["git", "config", "--local", "--get", "core.hooksPath"],
+            cwd=self.scenario.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(configured.stdout.strip(), "tampered-hooks")
 
     def test_apply_fault_injection_restores_every_target_file(self) -> None:
         import control_plane.adoption as adoption
@@ -359,7 +1198,7 @@ class AdoptionTests(unittest.TestCase):
 
     def test_adoption_mutex_is_released_after_process_kill(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            lock_path = Path(temporary) / "adoption.lock"
+            lock_path = Path(temporary).resolve() / "adoption.lock"
             child = subprocess.Popen(
                 [
                     sys.executable,
@@ -462,6 +1301,9 @@ class AdoptionTests(unittest.TestCase):
                 )
                 installed = b"installed\n"
                 (scenario.repo / "baseline.txt").write_bytes(installed)
+                staged = scenario.repo / "baseline.txt.codex-new"
+                if phase != "committed":
+                    staged.write_bytes(b"partial\n")
                 state = {"schema_version": 2, "status": "preparing"}
                 if phase in {"wal_and_config", "committed"}:
                     _atomic_json(
@@ -503,7 +1345,156 @@ class AdoptionTests(unittest.TestCase):
                     observed,
                     installed if phase == "committed" else original,
                 )
+                if phase != "committed":
+                    self.assertFalse(staged.exists())
                 self.assertFalse(_owner_pointer_path(peer).exists())
+
+    def test_other_worktree_recovers_snapshot_and_git_config_after_crash(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        scenario, peer = self._recovery_scenario("external-state")
+        plan = adoption.adoption_plan(
+            ROOT, scenario.repo, allow_dirty_source=True
+        )
+        source = adoption.discover_repository(ROOT)
+        target = adoption.discover_repository(scenario.repo)
+        rendered = adoption._render_distribution(
+            source, target, git_facts=plan["target_git"]
+        )
+        snapshot, files = adoption._installed_snapshot(
+            source,
+            target,
+            source_commit=plan["source_commit"],
+            git_facts=plan["target_git"],
+            rendered=rendered,
+        )
+        change = plan["git_config_changes"][0]
+        transaction = adoption._begin_transaction(
+            target,
+            operation="adopt",
+            records=[],
+            external_state={
+                "git_config_change": change,
+                "snapshot": {**snapshot, "created": True},
+            },
+        )
+        adoption._publish_install_snapshot(target, snapshot, files)
+        staging = Path(snapshot["staging_path"])
+        staging.mkdir(mode=0o700)
+        (staging / "partial").write_bytes(b"partial\n")
+        adoption._set_local_hooks_path(target, change["planned_value"])
+        adoption._advance_transaction(
+            transaction,
+            status="config_applied",
+            state={"schema_version": 2, "status": "preparing"},
+        )
+
+        adoption._recover_owner_transaction(peer)
+
+        configured = subprocess.run(
+            ["git", "config", "--local", "--get-all", "core.hooksPath"],
+            cwd=scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(configured.returncode, 1)
+        self.assertFalse(Path(snapshot["path"]).exists())
+        self.assertFalse(staging.exists())
+        self.assertFalse(adoption._owner_pointer_path(peer).exists())
+
+    def test_owner_recovery_attempts_external_compensation_after_file_failure(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        scenario, peer = self._recovery_scenario(
+            "external-after-file-failure"
+        )
+        plan = adoption.adoption_plan(
+            ROOT, scenario.repo, allow_dirty_source=True
+        )
+        source = adoption.discover_repository(ROOT)
+        target = adoption.discover_repository(scenario.repo)
+        rendered = adoption._render_distribution(
+            source, target, git_facts=plan["target_git"]
+        )
+        snapshot, files = adoption._installed_snapshot(
+            source,
+            target,
+            source_commit=plan["source_commit"],
+            git_facts=plan["target_git"],
+            rendered=rendered,
+        )
+        change = plan["git_config_changes"][0]
+        transaction = adoption._begin_transaction(
+            target,
+            operation="adopt",
+            records=[],
+            external_state={
+                "git_config_change": change,
+                "snapshot": {**snapshot, "created": True},
+            },
+        )
+        adoption._publish_install_snapshot(target, snapshot, files)
+        adoption._set_local_hooks_path(target, change["planned_value"])
+        adoption._advance_transaction(
+            transaction,
+            status="config_applied",
+            state={"schema_version": 2, "status": "preparing"},
+        )
+
+        with (
+            patch(
+                "control_plane.adoption._restore_records",
+                side_effect=OSError("injected record recovery failure"),
+            ),
+            self.assertRaisesRegex(
+                ValueError, "E_ADOPT_RECOVERY_UNKNOWN"
+            ),
+        ):
+            adoption._recover_owner_transaction(peer)
+
+        configured = subprocess.run(
+            ["git", "config", "--local", "--get-all", "core.hooksPath"],
+            cwd=scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(configured.returncode, 1)
+        self.assertFalse(Path(snapshot["path"]).exists())
+        self.assertTrue(adoption._owner_pointer_path(peer).exists())
+
+    def test_crash_before_commit_marker_restores_absent_adopt_journal(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        plan = adoption.adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        with (
+            patch(
+                "control_plane.adoption._commit_transaction",
+                side_effect=RuntimeError("injected pre-commit-marker crash"),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "injected pre-commit-marker crash"
+            ),
+        ):
+            adoption.adoption_apply(plan)
+
+        self.assertEqual(
+            adoption.adoption_status(self.scenario.repo)["status"],
+            "applied",
+        )
+        retried = adoption.adoption_apply(plan)
+
+        self.assertTrue(retried["ok"])
+        self.assertTrue(adoption.adoption_verify(self.scenario.repo)["ok"])
 
     def test_owner_pointer_never_hashes_mutable_journal(self) -> None:
         from control_plane.adoption import (
@@ -754,7 +1745,7 @@ class AdoptionTests(unittest.TestCase):
         )
         self.assertEqual(
             risk_payload["facts"]["governing_policy_source"],
-            "unavailable_pending_installed_manifest",
+            "installed_manifest",
         )
 
     def test_isolated_safe_read_matches_source_decisions(self) -> None:
@@ -986,6 +1977,375 @@ class AdoptionTests(unittest.TestCase):
             )
             self.assertTrue(adoption_verify(self.scenario.repo)["ok"])
             self.assertTrue(adoption_rollback(self.scenario.repo)["ok"])
+            self.assertFalse(
+                Path(plan["installed_snapshot"]["path"]).exists()
+            )
+            self.assertFalse(
+                Path(upgrade["installed_snapshot"]["path"]).exists()
+            )
+            configured = subprocess.run(
+                ["git", "config", "--local", "--get-all", "core.hooksPath"],
+                cwd=self.scenario.repo,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(configured.returncode, 1)
+
+    def test_upgrade_config_fault_restores_prior_snapshot_and_config(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            shutil.copytree(
+                ROOT,
+                source,
+                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            )
+            subprocess.run(
+                ["git", "init", "-b", "main", str(source)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Control Plane Tests"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "user.email",
+                    "control-plane@example.invalid",
+                ],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "test: source initial"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            first = adoption.adoption_plan(source, self.scenario.repo)
+            adoption.adoption_apply(first)
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=self.scenario.repo,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "test: adoption initial"],
+                cwd=self.scenario.repo,
+                check=True,
+                capture_output=True,
+            )
+            profile = source / "docs" / "profiles" / "generic.md"
+            profile.write_text(
+                profile.read_text(encoding="utf-8")
+                + "\nFAULT-INJECTION-UPGRADE\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "test: source upgrade"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            upgrade = adoption.upgrade_plan(source, self.scenario.repo)
+            old_snapshot = Path(first["installed_snapshot"]["path"])
+            new_snapshot = Path(upgrade["installed_snapshot"]["path"])
+            old_hooks = first["installed_snapshot"]["hooks_path"]
+            original = adoption._set_local_hooks_path
+
+            def set_then_fail(root: Path, value: str) -> None:
+                original(root, value)
+                raise OSError("injected upgrade config failure")
+
+            with (
+                patch(
+                    "control_plane.adoption._set_local_hooks_path",
+                    side_effect=set_then_fail,
+                ),
+                self.assertRaisesRegex(
+                    OSError, "injected upgrade config failure"
+                ),
+            ):
+                adoption.upgrade_apply(upgrade)
+
+            configured = subprocess.run(
+                ["git", "config", "--local", "--get", "core.hooksPath"],
+                cwd=self.scenario.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(configured.stdout.strip(), old_hooks)
+            self.assertTrue(old_snapshot.is_dir())
+            self.assertFalse(new_snapshot.exists())
+            self.assertTrue(adoption.adoption_verify(self.scenario.repo)["ok"])
+
+    def test_upgrade_faults_restore_exact_files_snapshot_and_config(
+        self,
+    ) -> None:
+        import control_plane.adoption as adoption
+
+        def snapshot_tree(path: Path) -> dict[str, tuple[bytes, int]]:
+            return {
+                item.relative_to(path).as_posix(): (
+                    item.read_bytes(),
+                    item.stat().st_mode & 0o777,
+                )
+                for item in sorted(path.rglob("*"))
+                if item.is_file()
+            }
+
+        for fault in (
+            "managed-file-replace",
+            "snapshot-publish",
+            "snapshot-verify",
+        ):
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                source = Path(temporary) / "source"
+                shutil.copytree(
+                    ROOT,
+                    source,
+                    ignore=shutil.ignore_patterns(
+                        ".git", "__pycache__", "*.pyc"
+                    ),
+                )
+                subprocess.run(
+                    ["git", "init", "-b", "main", str(source)],
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "Control Plane Tests"],
+                    cwd=source,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    [
+                        "git",
+                        "config",
+                        "user.email",
+                        "control-plane@example.invalid",
+                    ],
+                    cwd=source,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "add", "."],
+                    cwd=source,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", "test: source initial"],
+                    cwd=source,
+                    check=True,
+                    capture_output=True,
+                )
+
+                target = GitScenario()
+                self.addCleanup(target.close)
+                target.checkout_feature(f"codex/upgrade-{fault}")
+                first = adoption.adoption_plan(source, target.repo)
+                adoption.adoption_apply(first)
+                git(target.repo, "add", ".")
+                git(target.repo, "commit", "-m", "test: adoption initial")
+
+                profile = source / "docs" / "profiles" / "generic.md"
+                profile.write_text(
+                    profile.read_text(encoding="utf-8")
+                    + f"\nUPGRADE-{fault}\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(
+                    ["git", "add", "."],
+                    cwd=source,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", f"test: {fault} upgrade"],
+                    cwd=source,
+                    check=True,
+                    capture_output=True,
+                )
+
+                upgrade = adoption.upgrade_plan(source, target.repo)
+                old_snapshot = Path(first["installed_snapshot"]["path"])
+                new_snapshot = Path(upgrade["installed_snapshot"]["path"])
+                self.assertTrue(old_snapshot.is_dir())
+                self.assertFalse(new_snapshot.exists())
+                old_snapshot_before = snapshot_tree(old_snapshot)
+                config_before = git(
+                    target.repo,
+                    "config",
+                    "--local",
+                    "--get-all",
+                    "core.hooksPath",
+                ).splitlines()
+                targets_before: dict[
+                    str, tuple[bytes, int] | None
+                ] = {}
+                for change in upgrade["changes"]:
+                    relative = str(change["path"])
+                    path = target.repo / relative
+                    targets_before[relative] = (
+                        (path.read_bytes(), path.stat().st_mode & 0o777)
+                        if path.is_file()
+                        else None
+                    )
+
+                if fault == "managed-file-replace":
+                    original_replace = adoption._durable_replace_bytes
+                    injected = False
+
+                    def replace_then_fail(
+                        destination: Path,
+                        payload: bytes,
+                        *,
+                        suffix: str,
+                        expected_digest: str | None,
+                        mode: int,
+                    ) -> None:
+                        nonlocal injected
+                        original_replace(
+                            destination,
+                            payload,
+                            suffix=suffix,
+                            expected_digest=expected_digest,
+                            mode=mode,
+                        )
+                        if suffix == ".codex-upgrade" and not injected:
+                            injected = True
+                            raise OSError(
+                                "injected upgrade file replacement failure"
+                            )
+
+                    fault_patch = patch(
+                        "control_plane.adoption._durable_replace_bytes",
+                        side_effect=replace_then_fail,
+                    )
+                    expected_error = (
+                        OSError,
+                        "injected upgrade file replacement failure",
+                    )
+                elif fault == "snapshot-publish":
+                    original_publish = adoption._publish_install_snapshot
+                    injected = False
+
+                    def publish_then_fail(
+                        target_root: Path,
+                        snapshot,
+                        files,
+                    ) -> bool:
+                        nonlocal injected
+                        original_publish(target_root, snapshot, files)
+                        injected = True
+                        raise OSError(
+                            "injected upgrade snapshot publication failure"
+                        )
+
+                    fault_patch = patch(
+                        "control_plane.adoption._publish_install_snapshot",
+                        side_effect=publish_then_fail,
+                    )
+                    expected_error = (
+                        OSError,
+                        "injected upgrade snapshot publication failure",
+                    )
+                else:
+                    original_snapshot_valid = adoption._snapshot_is_valid
+                    validation_calls = 0
+                    injected = False
+
+                    def fail_final_snapshot_verification(
+                        target_root: Path,
+                        snapshot,
+                    ) -> bool:
+                        nonlocal injected, validation_calls
+                        valid = original_snapshot_valid(
+                            target_root, snapshot
+                        )
+                        if (
+                            str(snapshot.get("path")) == str(new_snapshot)
+                            and new_snapshot.exists()
+                        ):
+                            validation_calls += 1
+                            if validation_calls == 2:
+                                injected = True
+                                return False
+                        return valid
+
+                    fault_patch = patch(
+                        "control_plane.adoption._snapshot_is_valid",
+                        side_effect=fail_final_snapshot_verification,
+                    )
+                    expected_error = (ValueError, "E_UPGRADE_VERIFY")
+
+                with (
+                    fault_patch,
+                    self.assertRaisesRegex(*expected_error),
+                ):
+                    adoption.upgrade_apply(upgrade)
+
+                self.assertTrue(injected, f"{fault} was not reached")
+                self.assertEqual(
+                    git(
+                        target.repo,
+                        "config",
+                        "--local",
+                        "--get-all",
+                        "core.hooksPath",
+                    ).splitlines(),
+                    config_before,
+                )
+                self.assertEqual(
+                    snapshot_tree(old_snapshot), old_snapshot_before
+                )
+                self.assertFalse(new_snapshot.exists())
+                for relative, expected in targets_before.items():
+                    path = target.repo / relative
+                    observed = (
+                        (path.read_bytes(), path.stat().st_mode & 0o777)
+                        if path.is_file()
+                        else None
+                    )
+                    self.assertEqual(
+                        observed,
+                        expected,
+                        f"{fault} did not restore {relative}",
+                    )
+                status = adoption.adoption_status(target.repo)
+                self.assertEqual(status["status"], "applied")
+                self.assertEqual(status["plan_id"], first["plan_id"])
+                self.assertTrue(adoption.adoption_verify(target.repo)["ok"])
 
     def test_target_policy_uses_detected_develop_base_before_apply(self) -> None:
         from control_plane.adoption import adoption_apply, adoption_plan

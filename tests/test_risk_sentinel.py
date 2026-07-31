@@ -265,6 +265,65 @@ class RiskSentinelContractTests(unittest.TestCase):
         )
         self.assertNotEqual(result.status, "PASS")
 
+    def test_installed_guard_snapshot_binds_hooks_base_and_remote(self) -> None:
+        from types import SimpleNamespace
+
+        from control_plane.risk_sentinel import (
+            FAIL,
+            PASS,
+            _installed_guard_snapshot,
+        )
+        from tests.test_git_guards import InstalledGuardScenario
+
+        scenario = InstalledGuardScenario()
+        self.addCleanup(scenario.close)
+        policy = scenario.load()
+        hooks_path = str(
+            scenario.common_dir
+            / "codex-control-plane"
+            / "installs"
+            / scenario.manifest_digest
+            / "git-hooks"
+        )
+
+        self.assertEqual(
+            _installed_guard_snapshot(
+                scenario.repo, (hooks_path,), policy
+            ),
+            (hooks_path, PASS),
+        )
+        bindings = {
+            "policy_digest": policy.policy_digest,
+            "lock_digest": policy.lock_digest,
+            "runtime_digest": policy.runtime_digest,
+            "governing_base_commit": policy.governing_base_commit,
+            "remote_repository": policy.remote_repository,
+        }
+        for field, value in (
+            ("governing_base_commit", "0" * 40),
+            ("remote_repository", "other/repository"),
+        ):
+            with self.subTest(field=field):
+                mismatched = SimpleNamespace(
+                    **{**bindings, field: value}
+                )
+                self.assertEqual(
+                    _installed_guard_snapshot(
+                        scenario.repo, (hooks_path,), mismatched
+                    ),
+                    (None, FAIL),
+                )
+
+        (Path(hooks_path) / "pre-push").write_text(
+            "#!/bin/sh\nexit 1\n", encoding="utf-8"
+        )
+        self.assertEqual(
+            _installed_guard_snapshot(
+                scenario.repo, (hooks_path,), policy
+            ),
+            (None, FAIL),
+        )
+
     def test_serialized_decision_cannot_make_authority_or_clarification_pass(
         self,
     ) -> None:

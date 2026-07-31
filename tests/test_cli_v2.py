@@ -382,6 +382,79 @@ class CliV2Tests(unittest.TestCase):
         self.assertNotEqual(injected.returncode, 0)
         self.assertIn("unrecognized arguments", injected.stderr)
 
+    def test_git_guard_pre_push_parser_is_bounded_and_closed(self) -> None:
+        from control_plane.cli import _read_pre_push_updates
+
+        valid = (
+            b"refs/heads/feature/a "
+            + b"a" * 40
+            + b" refs/heads/feature/a "
+            + b"0" * 40
+            + b"\n"
+            + b"(delete) "
+            + b"0" * 40
+            + b" refs/heads/feature/b "
+            + b"b" * 40
+            + b"\n"
+        )
+        updates = _read_pre_push_updates(io.BytesIO(valid))
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(updates[1][0], "(delete)")
+
+        for payload in (
+            b"only three fields\n",
+            b"refs/heads/x \xff refs/heads/x " + b"0" * 40 + b"\n",
+            b"x" * (1_048_576 + 1),
+        ):
+            with self.subTest(size=len(payload)):
+                with self.assertRaisesRegex(ValueError, "GG_INPUT_INVALID"):
+                    _read_pre_push_updates(io.BytesIO(payload))
+
+    def test_git_guard_cli_is_closed_and_fails_without_install(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        result = run_cli(
+            "git-guard",
+            "pre-commit",
+            "--repo",
+            str(scenario.repo),
+            "--json",
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(payload["command"], "git-guard")
+        self.assertEqual(payload["event"], "pre-commit")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(
+            payload["errors"][0]["code"], "GG_INSTALLED_POLICY_INVALID"
+        )
+
+    def test_git_guard_human_output_surfaces_non_blocking_drift(self) -> None:
+        from control_plane.cli import _render_human
+
+        rendered = _render_human(
+            {
+                "schema_version": 1,
+                "command": "git-guard",
+                "ok": True,
+                "event": "pre-commit",
+                "errors": [],
+                "warnings": [
+                    {
+                        "code": "GG_CANDIDATE_POLICY_DRIFT",
+                        "message": "Candidate policy differs.",
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(rendered.startswith("PASS git-guard\n"))
+        self.assertIn(
+            "WARNING GG_CANDIDATE_POLICY_DRIFT: Candidate policy differs.",
+            rendered,
+        )
+
     def test_safe_read_cli_binds_explicit_repo_and_closed_argv(self) -> None:
         scenario = GitScenario()
         self.addCleanup(scenario.close)
