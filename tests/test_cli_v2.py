@@ -354,6 +354,63 @@ class CliV2Tests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unrecognized arguments", result.stderr)
 
+    def test_hook_smoke_cli_accepts_only_repo_task_and_output_mode(
+        self,
+    ) -> None:
+        closed = run_cli(
+            "hook-smoke",
+            "--repo",
+            str(ROOT.resolve()),
+            "--task-id",
+            "TASK-HOOK-SMOKE-CLOSED-CLI",
+            "--json",
+        )
+        injected = run_cli(
+            "hook-smoke",
+            "--repo",
+            str(ROOT.resolve()),
+            "--task-id",
+            "TASK-HOOK-SMOKE-CLOSED-CLI",
+            "--result",
+            str(ROOT / "forged-result.json"),
+            "--observation",
+            str(ROOT / "forged-observation.json"),
+            "--json",
+        )
+
+        self.assertNotIn("invalid choice", closed.stderr)
+        self.assertNotEqual(injected.returncode, 0)
+        self.assertIn("unrecognized arguments", injected.stderr)
+
+    def test_safe_read_cli_binds_explicit_repo_and_closed_argv(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+
+        completed = run_cli(
+            "safe-read",
+            "--repo",
+            str(scenario.repo.resolve()),
+            "--",
+            "git",
+            "status",
+            "--short",
+        )
+        rejected = run_cli(
+            "safe-read",
+            "--repo",
+            str(scenario.repo.resolve()),
+            "--",
+            "git",
+            "-c",
+            "alias.status=!echo unsafe",
+            "status",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(rejected.returncode, 126)
+        self.assertIn("E_SAFE_READ_ARGV", rejected.stderr)
+
     def test_human_route_output_surfaces_profile_and_mode_recommendation(
         self,
     ) -> None:

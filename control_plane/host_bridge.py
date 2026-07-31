@@ -10,11 +10,17 @@ import math
 import os
 from pathlib import Path
 from pathlib import PurePosixPath
+import platform
 import re
+import selectors
+import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import tomllib
 from typing import Callable, Iterator, Mapping
 from uuid import uuid4
@@ -288,6 +294,69 @@ def _runtime_host_object_registry():
             "_route_context",
             "_clarification_resolution",
             "_authorization",
+        ),
+        "completed_macos_hook_smoke": (
+            "_consumed",
+            "platform_name",
+            "repository",
+            "head",
+            "artifact_digests",
+            "harness_digest",
+            "harness_binding_digest",
+            "session_id",
+            "invocation_id",
+            "dedicated_temp_root",
+            "observed_at_monotonic",
+            "cases",
+            "mechanical_result",
+            "native_adapter",
+            "human_hooks_review",
+            "authorizes",
+            "completed_digest",
+        ),
+        "verification_task_context": (
+            "_consumed",
+            "task_id",
+            "task_digest",
+            "profile",
+            "profile_digest",
+            "runtime_digest",
+            "target_digest",
+            "repository",
+            "worktree",
+            "expected_head",
+            "session_id",
+            "lease_digest",
+            "generation",
+            "execution_context_digest",
+            "context_digest",
+        ),
+        "validated_native_macos_hook_smoke": (
+            "_consumed",
+            "_clock",
+            "event_id",
+            "completed_digest",
+            "repository",
+            "head",
+            "artifact_digests",
+            "session_id",
+            "invocation_id",
+            "native_adapter",
+            "freshness_deadline",
+            "observation_digest",
+        ),
+        "validated_hook_review": (
+            "_consumed",
+            "_clock",
+            "event_id",
+            "smoke_receipt_digest",
+            "repository",
+            "head",
+            "artifact_digests",
+            "session_id",
+            "invocation_id",
+            "freshness_deadline",
+            "observation_digest",
         ),
         "clarification_repository_observation": (
             "observation_id",
@@ -880,6 +949,7 @@ class WorktreeInventoryObservation:
 class ValidatedWorktreeInventoryObservation:
     __slots__ = (
         "_consumed",
+        "_clock",
         "observation_id",
         "invocation_id",
         "common_git_dir",
@@ -4501,6 +4571,17 @@ def _sanitized_git_environment() -> dict[str, str]:
     }
 
 
+def _trusted_git_executable() -> str | None:
+    for candidate in (Path("/usr/bin/git"), Path("/bin/git")):
+        if (
+            candidate.is_file()
+            and not candidate.is_symlink()
+            and os.access(candidate, os.X_OK)
+        ):
+            return str(candidate)
+    return None
+
+
 _CLOSED_GIT_CONFIG = (
     "-c",
     "core.hooksPath=/dev/null",
@@ -5397,9 +5478,14 @@ def observe_worktree_inventory(
         raise ValueError(
             "E_LEASE_OBSERVATION_UNKNOWN: invalid inventory observation binding"
         )
+    git = _trusted_git_executable()
+    if git is None:
+        raise ValueError(
+            "E_LEASE_OBSERVATION_UNKNOWN: trusted Git is unavailable"
+        )
     completed = subprocess.run(
         [
-            "git",
+            git,
             "--git-dir",
             str(common_dir),
             "worktree",
@@ -5488,6 +5574,7 @@ def validate_worktree_inventory_observation(
         )
     validated = object.__new__(ValidatedWorktreeInventoryObservation)
     validated._consumed = False
+    validated._clock = clock
     validated.observation_id = observation.observation_id
     validated.invocation_id = observation.invocation_id
     validated.common_git_dir = observation.common_git_dir
@@ -5528,6 +5615,7 @@ def _consume_worktree_inventory(
     if (
         type(inventory) is not ValidatedWorktreeInventoryObservation
         or inventory._consumed
+        or float(inventory._clock()) > inventory.freshness_deadline
         or inventory.common_git_dir != str(expected_common_git_dir.resolve())
         or not _inventory_is_current(inventory)
     ):
@@ -8364,3 +8452,1315 @@ def validate_pull_request_mutation(
         validated, "validated_pull_request_mutation_observation"
     )
     return validated
+
+
+MACOS_HOOK_SMOKE_SCENARIOS = (
+    "warning_once",
+    "sessionstart_compact_to_post_compact",
+    "safe_read_explicit_repo",
+    "feature_commit_push",
+    "base_detached_force_denied",
+    "stop_receipt",
+    "rollback_byte_exact",
+    "source_isolated_parity",
+)
+MACOS_HOOK_SMOKE_ARTIFACTS = {
+    "policy": ".codex/project-policy.toml",
+    "registry": ".codex/resource-registry.toml",
+    "lock": ".codex/control-plane.lock",
+    "launcher": "scripts/control-plane",
+    "hooks": ".codex/hooks.json",
+}
+_SMOKE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", re.ASCII)
+
+
+@dataclass(frozen=True)
+class MacOSHookSmokeCase:
+    case_id: str
+    status: str
+    exit_code: int | None
+    stdout_digest: str
+    stderr_digest: str
+
+
+class CompletedMacOSHookSmoke:
+    __slots__ = (
+        "_consumed",
+        "platform_name",
+        "repository",
+        "head",
+        "artifact_digests",
+        "harness_digest",
+        "harness_binding_digest",
+        "session_id",
+        "invocation_id",
+        "dedicated_temp_root",
+        "observed_at_monotonic",
+        "cases",
+        "mechanical_result",
+        "native_adapter",
+        "human_hooks_review",
+        "authorizes",
+        "completed_digest",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "CompletedMacOSHookSmoke":
+        raise TypeError("macOS hook smoke result is host-bound")
+
+
+class VerificationTaskContext:
+    __slots__ = (
+        "_consumed",
+        "task_id",
+        "task_digest",
+        "profile",
+        "profile_digest",
+        "runtime_digest",
+        "target_digest",
+        "repository",
+        "worktree",
+        "expected_head",
+        "session_id",
+        "lease_digest",
+        "generation",
+        "execution_context_digest",
+        "context_digest",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "VerificationTaskContext":
+        raise TypeError("verification task context is host-bound")
+
+
+@dataclass(frozen=True)
+class MacOSHookSmokeReceipt:
+    schema_version: int
+    kind: str
+    task_id: str
+    task_digest: str
+    profile: str
+    profile_digest: str
+    runtime_digest: str
+    target_digest: str
+    repository: str
+    head: str
+    artifact_digests: tuple[tuple[str, str], ...]
+    harness_digest: str
+    harness_binding_digest: str
+    session_id: str
+    invocation_id: str
+    generation: int
+    completed_digest: str
+    mechanical_result: str
+    native_adapter: str
+    human_hooks_review: str
+    authorizes: bool
+    receipt_digest: str
+
+
+@dataclass(frozen=True)
+class HookSmokePublicationResult:
+    receipt: MacOSHookSmokeReceipt
+    task_context: VerificationTaskContext
+
+
+class NativeMacOSProcessEvent:
+    __slots__ = (
+        "_consumed",
+        "event_id",
+        "completed_digest",
+        "repository",
+        "head",
+        "artifact_digests",
+        "session_id",
+        "invocation_id",
+        "native_adapter",
+        "observed_at_monotonic",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "NativeMacOSProcessEvent":
+        raise TypeError("native macOS process event is supplied only by the host")
+
+
+class ValidatedNativeMacOSHookSmokeObservation:
+    __slots__ = (
+        "_consumed",
+        "_clock",
+        "event_id",
+        "completed_digest",
+        "repository",
+        "head",
+        "artifact_digests",
+        "session_id",
+        "invocation_id",
+        "native_adapter",
+        "freshness_deadline",
+        "observation_digest",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedNativeMacOSHookSmokeObservation":
+        raise TypeError("native macOS smoke observation is host-bound")
+
+
+class NativeHooksReviewEvent:
+    __slots__ = (
+        "_consumed",
+        "event_id",
+        "smoke_receipt_digest",
+        "repository",
+        "head",
+        "artifact_digests",
+        "session_id",
+        "invocation_id",
+        "approved",
+        "observed_at_monotonic",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "NativeHooksReviewEvent":
+        raise TypeError("native hooks review event is supplied only by the host")
+
+
+class ValidatedHookReviewObservation:
+    __slots__ = (
+        "_consumed",
+        "_clock",
+        "event_id",
+        "smoke_receipt_digest",
+        "repository",
+        "head",
+        "artifact_digests",
+        "session_id",
+        "invocation_id",
+        "freshness_deadline",
+        "observation_digest",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedHookReviewObservation":
+        raise TypeError("hooks review observation is host-bound")
+
+
+@dataclass(frozen=True)
+class HookReviewReceipt:
+    schema_version: int
+    kind: str
+    task_id: str
+    task_digest: str
+    repository: str
+    head: str
+    artifact_digests: tuple[tuple[str, str], ...]
+    session_id: str
+    invocation_id: str
+    generation: int
+    smoke_receipt_digest: str
+    observation_digest: str
+    reviewed: bool
+    authorizes: bool
+    receipt_digest: str
+
+
+@dataclass(frozen=True)
+class HookReviewPublicationResult:
+    receipt: HookReviewReceipt
+    task_context: VerificationTaskContext
+
+
+def _closed_artifact_digests(
+    canonical_repo: Path, supplied: object
+) -> tuple[tuple[str, str], ...]:
+    if not isinstance(supplied, Mapping) or set(supplied) != set(
+        MACOS_HOOK_SMOKE_ARTIFACTS
+    ):
+        raise ValueError(
+            "E_MACOS_SMOKE_BINDING: artifact set is not exact"
+        )
+    observed: list[tuple[str, str]] = []
+    for name, relative in MACOS_HOOK_SMOKE_ARTIFACTS.items():
+        path = canonical_repo / relative
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                "E_MACOS_SMOKE_BINDING: required artifact is unavailable"
+            )
+        digest = f"sha256:{sha256(path.read_bytes()).hexdigest()}"
+        if supplied.get(name) != digest:
+            raise ValueError(
+                "E_MACOS_SMOKE_BINDING: artifact digest drifted"
+            )
+        observed.append((name, digest))
+    return tuple(observed)
+
+
+def _smoke_git_head(repository: Path) -> str:
+    git = _trusted_git_executable()
+    if git is None:
+        return ""
+    completed = subprocess.run(
+        [git, "-C", str(repository), "rev-parse", "HEAD"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else ""
+
+
+def _smoke_harness_binding(
+    repository: Path,
+    expected_head: str,
+) -> tuple[str, str, bool]:
+    harness_relative = "tests/macos_hook_smoke.py"
+    empty_digest = f"sha256:{sha256(b'').hexdigest()}"
+    git = _trusted_git_executable()
+    expected_bytes: bytes | None = None
+    if git is not None:
+        try:
+            completed = subprocess.run(
+                [
+                    git,
+                    "-C",
+                    str(repository),
+                    "show",
+                    f"{expected_head}:{harness_relative}",
+                ],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=_sanitized_git_environment(),
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            completed = None
+        if (
+            completed is not None
+            and completed.returncode == 0
+            and len(completed.stdout) <= 1_048_576
+        ):
+            expected_bytes = completed.stdout
+    harness = repository / harness_relative
+    current_bytes: bytes | None = None
+    try:
+        if (
+            not harness.is_symlink()
+            and harness.is_file()
+            and harness.stat().st_size <= 1_048_576
+        ):
+            current_bytes = harness.read_bytes()
+    except OSError:
+        current_bytes = None
+    expected_digest = (
+        f"sha256:{sha256(expected_bytes).hexdigest()}"
+        if expected_bytes is not None
+        else empty_digest
+    )
+    current_digest = (
+        f"sha256:{sha256(current_bytes).hexdigest()}"
+        if current_bytes is not None
+        else empty_digest
+    )
+    exact = expected_bytes is not None and current_bytes == expected_bytes
+    binding_digest = contract_digest(
+        {
+            "repository": str(repository),
+            "head": expected_head,
+            "path": harness_relative,
+            "expected_digest": expected_digest,
+            "current_digest": current_digest,
+            "status": "exact" if exact else "unknown",
+        }
+    )
+    return expected_digest, binding_digest, exact
+
+
+def _unknown_smoke_cases() -> tuple[dict[str, object], ...]:
+    empty_digest = f"sha256:{sha256(b'').hexdigest()}"
+    return tuple(
+        {
+            "id": case_id,
+            "status": "UNKNOWN",
+            "exit_code": None,
+            "stdout_digest": empty_digest,
+            "stderr_digest": empty_digest,
+        }
+        for case_id in MACOS_HOOK_SMOKE_SCENARIOS
+    )
+
+
+def _run_macos_smoke_process(
+    repository: Path,
+    dedicated_temp_root: Path,
+    timeout_seconds: float,
+) -> tuple[tuple[dict[str, object], ...], str]:
+    harness = repository / "tests" / "macos_hook_smoke.py"
+    if harness.is_symlink() or not harness.is_file():
+        raise ValueError(
+            "E_MACOS_SMOKE_RUNNER: smoke harness is unavailable"
+        )
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LC_ALL": "C",
+        "PYTHONSAFEPATH": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": str(dedicated_temp_root),
+    }
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(harness),
+            "--run-macos-hook-smoke",
+            "--repo",
+            str(repository),
+        ],
+        cwd=repository,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:
+        raise ValueError(
+            "E_MACOS_SMOKE_RUNNER: smoke pipes are unavailable"
+        )
+    selector = selectors.DefaultSelector()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    deadline = time.monotonic() + timeout_seconds
+    group_closed = False
+
+    def terminate_group() -> None:
+        nonlocal group_closed
+        if group_closed:
+            return
+        group_closed = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
+            process.wait(timeout=5)
+
+    try:
+        while selector.get_map():
+            remaining_time = deadline - time.monotonic()
+            if remaining_time <= 0:
+                terminate_group()
+                raise ValueError(
+                    "E_MACOS_SMOKE_RUNNER: smoke process timed out"
+                )
+            for key, _ in selector.select(min(0.1, remaining_time)):
+                stream = key.fileobj
+                name = str(key.data)
+                remaining = 262_144 - len(buffers[name])
+                try:
+                    chunk = os.read(
+                        stream.fileno(), max(1, min(65_536, remaining + 1))
+                    )
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                if len(chunk) > remaining:
+                    terminate_group()
+                    raise ValueError(
+                        "E_MACOS_SMOKE_RUNNER: smoke output exceeded cap"
+                    )
+                buffers[name].extend(chunk)
+        remaining_time = deadline - time.monotonic()
+        if remaining_time <= 0:
+            terminate_group()
+            raise ValueError(
+                "E_MACOS_SMOKE_RUNNER: smoke process timed out"
+            )
+        try:
+            returncode = process.wait(timeout=remaining_time)
+        except subprocess.TimeoutExpired as error:
+            terminate_group()
+            raise ValueError(
+                "E_MACOS_SMOKE_RUNNER: smoke process timed out"
+            ) from error
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+        terminate_group()
+    stdout = bytes(buffers["stdout"])
+    stderr = bytes(buffers["stderr"])
+    if returncode != 0:
+        raise ValueError(
+            "E_MACOS_SMOKE_RUNNER: smoke process failed"
+        )
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "E_MACOS_SMOKE_RUNNER: smoke output is invalid"
+        ) from error
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"schema_version", "scenarios", "native_adapter"}
+        or payload.get("schema_version") != 1
+        or not isinstance(payload.get("scenarios"), list)
+        or payload.get("native_adapter") not in {"ready", "absent", "failed"}
+    ):
+        raise ValueError(
+            "E_MACOS_SMOKE_RUNNER: smoke output schema is invalid"
+        )
+    return tuple(payload["scenarios"]), str(payload["native_adapter"])
+
+
+def _closed_smoke_cases(
+    supplied: object,
+) -> tuple[MacOSHookSmokeCase, ...]:
+    if not isinstance(supplied, tuple) or len(supplied) != len(
+        MACOS_HOOK_SMOKE_SCENARIOS
+    ):
+        raise ValueError(
+            "E_MACOS_SMOKE_RESULT: scenario set is not exact"
+        )
+    cases: list[MacOSHookSmokeCase] = []
+    for expected_id, item in zip(MACOS_HOOK_SMOKE_SCENARIOS, supplied):
+        if (
+            not isinstance(item, Mapping)
+            or set(item)
+            != {
+                "id",
+                "status",
+                "exit_code",
+                "stdout_digest",
+                "stderr_digest",
+            }
+            or item.get("id") != expected_id
+            or item.get("status") not in {"PASS", "FAIL", "UNKNOWN"}
+            or (
+                item.get("exit_code") is not None
+                and (
+                    not isinstance(item.get("exit_code"), int)
+                    or isinstance(item.get("exit_code"), bool)
+                )
+            )
+            or any(
+                not isinstance(item.get(name), str)
+                or SHA256_DIGEST.fullmatch(str(item[name])) is None
+                for name in ("stdout_digest", "stderr_digest")
+            )
+        ):
+            raise ValueError(
+                "E_MACOS_SMOKE_RESULT: scenario result is invalid"
+            )
+        cases.append(
+            MacOSHookSmokeCase(
+                case_id=expected_id,
+                status=str(item["status"]),
+                exit_code=item["exit_code"],
+                stdout_digest=str(item["stdout_digest"]),
+                stderr_digest=str(item["stderr_digest"]),
+            )
+        )
+    return tuple(cases)
+
+
+def run_macos_hook_smoke(
+    *,
+    canonical_repo: Path | str,
+    expected_head: str,
+    expected_artifact_digests: object,
+    session_id: str,
+    invocation_id: str,
+    dedicated_temp_root: Path | str,
+    clock: Callable[[], float],
+    timeout_seconds: float,
+) -> CompletedMacOSHookSmoke:
+    repository = Path(canonical_repo)
+    temp_root = Path(dedicated_temp_root)
+    if (
+        not repository.is_absolute()
+        or repository.is_symlink()
+        or not repository.is_dir()
+        or repository.resolve() != repository
+        or not temp_root.is_absolute()
+        or temp_root.is_symlink()
+        or temp_root.resolve(strict=False) != temp_root
+        or repository == temp_root
+        or repository in temp_root.parents
+        or temp_root in repository.parents
+        or _GIT_OBJECT_ID.fullmatch(expected_head) is None
+        or _smoke_git_head(repository) != expected_head
+        or _SMOKE_ID.fullmatch(session_id) is None
+        or _SMOKE_ID.fullmatch(invocation_id) is None
+        or not isinstance(timeout_seconds, (int, float))
+        or isinstance(timeout_seconds, bool)
+        or not 0 < float(timeout_seconds) <= 300
+    ):
+        raise ValueError(
+            "E_MACOS_SMOKE_BINDING: repository, HEAD, or invocation drifted"
+        )
+    try:
+        observed_at = float(clock())
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "E_MACOS_SMOKE_BINDING: clock is invalid"
+        ) from error
+    if not math.isfinite(observed_at):
+        raise ValueError("E_MACOS_SMOKE_BINDING: clock is invalid")
+    artifacts = _closed_artifact_digests(
+        repository, expected_artifact_digests
+    )
+    harness_digest, harness_binding_digest, harness_exact = (
+        _smoke_harness_binding(repository, expected_head)
+    )
+    temp_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if temp_root.is_symlink() or not temp_root.is_dir():
+        raise ValueError(
+            "E_MACOS_SMOKE_BINDING: temporary root is unsafe"
+        )
+    platform_name = platform.system()
+    if platform_name != "Darwin" or not harness_exact:
+        raw_cases = _unknown_smoke_cases()
+        native_adapter = "absent"
+    else:
+        raw_cases, native_adapter = _run_macos_smoke_process(
+            repository, temp_root, float(timeout_seconds)
+        )
+    cases = _closed_smoke_cases(raw_cases)
+    statuses = {item.status for item in cases}
+    mechanical_result = (
+        "FAIL"
+        if "FAIL" in statuses
+        else "UNKNOWN"
+        if "UNKNOWN" in statuses
+        else "PASS"
+    )
+    completed = object.__new__(CompletedMacOSHookSmoke)
+    completed._consumed = False
+    completed.platform_name = platform_name
+    completed.repository = str(repository)
+    completed.head = expected_head
+    completed.artifact_digests = artifacts
+    completed.harness_digest = harness_digest
+    completed.harness_binding_digest = harness_binding_digest
+    completed.session_id = session_id
+    completed.invocation_id = invocation_id
+    completed.dedicated_temp_root = str(temp_root)
+    completed.observed_at_monotonic = observed_at
+    completed.cases = cases
+    completed.mechanical_result = mechanical_result
+    completed.native_adapter = native_adapter
+    completed.human_hooks_review = "pending"
+    completed.authorizes = False
+    completed.completed_digest = contract_digest(
+        {
+            "platform_name": completed.platform_name,
+            "repository": completed.repository,
+            "head": completed.head,
+            "artifact_digests": completed.artifact_digests,
+            "harness_digest": completed.harness_digest,
+            "harness_binding_digest": completed.harness_binding_digest,
+            "session_id": completed.session_id,
+            "invocation_id": completed.invocation_id,
+            "observed_at_monotonic": completed.observed_at_monotonic,
+            "cases": [
+                {
+                    "case_id": item.case_id,
+                    "status": item.status,
+                    "exit_code": item.exit_code,
+                    "stdout_digest": item.stdout_digest,
+                    "stderr_digest": item.stderr_digest,
+                }
+                for item in completed.cases
+            ],
+            "mechanical_result": completed.mechanical_result,
+            "native_adapter": completed.native_adapter,
+            "human_hooks_review": completed.human_hooks_review,
+            "authorizes": completed.authorizes,
+        }
+    )
+    _register_runtime_host_object(
+        completed, "completed_macos_hook_smoke"
+    )
+    return completed
+
+
+def _task_context_core(
+    *,
+    execution_context: object,
+    generation: int,
+) -> dict[str, object]:
+    return {
+        "task_id": execution_context.task_id,
+        "task_digest": execution_context.task_digest,
+        "profile": execution_context.profile,
+        "profile_digest": execution_context.profile_digest,
+        "runtime_digest": execution_context.runtime_digest,
+        "target_digest": execution_context.target_digest,
+        "repository": execution_context.repository,
+        "worktree": execution_context.worktree,
+        "expected_head": execution_context.expected_head,
+        "session_id": execution_context.session_id,
+        "lease_digest": execution_context.lease_digest,
+        "generation": generation,
+        "execution_context_digest": execution_context.context_digest,
+    }
+
+
+def _new_verification_task_context(
+    values: Mapping[str, object],
+) -> VerificationTaskContext:
+    context = object.__new__(VerificationTaskContext)
+    context._consumed = False
+    for name, value in values.items():
+        setattr(context, name, value)
+    context.context_digest = contract_digest(values)
+    _register_runtime_host_object(context, "verification_task_context")
+    return context
+
+
+def frame_verification_task_context(
+    *,
+    task_store: object,
+    execution_context: object,
+    expected_generation: int,
+) -> VerificationTaskContext:
+    from control_plane.lifecycle import (
+        TaskStore,
+        VerificationExecutionContext,
+    )
+
+    if (
+        type(task_store) is not TaskStore
+        or type(execution_context) is not VerificationExecutionContext
+        or execution_context._consumed
+        or not isinstance(expected_generation, int)
+        or isinstance(expected_generation, bool)
+    ):
+        raise ValueError(
+            "E_VERIFICATION_TASK_CONTEXT: typed verifier context is required"
+        )
+    state = task_store.status(execution_context.task_id)
+    lease = task_store._read_owner_lease(execution_context.task_id)
+    if (
+        state.get("state") != "verifying"
+        or state.get("generation") != expected_generation
+        or state.get("task_digest") != execution_context.task_digest
+        or state.get("verification_profile") != execution_context.profile
+        or state.get("verification_profile_digest")
+        != execution_context.profile_digest
+        or state.get("verification_runtime_digest")
+        != execution_context.runtime_digest
+        or state.get("verification_target_digest")
+        != execution_context.target_digest
+        or state.get("session_id") != execution_context.session_id
+        or lease is None
+        or lease.get("lease_digest") != execution_context.lease_digest
+        or Path(execution_context.repository).resolve()
+        != Path(str(lease.get("worktree", ""))).resolve()
+        or _smoke_git_head(Path(execution_context.repository))
+        != execution_context.expected_head
+    ):
+        raise ValueError(
+            "E_VERIFICATION_TASK_CONTEXT: task, lease, or HEAD drifted"
+        )
+    return _new_verification_task_context(
+        _task_context_core(
+            execution_context=execution_context,
+            generation=expected_generation,
+        )
+    )
+
+
+def _refresh_verification_task_context(
+    context: VerificationTaskContext, generation: int
+) -> VerificationTaskContext:
+    values = {
+        name: getattr(context, name)
+        for name in (
+            "task_id",
+            "task_digest",
+            "profile",
+            "profile_digest",
+            "runtime_digest",
+            "target_digest",
+            "repository",
+            "worktree",
+            "expected_head",
+            "session_id",
+            "lease_digest",
+            "execution_context_digest",
+        )
+    }
+    values["generation"] = generation
+    return _new_verification_task_context(values)
+
+
+def _receipt_core(receipt: object) -> dict[str, object]:
+    return {
+        name: value
+        for name, value in receipt.__dict__.items()
+        if name != "receipt_digest"
+    }
+
+
+def _read_durable_receipt(path: Path) -> dict[str, object] | None:
+    if path.is_symlink():
+        raise ValueError(
+            "E_RECEIPT_RECOVERY: durable receipt is invalid"
+        )
+    if not path.exists():
+        return None
+    try:
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_size > 65_536
+        ):
+            raise ValueError
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError
+        digest = payload.get("receipt_digest")
+        if (
+            not isinstance(digest, str)
+            or SHA256_DIGEST.fullmatch(digest) is None
+            or contract_digest(
+                {
+                    key: value
+                    for key, value in payload.items()
+                    if key != "receipt_digest"
+                }
+            )
+            != digest
+        ):
+            raise ValueError
+    except (
+        OSError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as error:
+        raise ValueError(
+            "E_RECEIPT_RECOVERY: durable receipt is invalid"
+        ) from error
+    return payload
+
+
+def _atomic_receipt_json(
+    path: Path,
+    value: Mapping[str, object],
+) -> None:
+    """Persist receipt JSON through the dirfd/no-follow state writer."""
+
+    from control_plane.hooks import _atomic_json as atomic_private_json
+
+    atomic_private_json(path, value)
+
+
+def publish_macos_hook_smoke_receipt(
+    completed: CompletedMacOSHookSmoke,
+    *,
+    task_store: object,
+    task_context: VerificationTaskContext,
+    expected_generation: int,
+) -> HookSmokePublicationResult:
+    from control_plane.lifecycle import (
+        TaskStore,
+        _atomic_json,
+        _task_guard,
+    )
+
+    if type(completed) is not CompletedMacOSHookSmoke:
+        raise ValueError(
+            "E_MACOS_SMOKE: typed completed smoke is required"
+        )
+    if completed._consumed:
+        raise ValueError("E_MACOS_SMOKE_REPLAY: smoke was consumed")
+    if (
+        type(task_store) is not TaskStore
+        or type(task_context) is not VerificationTaskContext
+        or task_context._consumed
+        or not _runtime_host_object_is_live(
+            task_context, "verification_task_context"
+        )
+        or not _runtime_host_object_is_live(
+            completed, "completed_macos_hook_smoke"
+        )
+        or expected_generation != task_context.generation
+        or task_context.profile != "control_plane_assurance"
+        or completed.repository != task_context.repository
+        or completed.head != task_context.expected_head
+        or completed.session_id != task_context.session_id
+    ):
+        raise ValueError(
+            "E_MACOS_SMOKE: smoke and task context are not exact"
+        )
+    receipt_path = (
+        task_store.state_dir
+        / "codex-control-plane"
+        / "verification-receipts"
+        / task_context.task_id
+        / "MacOSHookSmokeReceipt.json"
+    )
+    receipt_values = {
+        "schema_version": 1,
+        "kind": "MacOSHookSmokeReceipt",
+        "task_id": task_context.task_id,
+        "task_digest": task_context.task_digest,
+        "profile": task_context.profile,
+        "profile_digest": task_context.profile_digest,
+        "runtime_digest": task_context.runtime_digest,
+        "target_digest": task_context.target_digest,
+        "repository": task_context.repository,
+        "head": task_context.expected_head,
+        "artifact_digests": completed.artifact_digests,
+        "harness_digest": completed.harness_digest,
+        "harness_binding_digest": completed.harness_binding_digest,
+        "session_id": task_context.session_id,
+        "invocation_id": completed.invocation_id,
+        "generation": expected_generation,
+        "completed_digest": completed.completed_digest,
+        "mechanical_result": completed.mechanical_result,
+        "native_adapter": completed.native_adapter,
+        "human_hooks_review": "pending",
+        "authorizes": False,
+    }
+    serialized_receipt_values = {
+        **receipt_values,
+        "artifact_digests": dict(completed.artifact_digests),
+    }
+    receipt = MacOSHookSmokeReceipt(
+        **receipt_values,
+        receipt_digest=contract_digest(serialized_receipt_values),
+    )
+    durable_receipt = {
+        **serialized_receipt_values,
+        "receipt_digest": receipt.receipt_digest,
+    }
+    registration_entry = {
+        "observation_id": f"macos-smoke-{completed.invocation_id}",
+        "receipt_digest": receipt.receipt_digest,
+        "status": receipt.mechanical_result,
+        "subject_digest": receipt.completed_digest,
+    }
+    with _task_guard(task_store.state_dir, task_context.task_id):
+        state = task_store._read(task_context.task_id)
+        lease = task_store._read_owner_lease(task_context.task_id)
+        (
+            current_harness_digest,
+            current_harness_binding_digest,
+            current_harness_exact,
+        ) = _smoke_harness_binding(
+            Path(task_context.repository),
+            task_context.expected_head,
+        )
+        persisted = _read_durable_receipt(receipt_path)
+        generation = state.get("generation")
+        if (
+            state.get("state") != "verifying"
+            or generation
+            not in {expected_generation, expected_generation + 1}
+            or state.get("task_digest") != task_context.task_digest
+            or state.get("verification_profile") != task_context.profile
+            or state.get("verification_profile_digest")
+            != task_context.profile_digest
+            or state.get("verification_runtime_digest")
+            != task_context.runtime_digest
+            or state.get("verification_target_digest")
+            != task_context.target_digest
+            or state.get("session_id") != task_context.session_id
+            or lease is None
+            or lease.get("lease_digest") != task_context.lease_digest
+            or _smoke_git_head(Path(task_context.repository))
+            != task_context.expected_head
+            or not current_harness_exact
+            or current_harness_digest != completed.harness_digest
+            or current_harness_binding_digest
+            != completed.harness_binding_digest
+            or (
+                persisted is not None
+                and persisted != durable_receipt
+            )
+        ):
+            raise ValueError(
+                "E_MACOS_SMOKE_CAS: task changed before smoke publish"
+            )
+        registration = dict(
+            state.get("verification_supplemental_evidence", {})
+        )
+        if generation == expected_generation:
+            if persisted is None:
+                _atomic_receipt_json(receipt_path, durable_receipt)
+            registration["MacOSHookSmokeReceipt"] = registration_entry
+            next_state = copy.deepcopy(state)
+            next_state["verification_supplemental_evidence"] = registration
+            next_state["generation"] = expected_generation + 1
+            next_state["hook_trust"] = "pending_hook_trust"
+            _atomic_json(
+                task_store._path(task_context.task_id), next_state
+            )
+        elif (
+            persisted is None
+            or registration.get("MacOSHookSmokeReceipt")
+            != registration_entry
+            or state.get("hook_trust") != "pending_hook_trust"
+        ):
+            raise ValueError(
+                "E_MACOS_SMOKE_CAS: partial publication is inconsistent"
+            )
+        if not _consume_runtime_host_object(
+            completed, "completed_macos_hook_smoke"
+        ) or not _consume_runtime_host_object(
+            task_context, "verification_task_context"
+        ):
+            raise ValueError(
+                "E_MACOS_SMOKE_REPLAY: host-bound input was consumed"
+            )
+        completed._consumed = True
+        task_context._consumed = True
+    refreshed = _refresh_verification_task_context(
+        task_context, expected_generation + 1
+    )
+    return HookSmokePublicationResult(
+        receipt=receipt, task_context=refreshed
+    )
+
+
+def observe_native_macos_hook_smoke(
+    *,
+    native_process_event: object,
+    completed_digest: str,
+    expected_repo: Path | str,
+    expected_head: str,
+    expected_artifact_digests: object,
+    session_id: str,
+    invocation_id: str,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> ValidatedNativeMacOSHookSmokeObservation:
+    repository = Path(expected_repo).resolve()
+    artifacts = _closed_artifact_digests(
+        repository, expected_artifact_digests
+    )
+    now = float(clock())
+    if (
+        type(native_process_event) is not NativeMacOSProcessEvent
+        or not _native_host_object_is_valid(
+            native_process_event, "macos_hook_smoke"
+        )
+        or native_process_event._consumed
+        or native_process_event.completed_digest != completed_digest
+        or native_process_event.repository != str(repository)
+        or native_process_event.head != expected_head
+        or native_process_event.artifact_digests != artifacts
+        or native_process_event.session_id != session_id
+        or native_process_event.invocation_id != invocation_id
+        or native_process_event.native_adapter not in {"ready", "failed"}
+        or not 0 <= now - native_process_event.observed_at_monotonic
+        <= ttl_seconds
+        or SHA256_DIGEST.fullmatch(completed_digest) is None
+    ):
+        raise ValueError(
+            "E_NATIVE_MACOS_SMOKE: native event binding drifted"
+        )
+    native_process_event._consumed = True
+    observation = object.__new__(
+        ValidatedNativeMacOSHookSmokeObservation
+    )
+    observation._consumed = False
+    observation._clock = clock
+    for name in (
+        "event_id",
+        "completed_digest",
+        "repository",
+        "head",
+        "artifact_digests",
+        "session_id",
+        "invocation_id",
+        "native_adapter",
+    ):
+        setattr(observation, name, getattr(native_process_event, name))
+    observation.freshness_deadline = now + ttl_seconds
+    observation.observation_digest = contract_digest(
+        {
+            name: getattr(observation, name)
+            for name in (
+                "event_id",
+                "completed_digest",
+                "repository",
+                "head",
+                "artifact_digests",
+                "session_id",
+                "invocation_id",
+                "native_adapter",
+                "freshness_deadline",
+            )
+        }
+    )
+    _register_runtime_host_object(
+        observation, "validated_native_macos_hook_smoke"
+    )
+    return observation
+
+
+def frame_hook_review_observation(
+    *,
+    native_hooks_review_event: object,
+    smoke_receipt_digest: str,
+    expected_repo: Path | str,
+    expected_head: str,
+    expected_artifact_digests: object,
+    session_id: str,
+    invocation_id: str,
+    clock: Callable[[], float],
+    ttl_seconds: float,
+) -> ValidatedHookReviewObservation:
+    repository = Path(expected_repo).resolve()
+    artifacts = _closed_artifact_digests(
+        repository, expected_artifact_digests
+    )
+    now = float(clock())
+    if (
+        type(native_hooks_review_event) is not NativeHooksReviewEvent
+        or not _native_host_object_is_valid(
+            native_hooks_review_event, "hooks_review"
+        )
+        or native_hooks_review_event._consumed
+        or native_hooks_review_event.approved is not True
+        or native_hooks_review_event.smoke_receipt_digest
+        != smoke_receipt_digest
+        or native_hooks_review_event.repository != str(repository)
+        or native_hooks_review_event.head != expected_head
+        or native_hooks_review_event.artifact_digests != artifacts
+        or native_hooks_review_event.session_id != session_id
+        or native_hooks_review_event.invocation_id != invocation_id
+        or not 0 <= now - native_hooks_review_event.observed_at_monotonic
+        <= ttl_seconds
+        or SHA256_DIGEST.fullmatch(smoke_receipt_digest) is None
+    ):
+        raise ValueError(
+            "E_HOOK_REVIEW: native review event binding drifted"
+        )
+    native_hooks_review_event._consumed = True
+    observation = object.__new__(ValidatedHookReviewObservation)
+    observation._consumed = False
+    observation._clock = clock
+    for name in (
+        "event_id",
+        "smoke_receipt_digest",
+        "repository",
+        "head",
+        "artifact_digests",
+        "session_id",
+        "invocation_id",
+    ):
+        setattr(
+            observation, name, getattr(native_hooks_review_event, name)
+        )
+    observation.freshness_deadline = now + ttl_seconds
+    observation.observation_digest = contract_digest(
+        {
+            name: getattr(observation, name)
+            for name in (
+                "event_id",
+                "smoke_receipt_digest",
+                "repository",
+                "head",
+                "artifact_digests",
+                "session_id",
+                "invocation_id",
+                "freshness_deadline",
+            )
+        }
+    )
+    _register_runtime_host_object(observation, "validated_hook_review")
+    return observation
+
+
+def publish_hook_review_receipt(
+    validated_review: ValidatedHookReviewObservation,
+    *,
+    task_store: object,
+    task_context: VerificationTaskContext,
+    expected_generation: int,
+) -> HookReviewPublicationResult:
+    from control_plane.lifecycle import (
+        TaskStore,
+        _atomic_json,
+        _task_guard,
+    )
+
+    if (
+        type(validated_review) is not ValidatedHookReviewObservation
+        or validated_review._consumed
+        or not _runtime_host_object_is_live(
+            validated_review, "validated_hook_review"
+        )
+        or type(task_store) is not TaskStore
+        or type(task_context) is not VerificationTaskContext
+        or task_context._consumed
+        or not _runtime_host_object_is_live(
+            task_context, "verification_task_context"
+        )
+        or expected_generation != task_context.generation
+        or float(validated_review._clock())
+        > validated_review.freshness_deadline
+        or validated_review.repository != task_context.repository
+        or validated_review.head != task_context.expected_head
+        or validated_review.session_id != task_context.session_id
+    ):
+        raise ValueError(
+            "E_HOOK_REVIEW: review and refreshed context are not exact"
+        )
+    receipt_path = (
+        task_store.state_dir
+        / "codex-control-plane"
+        / "verification-receipts"
+        / task_context.task_id
+        / "HookReviewReceipt.json"
+    )
+    smoke_receipt_path = receipt_path.with_name(
+        "MacOSHookSmokeReceipt.json"
+    )
+    values = {
+        "schema_version": 1,
+        "kind": "HookReviewReceipt",
+        "task_id": task_context.task_id,
+        "task_digest": task_context.task_digest,
+        "repository": task_context.repository,
+        "head": task_context.expected_head,
+        "artifact_digests": validated_review.artifact_digests,
+        "session_id": task_context.session_id,
+        "invocation_id": validated_review.invocation_id,
+        "generation": expected_generation,
+        "smoke_receipt_digest": (
+            validated_review.smoke_receipt_digest
+        ),
+        "observation_digest": validated_review.observation_digest,
+        "reviewed": True,
+        "authorizes": False,
+    }
+    serialized_values = {
+        **values,
+        "artifact_digests": dict(
+            validated_review.artifact_digests
+        ),
+    }
+    receipt = HookReviewReceipt(
+        **values, receipt_digest=contract_digest(serialized_values)
+    )
+    durable_receipt = {
+        **serialized_values,
+        "receipt_digest": receipt.receipt_digest,
+    }
+    registration_entry = {
+        "receipt_digest": receipt.receipt_digest,
+        "smoke_receipt_digest": receipt.smoke_receipt_digest,
+        "reviewed": True,
+        "authorizes": False,
+    }
+    with _task_guard(task_store.state_dir, task_context.task_id):
+        state = task_store._read(task_context.task_id)
+        smoke = state.get("verification_supplemental_evidence", {}).get(
+            "MacOSHookSmokeReceipt"
+        )
+        try:
+            persisted_smoke = _read_durable_receipt(
+                smoke_receipt_path
+            )
+            persisted_digest = (
+                persisted_smoke.get("receipt_digest")
+                if persisted_smoke is not None
+                else None
+            )
+        except ValueError:
+            persisted_smoke = None
+            persisted_digest = None
+        persisted_review = _read_durable_receipt(receipt_path)
+        generation = state.get("generation")
+        if (
+            state.get("state") != "verifying"
+            or generation
+            not in {expected_generation, expected_generation + 1}
+            or not isinstance(smoke, Mapping)
+            or smoke.get("receipt_digest")
+            != validated_review.smoke_receipt_digest
+            or smoke.get("status") != "PASS"
+            or not isinstance(persisted_smoke, Mapping)
+            or persisted_digest != validated_review.smoke_receipt_digest
+            or persisted_smoke.get("repository")
+            != task_context.repository
+            or persisted_smoke.get("head") != task_context.expected_head
+            or persisted_smoke.get("artifact_digests")
+            != dict(validated_review.artifact_digests)
+            or _smoke_git_head(Path(task_context.repository))
+            != task_context.expected_head
+            or (
+                persisted_review is not None
+                and persisted_review != durable_receipt
+            )
+        ):
+            raise ValueError(
+                "E_HOOK_REVIEW_CAS: task or smoke changed before publish"
+            )
+        if generation == expected_generation:
+            if persisted_review is None:
+                _atomic_receipt_json(receipt_path, durable_receipt)
+            next_state = copy.deepcopy(state)
+            next_state["hook_review_receipt"] = registration_entry
+            next_state["generation"] = expected_generation + 1
+            next_state["hook_trust"] = "reviewed"
+            _atomic_json(
+                task_store._path(task_context.task_id), next_state
+            )
+        elif (
+            persisted_review is None
+            or state.get("hook_review_receipt")
+            != registration_entry
+            or state.get("hook_trust") != "reviewed"
+        ):
+            raise ValueError(
+                "E_HOOK_REVIEW_CAS: partial publication is inconsistent"
+            )
+        if not _consume_runtime_host_object(
+            validated_review, "validated_hook_review"
+        ) or not _consume_runtime_host_object(
+            task_context, "verification_task_context"
+        ):
+            raise ValueError(
+                "E_HOOK_REVIEW_REPLAY: host-bound input was consumed"
+            )
+        validated_review._consumed = True
+        task_context._consumed = True
+    return HookReviewPublicationResult(
+        receipt=receipt,
+        task_context=_refresh_verification_task_context(
+            task_context, expected_generation + 1
+        ),
+    )

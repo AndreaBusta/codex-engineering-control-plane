@@ -703,7 +703,7 @@ class AdoptionTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(hook.returncode, 0, hook.stderr)
-        self.assertIn("CONTROL_PLANE_AUDIT_V2", hook.stdout)
+        self.assertIn("CONTROL PLANE RISK", hook.stdout)
         self.assertNotIn("TOP_LEVEL_SHADOW_IMPORTED", completed.stderr)
         self.assertNotIn("TOP_LEVEL_SHADOW_IMPORTED", hook.stderr)
         self.assertFalse(launcher_marker.exists())
@@ -756,6 +756,76 @@ class AdoptionTests(unittest.TestCase):
             risk_payload["facts"]["governing_policy_source"],
             "unavailable_pending_installed_manifest",
         )
+
+    def test_isolated_safe_read_matches_source_decisions(self) -> None:
+        from control_plane.adoption import adoption_apply, adoption_plan
+
+        plan = adoption_plan(
+            ROOT,
+            self.scenario.repo,
+            base_branch="main",
+            allow_dirty_source=True,
+        )
+        adoption_apply(plan)
+        installed = self.scenario.repo / "scripts" / "control-plane"
+        pilot = (self.scenario.repo / "pilot.md").resolve()
+        pilot.write_text("Closed pilot charter.\n", encoding="utf-8")
+
+        for argv, expected in (
+            (("git", "diff", "--check"), 0),
+            (("git", "status", "--porcelain"), 126),
+            (
+                (
+                    "rg",
+                    "--no-config",
+                    "--quiet",
+                    "-e",
+                    "not-present",
+                    "--",
+                    str(pilot),
+                ),
+                1,
+            ),
+            (("secret-scan-governing", "--", str(pilot)), 1),
+        ):
+            with self.subTest(argv=argv):
+                source = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "control_plane.cli",
+                        "safe-read",
+                        "--repo",
+                        str(self.scenario.repo.resolve()),
+                        "--",
+                        *argv,
+                    ],
+                    cwd=ROOT,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                isolated = subprocess.run(
+                    [
+                        str(installed),
+                        "safe-read",
+                        "--repo",
+                        str(self.scenario.repo.resolve()),
+                        "--",
+                        *argv,
+                    ],
+                    cwd=self.scenario.repo,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+                self.assertEqual(source.returncode, expected, source.stderr)
+                self.assertEqual(
+                    isolated.returncode, expected, isolated.stderr
+                )
+                self.assertEqual(source.stdout, isolated.stdout)
+                self.assertEqual(source.stderr, isolated.stderr)
 
     def test_pr_b_adopted_runtime_imports_and_renders_intake_without_source(
         self,

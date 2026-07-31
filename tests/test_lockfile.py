@@ -13,6 +13,22 @@ ROOT = Path(__file__).parents[1]
 
 
 class LockfileTests(unittest.TestCase):
+    def test_source_and_distributed_runtime_expose_task7_hook_contracts(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        import control_plane.hooks as hooks
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("hooks.py", RUNTIME_MODULES)
+        self.assertIn("host_bridge.py", RUNTIME_MODULES)
+        self.assertTrue(callable(hooks.execute_safe_read))
+        self.assertTrue(callable(hooks.evaluate_pretool_use))
+        self.assertTrue(callable(hooks.secret_pattern_set_digest))
+        self.assertTrue(callable(hooks.gc_current_warning_view))
+        self.assertTrue(callable(bridge.run_macos_hook_smoke))
+        self.assertTrue(callable(bridge.publish_macos_hook_smoke_receipt))
+
     def test_source_and_distributed_runtime_include_risk_sentinel(
         self,
     ) -> None:

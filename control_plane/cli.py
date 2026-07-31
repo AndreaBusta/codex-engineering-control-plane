@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from uuid import uuid4
 from typing import Any, Sequence
@@ -48,10 +51,21 @@ from control_plane.resource_registry import (
     validate_registry,
 )
 from control_plane.risk_sentinel import evaluate_risk_status
+from control_plane.hooks import (
+    _safe_read_repository_identity,
+    execute_safe_read,
+)
 from control_plane.host_bridge import (
     HOST_ADAPTER_UNAVAILABLE,
+    MACOS_HOOK_SMOKE_ARTIFACTS,
+    _smoke_git_head,
+    frame_verification_task_context,
     observe_inventory,
+    observe_worktree_inventory,
+    publish_macos_hook_smoke_receipt,
+    run_macos_hook_smoke,
     validate_inventory_observation,
+    validate_worktree_inventory_observation,
 )
 from control_plane.routing import (
     compact_route_manifest,
@@ -909,6 +923,59 @@ def command_task(arguments: argparse.Namespace) -> int:
         )
 
 
+def command_safe_read(arguments: argparse.Namespace) -> int:
+    """Execute a closed local read against one explicit registered worktree."""
+
+    try:
+        root, _, common_dir = _safe_read_repository_identity(
+            arguments.repo
+        )
+        invocation_id = f"safe-read-{uuid4().hex}"
+        observation = observe_worktree_inventory(
+            canonical_common_git_dir=common_dir,
+            invocation_id=invocation_id,
+            clock=time.monotonic,
+            ttl_seconds=30,
+            max_output_bytes=1_048_576,
+        )
+        inventory = validate_worktree_inventory_observation(
+            observation,
+            expected_common_git_dir=common_dir,
+            expected_invocation_id=invocation_id,
+            clock=time.monotonic,
+        )
+        argv = tuple(arguments.argv)
+        if argv and argv[0] == "--":
+            argv = argv[1:]
+        result = execute_safe_read(
+            argv,
+            root=root,
+            worktree_inventory=inventory,
+            timeout_seconds=arguments.timeout,
+            output_limit_bytes=arguments.output_limit,
+        )
+    except (RepositoryError, OSError, ValueError) as error:
+        code = str(error).split(":", 1)[0]
+        print(f"{code}: safe-read precondition failed", file=sys.stderr)
+        return 126
+    if result.stdout:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stdout.buffer.flush()
+    if result.stderr:
+        sys.stderr.buffer.write(result.stderr)
+        sys.stderr.buffer.flush()
+    if result.status == "completed":
+        return int(result.exit_code)
+    if result.status == "timeout":
+        print("E_SAFE_READ_TIMEOUT: bounded read timed out", file=sys.stderr)
+        return 124
+    if result.status == "truncated":
+        print("E_SAFE_READ_TRUNCATED: bounded read exceeded output cap", file=sys.stderr)
+        return 125
+    print("E_SAFE_READ_ARGV: rejected closed argv", file=sys.stderr)
+    return 126
+
+
 def command_verification_run(arguments: argparse.Namespace) -> int:
     try:
         root = discover_repository(arguments.repo)
@@ -970,6 +1037,102 @@ def command_verification_run(arguments: argparse.Namespace) -> int:
             {
                 "schema_version": 1,
                 "command": "verification-run",
+                "ok": False,
+                "errors": [{"code": code, "message": str(error)}],
+            },
+            arguments.json,
+        )
+
+
+def command_hook_smoke(arguments: argparse.Namespace) -> int:
+    """Run and publish the closed macOS hook smoke in this process."""
+
+    try:
+        root, state_dir, _ = _safe_read_repository_identity(
+            arguments.repo
+        )
+        store = TaskStore(state_dir)
+        task = store.status(arguments.task_id)
+        lease_path = (
+            state_dir
+            / "codex-control-plane"
+            / "leases"
+            / f"{arguments.task_id}.json"
+        )
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        head = _smoke_git_head(root)
+        if not head:
+            raise ValueError(
+                "E_MACOS_SMOKE_BINDING: repository HEAD is unavailable"
+            )
+        prior_path = os.environ.get("PATH")
+        os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        try:
+            execution_context = create_verification_execution_context(
+                task_context=task,
+                lease=lease,
+                canonical_repo=root,
+                expected_head=head,
+                session_id=str(task.get("session_id", "")),
+                dedicated_temp_root=(
+                    Path(tempfile.gettempdir()).resolve()
+                    / "control-plane-hook-smoke"
+                    / arguments.task_id
+                ),
+                clock=time.monotonic,
+            )
+        finally:
+            if prior_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = prior_path
+        generation = int(task.get("generation", -1))
+        task_context = frame_verification_task_context(
+            task_store=store,
+            execution_context=execution_context,
+            expected_generation=generation,
+        )
+        artifact_digests = {
+            name: f"sha256:{sha256((root / relative).read_bytes()).hexdigest()}"
+            for name, relative in MACOS_HOOK_SMOKE_ARTIFACTS.items()
+        }
+        completed = run_macos_hook_smoke(
+            canonical_repo=root,
+            expected_head=head,
+            expected_artifact_digests=artifact_digests,
+            session_id=execution_context.session_id,
+            invocation_id=f"hook-smoke-{uuid4().hex}",
+            dedicated_temp_root=execution_context.dedicated_temp_root,
+            clock=time.monotonic,
+            timeout_seconds=120.0,
+        )
+        publication = publish_macos_hook_smoke_receipt(
+            completed,
+            task_store=store,
+            task_context=task_context,
+            expected_generation=generation,
+        )
+        return _emit(
+            {
+                "schema_version": 1,
+                "command": "hook-smoke",
+                "ok": True,
+                "receipt": asdict(publication.receipt),
+                "task_generation": publication.task_context.generation,
+            },
+            arguments.json,
+        )
+    except (
+        RepositoryError,
+        ValueError,
+        OSError,
+        json.JSONDecodeError,
+    ) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        return _emit(
+            {
+                "schema_version": 1,
+                "command": "hook-smoke",
                 "ok": False,
                 "errors": [{"code": code, "message": str(error)}],
             },
@@ -1140,6 +1303,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_option(risk_parser)
     risk_parser.set_defaults(handler=command_risk_status)
 
+    safe_read_parser = subparsers.add_parser(
+        "safe-read",
+        help="Execute one bounded, closed local read in an explicit worktree.",
+    )
+    safe_read_parser.add_argument("--repo", type=Path, required=True)
+    safe_read_parser.add_argument("--timeout", type=float, default=3.0)
+    safe_read_parser.add_argument(
+        "--output-limit", type=int, default=65_536
+    )
+    safe_read_parser.add_argument("argv", nargs=argparse.REMAINDER)
+    safe_read_parser.set_defaults(handler=command_safe_read)
+
     verification_parser = subparsers.add_parser(
         "verification-run",
         help="Run the complete profile already bound to a verifier task.",
@@ -1150,6 +1325,15 @@ def build_parser() -> argparse.ArgumentParser:
     verification_parser.add_argument("--task-id", required=True)
     _add_output_option(verification_parser)
     verification_parser.set_defaults(handler=command_verification_run)
+
+    hook_smoke_parser = subparsers.add_parser(
+        "hook-smoke",
+        help="Run and publish the closed macOS hook smoke for a verifier task.",
+    )
+    hook_smoke_parser.add_argument("--repo", type=Path, required=True)
+    hook_smoke_parser.add_argument("--task-id", required=True)
+    _add_output_option(hook_smoke_parser)
+    hook_smoke_parser.set_defaults(handler=command_hook_smoke)
 
     task_parser = subparsers.add_parser("task", help="Manage task lifecycle state.")
     task_subparsers = task_parser.add_subparsers(dest="task_action", required=True)
