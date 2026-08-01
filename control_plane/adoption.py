@@ -1199,8 +1199,47 @@ def _render_registry(source_root: Path) -> bytes:
     return text.encode("utf-8")
 
 
+def _target_safe_agents_source(source_text: str) -> str:
+    headings = list(
+        re.finditer(r"(?m)^## Verificación[ \t]*$", source_text)
+    )
+    if len(headings) != 1:
+        raise ValueError(
+            "E_ADOPT_AGENTS: source verification section is missing or ambiguous"
+        )
+    heading = headings[0]
+    following = re.search(r"(?m)^## [^\n]+$", source_text[heading.end() :])
+    end = (
+        len(source_text)
+        if following is None
+        else heading.end() + following.start()
+    )
+    replacement = """## Verificación
+
+Ejecuta primero los gates canónicos documentados por el repositorio objetivo.
+Después valida la instalación local del Control Plane:
+
+```bash
+scripts/control-plane policy-check --policy .codex/project-policy.toml
+scripts/control-plane registry-check \\
+  --registry .codex/resource-registry.toml \\
+  --policy .codex/project-policy.toml
+scripts/control-plane doctor
+git diff --check
+git status --short --branch
+```
+
+Informa siempre si se tocaron dependencias, secretos o CI/CD y qué límites
+externos permanecen sin verificar.
+
+"""
+    return source_text[: heading.start()] + replacement + source_text[end:]
+
+
 def _render_agents(source_root: Path, target_root: Path) -> bytes:
-    source_text = (source_root / "AGENTS.md").read_text(encoding="utf-8").strip()
+    source_text = _target_safe_agents_source(
+        (source_root / "AGENTS.md").read_text(encoding="utf-8")
+    ).rstrip()
     target_path = target_root / "AGENTS.md"
     existing = target_path.read_text(encoding="utf-8") if target_path.is_file() else ""
     block = f"{AGENTS_START}\n{source_text}\n{AGENTS_END}"
@@ -1209,10 +1248,14 @@ def _render_agents(source_root: Path, target_root: Path) -> bytes:
             raise ValueError("E_ADOPT_AGENTS: managed AGENTS block is malformed")
         prefix, remainder = existing.split(AGENTS_START, 1)
         _, suffix = remainder.split(AGENTS_END, 1)
-        rendered = prefix.rstrip() + "\n\n" + block + suffix
+        rendered = prefix + block + suffix
     else:
-        rendered = existing.rstrip()
-        rendered = (rendered + "\n\n" if rendered else "") + block + "\n"
+        separator = (
+            ""
+            if not existing or existing.endswith("\n\n")
+            else ("\n" if existing.endswith("\n") else "\n\n")
+        )
+        rendered = existing + separator + block + "\n"
     return rendered.encode("utf-8")
 
 

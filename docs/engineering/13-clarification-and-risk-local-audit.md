@@ -26,6 +26,12 @@ comando `task clarification-status` en v2.1.
 
 ```bash
 scripts/control-plane risk-status --repo /ruta/al/repositorio --json
+
+scripts/control-plane risk-status \
+  --repo /ruta/al/repositorio \
+  --task-id TASK-EXAMPLE-001 \
+  --lease-session-id session-example-001 \
+  --json
 ```
 
 El resultado agrega dimensiones `local` y `remote`:
@@ -39,6 +45,21 @@ El resultado agrega dimensiones `local` y `remote`:
 La ausencia de policy gobernante, task, procedencia o evidencia remota nunca se
 convierte en `PASS`. En local-audit la dimensión remota es deliberadamente
 `UNKNOWN`; no es un fallo del runtime ni una autorización implícita.
+
+Para un worktree dirty, la segunda forma liga el diagnóstico a la task durable,
+la sesión, la rama, la policy y todas las rutas cambiadas. La cobertura tiene
+cuatro resultados cerrados:
+
+- `host_attested`: evidencia host exacta; el check dirty puede ser `PASS`;
+- `local_validated`: lease local exacta sin atestación host; devuelve `UNKNOWN`;
+- `unobservable`: Git o el estado durable no se pudieron observar; devuelve
+  `UNKNOWN`;
+- `invalid`: falta o contradice algún binding; devuelve `FAIL`.
+
+`--lease-session-id` es solo un hint local explícito y exige `--task-id`. No
+acepta JSON de lease, digest de lease ni evidencia host. El inventario trata
+los renames staged como delete+add para que origen y destino deban estar dentro
+del scope.
 
 ## Hooks reales
 

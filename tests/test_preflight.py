@@ -240,6 +240,170 @@ class GitPreflightTests(unittest.TestCase):
         self.assertEqual(dirty.status, "FAIL")
         self.assertEqual(task.status, "UNKNOWN")
 
+    def test_risk_status_local_lease_binding_is_unknown_never_pass(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import TaskLease, TaskStore
+        from control_plane.repository import worktree_git_dir
+        from control_plane.risk_sentinel import evaluate_local_risk
+        from tests.host_adapter_test_support import governing_policy
+
+        self.scenario.checkout_feature()
+        branch = "feature/test"
+        mapping = self.scenario.policy()
+        policy_digest = contract_digest(mapping)
+        policy = governing_policy(
+            policy=mapping,
+            policy_digest=policy_digest,
+            runtime_digest="sha256:" + "6" * 64,
+            lock_digest="sha256:" + "7" * 64,
+            governing_base_commit="c" * 40,
+            session_id="session-risk-local-binding",
+            invocation_id="invocation-risk-local-binding",
+            freshness_deadline=130.0,
+        )
+        state_dir = worktree_git_dir(self.scenario.repo)
+        task_id = "task-risk-local-binding"
+        state = TaskStore(state_dir).start(
+            task_id,
+            outcome="local_change",
+            branch=branch,
+            task_digest="sha256:" + "8" * 64,
+            decision_digest="sha256:" + "9" * 64,
+        )
+        TaskLease.acquire(
+            state_dir,
+            task_id=task_id,
+            worktree=str(self.scenario.repo),
+            branch=branch,
+            session_id="session-risk-local-binding",
+            paths=["dirty.txt"],
+            policy_digest=policy_digest,
+        )
+        (self.scenario.repo / "dirty.txt").write_text(
+            "leased\n", encoding="utf-8"
+        )
+
+        locally_bound = evaluate_local_risk(
+            self.scenario.repo,
+            policy,
+            task_state=state,
+            local_lease_session_id="session-risk-local-binding",
+        )
+        mismatched = evaluate_local_risk(
+            self.scenario.repo,
+            policy,
+            task_state=state,
+            local_lease_session_id="session-risk-wrong",
+        )
+
+        locally_bound_dirty = next(
+            check
+            for check in locally_bound.checks
+            if check.code == "RS_LOCAL_DIRTY"
+        )
+        mismatched_dirty = next(
+            check
+            for check in mismatched.checks
+            if check.code == "RS_LOCAL_DIRTY"
+        )
+        self.assertEqual(locally_bound_dirty.status, "UNKNOWN")
+        self.assertIsNone(locally_bound_dirty.facts["lease_valid"])
+        self.assertEqual(
+            locally_bound_dirty.facts["lease_coverage"],
+            "local_validated",
+        )
+        self.assertNotEqual(locally_bound_dirty.status, "PASS")
+        self.assertEqual(mismatched_dirty.status, "FAIL")
+        self.assertEqual(
+            mismatched_dirty.facts["lease_coverage"], "invalid"
+        )
+
+        blocked_state = TaskStore(state_dir).transition(
+            task_id,
+            "blocked",
+            reason="test",
+            current_branch=branch,
+        )
+        blocked = evaluate_local_risk(
+            self.scenario.repo,
+            policy,
+            task_state=blocked_state,
+            local_lease_session_id="session-risk-local-binding",
+        )
+        blocked_dirty = next(
+            check for check in blocked.checks if check.code == "RS_LOCAL_DIRTY"
+        )
+        self.assertEqual(blocked_dirty.status, "FAIL")
+        self.assertEqual(blocked_dirty.facts["lease_coverage"], "invalid")
+
+    def test_risk_status_counts_both_sides_of_staged_rename(self) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import TaskLease, TaskStore
+        from control_plane.repository import worktree_git_dir
+        from control_plane.risk_sentinel import evaluate_local_risk
+        from tests.host_adapter_test_support import governing_policy
+
+        self.scenario.checkout_feature("feature/risk-rename-scope")
+        (self.scenario.repo / "outside").mkdir()
+        (self.scenario.repo / "outside" / "owned.txt").write_text(
+            "outside\n", encoding="utf-8"
+        )
+        git(self.scenario.repo, "add", "outside/owned.txt")
+        git(self.scenario.repo, "commit", "-m", "test: add outside file")
+        branch = "feature/risk-rename-scope"
+        mapping = self.scenario.policy()
+        policy_digest = contract_digest(mapping)
+        policy = governing_policy(
+            policy=mapping,
+            policy_digest=policy_digest,
+            runtime_digest="sha256:" + "6" * 64,
+            lock_digest="sha256:" + "7" * 64,
+            governing_base_commit="c" * 40,
+            session_id="session-risk-rename-scope",
+            invocation_id="invocation-risk-rename-scope",
+            freshness_deadline=130.0,
+        )
+        state_dir = worktree_git_dir(self.scenario.repo)
+        task_id = "task-risk-rename-scope"
+        state = TaskStore(state_dir).start(
+            task_id,
+            outcome="local_change",
+            branch=branch,
+            task_digest="sha256:" + "8" * 64,
+            decision_digest="sha256:" + "9" * 64,
+        )
+        TaskLease.acquire(
+            state_dir,
+            task_id=task_id,
+            worktree=str(self.scenario.repo),
+            branch=branch,
+            session_id="session-risk-rename-scope",
+            paths=["inside/**"],
+            policy_digest=policy_digest,
+        )
+        (self.scenario.repo / "inside").mkdir()
+        git(
+            self.scenario.repo,
+            "mv",
+            "outside/owned.txt",
+            "inside/owned.txt",
+        )
+
+        risk = evaluate_local_risk(
+            self.scenario.repo,
+            policy,
+            task_state=state,
+            local_lease_session_id="session-risk-rename-scope",
+        )
+
+        dirty = next(
+            check for check in risk.checks if check.code == "RS_LOCAL_DIRTY"
+        )
+        self.assertEqual(dirty.status, "FAIL")
+        self.assertEqual(dirty.facts["lease_coverage"], "invalid")
+
     def test_alternative_base_branch_is_driven_by_policy(self) -> None:
         from control_plane.git_state import evaluate_preflight
 

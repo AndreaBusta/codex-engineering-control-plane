@@ -71,6 +71,9 @@ ORDERED_STATES = (
     "observed",
     "closed",
 )
+WRITER_LEASE_STATES = frozenset(
+    {"framed", "planned", "ready", "implementing", "verifying"}
+)
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     "framed": frozenset({"planned", "blocked"}),
     "planned": frozenset({"ready", "blocked"}),
@@ -98,6 +101,7 @@ OUTCOME_LIMITS = {
     "integration": "base_verified",
     "release": "observed",
 }
+WRITER_OUTCOMES = frozenset(OUTCOME_LIMITS) - {"answer"}
 TRANSITION_EVIDENCE = {
     "ready": frozenset({"preflight_ok"}),
     "verifying": frozenset({"implementation_complete"}),
@@ -136,6 +140,17 @@ VERIFICATION_COMMAND_IDS = {
         "governing_tree_clean",
     ),
 }
+
+
+def task_allows_writer_lease(state: Mapping[str, Any]) -> bool:
+    """Return whether durable lifecycle state may continue local writes."""
+
+    return (
+        state.get("state") in WRITER_LEASE_STATES
+        and state.get("outcome") in WRITER_OUTCOMES
+        and state.get("verification_profile") is None
+        and state.get("resume_forbidden") is not True
+    )
 
 
 def build_verification_task_envelope(

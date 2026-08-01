@@ -32,6 +32,7 @@ from control_plane.lifecycle import (
     TaskStore,
     create_verification_execution_context,
     run_verification_profile,
+    task_allows_writer_lease,
 )
 from control_plane.lockfile import validate_lock
 from control_plane.policy import PolicyError, load_policy, validate_policy
@@ -371,7 +372,14 @@ def _git_current_branch(repo: Path) -> str:
 
 def _git_changed_paths(repo: Path) -> list[str]:
     changed = subprocess.run(
-        ["git", "diff", "--name-only", "-z", "HEAD"],
+        [
+            "git",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            "HEAD",
+        ],
         cwd=repo,
         check=False,
         capture_output=True,
@@ -437,15 +445,36 @@ def command_preflight(arguments: argparse.Namespace) -> int:
     ):
         try:
             root = discover_repository(arguments.repo)
+            state_dir = worktree_git_dir(root)
+            store = TaskStore(state_dir)
+            before_task = store.status(arguments.task_id)
+            branch = payload["facts"].get("branch")
+            if (
+                before_task.get("branch") != branch
+                or not task_allows_writer_lease(before_task)
+            ):
+                raise ValueError(
+                    "E_STATE_CONTINUATION: task is not an active writer "
+                    "on the current branch"
+                )
             TaskLease.validate(
-                worktree_git_dir(root),
+                state_dir,
                 task_id=arguments.task_id,
                 worktree=str(root),
-                branch=str(payload["facts"].get("branch")),
+                branch=str(branch),
                 session_id=arguments.session_id,
                 policy_digest=contract_digest(policy),
                 changed_paths=_git_changed_paths(root),
             )
+            after_task = store.status(arguments.task_id)
+            if (
+                contract_digest(before_task) != contract_digest(after_task)
+                or after_task.get("branch") != branch
+                or not task_allows_writer_lease(after_task)
+            ):
+                raise ValueError(
+                    "E_STATE_CONTINUATION: task changed during lease validation"
+                )
             payload["errors"] = [
                 error
                 for error in payload["errors"]
@@ -453,10 +482,15 @@ def command_preflight(arguments: argparse.Namespace) -> int:
             ]
             payload["facts"]["lease_continuation"] = True
             payload["ok"] = not payload["errors"]
-        except (RepositoryError, ValueError) as error:
+        except (RepositoryError, OSError, ValueError) as error:
+            code = (
+                "E_STATE_CONTINUATION"
+                if isinstance(error, OSError)
+                else str(error).split(":", 1)[0]
+            )
             payload["errors"].append(
                 {
-                    "code": str(error).split(":", 1)[0],
+                    "code": code,
                     "message": str(error),
                 }
             )
@@ -777,6 +811,13 @@ def command_risk_status(arguments: argparse.Namespace) -> int:
 
     try:
         root = discover_repository(arguments.repo)
+        if (
+            arguments.lease_session_id is not None
+            and arguments.task_id is None
+        ):
+            raise ValueError(
+                "RS_LOCAL_LEASE_TASK: --lease-session-id requires --task-id"
+            )
         decision_hint = (
             _read_json(arguments.decision)
             if arguments.decision is not None
@@ -866,6 +907,7 @@ def command_risk_status(arguments: argparse.Namespace) -> int:
             governing_policy,
             task_state=task_state,
             route_decision_hint=decision_hint,
+            local_lease_session_id=arguments.lease_session_id,
         )
         payload = status.to_dict()
         payload["facts"]["governing_policy_source"] = (
@@ -1489,6 +1531,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Candidate policy hint only; never a governing policy source.",
     )
     risk_parser.add_argument("--task-id")
+    risk_parser.add_argument(
+        "--lease-session-id",
+        help=(
+            "Explicit local lease-binding hint; validates continuity but "
+            "never grants authority or PASS."
+        ),
+    )
     risk_parser.add_argument(
         "--decision",
         type=Path,
