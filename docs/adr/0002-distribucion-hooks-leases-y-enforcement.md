@@ -1,6 +1,6 @@
 # 0002 — Distribución, hooks, leases y promoción de enforcement
 
-- Estado: accepted
+- Estado: superseded in part by [0003](0003-local-audit-kernel-v2-1.md)
 - Fecha: 2026-07-28
 
 ## Contexto
@@ -55,6 +55,10 @@ audit → soft-enforce → enforce
 `soft-enforce` cubre primero estados mecánicos de alto riesgo. El enforcement
 semántico solo se activa después de 100 TaskEnvelopes, detección crítica del
 100 % y menos del 10 % de falsos positivos obligatorios.
+
+> La distribución, los hooks audit, los leases y el rollback permanecen
+> vigentes. ADR 0003 difiere la promoción a `soft-enforce`/`enforce` y toda
+> autoridad remota; esos umbrales ya no son trabajo de la entrega v2.1.
 
 ## Alternativas descartadas
 

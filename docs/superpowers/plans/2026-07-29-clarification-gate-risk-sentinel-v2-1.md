@@ -1,5 +1,11 @@
 # Clarification Gate and Risk Sentinel v2.1 Implementation Plan
 
+> **Estado desde 2026-07-31:** Tasks 0–8 conservan valor histórico y de
+> implementación. Tasks 9–15 quedan **superseded/deferred** por el
+> [plan de consolidación local-audit](2026-07-31-control-plane-v2-1-local-audit-consolidation.md).
+> No deben ejecutarse como ruta v2.1 vigente. La capacidad remota solo podrá
+> reabrirse mediante una ADR y un plan nuevos con adapter host real.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Estabilizar el control plane, hacer veraz su pre-framing y añadir
@@ -5152,7 +5158,7 @@ tests/test_lockfile.py
 Mensaje cerrado: `Install reversible local Git guards`. Reobservar
 `LocalGitObservation` y cerrar la ronda; no ejecutar add/commit raw.
 
-## Task 9: Añadir procedencia post-push en GitHub Actions
+## Task 9: Añadir procedencia post-push en GitHub Actions — superseded/deferred
 
 **Files:**
 - Create: `control_plane/github_provenance.py`
@@ -7181,7 +7187,7 @@ Continuar en el mismo worktree y child con Task 10, definir el set exhaustivo
 runtime definitivo. Tasks 9 y 10 forman una sola unidad de commit; si Task 10
 se bloquea, no se publica ni se empuja el estado intermedio.
 
-## Task 10: Versionar distribución, lock y documentación
+## Task 10: Versionar distribución, lock y documentación — superseded/deferred
 
 **Files:**
 - Carry uncommitted from Task 9:
@@ -7388,7 +7394,7 @@ ni ausencia ni archivo extra pasa. Mensaje cerrado:
 `Add and lock clarification risk control plane v2.1`. Reobservar el commit con
 `LocalGitObservation`; no ejecutar add/commit raw.
 
-## Task 11: Assurance, propiedades y mutation pressure
+## Task 11: Assurance, propiedades y mutation pressure — superseded/deferred
 
 **Files:**
 - Create: `control_plane/assurance.py`
@@ -8059,7 +8065,7 @@ el set staged mediante `safe-read`, y luego `commit_staged_change` con grant
 separado y mensaje cerrado `Stress test clarification and risk routing`.
 Reobservar HEAD/index/tree y cerrar la ronda. No ejecutar add/commit raw.
 
-## Task 12: Verificación integrada y revisión independiente
+## Task 12: Verificación integrada y revisión independiente — superseded/deferred
 
 **Files:**
 - Review: todo el diff desde `origin/main`
@@ -8463,7 +8469,7 @@ crear `VERIFY-R<n+1>`; repetir smoke macOS, las 12 sesiones, ambas revisiones y
 el profile autoritativo completo sobre el nuevo HEAD. No se reaprovecha un
 receipt anterior aunque el finding fuese documental.
 
-## Task 13: Procedimiento reutilizable de push, PR, checks e integración
+## Task 13: Procedimiento reutilizable de push, PR, checks e integración — superseded/deferred
 
 Este bloque no es una fase cronológica que espere hasta el final. Se invoca:
 
@@ -8908,7 +8914,7 @@ revierte un cleanup local ya demostrado. La siguiente rama puede crearse desde
 la base remota verificada aunque el usuario elija retener, pero el estado de
 retención queda visible y auditable.
 
-## Task 14: Ejecutar PR D como primer piloto autoritativo
+## Task 14: Ejecutar PR D como primer piloto autoritativo — superseded/deferred
 
 **Files:**
 - Create: `docs/engineering/pilots/control-plane-authority-v2-1.md`
@@ -9505,7 +9511,7 @@ Si PR D no puede completar todo el recorrido, v2.1 sigue siendo funcional en
 audit/shadow y guards mecánicos, pero el lifecycle remoto permanece
 `pending_github_host_adapter`. Eso no bloquea el handoff honesto.
 
-## Task 15: Handoff read-only de adopción, sin aplicarla
+## Task 15: Handoff read-only de adopción, sin aplicarla — superseded/deferred
 
 **Files:**
 - Read: `docs/engineering/07-adoption.md` ya actualizado y comprometido en
