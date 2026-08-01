@@ -809,6 +809,22 @@ class AdoptionTests(unittest.TestCase):
             / "cli.py"
         )
         self.assertTrue(installed.is_file())
+        installed_agents = (self.scenario.repo / "AGENTS.md").read_text(
+            encoding="utf-8"
+        )
+        from control_plane.adoption import AGENTS_END, AGENTS_START
+
+        managed_agents = installed_agents.split(AGENTS_START, 1)[1].split(
+            AGENTS_END, 1
+        )[0]
+        self.assertNotIn("bash tests/run.sh", managed_agents)
+        self.assertIn(
+            "gates canónicos documentados por el repositorio objetivo",
+            managed_agents,
+        )
+        self.assertIn(
+            "scripts/control-plane policy-check", managed_agents
+        )
         from control_plane.lockfile import validate_lock
         from control_plane.resource_registry import load_registry
 
@@ -832,6 +848,108 @@ class AdoptionTests(unittest.TestCase):
         self.assertTrue(rolled_back["ok"])
         for change in plan["changes"]:
             self.assertFalse((self.scenario.repo / change["path"]).exists())
+
+    def test_render_agents_preserves_target_gate_outside_managed_block(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            AGENTS_END,
+            AGENTS_START,
+            _render_agents,
+        )
+
+        target_text = (
+            "# Target rules\n\n"
+            "## Verification\n\n"
+            "```bash\n"
+            "bash tests/run.sh\n"
+            "```\n"
+        )
+        (self.scenario.repo / "AGENTS.md").write_text(
+            target_text, encoding="utf-8"
+        )
+
+        rendered = _render_agents(ROOT, self.scenario.repo).decode("utf-8")
+        managed = rendered.split(AGENTS_START, 1)[1].split(
+            AGENTS_END, 1
+        )[0]
+
+        self.assertTrue(rendered.startswith(target_text))
+        self.assertIn("bash tests/run.sh", rendered.split(AGENTS_START, 1)[0])
+        self.assertNotIn("bash tests/run.sh", managed)
+        self.assertIn(
+            "gates canónicos documentados por el repositorio objetivo",
+            managed,
+        )
+
+    def test_adopted_cli_reports_local_validated_lease_as_unknown(self) -> None:
+        from control_plane.adoption import adoption_apply, adoption_plan
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption_apply(plan)
+        launcher = self.scenario.repo / "scripts" / "control-plane"
+        digest = "sha256:" + "a" * 64
+        started = subprocess.run(
+            [
+                str(launcher),
+                "task",
+                "start",
+                "--repo",
+                str(self.scenario.repo),
+                "--task-id",
+                "TASK-ADOPTED-RISK",
+                "--outcome",
+                "local_change",
+                "--branch",
+                "codex/adopt-v2",
+                "--task-digest",
+                digest,
+                "--decision-digest",
+                digest,
+                "--session-id",
+                "session-adopted-risk",
+                "--scope-path",
+                ".",
+                "--json",
+            ],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        risk = subprocess.run(
+            [
+                str(launcher),
+                "risk-status",
+                "--repo",
+                str(self.scenario.repo),
+                "--task-id",
+                "TASK-ADOPTED-RISK",
+                "--lease-session-id",
+                "session-adopted-risk",
+                "--json",
+            ],
+            cwd=self.scenario.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertNotIn("unrecognized arguments", risk.stderr)
+        self.assertEqual(risk.returncode, 2, risk.stderr)
+        payload = json.loads(risk.stdout)
+        self.assertEqual(payload["status"], "UNKNOWN")
+        dirty = next(
+            item
+            for item in payload["dimensions"]["local"]["checks"]
+            if item["code"] == "RS_LOCAL_DIRTY"
+        )
+        self.assertEqual(dirty["status"], "UNKNOWN")
+        self.assertEqual(dirty["facts"]["lease_coverage"], "local_validated")
+        self.assertIsNone(dirty["facts"]["lease_valid"])
 
     def test_rollback_refuses_to_destroy_post_install_edit(self) -> None:
         from control_plane.adoption import (

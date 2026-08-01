@@ -117,10 +117,19 @@ scripts/control-plane upgrade plan --target /ruta/al/repositorio
 
 ```bash
 scripts/control-plane risk-status --repo /ruta/al/repositorio --json
+
+# Continuidad local de una task con cambios aún no comprometidos:
+scripts/control-plane risk-status \
+  --repo /ruta/al/repositorio \
+  --task-id TASK-EXAMPLE-001 \
+  --lease-session-id session-example-001 \
+  --json
 ```
 
 Exit codes: `PASS=0`, `FAIL=1`, `UNKNOWN=2`. En v2.1 local-audit la dimensión
-remota permanece `UNKNOWN` mientras no exista evidencia externa autorizada.
+remota permanece `UNKNOWN` mientras no exista evidencia externa autorizada. Una
+task y lease locales exactas validan continuidad, pero siguen produciendo
+`UNKNOWN`: `--lease-session-id` no concede autoridad ni puede producir `PASS`.
 
 ### Hooks, lectura segura y guards Git
 

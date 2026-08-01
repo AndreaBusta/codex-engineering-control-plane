@@ -59,12 +59,19 @@ scripts/control-plane task close --task-id TASK-2026-001
 
 El lease se guarda bajo el Git dir del worktree. Une tarea, worktree, rama,
 sesión, rutas y policy digest. Un preflight dirty solo continúa cuando todos
-coinciden. Otro writer con rutas superpuestas recibe `E_LEASE_CONFLICT`.
+coinciden y la task durable permanece en un estado writer activo. Una task
+`blocked`, cerrada o en finalización no puede reutilizar su lease. Otro writer
+con rutas superpuestas recibe `E_LEASE_CONFLICT`.
 La adquisición y liberación están serializadas mediante un lock de proceso; el
-inventario de archivos cambiados es obligatorio al validar continuidad.
+inventario de archivos cambiados es obligatorio al validar continuidad. Los
+renames staged cuentan origen y destino: mover un archivo hacia una ruta
+permitida no oculta una eliminación fuera del scope.
 
 El lease no concede commit, push, PR, merge o release. Solo prueba continuidad
-del mismo frente después de una edición autorizada.
+del mismo frente después de una edición autorizada. `risk-status --task-id ...
+--lease-session-id ...` puede diagnosticar una lease local exacta como
+`local_validated/UNKNOWN`; solo una atestación host exacta puede elevar el check
+dirty a `PASS`.
 
 ## Hooks audit
 

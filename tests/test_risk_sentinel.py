@@ -355,7 +355,7 @@ class RiskSentinelContractTests(unittest.TestCase):
         from control_plane.contracts import contract_digest
         from control_plane.lifecycle import TaskLease, TaskStore
         from control_plane.repository import worktree_git_dir
-        from control_plane.risk_sentinel import _lease_covers_dirty_tree
+        from control_plane.risk_sentinel import _lease_coverage
 
         scenario = GitScenario()
         self.addCleanup(scenario.close)
@@ -397,12 +397,31 @@ class RiskSentinelContractTests(unittest.TestCase):
             "lease_digest": "sha256:" + "f" * 64,
         }
 
+        exact = _lease_coverage(
+            scenario.repo,
+            task_state=state,
+            policy=mapping,
+            branch=branch,
+            host_evidence=host_evidence,
+        )
+        contradictory = _lease_coverage(
+            scenario.repo,
+            task_state=state,
+            policy=mapping,
+            branch=branch,
+            host_evidence={
+                **host_evidence,
+                "session_id": "session-risk-lease-other",
+            },
+            local_session_id="session-risk-lease-race",
+        )
+
         with patch.object(
             TaskLease,
             "validate",
             return_value=replacement,
         ):
-            covered = _lease_covers_dirty_tree(
+            coverage = _lease_coverage(
                 scenario.repo,
                 task_state=state,
                 policy=mapping,
@@ -410,7 +429,23 @@ class RiskSentinelContractTests(unittest.TestCase):
                 host_evidence=host_evidence,
             )
 
-        self.assertFalse(covered)
+        self.assertEqual(exact, "host_attested")
+        self.assertEqual(contradictory, "invalid")
+        self.assertEqual(coverage, "invalid")
+
+        with patch(
+            "control_plane.risk_sentinel._git_changed_paths",
+            return_value=None,
+        ):
+            unobservable = _lease_coverage(
+                scenario.repo,
+                task_state=state,
+                policy=mapping,
+                branch=branch,
+                host_evidence=None,
+                local_session_id="session-risk-lease-race",
+            )
+        self.assertEqual(unobservable, "unobservable")
 
 
     def test_task6_has_no_installed_policy_or_mapping_shortcut(self) -> None:

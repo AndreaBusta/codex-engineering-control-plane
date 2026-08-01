@@ -11,6 +11,7 @@ from pathlib import Path
 
 from tests.git_test_support import GitScenario
 from tests.git_test_support import FIXTURE_POLICY
+from tests.git_test_support import git
 from tests.router_test_support import task_envelope
 
 
@@ -211,6 +212,45 @@ class CliV2Tests(unittest.TestCase):
                 if item["code"] == "RS_AUTHORITY_REQUIRED"
             ),
             "UNKNOWN",
+        )
+
+    def test_risk_status_accepts_only_an_explicit_local_lease_binding_hint(
+        self,
+    ) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/risk-local-lease-cli")
+
+        result = run_cli(
+            "risk-status",
+            "--repo",
+            str(scenario.repo),
+            "--task-id",
+            "TASK-RISK-MISSING",
+            "--lease-session-id",
+            "session-risk-local-lease-cli",
+            "--json",
+        )
+
+        self.assertNotIn("unrecognized arguments", result.stderr)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "UNKNOWN")
+        self.assertFalse(payload["ok"])
+
+        unbound = run_cli(
+            "risk-status",
+            "--repo",
+            str(scenario.repo),
+            "--lease-session-id",
+            "session-risk-local-lease-cli",
+            "--json",
+        )
+        self.assertEqual(unbound.returncode, 1, unbound.stderr)
+        unbound_payload = json.loads(unbound.stdout)
+        self.assertEqual(
+            unbound_payload["errors"][0]["code"],
+            "RS_LOCAL_LEASE_TASK",
         )
 
     def test_risk_status_human_uses_closed_interaction_view(self) -> None:
@@ -725,6 +765,229 @@ class CliV2Tests(unittest.TestCase):
                     for item in json.loads(result.stdout)["errors"]
                 },
             )
+
+        blocked = run_cli(
+            "task",
+            "transition",
+            "--repo",
+            str(scenario.repo),
+            "--task-id",
+            "TASK-LEASE",
+            "--state",
+            "blocked",
+            "--json",
+        )
+        blocked_preflight = run_cli(
+            "preflight",
+            "--mode",
+            "write",
+            "--repo",
+            str(scenario.repo),
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--task-id",
+            "TASK-LEASE",
+            "--session-id",
+            "session-a",
+            "--json",
+        )
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        self.assertEqual(blocked_preflight.returncode, 1)
+        self.assertIn(
+            "E_STATE_CONTINUATION",
+            {
+                item["code"]
+                for item in json.loads(blocked_preflight.stdout)["errors"]
+            },
+        )
+
+    def test_dirty_preflight_rejects_non_writer_and_verifier_leases(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.host_bridge import _register_runtime_host_object
+        from control_plane.lifecycle import (
+            TaskLease,
+            TaskStore,
+            VerificationTaskBootstrap,
+            build_verification_task_envelope,
+        )
+        from control_plane.policy import load_policy
+        from control_plane.repository import worktree_git_dir
+
+        answer = GitScenario()
+        self.addCleanup(answer.close)
+        answer.checkout_feature("codex/answer-lease")
+        started = run_cli(
+            "task",
+            "start",
+            "--repo",
+            str(answer.repo),
+            "--task-id",
+            "TASK-ANSWER-LEASE",
+            "--outcome",
+            "answer",
+            "--branch",
+            "codex/answer-lease",
+            "--task-digest",
+            self.digest,
+            "--decision-digest",
+            self.digest,
+            "--session-id",
+            "session-answer-lease",
+            "--scope-path",
+            ".",
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--json",
+        )
+        (answer.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        answer_preflight = run_cli(
+            "preflight",
+            "--mode",
+            "write",
+            "--repo",
+            str(answer.repo),
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--task-id",
+            "TASK-ANSWER-LEASE",
+            "--session-id",
+            "session-answer-lease",
+            "--json",
+        )
+
+        verifier = GitScenario()
+        self.addCleanup(verifier.close)
+        verifier.checkout_feature("codex/verifier-lease")
+        state_dir = worktree_git_dir(verifier.repo)
+        store = TaskStore(state_dir)
+        bootstrap = object.__new__(VerificationTaskBootstrap)
+        bootstrap._consumed = False
+        bootstrap.task = build_verification_task_envelope(
+            task_id="TASK-VERIFIER-LEASE",
+            profile="control_plane_assurance",
+        )
+        bootstrap.task_digest = contract_digest(bootstrap.task)
+        bootstrap.profile = "control_plane_assurance"
+        bootstrap.profile_digest = self.digest
+        bootstrap.runtime_digest = store.runtime_digest
+        bootstrap.target_digest = self.digest
+        bootstrap.content_trust = "project_owned"
+        bootstrap.authority_digest = self.digest
+        bootstrap.bootstrap_digest = self.digest
+        bootstrap.session_id = "session-verifier-lease"
+        _register_runtime_host_object(
+            bootstrap, "verification_task_bootstrap"
+        )
+        store.start(
+            "TASK-VERIFIER-LEASE",
+            outcome="local_change",
+            branch="codex/verifier-lease",
+            task_digest=bootstrap.task_digest,
+            decision_digest=self.digest,
+            verification_bootstrap=bootstrap,
+        )
+        TaskLease.acquire(
+            state_dir,
+            task_id="TASK-VERIFIER-LEASE",
+            worktree=str(verifier.repo),
+            branch="codex/verifier-lease",
+            session_id="session-verifier-lease",
+            paths=["."],
+            policy_digest=contract_digest(load_policy(FIXTURE_POLICY)),
+        )
+        (verifier.repo / "dirty.txt").write_text(
+            "dirty\n", encoding="utf-8"
+        )
+        verifier_preflight = run_cli(
+            "preflight",
+            "--mode",
+            "write",
+            "--repo",
+            str(verifier.repo),
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--task-id",
+            "TASK-VERIFIER-LEASE",
+            "--session-id",
+            "session-verifier-lease",
+            "--json",
+        )
+
+        self.assertEqual(started.returncode, 0, started.stderr)
+        for result in (answer_preflight, verifier_preflight):
+            with self.subTest(stderr=result.stderr):
+                self.assertEqual(result.returncode, 1, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertFalse(payload["facts"]["lease_continuation"])
+                self.assertIn(
+                    "E_STATE_CONTINUATION",
+                    {item["code"] for item in payload["errors"]},
+                )
+
+    def test_dirty_preflight_counts_both_sides_of_staged_rename(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/lease-rename-scope")
+        (scenario.repo / "outside").mkdir()
+        (scenario.repo / "outside" / "owned.txt").write_text(
+            "outside\n", encoding="utf-8"
+        )
+        git(scenario.repo, "add", "outside/owned.txt")
+        git(scenario.repo, "commit", "-m", "test: add outside file")
+        started = run_cli(
+            "task",
+            "start",
+            "--repo",
+            str(scenario.repo),
+            "--task-id",
+            "TASK-LEASE-RENAME",
+            "--outcome",
+            "local_change",
+            "--branch",
+            "codex/lease-rename-scope",
+            "--task-digest",
+            self.digest,
+            "--decision-digest",
+            self.digest,
+            "--session-id",
+            "session-lease-rename",
+            "--scope-path",
+            "inside/**",
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--json",
+        )
+        (scenario.repo / "inside").mkdir()
+        git(
+            scenario.repo,
+            "mv",
+            "outside/owned.txt",
+            "inside/owned.txt",
+        )
+
+        result = run_cli(
+            "preflight",
+            "--mode",
+            "write",
+            "--repo",
+            str(scenario.repo),
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--task-id",
+            "TASK-LEASE-RENAME",
+            "--session-id",
+            "session-lease-rename",
+            "--json",
+        )
+
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(
+            "E_LEASE_SCOPE",
+            {item["code"] for item in json.loads(result.stdout)["errors"]},
+        )
 
     def test_task_lease_release_requires_exact_owner_bindings(self) -> None:
         scenario = GitScenario()

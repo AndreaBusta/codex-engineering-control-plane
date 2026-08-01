@@ -18,7 +18,11 @@ from typing import Any, Iterable, Mapping
 from control_plane.contracts import SHA256_DIGEST, contract_digest
 from control_plane.git_state import evaluate_preflight
 from control_plane.intake import render_interaction_recommendation
-from control_plane.lifecycle import TaskLease, TaskStore
+from control_plane.lifecycle import (
+    TaskLease,
+    TaskStore,
+    task_allows_writer_lease,
+)
 from control_plane.lockfile import validate_lock
 from control_plane.policy import (
     GoverningPolicy,
@@ -39,6 +43,15 @@ PASS = "PASS"
 UNKNOWN = "UNKNOWN"
 FAIL = "FAIL"
 _STATUS_RANK = {PASS: 0, UNKNOWN: 1, FAIL: 2}
+_LEASE_HOST_ATTESTED = "host_attested"
+_LEASE_LOCAL_VALIDATED = "local_validated"
+_LEASE_UNOBSERVABLE = "unobservable"
+_LEASE_INVALID = "invalid"
+_LEASE_NOT_APPLICABLE = "not_applicable"
+_TASK_EXACT = "exact"
+_TASK_MISSING = "missing"
+_TASK_UNOBSERVABLE = "unobservable"
+_TASK_INVALID = "invalid"
 
 
 @dataclass(frozen=True)
@@ -463,6 +476,36 @@ def _installed_guard_snapshot(
     return str(hooks_path), PASS
 
 
+def _durable_task_observation(
+    task_state: Mapping[str, Any],
+    *,
+    repo: Path | str,
+) -> tuple[str, Mapping[str, Any] | None]:
+    """Compare candidate task state with its runtime-owned durable record."""
+
+    if task_state.get("_unobserved") is True:
+        return _TASK_MISSING, None
+    task_id = task_state.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return _TASK_INVALID, None
+    try:
+        root = discover_repository(Path(repo))
+        durable = TaskStore(worktree_git_dir(root)).status(task_id)
+    except RepositoryError:
+        return _TASK_UNOBSERVABLE, None
+    except OSError:
+        return _TASK_UNOBSERVABLE, None
+    except ValueError as error:
+        if str(error).startswith(("E_TASK_NOT_FOUND:", "E_STATE_NOT_FOUND:")):
+            return _TASK_MISSING, None
+        return _TASK_INVALID, None
+    try:
+        matches = contract_digest(dict(task_state)) == contract_digest(durable)
+    except (TypeError, ValueError):
+        return _TASK_INVALID, None
+    return (_TASK_EXACT, durable) if matches else (_TASK_INVALID, durable)
+
+
 def _task_check(
     task_state: Mapping[str, Any] | None,
     *,
@@ -518,15 +561,14 @@ def _task_check(
             "Requested task state cannot be authenticated without a repository.",
             task_id=task_id,
         )
-    try:
-        root = discover_repository(Path(repo))
-        durable = TaskStore(worktree_git_dir(root)).status(str(task_id))
-    except (RepositoryError, OSError, ValueError) as error:
+    observation, durable = _durable_task_observation(
+        task_state,
+        repo=repo,
+    )
+    if observation != _TASK_EXACT or durable is None:
         status = (
             UNKNOWN
-            if str(error).startswith(
-                ("E_TASK_NOT_FOUND:", "E_STATE_NOT_FOUND:")
-            )
+            if observation in {_TASK_MISSING, _TASK_UNOBSERVABLE}
             else FAIL
         )
         return _check(
@@ -540,20 +582,13 @@ def _task_check(
             task_id=task_id,
         )
     supplied_digest = contract_digest(dict(task_state))
-    matches = supplied_digest == contract_digest(durable)
-    if not matches:
-        return _check(
-            "RS_TASK_STATE",
-            FAIL,
-            "Serialized task state differs from the durable record.",
-            task_id=task_id,
-        )
     if host_evidence is None:
         return _check(
             "RS_TASK_STATE",
             UNKNOWN,
             "Durable task state lacks a current opaque host attestation.",
             task_id=task_id,
+            durable_match=True,
         )
     anchored = (
         bool(host_evidence)
@@ -579,7 +614,14 @@ def _task_check(
 def _git_changed_paths(repo: Path) -> tuple[str, ...] | None:
     try:
         changed = subprocess.run(
-            ["git", "diff", "--name-only", "-z", "HEAD"],
+            [
+                "git",
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                "HEAD",
+            ],
             cwd=repo,
             check=False,
             capture_output=True,
@@ -611,39 +653,56 @@ def _git_changed_paths(repo: Path) -> tuple[str, ...] | None:
     return tuple(sorted(paths))
 
 
-def _lease_covers_dirty_tree(
+def _lease_coverage(
     repo: Path,
     *,
     task_state: Mapping[str, Any] | None,
     policy: Mapping[str, Any],
     branch: object,
     host_evidence: Mapping[str, Any] | None,
-) -> bool | None:
+    local_session_id: str | None = None,
+) -> str:
     if task_state is None or not isinstance(branch, str) or not branch:
-        return False
-    task_check = _task_check(
+        return _LEASE_INVALID
+    task_observation, durable = _durable_task_observation(
         task_state,
         repo=repo,
-        host_evidence=host_evidence,
     )
-    if task_check.status != PASS:
-        return False
-    if not host_evidence:
-        return False
-    expected_lease_digest = host_evidence.get("lease_digest")
-    expected_session_id = host_evidence.get("session_id")
+    if task_observation == _TASK_UNOBSERVABLE:
+        return _LEASE_UNOBSERVABLE
     if (
-        not isinstance(expected_lease_digest, str)
-        or SHA256_DIGEST.fullmatch(expected_lease_digest) is None
-        or not isinstance(expected_session_id, str)
-        or not expected_session_id
+        task_observation != _TASK_EXACT
+        or durable is None
+        or durable.get("branch") != branch
+        or not task_allows_writer_lease(durable)
     ):
-        return False
+        return _LEASE_INVALID
+    expected_lease_digest: str | None = None
+    if host_evidence is not None:
+        task_check = _task_check(
+            task_state,
+            repo=repo,
+            host_evidence=host_evidence,
+        )
+        expected_lease_digest = host_evidence.get("lease_digest")
+        expected_session_id = host_evidence.get("session_id")
+        if (
+            task_check.status != PASS
+            or not isinstance(expected_lease_digest, str)
+            or SHA256_DIGEST.fullmatch(expected_lease_digest) is None
+            or not isinstance(expected_session_id, str)
+            or not expected_session_id
+        ):
+            return _LEASE_INVALID
+    else:
+        expected_session_id = local_session_id
+        if not isinstance(expected_session_id, str) or not expected_session_id:
+            return _LEASE_INVALID
     task_id = str(task_state["task_id"])
     state_dir = worktree_git_dir(repo)
     changed_paths = _git_changed_paths(repo)
     if changed_paths is None:
-        return None
+        return _LEASE_UNOBSERVABLE
     try:
         validated = TaskLease.validate(
             state_dir,
@@ -655,12 +714,33 @@ def _lease_covers_dirty_tree(
             changed_paths=list(changed_paths),
         )
     except ValueError:
-        return False
+        return _LEASE_INVALID
     except OSError:
-        return None
+        return _LEASE_UNOBSERVABLE
+    after_observation, after = _durable_task_observation(
+        task_state,
+        repo=repo,
+    )
+    if after_observation == _TASK_UNOBSERVABLE:
+        return _LEASE_UNOBSERVABLE
+    if (
+        after_observation != _TASK_EXACT
+        or after is None
+        or after.get("branch") != branch
+        or not task_allows_writer_lease(after)
+    ):
+        return _LEASE_INVALID
+    if host_evidence is not None:
+        return (
+            _LEASE_HOST_ATTESTED
+            if isinstance(validated, Mapping)
+            and validated.get("lease_digest") == expected_lease_digest
+            else _LEASE_INVALID
+        )
     return (
-        isinstance(validated, Mapping)
-        and validated.get("lease_digest") == expected_lease_digest
+        _LEASE_LOCAL_VALIDATED
+        if isinstance(validated, Mapping)
+        else _LEASE_INVALID
     )
 
 
@@ -697,6 +777,7 @@ def evaluate_local_risk(
     *,
     task_state: Mapping[str, Any] | None = None,
     route_decision_hint: Mapping[str, Any] | None = None,
+    local_lease_session_id: str | None = None,
 ) -> RiskDimension:
     """Evaluate every normative local check without treating read mode as safe."""
 
@@ -878,16 +959,27 @@ def evaluate_local_risk(
         )
     )
     dirty = facts.get("dirty")
-    lease_valid = (
-        _lease_covers_dirty_tree(
+    lease_coverage = (
+        _lease_coverage(
             root,
             task_state=task_state,
             policy=policy_mapping,
             branch=branch,
             host_evidence=host_evidence,
+            local_session_id=local_lease_session_id,
         )
         if dirty is True
-        else False
+        else _LEASE_NOT_APPLICABLE
+    )
+    lease_valid = (
+        True
+        if lease_coverage == _LEASE_HOST_ATTESTED
+        else (
+            None
+            if lease_coverage
+            in {_LEASE_LOCAL_VALIDATED, _LEASE_UNOBSERVABLE}
+            else False
+        )
     )
     checks.append(
         _check(
@@ -897,25 +989,35 @@ def evaluate_local_risk(
                 if dirty is None
                 else (
                     PASS
-                    if not dirty or lease_valid is True
-                    else (UNKNOWN if lease_valid is None else FAIL)
+                    if not dirty or lease_coverage == _LEASE_HOST_ATTESTED
+                    else (
+                        UNKNOWN
+                        if lease_coverage
+                        in {_LEASE_LOCAL_VALIDATED, _LEASE_UNOBSERVABLE}
+                        else FAIL
+                    )
                 )
             ),
             (
-                "Working tree is clean or fully covered by a valid lease."
-                if dirty is False or lease_valid is True
+                "Working tree is clean or host-attested by a valid lease."
+                if dirty is False or lease_coverage == _LEASE_HOST_ATTESTED
                 else (
-                    "Working tree is dirty without a complete valid lease."
-                    if dirty is True and lease_valid is False
+                    "Working tree has a complete local lease but lacks host attestation."
+                    if lease_coverage == _LEASE_LOCAL_VALIDATED
                     else (
                         "Lease coverage is not observable."
-                        if dirty is True
-                        else "Working-tree status is not observable."
+                        if lease_coverage == _LEASE_UNOBSERVABLE
+                        else (
+                            "Working tree is dirty without a complete valid lease."
+                            if dirty is True
+                            else "Working-tree status is not observable."
+                        )
                     )
                 )
             ),
             dirty=dirty,
             lease_valid=lease_valid,
+            lease_coverage=lease_coverage,
         )
     )
 
@@ -1092,6 +1194,7 @@ def evaluate_risk_status(
     *,
     task_state: Mapping[str, Any] | None = None,
     route_decision_hint: Mapping[str, Any] | None = None,
+    local_lease_session_id: str | None = None,
 ) -> RiskStatus:
     """Return separate local and remote dimensions with a closed aggregate."""
 
@@ -1100,6 +1203,7 @@ def evaluate_risk_status(
         policy,
         task_state=task_state,
         route_decision_hint=route_decision_hint,
+        local_lease_session_id=local_lease_session_id,
     )
     remote = RiskDimension(
         status=UNKNOWN,
