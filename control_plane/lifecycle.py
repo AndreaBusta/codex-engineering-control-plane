@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -69,24 +70,26 @@ ORDERED_STATES = (
     "released",
     "observed",
     "closed",
-    "blocked",
 )
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
-    state: frozenset(
-        {
-            *(("blocked",) if state not in {"closed", "blocked"} else ()),
-            *(
-                (ORDERED_STATES[index + 1],)
-                if state not in {"closed", "blocked"}
-                and index + 1 < len(ORDERED_STATES) - 1
-                else ()
-            ),
-        }
-    )
-    for index, state in enumerate(ORDERED_STATES)
+    "framed": frozenset({"planned", "blocked"}),
+    "planned": frozenset({"ready", "blocked"}),
+    "ready": frozenset({"implementing", "blocked"}),
+    "implementing": frozenset({"verifying", "blocked"}),
+    "verifying": frozenset({"review_ready", "blocked"}),
+    "review_ready": frozenset({"committed", "blocked"}),
+    "committed": frozenset({"pushed", "blocked"}),
+    "pushed": frozenset({"pr_draft", "blocked"}),
+    "pr_draft": frozenset({"pr_ready", "blocked"}),
+    "pr_ready": frozenset({"merged", "blocked"}),
+    "merged": frozenset({"base_verified", "blocked"}),
+    "base_verified": frozenset({"release_pending", "blocked"}),
+    "release_pending": frozenset({"released", "blocked"}),
+    "released": frozenset({"observed", "blocked"}),
+    "observed": frozenset({"closed", "blocked"}),
+    "closed": frozenset(),
+    "blocked": frozenset(),
 }
-LEGAL_TRANSITIONS["closed"] = frozenset()
-LEGAL_TRANSITIONS["blocked"] = frozenset()
 OUTCOME_LIMITS = {
     "answer": "planned",
     "local_change": "review_ready",
@@ -1340,14 +1343,27 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_name, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _fsync_directory(path.parent)
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError(
+                "E_DURABILITY: directory is unsafe"
+            )
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
@@ -1677,6 +1693,242 @@ class TaskStore:
     def status(self, task_id: str) -> dict[str, Any]:
         return self._read(task_id)
 
+
+    def _metrics_dir(self, task_id: str) -> Path:
+        if not validate_task_id(task_id):
+            raise ValueError("E_TASK_ID: unsafe task ID")
+        return (
+            self.state_dir
+            / "codex-control-plane"
+            / "metrics"
+            / task_id
+        )
+
+    def record_context_metrics(
+        self,
+        task_id: str,
+        *,
+        task_digest: str,
+        session_id: str,
+        invocation_id: str,
+        subject_digest: str,
+        runtime_metrics: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Record deduplicated local runtime metrics under the task flock."""
+
+        metric_keys = {
+            "router_manifest_bytes",
+            "novice_brief_bytes",
+            "hook_output_bytes",
+            "context_units_selected",
+        }
+        if (
+            not validate_task_id(task_id)
+            or SHA256_DIGEST.fullmatch(task_digest) is None
+            or not validate_task_id(session_id)
+            or not validate_task_id(invocation_id)
+            or SHA256_DIGEST.fullmatch(subject_digest) is None
+            or not isinstance(runtime_metrics, Mapping)
+            or not set(runtime_metrics).issubset(metric_keys | {"tool_use_id"})
+        ):
+            raise ValueError("M_METRIC_BINDING: metric identity is invalid")
+        tool_use_id = runtime_metrics.get("tool_use_id")
+        if tool_use_id is not None and not validate_task_id(tool_use_id):
+            raise ValueError("M_METRIC_BINDING: runtime identity is invalid")
+        for metric in metric_keys.intersection(runtime_metrics):
+            value = runtime_metrics[metric]
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError("M_METRIC_BINDING: runtime metric is invalid")
+
+        observations: list[dict[str, Any]] = []
+        for metric in sorted(metric_keys.intersection(runtime_metrics)):
+            observation = {
+                "schema_version": 1,
+                "source": "runtime",
+                "metric": metric,
+                "task_digest": task_digest,
+                "session_id": session_id,
+                "invocation_id": invocation_id,
+                "subject_digest": subject_digest,
+                "tool_use_id": tool_use_id,
+                "value": runtime_metrics[metric],
+            }
+            observation["observation_digest"] = contract_digest(observation)
+            observations.append(observation)
+
+        with _task_guard(self.state_dir, task_id):
+            directory = self._metrics_dir(task_id)
+            directory.mkdir(parents=True, exist_ok=True)
+            for observation in observations:
+                identity = contract_digest(
+                    {
+                        "source": "runtime",
+                        "invocation_id": invocation_id,
+                        "tool_use_id": tool_use_id,
+                        "metric": observation["metric"],
+                        "subject_digest": subject_digest,
+                    }
+                ).removeprefix("sha256:")
+                path = directory / f"runtime-{identity}.json"
+                if path.exists():
+                    if path.is_symlink():
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric path is unsafe"
+                        )
+                    try:
+                        existing = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as error:
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric record is invalid"
+                        ) from error
+                    if existing != observation:
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: observation identity changed"
+                        )
+                    continue
+                _atomic_json(path, observation)
+        return self.context_metrics(task_id)
+
+    def context_metrics(self, task_id: str) -> dict[str, Any]:
+        """Aggregate only observed local runtime metrics."""
+
+        observation_keys = {
+            "schema_version",
+            "source",
+            "metric",
+            "task_digest",
+            "session_id",
+            "invocation_id",
+            "subject_digest",
+            "tool_use_id",
+            "value",
+            "observation_digest",
+        }
+        runtime_metric_keys = {
+            "router_manifest_bytes",
+            "novice_brief_bytes",
+            "hook_output_bytes",
+            "context_units_selected",
+        }
+        with _task_guard(self.state_dir, task_id):
+            directory = self._metrics_dir(task_id)
+            observations: list[dict[str, Any]] = []
+            if directory.exists():
+                if directory.is_symlink():
+                    raise ValueError(
+                        "M_METRIC_REPLAY_CONFLICT: metric directory is unsafe"
+                    )
+                paths = sorted(directory.glob("*.json"))
+                if len(paths) > 10000:
+                    raise ValueError(
+                        "M_METRIC_REPLAY_CONFLICT: metric record cap exceeded"
+                    )
+                for path in paths:
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric record is unsafe"
+                        )
+                    try:
+                        observation = json.loads(
+                            path.read_text(encoding="utf-8")
+                        )
+                    except (OSError, json.JSONDecodeError) as error:
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric record is invalid"
+                        ) from error
+                    semantic = {
+                        key: value
+                        for key, value in observation.items()
+                        if key != "observation_digest"
+                    }
+                    if (
+                        set(observation) != observation_keys
+                        or observation.get("schema_version") != 1
+                        or observation.get("source") != "runtime"
+                        or observation.get("metric") not in runtime_metric_keys
+                        or not isinstance(observation.get("value"), int)
+                        or isinstance(observation.get("value"), bool)
+                        or int(observation["value"]) < 0
+                        or SHA256_DIGEST.fullmatch(
+                            str(observation.get("task_digest"))
+                        )
+                        is None
+                        or not validate_task_id(observation.get("session_id"))
+                        or not validate_task_id(observation.get("invocation_id"))
+                        or SHA256_DIGEST.fullmatch(
+                            str(observation.get("subject_digest"))
+                        )
+                        is None
+                        or (
+                            observation.get("tool_use_id") is not None
+                            and not validate_task_id(
+                                observation.get("tool_use_id")
+                            )
+                        )
+                        or observation.get("observation_digest")
+                        != contract_digest(semantic)
+                    ):
+                        raise ValueError(
+                            "M_METRIC_REPLAY_CONFLICT: metric schema mismatch"
+                        )
+                    observations.append(observation)
+
+        def numeric(metric: str) -> list[int]:
+            return [
+                int(item["value"])
+                for item in observations
+                if item.get("metric") == metric
+            ]
+
+        def per_invocation(metric: str) -> list[int]:
+            grouped: dict[str, int] = {}
+            for item in observations:
+                if item.get("metric") != metric:
+                    continue
+                invocation = str(item["invocation_id"])
+                value = int(item["value"])
+                if invocation in grouped and grouped[invocation] != value:
+                    raise ValueError(
+                        "M_METRIC_REPLAY_CONFLICT: "
+                        "per-invocation metric changed across tools"
+                    )
+                grouped[invocation] = value
+            return [grouped[key] for key in sorted(grouped)]
+
+        def total_and_max(metric: str) -> tuple[int, int]:
+            values = numeric(metric)
+            return sum(values), max(values, default=0)
+
+        router_total, router_max = total_and_max("router_manifest_bytes")
+        brief_total, brief_max = total_and_max("novice_brief_bytes")
+        hook_total, hook_max = total_and_max("hook_output_bytes")
+        units = per_invocation("context_units_selected")
+        invocations = {str(item["invocation_id"]) for item in observations}
+        hook_invocations = {
+            str(item["tool_use_id"])
+            for item in observations
+            if item.get("tool_use_id") is not None
+        }
+        return {
+            "schema_version": 1,
+            "task_id": task_id,
+            "metrics_status": "local",
+            "router_manifest_bytes_total": router_total,
+            "router_manifest_bytes_max": router_max,
+            "novice_brief_bytes_total": brief_total,
+            "novice_brief_bytes_max": brief_max,
+            "hook_output_bytes_total": hook_total,
+            "hook_output_bytes_max": hook_max,
+            "context_units_selected_total": sum(units),
+            "context_units_selected_max": max(units, default=0),
+            "invocation_count_unique": len(invocations),
+            "hook_invocation_count_unique": len(hook_invocations),
+        }
+
     def transition(
         self,
         task_id: str,
@@ -1723,6 +1975,10 @@ class TaskStore:
         if current_branch != state["branch"]:
             raise ValueError("E_STATE_BRANCH: current branch differs from task branch")
         source = str(state["state"])
+        if target not in ORDERED_STATES and target != "blocked":
+            raise ValueError(
+                f"E_STATE_TRANSITION: {source} -> {target} is illegal"
+            )
         limit = OUTCOME_LIMITS[str(state["outcome"])]
         if target not in {"blocked", "closed"}:
             if ORDERED_STATES.index(target) > ORDERED_STATES.index(limit):
@@ -2149,6 +2405,8 @@ class TaskStore:
                         "E_STATE_RECOVERY: no writer finalization is pending"
                     )
                 finalization = state.get("finalization")
+                marker_finalization = copy.deepcopy(finalization)
+                marker_generation = int(state.get("generation", -1))
                 if not isinstance(finalization, Mapping):
                     if marker_state == "finalizing_abandon":
                         lease = self._read_owner_lease(task_id)
@@ -2189,7 +2447,12 @@ class TaskStore:
             with _task_guard(self.state_dir, task_id):
                 current = self._read(task_id)
                 self._assert_runtime_owner(current)
-                if current.get("state") != marker_state:
+                if (
+                    current.get("state") != marker_state
+                    or int(current.get("generation", -1))
+                    != marker_generation
+                    or current.get("finalization") != marker_finalization
+                ):
                     raise ValueError("E_STATE_CAS: recovery marker changed")
                 destination = str(finalization["destination"])
                 current.update(

@@ -54,7 +54,10 @@ un gate ni modifica la precedencia.
 | Bucle de `Stop` | chequeo `stop_hook_active` | test de reentrada | fallo del host |
 | Oversharing tras compactación | `SessionStart(compact)` y manifiesto menor de 4 KiB sin prompt | test de presupuesto | otros hooks pueden añadir contexto |
 | Receipt filtra información | solo IDs, digests, gates y efectos | contrato v1 | quien escriba fuera del runtime |
+| JSON simula una aclaración resuelta | el request es diagnóstico y el gate material queda `pending_host_capability` | contrato puro + tests de ausencia de autoridad | host sin adapter nativo |
+| Evidencia ausente parece éxito | `risk-status` separa `PASS`, `FAIL` y `UNKNOWN` | exit codes 0/1/2 + checks locales | observaciones externas pendientes |
 | Instalación destruye config | plan inmutable, lock de proceso, transacción, backup y rollback en dos fases | tests con fault injection y drift | caída del sistema operativo durante fsync |
+| Guard Git usa policy candidata mutable | snapshot content-addressed bajo Git common dir | manifest y digests instalados | operación fuera de los hooks instalados |
 | Perfil técnico mal clasificado | evidencia acotada, híbridos y fallback genérico | `project_profile` + tests por stack | estructura atípica sin marcadores |
 | Supply chain CI | stdlib, acciones por SHA y permisos read-only | contrato CI | runner o acción fijada comprometida |
 
@@ -66,14 +69,11 @@ Los hooks que pasan no imprimen nada, usan timeout de tres segundos y nunca
 persisten el prompt. Un hook no cubre hosted tools ni todos los caminos
 especializados, por lo que no es una frontera de seguridad.
 
-`soft-enforce` solo podrá promoverse después de revisar el corpus audit. El
-enforcement semántico exige los umbrales documentados y un cambio de lock
-revisable. No se usa bypass automático de confianza.
-
-El runtime reconoce `CODEX_CONTROL_PLANE_HOOK_MODE=soft-enforce` para bloquear
-el conjunto mecánico curado de comandos destructivos. El lock entregado fija
-`audit`; cambiar la variable sin actualizar policy, lock y evidencia no
-constituye una promoción gobernada.
+`soft-enforce` queda fuera de la entrega v2.1. Aunque el runtime conserve
+comportamiento mecánico compatible para futuras pruebas, el lock fija `audit` y
+no existe una ruta soportada de promoción. Cambiar una variable de entorno no
+actualiza policy, lock, trust ni evidencia y no constituye enforcement
+gobernado.
 
 ## Credenciales y datos
 
@@ -97,6 +97,10 @@ archivo arbitrario de grant como sustituto de ese canal.
 GitHub, Xcode Cloud y TestFlight permanecen
 `pending_external_evidence` hasta consultar el proveedor. La protección de
 `main` sigue incompleta mientras el plan de GitHub no permita aplicarla.
+
+La distribución v2.1 local-audit no instala `.github/workflows/**`, no añade un
+provider GitHub y no acepta policy candidata como sustituto de evidencia
+externa. Por ello la dimensión remota de `risk-status` es `UNKNOWN` por diseño.
 
 ## Reportar una vulnerabilidad
 

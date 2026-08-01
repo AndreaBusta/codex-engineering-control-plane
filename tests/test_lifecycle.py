@@ -6879,5 +6879,38 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(recovered["verification_aborted"])
 
 
+    def test_clear_task_can_transition_from_framed_to_planned(self) -> None:
+        from control_plane.lifecycle import TaskStore
+
+        store = TaskStore(self.state_dir)
+        store.start(
+            "TASK-CLEAR-ORDINAL",
+            outcome="answer",
+            branch="codex/clear-ordinal",
+            task_digest=self.digest,
+            decision_digest=self.digest,
+        )
+
+        state = store.transition(
+            "TASK-CLEAR-ORDINAL",
+            "planned",
+            current_branch="codex/clear-ordinal",
+        )
+
+        self.assertEqual(state["state"], "planned")
+        self.assertEqual(state["generation"], 1)
+
+
+    def test_outcome_limits_use_ordered_states_and_blocked_is_lateral(self) -> None:
+        from control_plane.lifecycle import (
+            ORDERED_STATES,
+            OUTCOME_LIMITS,
+        )
+
+        self.assertNotIn("blocked", ORDERED_STATES)
+        for terminal in OUTCOME_LIMITS.values():
+            self.assertIn(terminal, ORDERED_STATES)
+
+
 if __name__ == "__main__":
     unittest.main()

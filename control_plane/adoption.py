@@ -8,16 +8,21 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from control_plane.contracts import canonical_json, contract_digest
 from control_plane.policy import load_policy
 from control_plane.project_profiles import detect_project_profile
 from control_plane.repository import (
     discover_repository,
+    git_common_dir,
     git_environment,
     worktree_git_dir,
 )
@@ -28,8 +33,10 @@ RUNTIME_PACKAGE = "codex_control_plane_runtime_v2"
 RUNTIME_MODULES = (
     "__init__.py",
     "adoption.py",
+    "clarification.py",
     "cli.py",
     "contracts.py",
+    "git_guards.py",
     "git_state.py",
     "graph.py",
     "hooks.py",
@@ -41,6 +48,7 @@ RUNTIME_MODULES = (
     "project_profiles.py",
     "repository.py",
     "resource_registry.py",
+    "risk_sentinel.py",
     "routing.py",
     "scopes.py",
 )
@@ -50,6 +58,8 @@ MANAGED_FILES = (
     (".codex/control-plane.lock", ".codex/control-plane.lock"),
     (".codex/hooks.json", ".codex/hooks.json"),
     (".codex/hooks/control_plane_hook.py", ".codex/hooks/control_plane_hook.py"),
+    (".codex/git-hooks/pre-commit", ".codex/git-hooks/pre-commit"),
+    (".codex/git-hooks/pre-push", ".codex/git-hooks/pre-push"),
     ("scripts/control-plane", "scripts/control-plane"),
     ("AGENTS.md", "AGENTS.md"),
     ("SECURITY.md", "docs/codex-control-plane/SECURITY.md"),
@@ -237,6 +247,813 @@ def _git(root: Path, *arguments: str) -> str:
             "E_ADOPT_GIT: git command failed: " + " ".join(arguments)
         )
     return completed.stdout.strip()
+
+
+def _git_config_result(
+    root: Path, *arguments: str
+) -> subprocess.CompletedProcess[str]:
+    environment = git_environment()
+    environment["LANG"] = "C"
+    environment["LC_ALL"] = "C"
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", "config", *arguments],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(
+            "E_ADOPT_HOOK_PATH_CONFLICT: Git config is not observable"
+        ) from error
+    if (
+        completed.returncode == 128
+        and arguments[:1] == ("--worktree",)
+        and "worktreeConfig" in completed.stderr
+    ):
+        completed.returncode = 1
+        completed.stderr = ""
+    if (
+        completed.returncode not in {0, 1}
+        or len(completed.stdout.encode("utf-8")) > 131_072
+        or len(completed.stderr.encode("utf-8")) > 131_072
+    ):
+        raise ValueError(
+            "E_ADOPT_HOOK_PATH_CONFLICT: Git config is not observable"
+        )
+    return completed
+
+
+def _config_values(
+    root: Path, scope: str
+) -> list[str]:
+    if scope == "worktree":
+        enabled = _git_config_result(
+            root, "--local", "--get", "extensions.worktreeConfig"
+        )
+        if (
+            enabled.returncode == 1
+            or enabled.stdout.strip().lower() != "true"
+        ):
+            return []
+    result = _git_config_result(
+        root, f"--{scope}", "--get-all", "core.hooksPath"
+    )
+    if result.returncode == 1:
+        return []
+    return result.stdout.splitlines()
+
+
+def _current_managed_hooks_path(target_root: Path) -> str | None:
+    journal = _journal_path(target_root)
+    if not journal.is_file() or journal.is_symlink():
+        return None
+    try:
+        state = json.loads(journal.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    snapshot = state.get("installed_snapshot")
+    if (
+        state.get("status") == "applied"
+        and isinstance(snapshot, Mapping)
+        and isinstance(snapshot.get("hooks_path"), str)
+    ):
+        return str(snapshot["hooks_path"])
+    return None
+
+
+def _record_has_direct_local_origin(
+    target_root: Path, record: Mapping[str, str]
+) -> bool:
+    origin = record.get("origin", "")
+    if not origin.startswith("file:"):
+        return False
+    path = Path(origin.removeprefix("file:"))
+    if not path.is_absolute():
+        path = target_root / path
+    try:
+        observed = path.resolve(strict=True)
+        expected = (git_common_dir(target_root) / "config").resolve(
+            strict=True
+        )
+    except OSError:
+        return False
+    return observed == expected
+
+
+def _observe_git_hook_config(target_root: Path) -> dict[str, Any]:
+    result = _git_config_result(
+        target_root,
+        "--show-origin",
+        "--show-scope",
+        "--get-all",
+        "core.hooksPath",
+    )
+    records: list[dict[str, str]] = []
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            parts = line.split(maxsplit=2)
+            if len(parts) != 3:
+                raise ValueError(
+                    "E_ADOPT_HOOK_PATH_CONFLICT: Git config output is ambiguous"
+                )
+            records.append(
+                {
+                    "scope": parts[0],
+                    "origin": parts[1],
+                    "value": parts[2],
+                }
+            )
+    local_values = _config_values(target_root, "local")
+    worktree_values = _config_values(target_root, "worktree")
+    active_managed = _current_managed_hooks_path(target_root)
+    allowed_active = (
+        len(records) == 1
+        and records[0]["scope"] == "local"
+        and _record_has_direct_local_origin(target_root, records[0])
+        and records[0]["value"] == active_managed
+        and local_values == [active_managed]
+        and not worktree_values
+    )
+    conflict = bool(records or local_values or worktree_values) and not (
+        active_managed is not None and allowed_active
+    )
+    return {
+        "records": records,
+        "local_values": local_values,
+        "worktree_values": worktree_values,
+        "active_managed": active_managed,
+        "conflict": conflict,
+    }
+
+
+def _default_executable_hooks(target_root: Path) -> list[str]:
+    hooks = git_common_dir(target_root) / "hooks"
+    if not hooks.exists():
+        return []
+    if hooks.is_symlink() or not hooks.is_dir():
+        raise ValueError(
+            "E_ADOPT_EXISTING_HOOKS: default hooks directory is invalid"
+        )
+    found: list[str] = []
+    for path in sorted(hooks.iterdir()):
+        if path.name.endswith(".sample"):
+            continue
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.stat().st_mode & 0o111
+        ):
+            found.append(path.name)
+    return found
+
+
+def _worktree_count(target_root: Path) -> int:
+    raw = _git(target_root, "worktree", "list", "--porcelain")
+    count = sum(
+        1 for line in raw.splitlines() if line.startswith("worktree ")
+    )
+    if count < 1 or count > 4096:
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: worktree inventory is ambiguous"
+        )
+    return count
+
+
+def _remote_repository_identity(remote_url: str, target_root: Path) -> str:
+    patterns = (
+        r"^https://github\.com/([^/]+/[^/]+?)(?:\.git)?$",
+        r"^git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
+        r"^ssh://git@github\.com/([^/]+/[^/]+?)(?:\.git)?$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, remote_url)
+        if match is not None:
+            return match.group(1)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "-", target_root.name)
+    return f"local/{safe_name or 'repository'}"
+
+
+def _snapshot_remote_url(remote_url: str) -> str:
+    try:
+        parsed = urlsplit(remote_url)
+    except ValueError as error:
+        raise ValueError("E_ADOPT_REMOTE: push URL is invalid") from error
+    if (
+        parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+        or (
+            parsed.scheme.lower() in {"http", "https"}
+            and parsed.username is not None
+        )
+    ):
+        raise ValueError(
+            "E_ADOPT_REMOTE_CREDENTIALS: push URL contains userinfo"
+        )
+    return remote_url
+
+
+def _render_installed_launcher() -> bytes:
+    python_binary = str(Path(sys.executable).resolve(strict=True))
+    return f"""#!/bin/sh
+set -eu
+install_root=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)
+exec {json.dumps(python_binary)} -I -B -c '
+import importlib
+import importlib.util
+from hashlib import sha256
+import json
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+manifest_path = root / "manifest.json"
+raw = manifest_path.read_bytes()
+digest = "sha256:" + sha256(raw).hexdigest()
+if root.name != digest or stat.S_IMODE(manifest_path.stat().st_mode) != 0o600:
+    raise SystemExit("GG_INSTALLED_POLICY_INVALID: manifest binding failed")
+manifest = json.loads(raw)
+if raw != (
+    json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\\n"
+).encode("utf-8"):
+    raise SystemExit("GG_INSTALLED_POLICY_INVALID: manifest is not canonical")
+artifacts = {{item["path"]: item for item in manifest["artifacts"]}}
+expected_files = set(artifacts) | {{"manifest.json"}}
+expected_directories = set()
+for relative in expected_files:
+    parent = Path(relative).parent
+    while str(parent) not in {{"", "."}}:
+        expected_directories.add(parent.as_posix())
+        parent = parent.parent
+observed_files = set()
+for path in root.rglob("*"):
+    relative = path.relative_to(root).as_posix()
+    metadata = path.lstat()
+    if path.is_symlink():
+        raise SystemExit(
+            "GG_INSTALLED_POLICY_INVALID: unmanifested artifact"
+        )
+    if stat.S_ISDIR(metadata.st_mode):
+        if relative not in expected_directories:
+            raise SystemExit(
+                "GG_INSTALLED_POLICY_INVALID: unmanifested artifact"
+            )
+        continue
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or relative not in expected_files
+    ):
+        raise SystemExit(
+            "GG_INSTALLED_POLICY_INVALID: unmanifested artifact"
+        )
+    observed_files.add(relative)
+if observed_files != expected_files:
+    raise SystemExit("GG_INSTALLED_POLICY_INVALID: snapshot inventory drift")
+for relative, record in artifacts.items():
+    path = root / relative
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or "sha256:" + sha256(path.read_bytes()).hexdigest()
+        != record["digest"]
+        or stat.S_IMODE(path.stat().st_mode) != record["mode"]
+    ):
+        raise SystemExit("GG_INSTALLED_POLICY_INVALID: artifact drift")
+runtime = root / "{RUNTIME_PACKAGE}"
+spec = importlib.util.spec_from_file_location(
+    "{RUNTIME_PACKAGE}",
+    runtime / "__init__.py",
+    submodule_search_locations=[str(runtime)],
+)
+if spec is None or spec.loader is None:
+    raise SystemExit("GG_INSTALLED_POLICY_INVALID: runtime unavailable")
+package = importlib.util.module_from_spec(spec)
+sys.modules["{RUNTIME_PACKAGE}"] = package
+spec.loader.exec_module(package)
+cli = importlib.import_module("{RUNTIME_PACKAGE}.cli")
+raise SystemExit(cli.main(sys.argv[2:]))
+' "$install_root" "$@"
+""".encode("utf-8")
+
+
+def _render_installed_git_hook(source: bytes, *, action: str) -> bytes:
+    if b"__CONTROL_PLANE_ENTRYPOINT__" not in source:
+        raise ValueError(
+            "E_ADOPT_SOURCE: Git hook template lacks the entrypoint token"
+        )
+    arguments = (
+        'git-guard pre-commit --repo "$repo"'
+        if action == "pre-commit"
+        else (
+            'git-guard pre-push --repo "$repo" '
+            '--remote-name "$1" --remote-url "$2"'
+        )
+    )
+    return (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'repo=$(/usr/bin/git rev-parse --show-toplevel)\n'
+        'install_root=$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)\n'
+        f'exec "$install_root/scripts/control-plane" {arguments}\n'
+    ).encode("utf-8")
+
+
+def _installed_snapshot(
+    source_root: Path,
+    target_root: Path,
+    *,
+    source_commit: str,
+    git_facts: Mapping[str, Any],
+    rendered: Mapping[str, bytes],
+) -> tuple[dict[str, Any], dict[str, tuple[bytes, int]]]:
+    source_root = discover_repository(source_root)
+    target_root = discover_repository(target_root)
+    remote_name = str(git_facts["remote"])
+    remote_url = _snapshot_remote_url(
+        _git(target_root, "remote", "get-url", "--push", remote_name)
+    )
+    artifacts: dict[str, tuple[bytes, int, str]] = {
+        "policy": (
+            rendered[".codex/project-policy.toml"],
+            0o600,
+            "policy/project-policy.toml",
+        ),
+        "lock": (
+            rendered[".codex/control-plane.lock"],
+            0o600,
+            "control-plane.lock",
+        ),
+        "runtime_entrypoint": (
+            _render_installed_launcher(),
+            0o700,
+            "scripts/control-plane",
+        ),
+        "hook_pre_commit": (
+            _render_installed_git_hook(
+                (source_root / ".codex/git-hooks/pre-commit").read_bytes(),
+                action="pre-commit",
+            ),
+            0o700,
+            "git-hooks/pre-commit",
+        ),
+        "hook_pre_push": (
+            _render_installed_git_hook(
+                (source_root / ".codex/git-hooks/pre-push").read_bytes(),
+                action="pre-push",
+            ),
+            0o700,
+            "git-hooks/pre-push",
+        ),
+    }
+    runtime_prefix = f".codex/runtime/{RUNTIME_PACKAGE}/"
+    for relative, payload in rendered.items():
+        if relative.startswith(runtime_prefix):
+            name = Path(relative).name
+            artifacts[f"runtime_module:{name}"] = (
+                payload,
+                0o600,
+                f"{RUNTIME_PACKAGE}/{name}",
+            )
+    records = [
+        {
+            "role": role,
+            "path": relative,
+            "digest": _digest_bytes(payload),
+            "mode": mode,
+        }
+        for role, (payload, mode, relative) in artifacts.items()
+    ]
+    governing_base = _git(
+        target_root,
+        "rev-parse",
+        f"refs/remotes/{remote_name}/{git_facts['base_branch']}",
+    )
+    manifest = {
+        "schema_version": 1,
+        "repository_identity": str(git_common_dir(target_root)),
+        "common_git_dir": str(git_common_dir(target_root)),
+        "source_commit": source_commit,
+        "governing_base_commit": governing_base,
+        "install_invocation_id": contract_digest(
+            {
+                "source_commit": source_commit,
+                "target": str(target_root),
+                "policy": _digest_bytes(
+                    rendered[".codex/project-policy.toml"]
+                ),
+            }
+        ),
+        "git": {
+            "base_branch": str(git_facts["base_branch"]),
+            "remote_name": remote_name,
+            "remote_url_digest": _digest_bytes(remote_url.encode("utf-8")),
+            "remote_repository": _remote_repository_identity(
+                remote_url, target_root
+            ),
+        },
+        "artifacts": sorted(records, key=lambda item: str(item["path"])),
+    }
+    manifest_bytes = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    manifest_digest = _digest_bytes(manifest_bytes)
+    install_root = (
+        git_common_dir(target_root)
+        / "codex-control-plane"
+        / "installs"
+        / manifest_digest
+    )
+    staging_root = install_root.parent / f".{manifest_digest}.staging"
+    files = {
+        relative: (payload, mode)
+        for payload, mode, relative in artifacts.values()
+    }
+    files["manifest.json"] = (manifest_bytes, 0o600)
+    plan = {
+        "manifest_digest": manifest_digest,
+        "common_git_dir": str(git_common_dir(target_root)),
+        "path": str(install_root),
+        "staging_path": str(staging_root),
+        "hooks_path": str(install_root / "git-hooks"),
+        "artifact_digests": {
+            relative: _digest_bytes(payload)
+            for relative, (payload, _) in sorted(files.items())
+        },
+    }
+    return plan, files
+
+
+def _snapshot_is_valid(
+    target_root: Path, snapshot: Mapping[str, Any]
+) -> bool:
+    try:
+        from control_plane.git_guards import _validate_snapshot
+
+        observed = _validate_snapshot(
+            canonical_repo=target_root,
+            common_git_dir=Path(str(snapshot["common_git_dir"])),
+            manifest_digest=str(snapshot["manifest_digest"]),
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+    return (
+        str(observed["install_root"]) == str(snapshot.get("path"))
+        and str(observed["install_root"] / "git-hooks")
+        == str(snapshot.get("hooks_path"))
+    )
+
+
+def _control_state_directory(
+    common_git_dir: Path,
+    child_name: str | None,
+    *,
+    create: bool,
+    missing_ok: bool = False,
+    error_code: str,
+) -> Path | None:
+    common = Path(common_git_dir)
+    try:
+        common_metadata = common.lstat()
+        common_resolved = common.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(
+            f"{error_code}: common Git directory is unavailable"
+        ) from error
+    if (
+        not common.is_absolute()
+        or stat.S_ISLNK(common_metadata.st_mode)
+        or not stat.S_ISDIR(common_metadata.st_mode)
+        or common_resolved != common
+    ):
+        raise ValueError(
+            f"{error_code}: common Git directory is unsafe"
+        )
+    current = common
+    names = (
+        ("codex-control-plane", child_name)
+        if child_name is not None
+        else ("codex-control-plane",)
+    )
+    for name in names:
+        child = current / name
+        try:
+            metadata = child.lstat()
+        except FileNotFoundError:
+            if not create:
+                if missing_ok:
+                    return None
+                raise ValueError(
+                    f"{error_code}: control state parent is unavailable"
+                )
+            try:
+                child.mkdir(mode=0o700)
+                metadata = child.lstat()
+            except OSError as error:
+                raise ValueError(
+                    f"{error_code}: control state parent cannot be created"
+                ) from error
+        except OSError as error:
+            raise ValueError(
+                f"{error_code}: control state parent is unavailable"
+            ) from error
+        try:
+            resolved = child.resolve(strict=True)
+        except OSError as error:
+            raise ValueError(
+                f"{error_code}: control state parent is unavailable"
+            ) from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or resolved != child
+            or resolved.parent != current
+        ):
+            raise ValueError(
+                f"{error_code}: control state parent is unsafe"
+            )
+        current = child
+    return current
+
+
+def _snapshot_installs_directory(
+    common_git_dir: Path, *, create: bool, missing_ok: bool = False
+) -> Path | None:
+    return _control_state_directory(
+        common_git_dir,
+        "installs",
+        create=create,
+        missing_ok=missing_ok,
+        error_code="E_ADOPT_SNAPSHOT_DRIFT",
+    )
+
+
+def _remove_snapshot_tree(path: Path, *, common_git_dir: Path) -> None:
+    installs = _snapshot_installs_directory(
+        common_git_dir, create=False, missing_ok=True
+    )
+    if installs is None:
+        return
+    if not path.is_absolute() or path.parent != installs:
+        raise ValueError(
+            "E_ADOPT_SNAPSHOT_DRIFT: installed snapshot path is unsafe"
+        )
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ValueError(
+            "E_ADOPT_SNAPSHOT_DRIFT: installed snapshot is unavailable"
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(
+            "E_ADOPT_SNAPSHOT_DRIFT: installed snapshot path is unsafe"
+        )
+    entries = list(path.rglob("*"))
+    for child in entries:
+        try:
+            child_metadata = child.lstat()
+        except OSError as error:
+            raise ValueError(
+                "E_ADOPT_SNAPSHOT_DRIFT: installed snapshot is unavailable"
+            ) from error
+        if stat.S_ISLNK(child_metadata.st_mode) or not (
+            stat.S_ISDIR(child_metadata.st_mode)
+            or stat.S_ISREG(child_metadata.st_mode)
+        ):
+            raise ValueError(
+                "E_ADOPT_SNAPSHOT_DRIFT: installed snapshot entry is invalid"
+            )
+    for child in sorted(
+        entries, key=lambda item: len(item.parts), reverse=True
+    ):
+        if child.is_dir():
+            child.rmdir()
+        else:
+            child.unlink()
+    path.rmdir()
+    _fsync_directory(installs)
+
+
+def _publish_install_snapshot(
+    target_root: Path,
+    snapshot: Mapping[str, Any],
+    files: Mapping[str, tuple[bytes, int]],
+) -> bool:
+    install_root = Path(str(snapshot["path"]))
+    common = Path(str(snapshot["common_git_dir"]))
+    installs = _snapshot_installs_directory(common, create=True)
+    if (
+        not install_root.is_absolute()
+        or install_root.parent != installs
+        or install_root.name != snapshot.get("manifest_digest")
+    ):
+        raise ValueError(
+            "E_ADOPT_SNAPSHOT_DRIFT: planned snapshot path is unsafe"
+        )
+    if install_root.exists():
+        if not _snapshot_is_valid(target_root, snapshot):
+            raise ValueError(
+                "E_ADOPT_SNAPSHOT_DRIFT: digest path already exists with drift"
+            )
+        return False
+    temporary = Path(str(snapshot.get("staging_path")))
+    if (
+        not temporary.is_absolute()
+        or temporary.parent != installs
+        or temporary.name
+        != f".{snapshot['manifest_digest']}.staging"
+    ):
+        raise ValueError(
+            "E_ADOPT_SNAPSHOT_DRIFT: staging path is unsafe"
+        )
+    if temporary.exists():
+        raise ValueError("E_ADOPT_SNAPSHOT_BUSY: staging path already exists")
+    temporary.mkdir(mode=0o700)
+    try:
+        for relative, (payload, mode) in sorted(files.items()):
+            destination = _safe_target(temporary, relative)
+            _durable_replace_bytes(
+                destination,
+                payload,
+                suffix=".snapshot-new",
+                expected_digest=_digest_bytes(payload),
+                mode=mode,
+            )
+        os.rename(temporary, install_root)
+        _fsync_directory(installs)
+        if not _snapshot_is_valid(target_root, snapshot):
+            raise ValueError(
+                "E_ADOPT_SNAPSHOT_DRIFT: published snapshot failed verification"
+            )
+    except Exception:
+        if temporary.exists():
+            _remove_snapshot_tree(temporary, common_git_dir=common)
+        if install_root.exists() and not _snapshot_is_valid(
+            target_root, snapshot
+        ):
+            _remove_snapshot_tree(install_root, common_git_dir=common)
+        raise
+    return True
+
+
+def _git_config_mutation(
+    root: Path, *arguments: str, allowed: set[int]
+) -> None:
+    environment = git_environment()
+    environment["LANG"] = "C"
+    environment["LC_ALL"] = "C"
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", "config", *arguments],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(
+            "E_ADOPT_HOOK_CONFIG: Git config mutation failed"
+        ) from error
+    if completed.returncode not in allowed:
+        raise ValueError(
+            "E_ADOPT_HOOK_CONFIG: Git config mutation failed"
+        )
+
+
+def _restore_local_hook_config(root: Path, values: list[str]) -> None:
+    if len(values) > 1 or not all(isinstance(item, str) for item in values):
+        raise ValueError(
+            "E_ADOPT_HOOK_CONFIG: prior local config is ambiguous"
+        )
+    _git_config_mutation(
+        root,
+        "--local",
+        "--unset-all",
+        "core.hooksPath",
+        allowed={0, 5},
+    )
+    if values:
+        _git_config_mutation(
+            root,
+            "--local",
+            "--add",
+            "core.hooksPath",
+            values[0],
+            allowed={0},
+        )
+
+
+def _set_local_hooks_path(root: Path, value: str) -> None:
+    _restore_local_hook_config(root, [value])
+
+
+def _git_config_change_is_applied(
+    root: Path, change: Mapping[str, Any]
+) -> bool:
+    planned = change.get("planned_value")
+    if not isinstance(planned, str) or not Path(planned).is_absolute():
+        return False
+    result = _git_config_result(
+        root,
+        "--show-origin",
+        "--show-scope",
+        "--get-all",
+        "core.hooksPath",
+    )
+    if result.returncode != 0:
+        return False
+    records = []
+    for line in result.stdout.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) != 3:
+            return False
+        records.append(parts)
+    return (
+        len(records) == 1
+        and records[0][0] == "local"
+        and _record_has_direct_local_origin(
+            root,
+            {
+                "scope": records[0][0],
+                "origin": records[0][1],
+                "value": records[0][2],
+            },
+        )
+        and records[0][2] == planned
+        and _config_values(root, "local") == [planned]
+        and not _config_values(root, "worktree")
+    )
+
+
+def _git_config_precondition_matches(
+    root: Path, change: Mapping[str, Any]
+) -> bool:
+    observed = _observe_git_hook_config(root)
+    return (
+        observed["records"] == change.get("observed_records")
+        and observed["local_values"]
+        == change.get("previous_local_values")
+        and not observed["worktree_values"]
+    )
+
+
+def _restore_external_state(
+    target_root: Path, external_state: Mapping[str, Any] | None
+) -> None:
+    if not external_state:
+        return
+    change = external_state.get("git_config_change")
+    if not isinstance(change, Mapping):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: config recovery is ambiguous"
+        )
+    previous = change.get("previous_local_values")
+    if not isinstance(previous, list):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: prior config is ambiguous"
+        )
+    snapshot = external_state.get("snapshot")
+    if not isinstance(snapshot, Mapping):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: snapshot recovery is ambiguous"
+        )
+    failures: list[Exception] = []
+    try:
+        _restore_local_hook_config(target_root, list(previous))
+    except Exception as error:
+        failures.append(error)
+    common_git_dir = Path(str(snapshot.get("common_git_dir")))
+    staging_path = Path(str(snapshot.get("staging_path")))
+    try:
+        _remove_snapshot_tree(
+            staging_path,
+            common_git_dir=common_git_dir,
+        )
+    except Exception as error:
+        failures.append(error)
+    if snapshot.get("created") is True:
+        try:
+            _remove_snapshot_tree(
+                Path(str(snapshot["path"])),
+                common_git_dir=common_git_dir,
+            )
+        except Exception as error:
+            failures.append(error)
+    if failures:
+        grouped = ExceptionGroup(
+            "external adoption recovery failures", failures
+        )
+        raise ValueError(
+            "E_ADOPT_RECOVERY_FAILED: external state remains pending"
+        ) from grouped
 
 
 def _source_identity(source_root: Path) -> tuple[str, bool]:
@@ -581,12 +1398,14 @@ def _render_lock(rendered: Mapping[str, bytes]) -> bytes:
     digest = lambda relative: _digest_bytes(rendered[relative])
     lines = [
         "schema_version = 1",
-        'product_version = "2.0.0"',
+        'product_version = "2.1.0"',
         "policy_schema = 1",
         "registry_schema = 1",
         "task_schema = 1",
         "route_schema = 1",
         "receipt_schema = 1",
+        "clarification_schema = 1",
+        "risk_schema = 1",
         'hook_mode = "audit"',
         'hook_trust = "pending_hook_trust"',
         f'runtime_package = "{RUNTIME_PACKAGE}"',
@@ -597,6 +1416,8 @@ def _render_lock(rendered: Mapping[str, bytes]) -> bytes:
         f'resource_registry = "{digest(".codex/resource-registry.toml")}"',
         f'hooks = "{digest(".codex/hooks.json")}"',
         f'hook_entrypoint = "{digest(".codex/hooks/control_plane_hook.py")}"',
+        f'git_pre_commit = "{digest(".codex/git-hooks/pre-commit")}"',
+        f'git_pre_push = "{digest(".codex/git-hooks/pre-push")}"',
         f'entrypoint = "{digest("scripts/control-plane")}"',
         f'runtime = "sha256:{runtime_hasher.hexdigest()}"',
         "",
@@ -659,6 +1480,22 @@ def adoption_plan(
     rendered = _render_distribution(
         source_root, target_root, git_facts=git_facts
     )
+    installed_snapshot, _ = _installed_snapshot(
+        source_root,
+        target_root,
+        source_commit=source_commit,
+        git_facts=git_facts,
+        rendered=rendered,
+    )
+    hook_config = _observe_git_hook_config(target_root)
+    git_config_changes = [
+        {
+            "key": "core.hooksPath",
+            "observed_records": hook_config["records"],
+            "previous_local_values": hook_config["local_values"],
+            "planned_value": installed_snapshot["hooks_path"],
+        }
+    ]
     changes: list[dict[str, Any]] = []
     for _, target_relative in MANAGED_FILES:
         target_path = _safe_target(target_root, target_relative)
@@ -683,6 +1520,7 @@ def adoption_plan(
                 path: _digest_bytes(value)
                 for path, value in sorted(rendered.items())
             },
+            "installed_snapshot": installed_snapshot,
         }
     )
     preflight_errors = []
@@ -692,6 +1530,15 @@ def adoption_plan(
         preflight_errors.append("E_ADOPT_TARGET_DIRTY")
     if git_facts["current_branch"] == git_facts["base_branch"]:
         preflight_errors.append("E_ADOPT_PROTECTED_BRANCH")
+    if hook_config["conflict"]:
+        preflight_errors.append("E_ADOPT_HOOK_PATH_CONFLICT")
+    if _default_executable_hooks(target_root):
+        preflight_errors.append("E_ADOPT_EXISTING_HOOKS")
+    warnings = (
+        ["W_ADOPT_SHARED_COMMON_HOOK_PATH"]
+        if _worktree_count(target_root) > 1
+        else []
+    )
     plan_core = {
         "schema_version": 2,
         "operation": "adopt",
@@ -703,6 +1550,9 @@ def adoption_plan(
         "source_manifest_digest": source_manifest_digest,
         "target_git": git_facts,
         "changes": changes,
+        "installed_snapshot": installed_snapshot,
+        "git_config_changes": git_config_changes,
+        "warnings": warnings,
         "preflight_errors": preflight_errors,
     }
     plan = {
@@ -756,6 +1606,9 @@ def upgrade_plan(
         "target_git": adopt["target_git"],
         "from_plan_id": status.get("plan_id"),
         "changes": adopt["changes"],
+        "installed_snapshot": adopt["installed_snapshot"],
+        "git_config_changes": adopt["git_config_changes"],
+        "warnings": adopt["warnings"],
         "preflight_errors": adopt["preflight_errors"],
     }
     return {
@@ -768,7 +1621,17 @@ def upgrade_plan(
 
 
 def _journal_path(target: Path) -> Path:
-    return worktree_git_dir(target) / "codex-control-plane" / "adoption.json"
+    owner_git_dir = worktree_git_dir(target)
+    control_root = _control_state_directory(
+        owner_git_dir,
+        None,
+        create=False,
+        missing_ok=True,
+        error_code="E_ADOPT_RECOVERY_UNKNOWN",
+    )
+    if control_root is None:
+        control_root = owner_git_dir / "codex-control-plane"
+    return control_root / "adoption.json"
 
 
 def _lock_path(target: Path) -> Path:
@@ -776,12 +1639,15 @@ def _lock_path(target: Path) -> Path:
     raw = _git(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
     common = Path(raw)
     if not common.is_absolute():
-        common = (root / common).resolve()
-    else:
-        common = common.resolve()
-    if common.is_symlink() or not common.is_dir():
-        raise ValueError("E_ADOPT_RECOVERY_UNKNOWN: common Git dir unavailable")
-    return common / "codex-control-plane" / "locks" / "adoption.lock"
+        common = (root / common).absolute()
+    locks = _control_state_directory(
+        common,
+        "locks",
+        create=True,
+        error_code="E_ADOPT_RECOVERY_UNKNOWN",
+    )
+    assert locks is not None
+    return locks / "adoption.lock"
 
 
 class _ProcessLock:
@@ -790,7 +1656,21 @@ class _ProcessLock:
         self.fd: int | None = None
 
     def __enter__(self) -> "_ProcessLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            parent_metadata = self.path.parent.lstat()
+            parent_resolved = self.path.parent.resolve(strict=True)
+        except OSError as error:
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: lock parent is unavailable"
+            ) from error
+        if (
+            stat.S_ISLNK(parent_metadata.st_mode)
+            or not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_resolved != self.path.parent
+        ):
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: lock parent is unsafe"
+            )
         flags = os.O_CREAT | os.O_RDWR
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -813,7 +1693,60 @@ class _ProcessLock:
 
 
 def _owner_pointer_path(target: Path) -> Path:
-    return _lock_path(target).parent.parent / "transactions" / "adoption-owner.json"
+    lock_path = _lock_path(target)
+    common = lock_path.parent.parent.parent
+    transactions = _control_state_directory(
+        common,
+        "transactions",
+        create=True,
+        error_code="E_ADOPT_RECOVERY_UNKNOWN",
+    )
+    assert transactions is not None
+    return transactions / "adoption-owner.json"
+
+
+def _read_owner_pointer(path: Path) -> dict[str, Any] | None:
+    """Read one bounded regular pointer without following filesystem links."""
+
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: safe owner pointer reads are unsupported"
+        )
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: owner pointer is unsafe"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65_536:
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: owner pointer is unsafe"
+            )
+        payload = os.read(descriptor, 65_537)
+        if len(payload) > 65_536:
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: owner pointer exceeds cap"
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: owner pointer is invalid"
+        ) from error
+    if not isinstance(value, dict):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: owner pointer is invalid"
+        )
+    return value
 
 
 def _registered_worktree_owners(target: Path) -> dict[str, Path]:
@@ -858,12 +1791,14 @@ def _unlink_and_fsync(path: Path) -> None:
 
 
 def _transaction_owner_root(target: Path, transaction_id: str) -> Path:
-    return (
-        worktree_git_dir(target)
-        / "codex-control-plane"
-        / "transactions"
-        / transaction_id
+    transactions = _control_state_directory(
+        worktree_git_dir(target),
+        "transactions",
+        create=True,
+        error_code="E_ADOPT_RECOVERY_UNKNOWN",
     )
+    assert transactions is not None
+    return transactions / transaction_id
 
 
 def _begin_transaction(
@@ -872,6 +1807,7 @@ def _begin_transaction(
     operation: str,
     records: list[Mapping[str, Any]],
     previous_state: Mapping[str, Any] | None = None,
+    external_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     transaction_id = (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -891,6 +1827,9 @@ def _begin_transaction(
         "records": [dict(item) for item in records],
         "previous_state": (
             dict(previous_state) if previous_state is not None else None
+        ),
+        "external_state": (
+            dict(external_state) if external_state is not None else None
         ),
     }
     _atomic_json(manifest_path, manifest)
@@ -966,11 +1905,11 @@ def _commit_transaction(
 
 def _recover_owner_transaction(target: Path) -> None:
     pointer_path = _owner_pointer_path(target)
-    if not pointer_path.exists():
+    pointer = _read_owner_pointer(pointer_path)
+    if pointer is None:
         return
     try:
         registered_owners = _registered_worktree_owners(target)
-        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         if (
             set(pointer)
             != {
@@ -997,9 +1936,18 @@ def _recover_owner_transaction(target: Path) -> None:
             or registered_owners[target_identity] != owner_git_dir
         ):
             raise ValueError
+        owner_transactions = _control_state_directory(
+            owner_git_dir,
+            "transactions",
+            create=False,
+            error_code="E_ADOPT_RECOVERY_UNKNOWN",
+        )
+        if owner_transactions is None:
+            raise ValueError
         manifest_path = owner_git_dir.joinpath(*relative.parts)
         if (
             manifest_path.is_symlink()
+            or manifest_path.parent.parent != owner_transactions
             or not manifest_path.resolve().is_relative_to(owner_git_dir.resolve())
             or _digest(manifest_path) != pointer["manifest_digest"]
         ):
@@ -1016,6 +1964,7 @@ def _recover_owner_transaction(target: Path) -> None:
                 "wal_path",
                 "records",
                 "previous_state",
+                "external_state",
             }
             or manifest.get("schema_version") != 1
             or manifest.get("transaction_id") != pointer["transaction_id"]
@@ -1123,11 +2072,36 @@ def _recover_owner_transaction(target: Path) -> None:
                     or _digest(backup_path) != record["before_digest"]
                 ):
                     raise ValueError
-        _restore_records(recovery_target, records)
+        external_state = manifest.get("external_state")
+        if external_state is not None and not isinstance(
+            external_state, Mapping
+        ):
+            raise ValueError
+        _recover_failed_transaction(
+            original_error=ValueError(
+                "E_ADOPT_RECOVERY_PENDING: interrupted transaction"
+            ),
+            target_root=recovery_target,
+            external_state=(
+                external_state
+                if isinstance(external_state, Mapping)
+                else {}
+            ),
+            records=records,
+            staging_suffix=(
+                ".codex-new"
+                if manifest["operation"] == "adopt"
+                else ".codex-upgrade"
+            ),
+        )
         previous_state = manifest.get("previous_state")
         if isinstance(previous_state, Mapping):
             _atomic_json(_journal_path(recovery_target), previous_state)
-        elif previous_state is not None:
+        elif previous_state is None and manifest["operation"] == "adopt":
+            _unlink_if_present_and_fsync(
+                _journal_path(recovery_target)
+            )
+        else:
             raise ValueError
         _unlink_and_fsync(pointer_path)
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -1182,6 +2156,41 @@ def _restore_records(root: Path, records: list[Mapping[str, Any]]) -> None:
             _unlink_if_present_and_fsync(path)
 
 
+def _recover_failed_transaction(
+    *,
+    original_error: Exception,
+    target_root: Path,
+    external_state: Mapping[str, Any],
+    records: list[Mapping[str, Any]],
+    staging_suffix: str,
+) -> None:
+    failures: list[Exception] = []
+    for recovery in (
+        lambda: _restore_records(target_root, records),
+        lambda: _restore_external_state(target_root, external_state),
+    ):
+        try:
+            recovery()
+        except Exception as error:
+            failures.append(error)
+    for record in records:
+        try:
+            path = _safe_target(target_root, str(record["path"]))
+            _unlink_if_present_and_fsync(
+                path.with_suffix(path.suffix + staging_suffix)
+            )
+        except Exception as error:
+            failures.append(error)
+    if failures:
+        grouped = ExceptionGroup(
+            "adoption failure and recovery failures",
+            [original_error, *failures],
+        )
+        raise ValueError(
+            "E_ADOPT_RECOVERY_FAILED: recovery remains pending"
+        ) from grouped
+
+
 def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Apply an approved plan transactionally with automatic failure recovery."""
 
@@ -1219,9 +2228,52 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
         rendered = _render_distribution(
             source_root, target_root, git_facts=plan["target_git"]
         )
+        installed_snapshot, snapshot_files = _installed_snapshot(
+            source_root,
+            target_root,
+            source_commit=str(plan["source_commit"]),
+            git_facts=plan["target_git"],
+            rendered=rendered,
+        )
+        if installed_snapshot != plan.get("installed_snapshot"):
+            raise ValueError(
+                "E_ADOPT_PLAN_STALE: installed snapshot changed after plan"
+            )
+        _snapshot_installs_directory(
+            Path(str(installed_snapshot["common_git_dir"])),
+            create=True,
+        )
+        config_changes = plan.get("git_config_changes")
+        if (
+            not isinstance(config_changes, list)
+            or len(config_changes) != 1
+            or not isinstance(config_changes[0], Mapping)
+        ):
+            raise ValueError("E_ADOPT_PLAN: Git config change is invalid")
+        config_change = dict(config_changes[0])
+        snapshot_preexisting = Path(
+            str(installed_snapshot["path"])
+        ).exists()
+        if snapshot_preexisting and not _snapshot_is_valid(
+            target_root, installed_snapshot
+        ):
+            raise ValueError(
+                "E_ADOPT_SNAPSHOT_DRIFT: planned snapshot path has drift"
+            )
+        external_state = {
+            "git_config_change": config_change,
+            "snapshot": {
+                **installed_snapshot,
+                "created": not snapshot_preexisting,
+            },
+        }
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        state_root = journal.parent
-        backup_root = state_root / "backups" / stamp
+        _control_state_directory(
+            worktree_git_dir(target_root),
+            "backups",
+            create=True,
+            error_code="E_ADOPT_RECOVERY_UNKNOWN",
+        )
         records: list[dict[str, Any]] = []
         for change in plan["changes"]:
             relative = str(change["path"])
@@ -1255,21 +2307,48 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             "source_commit": plan["source_commit"],
             "source_manifest_digest": plan["source_manifest_digest"],
             "records": records,
+            "git_config_changes": [config_change],
+            "installed_snapshot": installed_snapshot,
+            "snapshot_records": [
+                {
+                    **installed_snapshot,
+                    "created": not snapshot_preexisting,
+                }
+            ],
+            "initial_git_config_values": list(
+                config_change["previous_local_values"]
+            ),
+            "warnings": list(plan.get("warnings", [])),
         }
         transaction = _begin_transaction(
             target_root,
             operation="adopt",
             records=records,
+            external_state=external_state,
         )
         _atomic_json(journal, state)
         _advance_transaction(transaction, status="preparing", state=state)
         try:
+            if (
+                not _git_config_precondition_matches(
+                    target_root, config_change
+                )
+                or _default_executable_hooks(target_root)
+            ):
+                raise ValueError(
+                    "E_ADOPT_PLAN_STALE: Git hook state changed before apply"
+                )
             for record in records:
                 path = _safe_target(target_root, str(record["path"]))
                 mode = (
                     0o755
                     if path.name
-                    in {"control-plane", "control_plane_hook.py"}
+                    in {
+                        "control-plane",
+                        "control_plane_hook.py",
+                        "pre-commit",
+                        "pre-push",
+                    }
                     else 0o644
                 )
                 _durable_replace_bytes(
@@ -1279,19 +2358,44 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
                     expected_digest=str(record["installed_digest"]),
                     mode=mode,
                 )
+            _publish_install_snapshot(
+                target_root, installed_snapshot, snapshot_files
+            )
+            if (
+                not _git_config_precondition_matches(
+                    target_root, config_change
+                )
+                or _default_executable_hooks(target_root)
+            ):
+                raise ValueError(
+                    "E_ADOPT_PLAN_STALE: Git hook state changed during apply"
+                )
+            _set_local_hooks_path(
+                target_root, str(config_change["planned_value"])
+            )
             if any(
                 _digest(_safe_target(target_root, str(record["path"])))
                 != record["installed_digest"]
                 for record in records
             ):
                 raise ValueError("E_ADOPT_VERIFY: installed files do not match plan")
-        except Exception:
-            _restore_records(target_root, records)
-            for record in records:
-                path = _safe_target(target_root, str(record["path"]))
-                _unlink_if_present_and_fsync(
-                    path.with_suffix(path.suffix + ".codex-new")
+            if (
+                not _snapshot_is_valid(target_root, installed_snapshot)
+                or not _git_config_change_is_applied(
+                    target_root, config_change
                 )
+            ):
+                raise ValueError(
+                    "E_ADOPT_VERIFY: installed guard state does not match plan"
+                )
+        except Exception as error:
+            _recover_failed_transaction(
+                original_error=error,
+                target_root=target_root,
+                external_state=external_state,
+                records=records,
+                staging_suffix=".codex-new",
+            )
             state["status"] = "failed_rolled_back"
             _atomic_json(journal, state)
             _commit_transaction(target_root, transaction, state=state)
@@ -1350,6 +2454,45 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
         rendered = _render_distribution(
             source_root, target_root, git_facts=plan["target_git"]
         )
+        installed_snapshot, snapshot_files = _installed_snapshot(
+            source_root,
+            target_root,
+            source_commit=str(plan["source_commit"]),
+            git_facts=plan["target_git"],
+            rendered=rendered,
+        )
+        if installed_snapshot != plan.get("installed_snapshot"):
+            raise ValueError(
+                "E_UPGRADE_STALE: installed snapshot changed after plan"
+            )
+        _snapshot_installs_directory(
+            Path(str(installed_snapshot["common_git_dir"])),
+            create=True,
+        )
+        config_changes = plan.get("git_config_changes")
+        if (
+            not isinstance(config_changes, list)
+            or len(config_changes) != 1
+            or not isinstance(config_changes[0], Mapping)
+        ):
+            raise ValueError("E_UPGRADE_PLAN: Git config change is invalid")
+        config_change = dict(config_changes[0])
+        snapshot_preexisting = Path(
+            str(installed_snapshot["path"])
+        ).exists()
+        if snapshot_preexisting and not _snapshot_is_valid(
+            target_root, installed_snapshot
+        ):
+            raise ValueError(
+                "E_ADOPT_SNAPSHOT_DRIFT: planned snapshot path has drift"
+            )
+        external_state = {
+            "git_config_change": config_change,
+            "snapshot": {
+                **installed_snapshot,
+                "created": not snapshot_preexisting,
+            },
+        }
         for change in plan["changes"]:
             if _digest(
                 _safe_target(target_root, str(change["path"]))
@@ -1358,6 +2501,12 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
                     f"E_UPGRADE_STALE: target changed: {change['path']}"
                 )
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        _control_state_directory(
+            worktree_git_dir(target_root),
+            "upgrades",
+            create=True,
+            error_code="E_ADOPT_RECOVERY_UNKNOWN",
+        )
         upgrade_records: list[dict[str, Any]] = []
         for change in plan["changes"]:
             relative = str(change["path"])
@@ -1397,24 +2546,41 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             "plan_id": plan["plan_id"],
             "previous_state": previous_state,
             "upgrade_records": upgrade_records,
+            "git_config_changes": [config_change],
+            "installed_snapshot": installed_snapshot,
         }
         transaction = _begin_transaction(
             target_root,
             operation="upgrade",
             records=upgrade_records,
             previous_state=previous_state,
+            external_state=external_state,
         )
         _atomic_json(journal, upgrading)
         _advance_transaction(
             transaction, status="upgrading", state=upgrading
         )
         try:
+            if (
+                not _git_config_precondition_matches(
+                    target_root, config_change
+                )
+                or _default_executable_hooks(target_root)
+            ):
+                raise ValueError(
+                    "E_UPGRADE_STALE: Git hook state changed before upgrade"
+                )
             for record in upgrade_records:
                 path = _safe_target(target_root, str(record["path"]))
                 mode = (
                     0o755
                     if path.name
-                    in {"control-plane", "control_plane_hook.py"}
+                    in {
+                        "control-plane",
+                        "control_plane_hook.py",
+                        "pre-commit",
+                        "pre-push",
+                    }
                     else 0o644
                 )
                 _durable_replace_bytes(
@@ -1424,13 +2590,49 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
                     expected_digest=str(record["installed_digest"]),
                     mode=mode,
                 )
-        except Exception:
-            _restore_records(target_root, upgrade_records)
-            for record in upgrade_records:
-                path = _safe_target(target_root, str(record["path"]))
-                _unlink_if_present_and_fsync(
-                    path.with_suffix(path.suffix + ".codex-upgrade")
+            _publish_install_snapshot(
+                target_root, installed_snapshot, snapshot_files
+            )
+            if (
+                not _git_config_precondition_matches(
+                    target_root, config_change
                 )
+                or _default_executable_hooks(target_root)
+            ):
+                raise ValueError(
+                    "E_UPGRADE_STALE: Git hook state changed during upgrade"
+                )
+            _set_local_hooks_path(
+                target_root, str(config_change["planned_value"])
+            )
+            if (
+                any(
+                    _digest(
+                        _safe_target(
+                            target_root, str(record["path"])
+                        )
+                    )
+                    != record["installed_digest"]
+                    for record in upgrade_records
+                )
+                or not _snapshot_is_valid(
+                    target_root, installed_snapshot
+                )
+                or not _git_config_change_is_applied(
+                    target_root, config_change
+                )
+            ):
+                raise ValueError(
+                    "E_UPGRADE_VERIFY: upgraded guard state does not match plan"
+                )
+        except Exception as error:
+            _recover_failed_transaction(
+                original_error=error,
+                target_root=target_root,
+                external_state=external_state,
+                records=upgrade_records,
+                staging_suffix=".codex-upgrade",
+            )
             _atomic_json(journal, previous_state)
             _commit_transaction(
                 target_root, transaction, state=previous_state
@@ -1453,6 +2655,22 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
                     "installed_digest": record["installed_digest"],
                     "backup": None,
                 }
+        snapshot_records = [
+            dict(item)
+            for item in previous_state.get("snapshot_records", [])
+            if isinstance(item, Mapping)
+        ]
+        if not any(
+            item.get("manifest_digest")
+            == installed_snapshot["manifest_digest"]
+            for item in snapshot_records
+        ):
+            snapshot_records.append(
+                {
+                    **installed_snapshot,
+                    "created": not snapshot_preexisting,
+                }
+            )
         final = {
             "schema_version": 2,
             "status": "applied",
@@ -1462,6 +2680,13 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             "records": [
                 original_records[path] for path in sorted(original_records)
             ],
+            "git_config_changes": [config_change],
+            "installed_snapshot": installed_snapshot,
+            "snapshot_records": snapshot_records,
+            "initial_git_config_values": list(
+                previous_state.get("initial_git_config_values", [])
+            ),
+            "warnings": list(plan.get("warnings", [])),
             "upgrade_history": [
                 *previous_state.get("upgrade_history", []),
                 {
@@ -1522,6 +2747,20 @@ def adoption_verify(target: Path) -> dict[str, Any]:
         if _digest(_safe_target(root, str(record["path"])))
         != record["installed_digest"]
     ]
+    snapshot = status.get("installed_snapshot")
+    if (
+        not isinstance(snapshot, Mapping)
+        or not _snapshot_is_valid(root, snapshot)
+    ):
+        drift.append("<installed-snapshot>")
+    config_changes = status.get("git_config_changes")
+    if (
+        not isinstance(config_changes, list)
+        or len(config_changes) != 1
+        or not isinstance(config_changes[0], Mapping)
+        or not _git_config_change_is_applied(root, config_changes[0])
+    ):
+        drift.append("<git-config:core.hooksPath>")
     return {
         "schema_version": 2,
         "command": "adopt-verify",
@@ -1567,7 +2806,27 @@ def adoption_rollback(target: Path) -> dict[str, Any]:
                 )
                 != record["before_digest"]
             ]
-            if drift or backup_errors:
+            snapshot_records = status.get("snapshot_records")
+            config_changes = status.get("git_config_changes")
+            initial_config = status.get("initial_git_config_values")
+            external_errors = []
+            if (
+                not isinstance(snapshot_records, list)
+                or not all(
+                    isinstance(item, Mapping)
+                    and _snapshot_is_valid(root, item)
+                    for item in snapshot_records
+                )
+                or not isinstance(config_changes, list)
+                or len(config_changes) != 1
+                or not isinstance(config_changes[0], Mapping)
+                or not _git_config_change_is_applied(
+                    root, config_changes[0]
+                )
+                or not isinstance(initial_config, list)
+            ):
+                external_errors.append("installed guard state")
+            if drift or backup_errors or external_errors:
                 raise ValueError(
                     "E_ADOPT_DRIFT: rollback preflight failed; no files changed"
                 )
@@ -1579,6 +2838,18 @@ def adoption_rollback(target: Path) -> dict[str, Any]:
             state["status"] = "rolling_back"
             _atomic_json(_journal_path(root), state)
         _restore_records(root, records)
+        initial_config = status.get("initial_git_config_values", [])
+        _restore_local_hook_config(root, list(initial_config))
+        for snapshot_record in reversed(
+            list(status.get("snapshot_records", []))
+        ):
+            if snapshot_record.get("created") is True:
+                _remove_snapshot_tree(
+                    Path(str(snapshot_record["path"])),
+                    common_git_dir=Path(
+                        str(snapshot_record["common_git_dir"])
+                    ),
+                )
         state = {
             key: value
             for key, value in adoption_status(root).items()

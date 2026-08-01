@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +14,91 @@ ROOT = Path(__file__).parents[1]
 
 
 class LockfileTests(unittest.TestCase):
+    def test_lock_selects_v2_1_local_contract_schemas(self) -> None:
+        lock = tomllib.loads(
+            (ROOT / ".codex" / "control-plane.lock").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(lock["product_version"], "2.1.0")
+        self.assertEqual(lock["clarification_schema"], 1)
+        self.assertEqual(lock["risk_schema"], 1)
+        self.assertNotIn("risk_workflow", lock["digests"])
+        self.assertNotIn("risk_workflow_template", lock["digests"])
+
+    def test_task8_runtime_and_git_guard_sources_are_locked(self) -> None:
+        from hashlib import sha256
+
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("git_guards.py", RUNTIME_MODULES)
+        lock = tomllib.loads(
+            (ROOT / ".codex" / "control-plane.lock").read_text(
+                encoding="utf-8"
+            )
+        )
+        for key, relative in (
+            ("git_pre_commit", ".codex/git-hooks/pre-commit"),
+            ("git_pre_push", ".codex/git-hooks/pre-push"),
+        ):
+            payload = (ROOT / relative).read_bytes()
+            self.assertEqual(
+                lock["digests"][key],
+                f"sha256:{sha256(payload).hexdigest()}",
+            )
+
+    def test_source_and_distributed_runtime_expose_task7_hook_contracts(
+        self,
+    ) -> None:
+        import control_plane.host_bridge as bridge
+        import control_plane.hooks as hooks
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("hooks.py", RUNTIME_MODULES)
+        self.assertIn("host_bridge.py", RUNTIME_MODULES)
+        self.assertTrue(callable(hooks.execute_safe_read))
+        self.assertTrue(callable(hooks.evaluate_hook))
+        self.assertTrue(callable(hooks.run_hook))
+        self.assertTrue(callable(hooks.secret_pattern_set_digest))
+        self.assertTrue(callable(hooks.should_emit_warning))
+        self.assertFalse(hasattr(hooks, "evaluate_pretool_use"))
+        self.assertFalse(hasattr(hooks, "CurrentWarningView"))
+        self.assertTrue(callable(bridge.run_macos_hook_smoke))
+        self.assertTrue(callable(bridge.publish_macos_hook_smoke_receipt))
+
+    def test_source_and_distributed_runtime_include_risk_sentinel(
+        self,
+    ) -> None:
+        import control_plane.risk_sentinel as sentinel
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("risk_sentinel.py", RUNTIME_MODULES)
+        self.assertTrue(
+            (ROOT / "control_plane" / "risk_sentinel.py").is_file()
+        )
+        self.assertTrue(callable(sentinel.aggregate_status))
+        self.assertTrue(callable(sentinel.evaluate_risk_status))
+
+    def test_source_runtime_exposes_pure_clarification_and_base_reframe(
+        self,
+    ) -> None:
+        import control_plane.clarification as clarification
+        from control_plane.adoption import RUNTIME_MODULES
+        from control_plane.lifecycle import TaskStore
+
+        self.assertIn("clarification.py", RUNTIME_MODULES)
+        self.assertIn("lifecycle.py", RUNTIME_MODULES)
+        self.assertTrue(callable(clarification.validate_clarification_request))
+        self.assertTrue(callable(clarification.clarification_level))
+        self.assertTrue(callable(clarification.evaluate_clarification_gate))
+        self.assertTrue(callable(TaskStore.suspend_for_reframe))
+        self.assertFalse(hasattr(TaskStore, "require_clarification"))
+        self.assertFalse(
+            hasattr(TaskStore, "resolve_and_resume_clarification")
+        )
+        self.assertFalse(hasattr(TaskStore, "clarification_status"))
+
     def test_source_and_distributed_runtime_include_intake_module(
         self,
     ) -> None:
@@ -20,6 +106,16 @@ class LockfileTests(unittest.TestCase):
 
         self.assertIn("intake.py", RUNTIME_MODULES)
         self.assertTrue((ROOT / "control_plane" / "intake.py").is_file())
+
+    def test_source_and_distributed_runtime_include_clarification_module(
+        self,
+    ) -> None:
+        from control_plane.adoption import RUNTIME_MODULES
+
+        self.assertIn("clarification.py", RUNTIME_MODULES)
+        self.assertTrue(
+            (ROOT / "control_plane" / "clarification.py").is_file()
+        )
 
     def _source_runtime_fixture(self, root: Path) -> None:
         shutil.copytree(ROOT / ".codex", root / ".codex")

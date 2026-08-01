@@ -515,6 +515,10 @@ class PolicyContractTests(unittest.TestCase):
                 project_root / ".codex" / "hooks",
                 root / ".codex" / "hooks",
             )
+            shutil.copytree(
+                project_root / ".codex" / "git-hooks",
+                root / ".codex" / "git-hooks",
+            )
             for name in (
                 "hooks.json",
                 "resource-registry.toml",
@@ -557,6 +561,28 @@ class PolicyContractTests(unittest.TestCase):
                             / ".codex"
                             / "hooks"
                             / "control_plane_hook.py"
+                        ).read_bytes()
+                    ).hexdigest()
+                ),
+                "git_pre_commit": (
+                    "sha256:"
+                    + sha256(
+                        (
+                            root
+                            / ".codex"
+                            / "git-hooks"
+                            / "pre-commit"
+                        ).read_bytes()
+                    ).hexdigest()
+                ),
+                "git_pre_push": (
+                    "sha256:"
+                    + sha256(
+                        (
+                            root
+                            / ".codex"
+                            / "git-hooks"
+                            / "pre-push"
                         ).read_bytes()
                     ).hexdigest()
                 ),

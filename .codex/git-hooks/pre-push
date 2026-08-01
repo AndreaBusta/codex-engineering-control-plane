@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+repo=$(/usr/bin/git rev-parse --show-toplevel)
+exec "__CONTROL_PLANE_ENTRYPOINT__" git-guard pre-push \
+  --repo "$repo" \
+  --remote-name "$1" \
+  --remote-url "$2"

@@ -6,15 +6,13 @@ El sistema mejora de forma material la manera de trabajar: transforma reglas
 narrativas en policy, tests y gates, reduce la carga inicial de la skill y hace
 visibles las fronteras entre local, GitHub y release.
 
-No es “completamente óptimo” en sentido absoluto. La v1 fue fusionada mediante
-PR #1 y su squash commit se demostró en `origin/main`. La candidata v2 conserva
-los 63 tests heredados y añade routing, lifecycle, hooks audit, adopción y
-assurance reproducible.
+No es “completamente óptimo” en sentido absoluto. v2.1 se consolida como kernel
+`local-audit`: hace verificables routing, lifecycle, hooks, guards y adopción,
+pero difiere expresamente autoridad y procedencia remotas.
 
-Ya existen baseline, remote privado, CI y PR. La garantía remota sigue siendo
-parcial porque GitHub no habilita Rulesets ni protección clásica para este
-repositorio privado con el plan actual. Tampoco existe prueba de TestFlight
-hasta conectar Xcode Cloud/App Store Connect con autorización.
+La garantía remota sigue siendo una capa distinta. La ausencia de adapter host,
+Ruleset o evidencia de proveedor se informa como `UNKNOWN`; no se suple con
+tests, JSON, un MCP ni la policy de la rama candidata.
 
 ## DAFO
 
@@ -41,8 +39,7 @@ hasta conectar Xcode Cloud/App Store Connect con autorización.
 - Hooks audit acotados, reversibles y pendientes de trust humano.
 - Adopción transaccional e idempotente con plan target-specific, apply,
   verify, status, upgrade y rollback.
-- Assurance de 15 golden, 12 propiedades con 1.000 semillas, 24 mutantes,
-  corpus de 100 tareas y benchmark de 10.000 recursos.
+- Suite hermética y contratos de ausencia para superficies remotas diferidas.
 
 ### Debilidades
 
@@ -62,9 +59,9 @@ hasta conectar Xcode Cloud/App Store Connect con autorización.
 
 - Habilitar GitHub Pro o mover la policy a un contexto que permita Rulesets.
 - Activar PR y `verify` obligatorios cuando el proveedor lo permita.
-- Fusionar la v2 únicamente después de revisión y checks.
-- Promover hooks de audit a soft-enforce después de observar uso real.
-- GitHub MCP para demostrar PR y merge commit.
+- Fusionar v2.1 únicamente después de revisión y checks.
+- Reevaluar promoción solo después de 10–20 tareas reales y una ADR nueva.
+- Adapter host nativo para demostrar PR y merge sin autoatestación.
 - Xcode Cloud para procedencia TestFlight.
 - Policies específicas para iOS, SaaS e híbridos.
 - Métricas reales de agentes, reintentos, contexto y tokens.
@@ -138,7 +135,7 @@ Fallo evitado: infra-documentación de un cambio pequeño pero crítico.
 
 ## Registro de riesgos
 
-| ID | Riesgo | Probabilidad | Impacto | Control v1 | Residual |
+| ID | Riesgo | Probabilidad | Impacto | Control actual | Residual |
 |---|---|---:|---:|---|---|
 | R1 | escribir en base | media | alto | preflight write + PR | Ruleset no disponible en el plan |
 | R2 | rama atrasada | media | alto | remote + divergence gate + `--refresh` | uso accidental de modo offline |
@@ -172,7 +169,7 @@ Fallo evitado: infra-documentación de un cambio pequeño pero crítico.
 - [x] PR de la propia configuración;
 - [ ] Ruleset o protección equivalente;
 - [x] prueba de merge v1 en base.
-- [ ] integración de la candidata v2.
+- [ ] integración de la candidata v2.1 local-audit.
 
 ### Release
 

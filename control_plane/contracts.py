@@ -138,7 +138,7 @@ RISK_AXES = frozenset(
         "verification_complexity",
     }
 )
-AUTHORIZATION_GRANT_KEYS = frozenset(
+AUTHORIZATION_REQUEST_KEYS = frozenset(
     {
         "schema_version",
         "grant_id",
@@ -146,10 +146,8 @@ AUTHORIZATION_GRANT_KEYS = frozenset(
         "session_id",
         "allowed_effects",
         "scope_paths",
-        "issuer",
     }
 )
-AUTHORIZATION_GRANT_ISSUERS = frozenset({"trusted_host", "project_policy"})
 
 
 @dataclass(frozen=True)
@@ -169,7 +167,9 @@ def validate_task_id(task_id: Any) -> bool:
     )
 
 
-def _safe_scope_path(value: Any) -> bool:
+def safe_scope_path(value: Any) -> bool:
+    """Return whether a repository-relative scope is traversal-free."""
+
     if (
         not isinstance(value, str)
         or not value
@@ -181,53 +181,51 @@ def _safe_scope_path(value: Any) -> bool:
     return not path.is_absolute() and ".." not in path.parts
 
 
-def validate_authorization_grant(
-    grant: Mapping[str, Any],
+_safe_scope_path = safe_scope_path
+
+
+def validate_authorization_request(
+    request: Mapping[str, Any],
     *,
     task_digest: str,
     scope_paths: list[str],
 ) -> list[ContractIssue]:
-    """Validate host-supplied authority independently from model-framed intent.
-
-    This contract deliberately is not part of TaskEnvelope. A prompt may request
-    an effect, but only a trusted host or project-policy channel may supply this
-    separate, task-bound grant.
-    """
+    """Validate an inert request that cannot grant authority by serialization."""
 
     issues: list[ContractIssue] = []
-    if set(grant) != AUTHORIZATION_GRANT_KEYS:
+    if set(request) != AUTHORIZATION_REQUEST_KEYS:
         issues.append(
             ContractIssue(
-                "A_SCHEMA",
+                "Z_SCHEMA",
                 "",
-                "AuthorizationGrant must use the closed schema-1 fields.",
+                "AuthorizationRequest must use the closed schema-1 fields.",
             )
         )
-    if grant.get("schema_version") != 1:
+    if request.get("schema_version") != 1:
         issues.append(
             ContractIssue(
-                "A_SCHEMA",
+                "Z_SCHEMA",
                 "schema_version",
-                "Only AuthorizationGrant schema 1 is supported.",
+                "Only AuthorizationRequest schema 1 is supported.",
             )
         )
-    if not validate_task_id(grant.get("grant_id")):
+    if not validate_task_id(request.get("grant_id")):
         issues.append(
             ContractIssue(
-                "A_GRANT_ID",
+                "Z_SCHEMA",
                 "grant_id",
-                "Grant ID must be bounded path-safe ASCII.",
+                "Request ID must be bounded path-safe ASCII.",
             )
         )
-    if not validate_task_id(grant.get("session_id")):
+    if not validate_task_id(request.get("session_id")):
         issues.append(
             ContractIssue(
-                "A_SESSION_ID",
+                "Z_SESSION",
                 "session_id",
                 "Session ID must be bounded path-safe ASCII.",
             )
         )
-    supplied_digest = grant.get("task_digest")
+    supplied_digest = request.get("task_digest")
     if (
         not isinstance(supplied_digest, str)
         or SHA256_DIGEST.fullmatch(supplied_digest) is None
@@ -235,12 +233,12 @@ def validate_authorization_grant(
     ):
         issues.append(
             ContractIssue(
-                "A_TASK_DIGEST",
+                "Z_TASK_DIGEST",
                 "task_digest",
-                "Grant must bind to the exact TaskEnvelope digest.",
+                "Request must bind to the exact TaskEnvelope digest.",
             )
         )
-    allowed_effects = grant.get("allowed_effects")
+    allowed_effects = request.get("allowed_effects")
     if (
         not isinstance(allowed_effects, list)
         or not allowed_effects
@@ -249,12 +247,12 @@ def validate_authorization_grant(
     ):
         issues.append(
             ContractIssue(
-                "A_EFFECT",
+                "Z_EFFECT",
                 "allowed_effects",
-                "Grant effects must be unique closed-vocabulary values.",
+                "Request effects must be unique closed-vocabulary values.",
             )
         )
-    supplied_scope = grant.get("scope_paths")
+    supplied_scope = request.get("scope_paths")
     if (
         not isinstance(supplied_scope, list)
         or not supplied_scope
@@ -263,20 +261,27 @@ def validate_authorization_grant(
     ):
         issues.append(
             ContractIssue(
-                "A_SCOPE",
+                "Z_SCOPE",
                 "scope_paths",
-                "Grant scope must exactly match the framed task scope.",
-            )
-        )
-    if grant.get("issuer") not in AUTHORIZATION_GRANT_ISSUERS:
-        issues.append(
-            ContractIssue(
-                "A_ISSUER",
-                "issuer",
-                "Grant issuer is not an accepted trusted channel.",
+                "Request scope must exactly match the framed task scope.",
             )
         )
     return sorted(issues, key=lambda item: (item.code, item.path))
+
+
+def validate_authorization_grant(
+    grant: Mapping[str, Any],
+    *,
+    task_digest: str,
+    scope_paths: list[str],
+) -> list[ContractIssue]:
+    """Compatibility name for inert AuthorizationRequest validation."""
+
+    return validate_authorization_request(
+        grant,
+        task_digest=task_digest,
+        scope_paths=scope_paths,
+    )
 
 
 def validate_task_envelope(task: Mapping[str, Any]) -> list[ContractIssue]:

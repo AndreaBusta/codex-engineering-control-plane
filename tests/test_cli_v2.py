@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import subprocess
 import sys
@@ -78,6 +80,10 @@ class CliV2Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(payload["summary"]["tier"], "T2")
         self.assertIn("skill.verified-workflow", payload["summary"]["required"])
+        self.assertEqual(
+            payload["interaction"]["clarification_gate"]["status"],
+            "pending_host_capability",
+        )
 
     def test_route_rejects_serialized_inventory_input(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -100,6 +106,236 @@ class CliV2Tests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unrecognized arguments: --inventory", result.stderr)
 
+    def test_route_has_no_serialized_clarification_or_authority_inputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            task_path = Path(temporary) / "task.json"
+            task_path.write_text(json.dumps(task_envelope()), encoding="utf-8")
+            for flag in (
+                "--clarification-request",
+                "--clarification-resolution",
+                "--assumption",
+                "--irreversible-confirmation",
+                "--authorization",
+            ):
+                with self.subTest(flag=flag):
+                    result = run_cli(
+                        "route",
+                        "--repo",
+                        str(ROOT),
+                        "--task",
+                        str(task_path),
+                        flag,
+                        str(task_path),
+                        "--json",
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_serialized_resource_receipt_is_diagnostic_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            decision_path = Path(temporary) / "decision.json"
+            receipt_path = Path(temporary) / "receipt.json"
+            decision_path.write_text("{}\n", encoding="utf-8")
+            receipt_path.write_text("{}\n", encoding="utf-8")
+
+            result = run_cli(
+                "route-verify",
+                "--decision",
+                str(decision_path),
+                "--receipt",
+                str(receipt_path),
+                "--mode",
+                "audit",
+                "--json",
+            )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(payload["authoritative"])
+        self.assertEqual(payload["status"], "diagnostic")
+
+    def test_risk_status_without_host_anchor_is_unknown_exit_two(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/risk-cli")
+        with tempfile.TemporaryDirectory() as temporary:
+            decision_path = Path(temporary) / "decision.json"
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        "interaction": {
+                            "recommended_mode": "plan",
+                            "reason_codes": ["MODE_COMPLEX_OR_UNCERTAIN"],
+                        },
+                        "authorization": {"local_write": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_cli(
+                "risk-status",
+                "--repo",
+                str(scenario.repo),
+                "--policy",
+                str(ROOT / ".codex" / "project-policy.toml"),
+                "--task-id",
+                "TASK-RISK-MISSING",
+                "--decision",
+                str(decision_path),
+                "--json",
+            )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(payload["status"], "UNKNOWN")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["dimensions"]["local"]["status"], "UNKNOWN")
+        self.assertEqual(payload["dimensions"]["remote"]["status"], "UNKNOWN")
+        self.assertEqual(
+            payload["facts"]["governing_policy_source"],
+            "unavailable_pending_installed_manifest",
+        )
+        self.assertEqual(
+            payload["facts"]["candidate_policy_status"], "valid_hint"
+        )
+        self.assertFalse(
+            payload["facts"]["serialized_decision_authoritative"]
+        )
+        checks = payload["dimensions"]["local"]["checks"]
+        self.assertEqual(
+            next(
+                item["status"]
+                for item in checks
+                if item["code"] == "RS_AUTHORITY_REQUIRED"
+            ),
+            "UNKNOWN",
+        )
+
+    def test_risk_status_human_uses_closed_interaction_view(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/risk-human")
+        with tempfile.TemporaryDirectory() as temporary:
+            decision_path = Path(temporary) / "decision.json"
+            decision_path.write_text(
+                json.dumps(
+                    {
+                        "interaction": {
+                            "recommended_mode": "plan_then_goal",
+                            "reason_codes": [
+                                "MODE_LONG_RUNNING",
+                                "MODE_REQUIRES_PLAN",
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_cli(
+                "risk-status",
+                "--repo",
+                str(scenario.repo),
+                "--decision",
+                str(decision_path),
+            )
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(result.stdout.startswith("UNKNOWN risk-status\n"))
+        self.assertIn("local=UNKNOWN", result.stdout)
+        self.assertIn("remote=UNKNOWN", result.stdout)
+        self.assertIn(
+            "interaction_recommended=plan_then_goal", result.stdout
+        )
+        self.assertIn("interaction_commands=/plan,/goal", result.stdout)
+        self.assertIn("automatic_change=false", result.stdout)
+        self.assertIn("RS_REMOTE_NOT_OBSERVED ", result.stdout)
+
+    def test_risk_emit_contract_uses_exit_zero_one_two_in_both_formats(
+        self,
+    ) -> None:
+        from control_plane.cli import _emit
+
+        for status, expected in (("PASS", 0), ("FAIL", 1), ("UNKNOWN", 2)):
+            payload = {
+                "schema_version": 1,
+                "command": "risk-status",
+                "ok": status == "PASS",
+                "status": status,
+                "dimensions": {
+                    "local": {"status": status, "checks": [], "errors": []},
+                    "remote": {"status": "PASS", "checks": [], "errors": []},
+                },
+                "facts": {
+                    "interaction": {
+                        "mode": "normal",
+                        "commands": [],
+                        "human_message": "continue",
+                        "automatic_change": False,
+                    },
+                    "project_profile": {"profiles": ["generic"]},
+                },
+                "errors": [],
+            }
+            for as_json in (False, True):
+                with self.subTest(status=status, as_json=as_json):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        code = _emit(payload, as_json)
+                    self.assertEqual(code, expected)
+                    self.assertTrue(output.getvalue())
+
+    def test_risk_json_and_human_share_all_closed_interaction_modes(
+        self,
+    ) -> None:
+        from control_plane.cli import _render_human
+        from control_plane.intake import render_interaction_recommendation
+        from control_plane.risk_sentinel import evaluate_risk_status
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/risk-interaction")
+        cases = (
+            ("default", "normal", ["MODE_BOUNDED"]),
+            ("plan", "plan", ["MODE_COMPLEX_OR_UNCERTAIN"]),
+            ("goal", "goal", ["MODE_LONG_RUNNING"]),
+            (
+                "plan_then_goal",
+                "plan_then_goal",
+                ["MODE_LONG_RUNNING", "MODE_REQUIRES_PLAN"],
+            ),
+        )
+        for route_mode, view_mode, reasons in cases:
+            with self.subTest(mode=route_mode):
+                status = evaluate_risk_status(
+                    scenario.repo,
+                    None,
+                    route_decision_hint={
+                        "interaction": {
+                            "recommended_mode": route_mode,
+                            "reason_codes": reasons,
+                        }
+                    },
+                )
+                payload = status.to_dict()
+                expected = render_interaction_recommendation(
+                    view_mode, reasons
+                ).as_dict()
+                self.assertEqual(payload["facts"]["interaction"], expected)
+                human = _render_human(payload)
+                self.assertIn(
+                    f"interaction_recommended={view_mode}", human
+                )
+                self.assertIn(
+                    "interaction_commands=" + ",".join(expected["commands"]),
+                    human,
+                )
+                self.assertIn(
+                    f"interaction_message={expected['human_message']}", human
+                )
+                self.assertIn("automatic_change=false", human)
+
     def test_verification_run_rejects_caller_selected_profile_or_command(
         self,
     ) -> None:
@@ -117,6 +353,136 @@ class CliV2Tests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_hook_smoke_cli_accepts_only_repo_task_and_output_mode(
+        self,
+    ) -> None:
+        closed = run_cli(
+            "hook-smoke",
+            "--repo",
+            str(ROOT.resolve()),
+            "--task-id",
+            "TASK-HOOK-SMOKE-CLOSED-CLI",
+            "--json",
+        )
+        injected = run_cli(
+            "hook-smoke",
+            "--repo",
+            str(ROOT.resolve()),
+            "--task-id",
+            "TASK-HOOK-SMOKE-CLOSED-CLI",
+            "--result",
+            str(ROOT / "forged-result.json"),
+            "--observation",
+            str(ROOT / "forged-observation.json"),
+            "--json",
+        )
+
+        self.assertNotIn("invalid choice", closed.stderr)
+        self.assertNotEqual(injected.returncode, 0)
+        self.assertIn("unrecognized arguments", injected.stderr)
+
+    def test_git_guard_pre_push_parser_is_bounded_and_closed(self) -> None:
+        from control_plane.cli import _read_pre_push_updates
+
+        valid = (
+            b"refs/heads/feature/a "
+            + b"a" * 40
+            + b" refs/heads/feature/a "
+            + b"0" * 40
+            + b"\n"
+            + b"(delete) "
+            + b"0" * 40
+            + b" refs/heads/feature/b "
+            + b"b" * 40
+            + b"\n"
+        )
+        updates = _read_pre_push_updates(io.BytesIO(valid))
+        self.assertEqual(len(updates), 2)
+        self.assertEqual(updates[1][0], "(delete)")
+
+        for payload in (
+            b"only three fields\n",
+            b"refs/heads/x \xff refs/heads/x " + b"0" * 40 + b"\n",
+            b"x" * (1_048_576 + 1),
+        ):
+            with self.subTest(size=len(payload)):
+                with self.assertRaisesRegex(ValueError, "GG_INPUT_INVALID"):
+                    _read_pre_push_updates(io.BytesIO(payload))
+
+    def test_git_guard_cli_is_closed_and_fails_without_install(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        result = run_cli(
+            "git-guard",
+            "pre-commit",
+            "--repo",
+            str(scenario.repo),
+            "--json",
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(payload["command"], "git-guard")
+        self.assertEqual(payload["event"], "pre-commit")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(
+            payload["errors"][0]["code"], "GG_INSTALLED_POLICY_INVALID"
+        )
+
+    def test_git_guard_human_output_surfaces_non_blocking_drift(self) -> None:
+        from control_plane.cli import _render_human
+
+        rendered = _render_human(
+            {
+                "schema_version": 1,
+                "command": "git-guard",
+                "ok": True,
+                "event": "pre-commit",
+                "errors": [],
+                "warnings": [
+                    {
+                        "code": "GG_CANDIDATE_POLICY_DRIFT",
+                        "message": "Candidate policy differs.",
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(rendered.startswith("PASS git-guard\n"))
+        self.assertIn(
+            "WARNING GG_CANDIDATE_POLICY_DRIFT: Candidate policy differs.",
+            rendered,
+        )
+
+    def test_safe_read_cli_binds_explicit_repo_and_closed_argv(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+
+        completed = run_cli(
+            "safe-read",
+            "--repo",
+            str(scenario.repo.resolve()),
+            "--",
+            "git",
+            "status",
+            "--short",
+        )
+        rejected = run_cli(
+            "safe-read",
+            "--repo",
+            str(scenario.repo.resolve()),
+            "--",
+            "git",
+            "-c",
+            "alias.status=!echo unsafe",
+            "status",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(rejected.returncode, 126)
+        self.assertIn("E_SAFE_READ_ARGV", rejected.stderr)
 
     def test_human_route_output_surfaces_profile_and_mode_recommendation(
         self,
@@ -151,6 +517,15 @@ class CliV2Tests(unittest.TestCase):
         self.assertIn("project_profiles=generic", result.stdout)
         self.assertIn("interaction_recommended=plan_then_goal", result.stdout)
         self.assertIn("interaction_automatic_change=false", result.stdout)
+        self.assertIn("clarification_level=high", result.stdout)
+        self.assertIn(
+            "clarification_status=pending_host_capability", result.stdout
+        )
+        self.assertIn(
+            "clarification_next_action=wait_for_host_capability",
+            result.stdout,
+        )
+        self.assertIn("clarification_ready=false", result.stdout)
 
     def test_actual_registry_auto_selects_security_and_multidomain_guides(
         self,
@@ -394,6 +769,65 @@ class CliV2Tests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["ok"])
+
+
+    def test_task_cli_has_no_serialized_clarification_resolution_path(
+        self,
+    ) -> None:
+        result = run_cli(
+            "task",
+            "clarify",
+            "--repo",
+            str(ROOT),
+            "--task-id",
+            "TASK-NO-SERIALIZED-RESOLUTION",
+            "--resolution",
+            "resolution.json",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid choice", result.stderr)
+
+    def test_task_transition_rejects_removed_clarification_state(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        started = run_cli(
+            "task",
+            "start",
+            "--repo",
+            str(scenario.repo),
+            "--task-id",
+            "TASK-CLI-NO-LATERAL",
+            "--outcome",
+            "local_change",
+            "--branch",
+            "main",
+            "--task-digest",
+            self.digest,
+            "--decision-digest",
+            self.digest,
+            "--json",
+        )
+        transitioned = run_cli(
+            "task",
+            "transition",
+            "--repo",
+            str(scenario.repo),
+            "--task-id",
+            "TASK-CLI-NO-LATERAL",
+            "--state",
+            "clarification_required",
+            "--json",
+        )
+
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertNotEqual(transitioned.returncode, 0)
+        self.assertIn(
+            "E_STATE_TRANSITION",
+            {
+                item["code"]
+                for item in json.loads(transitioned.stdout)["errors"]
+            },
+        )
 
 
 if __name__ == "__main__":

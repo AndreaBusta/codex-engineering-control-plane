@@ -30,6 +30,8 @@ Un fallo produce diagnóstico, no una mutación automática.
 
 ## Nivel 2 — Enforce local
 
+Estado v2.1: **diferido**. El kernel distribuido permanece en audit.
+
 Requisitos:
 
 - tests herméticos estables;
@@ -43,6 +45,9 @@ auditados. Los hooks siguen siendo defensa adicional y deben tener bypass
 explícito y registrado para recuperación.
 
 ## Nivel 3 — Enforce remoto
+
+Estado v2.1: **fuera de alcance**. Requiere adapter host, ADR, plan y
+autorización CI/CD independientes.
 
 Configurar con autorización:
 
@@ -70,16 +75,19 @@ La protección remota es autoritativa para integración.
 ## Migración de un proyecto
 
 1. ejecutar `adopt plan` sin mutar el destino;
-2. detectar rama base y remote;
+2. detectar rama base y remote como hechos del target, sin modificar el remote;
 3. revisar el plan target-specific: policy, registry, `AGENTS.md`, hooks,
    rama base, remote y digests finales;
 4. guardar el JSON aprobado y ejecutar `adopt apply --plan ...`;
 5. ejecutar `adopt verify`;
-6. ejecutar corpus en modo audit;
+6. ejecutar los gates reales del proyecto en modo audit;
 7. revisar hooks con `/hooks`;
 8. corregir falsos positivos;
-9. abrir PR;
-10. activar soft-enforce y enforcement después de sus umbrales.
+9. ejecutar `adopt rollback` y demostrar restauración exacta;
+10. reaplicar solo con nueva autorización y dejar el cambio en `review_ready`.
+
+Commit, PR y cualquier promoción se deciden después, como transiciones
+separadas. La adopción v2.1 no instala `.github/workflows/**`.
 
 No copiar una policy `main` si el proyecto usa `develop`. No inventar scheme,
 workspace o test command.
@@ -136,13 +144,14 @@ Tras un periodo:
 - tareas por nivel;
 - reintentos;
 - workers;
-- contexto transferido;
+- bytes de manifest, unidades seleccionadas y bytes de hook;
 - gates fallidos;
 - incidencias post-merge;
 - releases con recibo;
 - falsos positivos.
 
-No afirmar ahorro de tokens hasta medirlo.
+Estas magnitudes describen payload local; no son telemetría exacta de tokens.
+No afirmar ahorro económico hasta medirlo fuera del runtime.
 
 ## Criterio para avanzar
 
@@ -156,17 +165,15 @@ Subir de nivel solo si:
 
 ## Estado actual de este repositorio
 
-Nivel 1 audit v2:
+Nivel 1 `local-audit` v2.1:
 
-- v1 integrada en `origin/main`;
-- remote y CI Ubuntu operativos;
-- policy, registry, lock, router, lifecycle, leases, adopción transaccional y
-  upgrade versionado implementados en la candidata;
-- hooks audit creados pero `pending_hook_trust`;
-- macOS manual pendiente antes de confiar hooks;
-- Ruleset no disponible para este repositorio privado con el plan actual;
-- GitHub remoto y TestFlight siguen `pending_external_evidence` cuando una
-  tarea concreta los requiera;
-- no se ha instalado el sistema en otros repositorios.
+- policy, registry, lock, router, lifecycle y leases locales;
+- aclaración diagnóstica sin resolución durable;
+- Risk Sentinel triestado, guards Git y adopción/upgrade transaccionales;
+- hooks en `audit` y `pending_hook_trust`;
+- provider GitHub, workflow de procedencia y policy remota diferidos;
+- GitHub, CI y release permanecen `pending_external_evidence` cuando una tarea
+  concreta los requiera;
+- la adopción en otros repositorios exige piloto separado y reversible.
 
 Estas limitaciones son estados explícitos, no permisos implícitos.

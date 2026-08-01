@@ -23,6 +23,10 @@ El resultado pedido fija el estado terminal previo a `closed`:
 `blocked` conserva `resume_state`; reanudar vuelve exactamente allí. No se
 pueden saltar estados aunque el resultado final tenga más alcance.
 
+v2.1 no añade un estado lateral durable de aclaración. El router diagnostica
+ambigüedad material como `pending_host_capability`; `blocked` y
+`suspend_for_reframe` siguen siendo las salidas persistentes honestas.
+
 Desde `ready`, los estados exigen evidencia machine-readable: preflight,
 implementación completa, gates y decisión documental, commit, remote head, PR,
 checks, merge commit, base remota, manifest, build de proveedor y observación
@@ -92,6 +96,10 @@ pending_hook_trust
 
 No usar `--dangerously-bypass-hook-trust` como instalación normal.
 
+La ruta productiva única es
+`.codex/hooks/control_plane_hook.py → run_hook → evaluate_hook`. No existe un
+evaluador paralelo ni una vista de warning publicada por el host.
+
 ## Adopción
 
 ```bash
@@ -116,6 +124,11 @@ resuelven antes de aprobar el plan. Comandos reales, arquitectura, release y
 recursos project-local canónicos siguen necesitando verificación del proyecto
 antes de enforcement. No se instala en BUSTAFIT, `textosv2` u otro repositorio
 sin autorización explícita.
+
+La distribución local no incluye workflows ni providers GitHub. El ciclo
+recomendado de piloto es `plan → apply → verify → gates del proyecto → rollback`;
+una segunda aplicación requiere nueva autorización. La restauración incluye el
+valor o ausencia anterior de `core.hooksPath`.
 
 Cambios globales de `AGENTS.md`, `config.toml`, plugins o MCP quedan fuera de la
 adopción project-local y exigen diff y autorización separados.

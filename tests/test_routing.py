@@ -31,12 +31,28 @@ class RoutingTests(unittest.TestCase):
         inventory: dict | None = None,
         *,
         mode: str = "audit",
-        authorization_grant: object | None = None,
+        host_capability: object | None = None,
+        clarification_request: object | None = None,
+        authorization: object | None = None,
     ) -> dict:
+        import control_plane.host_bridge as bridge
         from control_plane.routing import resolve_route
 
         framed_task = task or task_envelope()
         snapshot = inventory or inventory_snapshot()
+        if host_capability is None:
+            host_capability = bridge.HOST_ADAPTER_UNAVAILABLE
+        suppress_default_request = clarification_request is False
+        if suppress_default_request:
+            clarification_request = None
+        if (
+            clarification_request is None
+            and not suppress_default_request
+            and int(framed_task["risk"]["uncertainty"]) == 2
+        ):
+            clarification_request = self.validated_request(
+                framed_task, repository_status="resolved"
+            )
         return resolve_route(
             framed_task,
             self.policy,
@@ -48,8 +64,136 @@ class RoutingTests(unittest.TestCase):
                 invocation_id="routing-test-inventory",
             ),
             mode=mode,
-            authorization_grant=authorization_grant,
+            host_capability=host_capability,
+            clarification_request=clarification_request,
+            authorization=authorization,
         )
+
+    def host_capability(
+        self,
+        *,
+        invocation_id: str = "routing-host-capability",
+        clock=lambda: 100.0,
+        ttl_seconds: float = 30,
+    ):
+        import control_plane.host_bridge as bridge
+        from tests.host_adapter_test_support import native_session_event
+
+        event = native_session_event(
+            event_id=f"event-{invocation_id}",
+            session_id="session-routing-tests",
+            invocation_id=invocation_id,
+            observed_at_monotonic=100.0,
+        )
+        return bridge.attest_host_adapter_capability(
+            event,
+            expected_session_id="session-routing-tests",
+            expected_invocation_id=invocation_id,
+            clock=clock,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def validated_request(
+        self,
+        task: dict,
+        *,
+        repository_status: str,
+        issue_kind: str = "clarification",
+        invocation_id: str = "routing-request",
+    ):
+        from control_plane.contracts import contract_digest
+
+        evidence_digest = (
+            None
+            if repository_status == "not_checked"
+            else contract_digest(
+                {
+                    "repository_status": repository_status,
+                    "task_id": task["task_id"],
+                }
+            )
+        )
+        payload = {
+            "schema_version": 1,
+            "request_id": f"request-{invocation_id}",
+            "task_digest": contract_digest(task),
+            "session_id": "session-routing-tests",
+            "issue_kind": issue_kind,
+            "severity": (
+                "low",
+                "medium",
+                "high",
+                "critical",
+            )[int(task["risk"]["uncertainty"])],
+            "question_digest": contract_digest(
+                {"question": task["task_id"], "kind": issue_kind}
+            ),
+            "presentation_digest": contract_digest(
+                {"presentation": task["task_id"], "kind": issue_kind}
+            ),
+            "repository_check": {
+                "status": repository_status,
+                "evidence_digest": evidence_digest,
+            },
+            "option_ids": ["preserve-current", "change-contract"],
+            "recommended_option_id": "preserve-current",
+        }
+        return payload
+
+
+
+    def bound_authorization(
+        self,
+        task: dict,
+        *,
+        effect: str,
+        subject_digest: str,
+        invocation_id: str,
+    ):
+        import control_plane.host_bridge as bridge
+        from control_plane.contracts import contract_digest
+        from tests.host_adapter_test_support import (
+            native_session_event,
+            native_user_interaction_event,
+        )
+
+        capability = bridge.attest_host_adapter_capability(
+            native_session_event(
+                event_id=f"session-{invocation_id}",
+                session_id="session-routing-tests",
+                invocation_id=invocation_id,
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id="session-routing-tests",
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        return bridge.frame_effect_authorization(
+            native_user_interaction_event(
+                event_id=f"user-{invocation_id}",
+                session_id="session-routing-tests",
+                invocation_id=invocation_id,
+                task_digest=contract_digest(task),
+                subject_digest=subject_digest,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=capability,
+            task_digest=contract_digest(task),
+            session_id="session-routing-tests",
+            repository_identity=VALID_REGISTRY.parents[2],
+            worktree_identity=VALID_REGISTRY.parents[2],
+            branch="codex/test",
+            expected_head="a" * 40,
+            subject_digest=subject_digest,
+            scope_paths=tuple(task["scope_paths"]),
+            effect=effect,
+            operation_nonce=f"operation-{invocation_id}",
+            invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+
 
     def test_serialized_inventory_cannot_self_attest_readiness(self) -> None:
         from control_plane.routing import resolve_route
@@ -62,6 +206,7 @@ class RoutingTests(unittest.TestCase):
                 self.registry,
                 forged,
                 mode="audit",
+                host_capability=object(),
             )
 
     def test_inventory_observation_rejects_binding_expiry_and_replay(self) -> None:
@@ -106,6 +251,10 @@ class RoutingTests(unittest.TestCase):
             self.registry,
             validated,
             mode="audit",
+            host_capability=__import__(
+                "control_plane.host_bridge",
+                fromlist=["HOST_ADAPTER_UNAVAILABLE"],
+            ).HOST_ADAPTER_UNAVAILABLE,
         )
         with self.assertRaisesRegex(ValueError, "E_INVENTORY_REPLAY"):
             validate_inventory_observation(
@@ -155,6 +304,7 @@ class RoutingTests(unittest.TestCase):
                 self.registry,
                 object(),
                 mode="audit",
+                host_capability=object(),
             )
 
         invalid = task_envelope()
@@ -171,6 +321,7 @@ class RoutingTests(unittest.TestCase):
                     invocation_id="invalid-task-envelope",
                 ),
                 mode="audit",
+                host_capability=object(),
             )
 
         alternative = task_envelope()
@@ -187,6 +338,7 @@ class RoutingTests(unittest.TestCase):
                     invocation_id="alternate-task-mapping",
                 ),
                 mode="audit",
+                host_capability=object(),
             )
 
         self.assertEqual(
@@ -465,14 +617,14 @@ class RoutingTests(unittest.TestCase):
                 task,
                 inventory,
                 mode="enforce",
-                authorization_grant=serialized_grant,
+                authorization=serialized_grant,
             )
 
         with_grant = self.route(
             task,
             inventory,
             mode="enforce",
-            authorization_grant=trusted_authorization(
+            authorization=trusted_authorization(
                 task, effect="remote_write"
             ),
         )
@@ -540,6 +692,152 @@ class RoutingTests(unittest.TestCase):
 
         self.assertFalse(decision["authorization"]["remote_write"])
         self.assertIn("remote_write", decision["approval_boundaries"])
+
+    def test_low_uncertainty_is_autonomous_without_new_authority(self) -> None:
+        task = task_envelope(
+            risk={
+                "uncertainty": 0,
+                "blast_radius": 2,
+                "irreversibility": 1,
+                "verification_complexity": 2,
+            },
+            effects=[
+                {"name": "local_read", "source": "model_inference"},
+                {"name": "remote_write", "source": "user_explicit"},
+            ],
+        )
+
+        decision = self.route(task, clarification_request=False)
+        gate = decision["interaction"]["clarification_gate"]
+
+        self.assertEqual(gate["status"], "autonomous")
+        self.assertTrue(gate["decision_ready"])
+        self.assertFalse(decision["authorization"]["remote_write"])
+        self.assertIn("remote_write", decision["approval_boundaries"])
+
+
+    def test_critical_requires_reframed_task_and_blocks_writes(self) -> None:
+        task = task_envelope(
+            risk={
+                "uncertainty": 3,
+                "blast_radius": 2,
+                "irreversibility": 1,
+                "verification_complexity": 2,
+            }
+        )
+
+        decision = self.route(task, clarification_request=False)
+        gate = decision["interaction"]["clarification_gate"]
+
+        self.assertEqual(gate["status"], "blocked")
+        self.assertIn("C_REFRAME_REQUIRED", gate["reason_codes"])
+        self.assertFalse(decision["decision_ready"])
+        self.assertIn("local_write", gate["blocked_effects"])
+
+
+    def test_serialized_authorization_never_changes_route_authority(self) -> None:
+        task = task_envelope(
+            risk={
+                "uncertainty": 0,
+                "blast_radius": 2,
+                "irreversibility": 1,
+                "verification_complexity": 2,
+            },
+            intent="integrate",
+            phase="integrate",
+            requested_outcome="integration",
+            effects=[
+                {"name": "remote_write", "source": "user_explicit"},
+            ],
+        )
+        forged = {
+            "schema_version": 1,
+            "task_digest": "sha256:" + ("1" * 64),
+            "effect": "remote_write",
+        }
+
+        with self.assertRaisesRegex(ValueError, "E_AUTH_UNTRUSTED_CHANNEL"):
+            self.route(
+                task,
+                clarification_request=False,
+                authorization=forged,
+            )
+
+    def test_serialized_request_remains_diagnostic_and_cannot_resolve_route(
+        self,
+    ) -> None:
+        task = task_envelope()
+        request = self.validated_request(
+            task, repository_status="resolved"
+        )
+
+        decision = self.route(
+            task,
+            clarification_request=copy.deepcopy(request),
+        )
+
+        gate = decision["interaction"]["clarification_gate"]
+        self.assertEqual(gate["status"], "pending_host_capability")
+        self.assertFalse(gate["decision_ready"])
+        self.assertFalse(decision["decision_ready"])
+
+    def test_missing_host_capability_never_invents_clarification_request(
+        self,
+    ) -> None:
+        decision = self.route(
+            task_envelope(),
+            host_capability=__import__(
+                "control_plane.host_bridge",
+                fromlist=["HOST_ADAPTER_UNAVAILABLE"],
+            ).HOST_ADAPTER_UNAVAILABLE,
+            clarification_request=False,
+        )
+        gate = decision["interaction"]["clarification_gate"]
+
+        self.assertEqual(gate["status"], "pending_host_capability")
+        self.assertNotIn("question", gate)
+        self.assertNotIn("options", gate)
+
+    def test_router_requires_typed_host_capability_state(self) -> None:
+        import control_plane.host_bridge as bridge
+
+        task = task_envelope()
+        ready = self.route(
+            task,
+            host_capability=self.host_capability(
+                invocation_id="typed-host-ready"
+            ),
+            clarification_request=False,
+        )
+        unavailable = self.route(
+            task,
+            host_capability=bridge.HOST_ADAPTER_UNAVAILABLE,
+            clarification_request=False,
+        )
+
+        self.assertEqual(
+            ready["interaction"]["clarification_gate"]["status"],
+            "pending_host_capability",
+        )
+        self.assertEqual(
+            unavailable["interaction"]["clarification_gate"]["status"],
+            "pending_host_capability",
+        )
+        for forged in (
+            {},
+            "ready",
+            True,
+            object.__new__(bridge.HostAdapterUnavailable),
+        ):
+            with self.subTest(forged=forged):
+                with self.assertRaisesRegex(
+                    ValueError, "C_UNTRUSTED_HOST_CAPABILITY"
+                ):
+                    self.route(
+                        task,
+                        host_capability=forged,
+                        clarification_request=False,
+                    )
 
     def test_answer_outcome_cannot_authorize_local_write(self) -> None:
         decision = self.route(
@@ -663,7 +961,7 @@ class RoutingTests(unittest.TestCase):
             task,
             inventory,
             mode="audit",
-            authorization_grant=trusted_authorization(
+            authorization=trusted_authorization(
                 task, effect="network_read"
             ),
         )
@@ -714,160 +1012,6 @@ class RoutingTests(unittest.TestCase):
 
         self.assertTrue(decision["ok"])
 
-    def test_route_verify_checks_required_forbidden_effects_and_digests(
-        self,
-    ) -> None:
-        from control_plane.lifecycle import create_resource_receipt
-        from control_plane.routing import verify_route
-
-        decision = self.route()
-        receipt = create_resource_receipt(
-            task_id="task-router-001",
-            decision_digest=decision["decision_digest"],
-            digests={
-                "task": decision["facts"]["task_digest"],
-                "policy": decision["facts"]["policy_digest"],
-                "registry": decision["facts"]["registry_digest"],
-                "inventory": decision["facts"]["inventory_digest"],
-            },
-            used=decision["summary"]["required"],
-            resource_digests=decision["selected_resource_digests"],
-            omitted=decision["summary"]["recommended"],
-            gates=[
-                {
-                    "gate_id": gate_id,
-                    "ok": True,
-                    "report_digest": decision["facts"]["task_digest"],
-                }
-                for gate_id in decision["required_gates"]
-            ],
-            effects=["local_read", "local_write"],
-        )
-
-        result = verify_route(decision, receipt, mode="enforce")
-
-        self.assertTrue(result["ok"], result)
-        receipt["used"].append(
-            {
-                "resource_id": "forbidden.fake",
-                "locator_digest": decision["facts"]["task_digest"],
-                "evidence_digest": decision["facts"]["task_digest"],
-            }
-        )
-        receipt["observed_effects"].append("release")
-        result = verify_route(decision, receipt, mode="enforce")
-        self.assertFalse(result["ok"])
-
-    def test_route_verify_fails_closed_for_empty_or_tampered_contracts(
-        self,
-    ) -> None:
-        from control_plane.routing import verify_route
-
-        empty = verify_route({}, {}, mode="enforce")
-        self.assertFalse(empty["ok"])
-        self.assertFalse(empty["compliant"])
-        self.assertIn(
-            "E_DECISION_SCHEMA", {error["code"] for error in empty["errors"]}
-        )
-
-        decision = self.route()
-        decision["summary"]["tier"] = "T0"
-        tampered = verify_route(decision, {}, mode="enforce")
-        self.assertFalse(tampered["ok"])
-        self.assertIn(
-            "E_DECISION_DIGEST",
-            {error["code"] for error in tampered["errors"]},
-        )
-
-    def test_route_verify_cannot_certify_a_decision_that_is_not_ready(
-        self,
-    ) -> None:
-        from control_plane.lifecycle import create_resource_receipt
-        from control_plane.routing import verify_route
-
-        task = task_envelope(
-            intent="integrate",
-            phase="integrate",
-            requested_outcome="integration",
-            effects=[
-                {"name": "remote_write", "source": "user_explicit"},
-            ],
-        )
-        decision = self.route(task, mode="audit")
-        receipt = create_resource_receipt(
-            task_id="task-router-001",
-            decision_digest=decision["decision_digest"],
-            digests={
-                "task": decision["facts"]["task_digest"],
-                "policy": decision["facts"]["policy_digest"],
-                "registry": decision["facts"]["registry_digest"],
-                "inventory": decision["facts"]["inventory_digest"],
-            },
-            used=decision["summary"]["required"],
-            resource_digests=decision["selected_resource_digests"],
-            omitted=decision["summary"]["recommended"],
-            gates=[
-                {
-                    "gate_id": gate_id,
-                    "ok": True,
-                    "report_digest": decision["facts"]["task_digest"],
-                }
-                for gate_id in decision["required_gates"]
-            ],
-            effects=[],
-        )
-
-        result = verify_route(decision, receipt, mode="enforce")
-
-        self.assertFalse(decision["decision_ready"])
-        self.assertFalse(result["ok"])
-        self.assertIn(
-            "E_DECISION_NOT_READY",
-            {error["code"] for error in result["errors"]},
-        )
-
-    def test_route_verify_rejects_unrequested_local_write(self) -> None:
-        from control_plane.lifecycle import create_resource_receipt
-        from control_plane.routing import verify_route
-
-        decision = self.route(
-            task_envelope(
-                intent="audit",
-                requested_outcome="answer",
-                effects=[{"name": "local_write", "source": "model_inference"}],
-            ),
-            mode="audit",
-        )
-        receipt = create_resource_receipt(
-            task_id="task-router-001",
-            decision_digest=decision["decision_digest"],
-            digests={
-                "task": decision["facts"]["task_digest"],
-                "policy": decision["facts"]["policy_digest"],
-                "registry": decision["facts"]["registry_digest"],
-                "inventory": decision["facts"]["inventory_digest"],
-            },
-            used=decision["summary"]["required"],
-            resource_digests=decision["selected_resource_digests"],
-            omitted=decision["summary"]["recommended"],
-            gates=[
-                {
-                    "gate_id": gate_id,
-                    "ok": True,
-                    "report_digest": decision["facts"]["task_digest"],
-                }
-                for gate_id in decision["required_gates"]
-            ],
-            effects=["local_write"],
-        )
-
-        result = verify_route(decision, receipt, mode="enforce")
-
-        self.assertFalse(result["ok"])
-        self.assertIn(
-            "E_RECEIPT_EFFECT",
-            {error["code"] for error in result["errors"]},
-        )
 
     def test_inventory_digest_and_ready_state_are_enforced(self) -> None:
         inventory = inventory_snapshot()

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from uuid import uuid4
 from typing import Any, Sequence
@@ -47,11 +50,28 @@ from control_plane.resource_registry import (
     validate_policy_references,
     validate_registry,
 )
-from control_plane.host_bridge import (
-    observe_inventory,
-    validate_inventory_observation,
+from control_plane.risk_sentinel import evaluate_risk_status
+from control_plane.hooks import (
+    _safe_read_repository_identity,
+    execute_safe_read,
 )
-from control_plane.routing import resolve_route, verify_route
+from control_plane.host_bridge import (
+    HOST_ADAPTER_UNAVAILABLE,
+    MACOS_HOOK_SMOKE_ARTIFACTS,
+    _smoke_git_head,
+    frame_verification_task_context,
+    observe_inventory,
+    observe_worktree_inventory,
+    publish_macos_hook_smoke_receipt,
+    run_macos_hook_smoke,
+    validate_inventory_observation,
+    validate_worktree_inventory_observation,
+)
+from control_plane.routing import (
+    compact_route_manifest,
+    resolve_route,
+    verify_route,
+)
 
 
 def _policy_path(repo: Path, explicit_path: Path | None) -> Path:
@@ -103,10 +123,99 @@ def _load_validated_policy(path: Path) -> tuple[dict[str, Any] | None, dict[str,
 
 def _render_human(payload: dict[str, Any]) -> str:
     command = str(payload.get("command", "control-plane"))
+    if command == "risk-status" and payload.get("status") in {
+        "PASS",
+        "FAIL",
+        "UNKNOWN",
+    }:
+        status = str(payload["status"])
+        dimensions = payload.get("dimensions", {})
+        local = (
+            dimensions.get("local", {})
+            if isinstance(dimensions, dict)
+            else {}
+        )
+        remote = (
+            dimensions.get("remote", {})
+            if isinstance(dimensions, dict)
+            else {}
+        )
+        facts = payload.get("facts", {})
+        interaction = (
+            facts.get("interaction", {}) if isinstance(facts, dict) else {}
+        )
+        profile = (
+            facts.get("project_profile", {})
+            if isinstance(facts, dict)
+            else {}
+        )
+        commands = (
+            interaction.get("commands", [])
+            if isinstance(interaction, dict)
+            else []
+        )
+        profiles = (
+            profile.get("profiles", [])
+            if isinstance(profile, dict)
+            else []
+        )
+        lines = [
+            f"{status} risk-status",
+            f"local={local.get('status', 'UNKNOWN')}",
+            f"remote={remote.get('status', 'UNKNOWN')}",
+            "interaction_recommended="
+            f"{interaction.get('mode', 'normal')}",
+            "interaction_commands="
+            + (
+                ",".join(str(item) for item in commands)
+                if isinstance(commands, list)
+                else ""
+            ),
+            "interaction_message="
+            f"{interaction.get('human_message', '')}",
+            "automatic_change="
+            f"{str(bool(interaction.get('automatic_change'))).lower()}",
+            "project_profiles="
+            + (
+                ",".join(str(item) for item in profiles)
+                if isinstance(profiles, list)
+                else "unknown"
+            ),
+        ]
+        if isinstance(dimensions, dict):
+            for name in ("local", "remote"):
+                dimension = dimensions.get(name, {})
+                if not isinstance(dimension, dict):
+                    continue
+                for check in dimension.get("checks", []):
+                    lines.append(
+                        f"{check.get('code', 'UNKNOWN')} "
+                        f"{check.get('message', '')}"
+                    )
+                for error in dimension.get("errors", []):
+                    lines.append(
+                        f"{error.get('code', 'UNKNOWN')} "
+                        f"{error.get('message', '')}"
+                    )
+        for error in payload.get("errors", []):
+            lines.append(
+                f"{error.get('code', 'UNKNOWN')} "
+                f"{error.get('message', '')}"
+            )
+        return "\n".join(lines)
     diagnostic = (
-        command == "preflight"
-        and payload.get("mode") == "read"
-        and any(not check.get("ok", False) for check in payload.get("checks", []))
+        (
+            command == "preflight"
+            and payload.get("mode") == "read"
+            and any(
+                not check.get("ok", False)
+                for check in payload.get("checks", [])
+            )
+        )
+        or (
+            command == "route-verify"
+            and payload.get("authoritative") is False
+        )
     )
     status = (
         "DIAGNOSTIC"
@@ -157,6 +266,24 @@ def _render_human(payload: dict[str, Any]) -> str:
                 "interaction_automatic_change="
                 f"{str(bool(interaction.get('automatic_change'))).lower()}"
             )
+            clarification = interaction.get("clarification_gate", {})
+            if isinstance(clarification, dict):
+                lines.append(
+                    "clarification_level="
+                    f"{clarification.get('level', 'unknown')}"
+                )
+                lines.append(
+                    "clarification_status="
+                    f"{clarification.get('status', 'unknown')}"
+                )
+                lines.append(
+                    "clarification_next_action="
+                    f"{clarification.get('next_action', '')}"
+                )
+                lines.append(
+                    "clarification_ready="
+                    f"{str(bool(clarification.get('decision_ready'))).lower()}"
+                )
 
     facts = payload.get("facts")
     if isinstance(facts, dict):
@@ -172,6 +299,11 @@ def _render_human(payload: dict[str, Any]) -> str:
         lines.append(
             f"ERROR {error.get('code', 'UNKNOWN')}: {error.get('message', '')}"
         )
+    for warning in payload.get("warnings", []):
+        lines.append(
+            f"WARNING {warning.get('code', 'UNKNOWN')}: "
+            f"{warning.get('message', '')}"
+        )
 
     return "\n".join(lines)
 
@@ -181,6 +313,11 @@ def _emit(payload: dict[str, Any], as_json: bool) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print(_render_human(payload))
+    if (
+        payload.get("command") == "risk-status"
+        and payload.get("status") == "UNKNOWN"
+    ):
+        return 2
     return 0 if payload.get("ok") else 1
 
 
@@ -526,7 +663,78 @@ def command_route(arguments: argparse.Namespace) -> int:
             expected_invocation_id=invocation_id,
             clock=time.monotonic,
         )
-        payload = resolve_route(task, policy, registry, inventory, mode=arguments.mode)
+        trusted_decision = resolve_route(
+            task,
+            policy,
+            registry,
+            inventory,
+            mode=arguments.mode,
+            host_capability=HOST_ADAPTER_UNAVAILABLE,
+        )
+        manifest = compact_route_manifest(trusted_decision)
+        payload = dict(trusted_decision)
+        state_dir = worktree_git_dir(root)
+        task_id = str(task["task_id"])
+        task_state_path = (
+            state_dir
+            / "codex-control-plane"
+            / "tasks"
+            / f"{task_id}.json"
+        )
+        lease_path = (
+            state_dir
+            / "codex-control-plane"
+            / "leases"
+            / f"{task_id}.json"
+        )
+        if task_state_path.is_file() and lease_path.is_file():
+            store = TaskStore(state_dir)
+            try:
+                state = store.status(task_id)
+            except ValueError as error:
+                if not str(error).startswith("E_FOREIGN_RUNTIME_STATE:"):
+                    raise
+            else:
+                if lease_path.is_symlink():
+                    raise ValueError(
+                        "M_METRIC_BINDING: active lease path is unsafe"
+                    )
+                lease = _read_json(lease_path)
+                lease_semantic = {
+                    key: value
+                    for key, value in lease.items()
+                    if key != "lease_digest"
+                }
+                if (
+                    state.get("task_digest")
+                    != payload["facts"]["task_digest"]
+                    or lease.get("task_id") != task_id
+                    or lease.get("worktree") != str(root)
+                    or lease.get("session_id") is None
+                    or lease.get("lease_digest")
+                    != contract_digest(lease_semantic)
+                ):
+                    raise ValueError(
+                        "M_METRIC_BINDING: active task does not match route"
+                    )
+                store.record_context_metrics(
+                    task_id,
+                    task_digest=payload["facts"]["task_digest"],
+                    session_id=str(lease["session_id"]),
+                    invocation_id=invocation_id,
+                    subject_digest=payload["decision_digest"],
+                    runtime_metrics={
+                        "router_manifest_bytes": len(
+                            manifest.encode("utf-8")
+                        ),
+                        "context_units_selected": int(
+                            payload["summary"][
+                                "selected_context_units"
+                            ]
+                        ),
+                        "tool_use_id": None,
+                    },
+                )
         payload["command"] = "route"
         return _emit(payload, arguments.json)
     except (RepositoryError, PolicyError, RegistryError, ValueError) as error:
@@ -562,6 +770,127 @@ def command_route_verify(arguments: argparse.Namespace) -> int:
             },
             arguments.json,
         )
+
+
+def command_risk_status(arguments: argparse.Namespace) -> int:
+    """Render local risk from a validated installed anchor when available."""
+
+    try:
+        root = discover_repository(arguments.repo)
+        decision_hint = (
+            _read_json(arguments.decision)
+            if arguments.decision is not None
+            else None
+        )
+        task_state: dict[str, Any] | None = None
+        if arguments.task_id is not None:
+            try:
+                task_state = TaskStore(worktree_git_dir(root)).status(
+                    arguments.task_id
+                )
+            except ValueError:
+                task_state = {
+                    "task_id": arguments.task_id,
+                    "_unobserved": True,
+                }
+        candidate_status = "not_provided"
+        candidate_digest = None
+        if arguments.policy is not None:
+            candidate, candidate_payload = _load_validated_policy(
+                arguments.policy
+            )
+            candidate_status = (
+                "valid_hint"
+                if candidate is not None and candidate_payload["ok"]
+                else "invalid_hint"
+            )
+            if candidate is not None:
+                candidate_digest = contract_digest(candidate)
+        governing_policy = None
+        governing_source = "unavailable_pending_installed_manifest"
+        try:
+            manifest_digest = _installed_runtime_manifest_digest()
+        except ValueError:
+            try:
+                manifest_digest = _configured_installed_manifest_digest(root)
+            except ValueError:
+                manifest_digest = None
+        if manifest_digest is not None:
+            invocation_id = f"risk-installed-{uuid4().hex}"
+            session_id = f"risk-session-{uuid4().hex}"
+            try:
+                from control_plane.git_guards import (
+                    load_protected_git_policy,
+                    observe_installed_policy_source,
+                    validate_installed_policy_source,
+                )
+                from control_plane.host_bridge import (
+                    load_governing_local_policy,
+                )
+
+                protected = load_protected_git_policy(
+                    canonical_repo=root,
+                    common_git_dir=git_common_dir(root),
+                    installed_manifest_digest=manifest_digest,
+                    invocation_id=invocation_id,
+                    clock=time.monotonic,
+                )
+                observation = observe_installed_policy_source(
+                    protected_policy=protected,
+                    canonical_repo=root,
+                    expected_manifest_digest=manifest_digest,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    clock=time.monotonic,
+                    ttl_seconds=30.0,
+                )
+                validated = validate_installed_policy_source(
+                    observation,
+                    expected_repository_identity=root,
+                    expected_manifest_digest=manifest_digest,
+                    expected_session_id=session_id,
+                    expected_invocation_id=invocation_id,
+                    clock=time.monotonic,
+                )
+                governing_policy = load_governing_local_policy(
+                    canonical_repo=root,
+                    governing_base_observation=validated,
+                    expected_invocation_id=invocation_id,
+                    clock=time.monotonic,
+                )
+                governing_source = "installed_manifest"
+            except (OSError, TypeError, ValueError):
+                governing_source = "installed_manifest_invalid"
+        status = evaluate_risk_status(
+            root,
+            governing_policy,
+            task_state=task_state,
+            route_decision_hint=decision_hint,
+        )
+        payload = status.to_dict()
+        payload["facts"]["governing_policy_source"] = (
+            governing_source
+        )
+        payload["facts"]["candidate_policy_status"] = candidate_status
+        payload["facts"]["candidate_policy_digest"] = candidate_digest
+        payload["facts"]["serialized_decision_authoritative"] = False
+        payload["facts"]["automatic_change"] = False
+        return _emit(payload, arguments.json)
+    except (RepositoryError, ValueError, OSError) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        payload = {
+            "schema_version": 1,
+            "command": "risk-status",
+            "ok": False,
+            "status": "FAIL",
+            "dimensions": {
+                "local": {"status": "FAIL", "checks": [], "errors": []},
+                "remote": {"status": "UNKNOWN", "checks": [], "errors": []},
+            },
+            "facts": {},
+            "errors": [{"code": code, "message": str(error)}],
+        }
+        return _emit(payload, arguments.json)
 
 
 def command_task(arguments: argparse.Namespace) -> int:
@@ -648,6 +977,59 @@ def command_task(arguments: argparse.Namespace) -> int:
         )
 
 
+def command_safe_read(arguments: argparse.Namespace) -> int:
+    """Execute a closed local read against one explicit registered worktree."""
+
+    try:
+        root, _, common_dir = _safe_read_repository_identity(
+            arguments.repo
+        )
+        invocation_id = f"safe-read-{uuid4().hex}"
+        observation = observe_worktree_inventory(
+            canonical_common_git_dir=common_dir,
+            invocation_id=invocation_id,
+            clock=time.monotonic,
+            ttl_seconds=30,
+            max_output_bytes=1_048_576,
+        )
+        inventory = validate_worktree_inventory_observation(
+            observation,
+            expected_common_git_dir=common_dir,
+            expected_invocation_id=invocation_id,
+            clock=time.monotonic,
+        )
+        argv = tuple(arguments.argv)
+        if argv and argv[0] == "--":
+            argv = argv[1:]
+        result = execute_safe_read(
+            argv,
+            root=root,
+            worktree_inventory=inventory,
+            timeout_seconds=arguments.timeout,
+            output_limit_bytes=arguments.output_limit,
+        )
+    except (RepositoryError, OSError, ValueError) as error:
+        code = str(error).split(":", 1)[0]
+        print(f"{code}: safe-read precondition failed", file=sys.stderr)
+        return 126
+    if result.stdout:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stdout.buffer.flush()
+    if result.stderr:
+        sys.stderr.buffer.write(result.stderr)
+        sys.stderr.buffer.flush()
+    if result.status == "completed":
+        return int(result.exit_code)
+    if result.status == "timeout":
+        print("E_SAFE_READ_TIMEOUT: bounded read timed out", file=sys.stderr)
+        return 124
+    if result.status == "truncated":
+        print("E_SAFE_READ_TRUNCATED: bounded read exceeded output cap", file=sys.stderr)
+        return 125
+    print("E_SAFE_READ_ARGV: rejected closed argv", file=sys.stderr)
+    return 126
+
+
 def command_verification_run(arguments: argparse.Namespace) -> int:
     try:
         root = discover_repository(arguments.repo)
@@ -716,6 +1098,102 @@ def command_verification_run(arguments: argparse.Namespace) -> int:
         )
 
 
+def command_hook_smoke(arguments: argparse.Namespace) -> int:
+    """Run and publish the closed macOS hook smoke in this process."""
+
+    try:
+        root, state_dir, _ = _safe_read_repository_identity(
+            arguments.repo
+        )
+        store = TaskStore(state_dir)
+        task = store.status(arguments.task_id)
+        lease_path = (
+            state_dir
+            / "codex-control-plane"
+            / "leases"
+            / f"{arguments.task_id}.json"
+        )
+        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        head = _smoke_git_head(root)
+        if not head:
+            raise ValueError(
+                "E_MACOS_SMOKE_BINDING: repository HEAD is unavailable"
+            )
+        prior_path = os.environ.get("PATH")
+        os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        try:
+            execution_context = create_verification_execution_context(
+                task_context=task,
+                lease=lease,
+                canonical_repo=root,
+                expected_head=head,
+                session_id=str(task.get("session_id", "")),
+                dedicated_temp_root=(
+                    Path(tempfile.gettempdir()).resolve()
+                    / "control-plane-hook-smoke"
+                    / arguments.task_id
+                ),
+                clock=time.monotonic,
+            )
+        finally:
+            if prior_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = prior_path
+        generation = int(task.get("generation", -1))
+        task_context = frame_verification_task_context(
+            task_store=store,
+            execution_context=execution_context,
+            expected_generation=generation,
+        )
+        artifact_digests = {
+            name: f"sha256:{sha256((root / relative).read_bytes()).hexdigest()}"
+            for name, relative in MACOS_HOOK_SMOKE_ARTIFACTS.items()
+        }
+        completed = run_macos_hook_smoke(
+            canonical_repo=root,
+            expected_head=head,
+            expected_artifact_digests=artifact_digests,
+            session_id=execution_context.session_id,
+            invocation_id=f"hook-smoke-{uuid4().hex}",
+            dedicated_temp_root=execution_context.dedicated_temp_root,
+            clock=time.monotonic,
+            timeout_seconds=120.0,
+        )
+        publication = publish_macos_hook_smoke_receipt(
+            completed,
+            task_store=store,
+            task_context=task_context,
+            expected_generation=generation,
+        )
+        return _emit(
+            {
+                "schema_version": 1,
+                "command": "hook-smoke",
+                "ok": True,
+                "receipt": asdict(publication.receipt),
+                "task_generation": publication.task_context.generation,
+            },
+            arguments.json,
+        )
+    except (
+        RepositoryError,
+        ValueError,
+        OSError,
+        json.JSONDecodeError,
+    ) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        return _emit(
+            {
+                "schema_version": 1,
+                "command": "hook-smoke",
+                "ok": False,
+                "errors": [{"code": code, "message": str(error)}],
+            },
+            arguments.json,
+        )
+
+
 def command_adopt(arguments: argparse.Namespace) -> int:
     try:
         functions = {
@@ -768,6 +1246,146 @@ def command_upgrade(arguments: argparse.Namespace) -> int:
             },
             arguments.json,
         )
+
+
+def _read_pre_push_updates(
+    stream: Any, *, limit: int = 1_048_576
+) -> list[tuple[str, str, str, str]]:
+    """Read one complete, bounded pre-push input stream."""
+
+    try:
+        payload = stream.read(limit + 1)
+    except (AttributeError, OSError, ValueError) as error:
+        raise ValueError(
+            "GG_INPUT_INVALID: pre-push input could not be read"
+        ) from error
+    if not isinstance(payload, bytes) or len(payload) > limit:
+        raise ValueError(
+            "GG_INPUT_INVALID: pre-push input exceeds the 1 MiB limit"
+        )
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            "GG_INPUT_INVALID: pre-push input must be UTF-8"
+        ) from error
+    updates: list[tuple[str, str, str, str]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 4:
+            raise ValueError(
+                "GG_INPUT_INVALID: each pre-push line requires four fields"
+            )
+        updates.append((fields[0], fields[1], fields[2], fields[3]))
+    return updates
+
+
+def _installed_runtime_manifest_digest() -> str:
+    install_root = Path(__file__).resolve(strict=True).parent.parent
+    digest = install_root.name
+    if (
+        not digest.startswith("sha256:")
+        or len(digest) != 71
+        or any(character not in "0123456789abcdef" for character in digest[7:])
+    ):
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: CLI is not running from an "
+            "installed digest snapshot"
+        )
+    return digest
+
+
+def _configured_installed_manifest_digest(repo: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", "config", "--get-all", "core.hooksPath"],
+            cwd=repo,
+            env=git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5.0,
+            check=False,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: hook config is not observable"
+        ) from error
+    values = [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if line.strip()
+    ]
+    if completed.returncode != 0 or len(values) != 1:
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: one managed hook path is required"
+        )
+    hooks_path = Path(values[0])
+    expected_parent = (
+        git_common_dir(repo) / "codex-control-plane" / "installs"
+    )
+    if (
+        not hooks_path.is_absolute()
+        or hooks_path.name != "git-hooks"
+        or hooks_path.parent.parent != expected_parent
+    ):
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: managed hook path is invalid"
+        )
+    digest = hooks_path.parent.name
+    if (
+        not digest.startswith("sha256:")
+        or len(digest) != 71
+        or any(character not in "0123456789abcdef" for character in digest[7:])
+    ):
+        raise ValueError(
+            "GG_INSTALLED_POLICY_INVALID: managed manifest digest is invalid"
+        )
+    return digest
+
+
+def command_git_guard(arguments: argparse.Namespace) -> int:
+    from control_plane.git_guards import (
+        guard_pre_commit,
+        guard_pre_push,
+        load_protected_git_policy,
+    )
+
+    event = arguments.guard_action
+    try:
+        repo = discover_repository(arguments.repo)
+        protected = load_protected_git_policy(
+            canonical_repo=repo,
+            common_git_dir=git_common_dir(repo),
+            installed_manifest_digest=_installed_runtime_manifest_digest(),
+            invocation_id=f"git-guard-{uuid4().hex}",
+            clock=time.monotonic,
+        )
+        if event == "pre-commit":
+            payload = guard_pre_commit(repo, protected)
+        else:
+            updates = _read_pre_push_updates(sys.stdin.buffer)
+            payload = guard_pre_push(
+                repo,
+                protected,
+                remote_name=arguments.remote_name,
+                remote_url=arguments.remote_url,
+                updates=updates,
+            )
+    except (RepositoryError, ValueError, OSError) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        payload = {
+            "schema_version": 1,
+            "command": "git-guard",
+            "ok": False,
+            "event": event,
+            "errors": [{"code": code, "message": str(error)}],
+            "warnings": [],
+        }
+    return _emit(payload, arguments.json)
 
 
 def _add_output_option(parser: argparse.ArgumentParser) -> None:
@@ -860,6 +1478,37 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_option(verify_parser)
     verify_parser.set_defaults(handler=command_route_verify)
 
+    risk_parser = subparsers.add_parser(
+        "risk-status",
+        help="Evaluate tri-state local and remote engineering risk.",
+    )
+    risk_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    risk_parser.add_argument(
+        "--policy",
+        type=Path,
+        help="Candidate policy hint only; never a governing policy source.",
+    )
+    risk_parser.add_argument("--task-id")
+    risk_parser.add_argument(
+        "--decision",
+        type=Path,
+        help="Serialized route hint only; never native authority.",
+    )
+    _add_output_option(risk_parser)
+    risk_parser.set_defaults(handler=command_risk_status)
+
+    safe_read_parser = subparsers.add_parser(
+        "safe-read",
+        help="Execute one bounded, closed local read in an explicit worktree.",
+    )
+    safe_read_parser.add_argument("--repo", type=Path, required=True)
+    safe_read_parser.add_argument("--timeout", type=float, default=3.0)
+    safe_read_parser.add_argument(
+        "--output-limit", type=int, default=65_536
+    )
+    safe_read_parser.add_argument("argv", nargs=argparse.REMAINDER)
+    safe_read_parser.set_defaults(handler=command_safe_read)
+
     verification_parser = subparsers.add_parser(
         "verification-run",
         help="Run the complete profile already bound to a verifier task.",
@@ -870,6 +1519,32 @@ def build_parser() -> argparse.ArgumentParser:
     verification_parser.add_argument("--task-id", required=True)
     _add_output_option(verification_parser)
     verification_parser.set_defaults(handler=command_verification_run)
+
+    hook_smoke_parser = subparsers.add_parser(
+        "hook-smoke",
+        help="Run and publish the closed macOS hook smoke for a verifier task.",
+    )
+    hook_smoke_parser.add_argument("--repo", type=Path, required=True)
+    hook_smoke_parser.add_argument("--task-id", required=True)
+    _add_output_option(hook_smoke_parser)
+    hook_smoke_parser.set_defaults(handler=command_hook_smoke)
+
+    guard_parser = subparsers.add_parser(
+        "git-guard", help="Enforce the installed protected Git policy."
+    )
+    guard_subparsers = guard_parser.add_subparsers(
+        dest="guard_action", required=True
+    )
+    pre_commit_parser = guard_subparsers.add_parser("pre-commit")
+    pre_commit_parser.add_argument("--repo", type=Path, required=True)
+    _add_output_option(pre_commit_parser)
+    pre_commit_parser.set_defaults(handler=command_git_guard)
+    pre_push_parser = guard_subparsers.add_parser("pre-push")
+    pre_push_parser.add_argument("--repo", type=Path, required=True)
+    pre_push_parser.add_argument("--remote-name", required=True)
+    pre_push_parser.add_argument("--remote-url", required=True)
+    _add_output_option(pre_push_parser)
+    pre_push_parser.set_defaults(handler=command_git_guard)
 
     task_parser = subparsers.add_parser("task", help="Manage task lifecycle state.")
     task_subparsers = task_parser.add_subparsers(dest="task_action", required=True)

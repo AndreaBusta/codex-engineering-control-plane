@@ -13,8 +13,16 @@ from control_plane.contracts import (
     validate_task_id,
     validate_task_envelope,
 )
+from control_plane.clarification import evaluate_clarification_gate
 from control_plane.host_bridge import (
+    HOST_ADAPTER_UNAVAILABLE,
+    HostAdapterCapability,
+    HostAdapterUnavailable,
+    TrustedAuthorization,
+    TrustedRouteDecision,
     ValidatedInventory,
+    _host_adapter_capability_is_live,
+    _seal_trusted_route_decision,
     authorization_effects_for_route,
 )
 from control_plane.resource_registry import (
@@ -330,8 +338,12 @@ def resolve_route(
     inventory: ValidatedInventory,
     *,
     mode: str,
-    authorization_grant: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+    host_capability: HostAdapterCapability | HostAdapterUnavailable = (
+        HOST_ADAPTER_UNAVAILABLE
+    ),
+    clarification_request: Mapping[str, Any] | None = None,
+    authorization: TrustedAuthorization | None = None,
+) -> TrustedRouteDecision:
     """Resolve a pre-framed task without I/O, execution, or interpretation."""
 
     if mode not in {"audit", "enforce"}:
@@ -350,6 +362,15 @@ def resolve_route(
     if not isinstance(inventory, ValidatedInventory):
         raise ValueError(
             "E_INVENTORY_OBSERVATION: resolver requires ValidatedInventory"
+        )
+    host_capability_ready = _host_adapter_capability_is_live(
+        host_capability
+    )
+    if not host_capability_ready and (
+        host_capability is not HOST_ADAPTER_UNAVAILABLE
+    ):
+        raise ValueError(
+            "C_UNTRUSTED_HOST_CAPABILITY: typed host state is required"
         )
     inventory_snapshot = inventory._snapshot_for_router(
         expected_task_digest=task_digest,
@@ -381,9 +402,9 @@ def resolve_route(
         for issue in inventory_issues
     ]
     granted_effects: set[str] = set()
-    if authorization_grant is not None:
+    if authorization is not None:
         granted_effects = authorization_effects_for_route(
-            authorization_grant,
+            authorization,
             expected_task_digest=task_digest,
             expected_scope_paths=tuple(
                 str(item)
@@ -560,7 +581,7 @@ def resolve_route(
         for item in task.get("effects", [])
         if isinstance(item, Mapping) and isinstance(item.get("name"), str)
     ]
-    authorization: dict[str, bool] = {}
+    authorization_effects: dict[str, bool] = {}
     approval_boundaries: list[str] = []
     for effect in sorted({str(item["name"]) for item in effects}):
         outcome_authorized = outcome_rank >= EFFECT_MINIMUM_OUTCOME.get(effect, 0)
@@ -572,7 +593,7 @@ def resolve_route(
             authorized = effect not in EXTERNAL_EFFECTS or (
                 effect in granted_effects and outcome_authorized
             )
-        authorization[effect] = authorized
+        authorization_effects[effect] = authorized
         if effect in EXTERNAL_EFFECTS.union({"local_write"}) and not authorized:
             approval_boundaries.append(effect)
 
@@ -587,7 +608,7 @@ def resolve_route(
         missing_authority = sorted(
             effect
             for effect in external_resource_effects
-            if not authorization.get(effect, False)
+            if not authorization_effects.get(effect, False)
         )
         if missing_authority:
             unresolved.append(identifier)
@@ -636,6 +657,11 @@ def resolve_route(
         "signals", []
     )
     interaction = _interaction_mode(task, tier, prompt_multifront)
+    clarification_gate = evaluate_clarification_gate(
+        task,
+        request=clarification_request,
+    )
+    interaction["clarification_gate"] = clarification_gate
     graph_candidate = (
         prompt_multifront and int(budget.get("max_agents", 0)) >= 2
     )
@@ -694,7 +720,25 @@ def resolve_route(
         ),
         "profile_mismatch": profile_mismatch,
     }
-    blocking = bool(errors) or bool(approval_boundaries)
+    clarification_blocks_write = bool(
+        clarification_gate.get("decision_ready") is not True
+        and clarification_gate.get("blocked_effects")
+    )
+    if clarification_blocks_write:
+        errors.append(
+            {
+                "code": "R_CLARIFICATION_PENDING",
+                "message": (
+                    "Material clarification is unresolved for requested "
+                    "write effects."
+                ),
+            }
+        )
+    blocking = (
+        bool(errors)
+        or bool(approval_boundaries)
+        or clarification_blocks_write
+    )
     decision: dict[str, Any] = {
         "schema_version": 1,
         "task_id": task.get("task_id"),
@@ -705,7 +749,7 @@ def resolve_route(
         "documentation": _documentation(task, tier),
         "interaction": interaction,
         "approval_boundaries": sorted(approval_boundaries),
-        "authorization": authorization,
+        "authorization": authorization_effects,
         "required_gates": required_gates,
         "selected_resource_digests": {
             identifier: str(inventory_by_id[identifier]["locator_digest"])
@@ -720,7 +764,7 @@ def resolve_route(
         "errors": errors,
     }
     decision["decision_digest"] = contract_digest(decision)
-    return decision
+    return _seal_trusted_route_decision(decision)
 
 
 def verify_route(
@@ -729,7 +773,7 @@ def verify_route(
     *,
     mode: str,
 ) -> dict[str, Any]:
-    """Verify that resource use and observed effects conform to a decision."""
+    """Verify a serialized receipt diagnostically without host authority."""
 
     if mode not in {"audit", "enforce"}:
         raise ValueError("mode must be audit or enforce")
@@ -1065,6 +1109,8 @@ def verify_route(
         "mode": mode,
         "ok": not errors if mode == "enforce" else True,
         "compliant": not errors,
+        "authoritative": False,
+        "status": "diagnostic",
         "errors": errors,
     }
 
@@ -1073,6 +1119,25 @@ def compact_route_manifest(decision: Mapping[str, Any]) -> str:
     """Render only the route facts Codex needs to rehydrate after compaction."""
 
     summary = decision.get("summary", {})
+    project_profile = summary.get("project_profile", {})
+    if isinstance(project_profile, Mapping):
+        compact_profile = {
+            key: project_profile.get(key)
+            for key in (
+                "schema_version",
+                "kind",
+                "profiles",
+                "evidence",
+                "confidence",
+                "truncated",
+            )
+        }
+        compact_profile["evidence"] = []
+    else:
+        compact_profile = None
+    gate = decision.get("interaction", {}).get(
+        "clarification_gate", {}
+    )
     compact = {
         "schema_version": 1,
         "task_digest": decision.get("facts", {}).get("task_digest"),
@@ -1091,8 +1156,18 @@ def compact_route_manifest(decision: Mapping[str, Any]) -> str:
         ),
         "approval_boundaries": decision.get("approval_boundaries", []),
         "required_gates": decision.get("required_gates", []),
-        "project_profile": summary.get("project_profile"),
-        "interaction": decision.get("interaction"),
+        "project_profile": compact_profile,
+        "interaction": {
+            key: value
+            for key, value in decision.get("interaction", {}).items()
+            if key != "clarification_gate"
+        },
+        "clarification": {
+            "level": gate.get("level"),
+            "status": gate.get("status"),
+            "decision_ready": gate.get("decision_ready"),
+            "reason_codes": gate.get("reason_codes", []),
+        },
     }
     from control_plane.contracts import canonical_json, contract_digest
 

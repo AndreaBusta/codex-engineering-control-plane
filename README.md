@@ -17,22 +17,24 @@ GitHub o TestFlight. Separa:
 
 ## Estado de esta entrega
 
-La v1 fue fusionada mediante PR #1. La v2 parte del squash commit
-`5476fa7d6a40773ef478f9c090154b78195a28af` demostrado en `origin/main` y
-añade router, registry, inventory, lifecycle, leases, receipts, hooks audit,
-adopción reversible y assurance. Está versionada en el repositorio privado
-[`AndreaBusta/codex-engineering-control-plane`](https://github.com/AndreaBusta/codex-engineering-control-plane).
+v2.1 se define como un **local audit kernel**. Conserva router, registry,
+inventory, lifecycle, leases, receipts y adopción transaccional, y añade:
 
-La candidata v2 se desarrolla en `codex/resource-router-v2`. Un cambio local o
-un PR abierto no se describe como integrado hasta demostrar el merge remoto.
-Los hooks permanecen `pending_hook_trust` y macOS se ejecuta manualmente antes
-de confiar sus hashes.
+- aclaración material pura y diagnóstica;
+- Risk Sentinel triestado;
+- warning y PreToolUse audit con lectura segura y smoke macOS;
+- guards Git locales con policy instalada content-addressed;
+- rollback exacto de archivos y `core.hooksPath`.
 
-GitHub ha rechazado Rulesets y protección clásica de rama para este repositorio
-privado con el plan actual. Se permite únicamente squash merge y se borrará la
-rama remota después de una futura integración. Hasta disponer de protección
-remota, el preflight, el Draft PR y CI reducen riesgo, pero no impiden por sí
-solos un push directo realizado fuera del proceso.
+No activa provider GitHub nuevo, workflow de procedencia, configuración remota
+ni adapter host simulado. Las APIs Git/PR heredadas siguen fail-closed hasta
+recibir capacidades nativas. La evidencia remota ausente produce `UNKNOWN`,
+nunca `PASS`. Los hooks permanecen `audit` y `pending_hook_trust` hasta revisión
+humana.
+
+Un cambio local o un PR abierto no se describe como integrado hasta demostrar
+el squash en `origin/main`. La protección de rama, CI y los proveedores de
+release siguen siendo fronteras externas y requieren sus propias evidencias.
 
 ## Inicio rápido
 
@@ -103,8 +105,33 @@ El router selecciona; no ejecuta ni autoriza. Consulta
 
 ```bash
 scripts/control-plane task status --task-id TASK-EXAMPLE-001
-scripts/control-plane adopt plan --target /ruta/al/repositorio
+scripts/control-plane adopt plan \
+  --target /ruta/al/repositorio --json > adoption-plan.json
+scripts/control-plane adopt apply --plan adoption-plan.json
+scripts/control-plane adopt verify --target /ruta/al/repositorio
+scripts/control-plane adopt rollback --target /ruta/al/repositorio
 scripts/control-plane upgrade plan --target /ruta/al/repositorio
+```
+
+### Diagnosticar riesgo local
+
+```bash
+scripts/control-plane risk-status --repo /ruta/al/repositorio --json
+```
+
+Exit codes: `PASS=0`, `FAIL=1`, `UNKNOWN=2`. En v2.1 local-audit la dimensión
+remota permanece `UNKNOWN` mientras no exista evidencia externa autorizada.
+
+### Hooks, lectura segura y guards Git
+
+```bash
+scripts/control-plane safe-read --repo /ruta -- git status --short
+scripts/control-plane hook-smoke \
+  --repo /ruta/al/repositorio \
+  --task-id TASK-VERIFY-001 \
+  --json
+scripts/control-plane git-guard pre-commit
+scripts/control-plane git-guard pre-push
 ```
 
 ## Dónde leer
@@ -122,6 +149,8 @@ scripts/control-plane upgrade plan --target /ruta/al/repositorio
 - [Router y contratos](docs/engineering/10-resource-routing.md)
 - [Lifecycle, hooks y adopción](docs/engineering/11-lifecycle-hooks-adoption.md)
 - [Multidominio y recomendación de `/plan` o `/goal`](docs/engineering/12-multidominio-y-modos.md)
+- [Aclaración y riesgo local-audit v2.1](docs/engineering/13-clarification-and-risk-local-audit.md)
+- [ADR 0003: núcleo local-audit](docs/adr/0003-local-audit-kernel-v2-1.md)
 - [Threat model](SECURITY.md)
 
 ## Límites
@@ -134,4 +163,6 @@ El control plane no:
 - sustituye Rulesets o checks obligatorios;
 - prueba el estado de TestFlight sin consultar Apple;
 - calcula tokens exactos sin telemetría de plataforma;
+- resuelve aclaraciones de forma durable sin interacción nativa;
+- instala workflows o modifica CI/CD durante la adopción local;
 - trata un hook o plugin como frontera completa de seguridad.

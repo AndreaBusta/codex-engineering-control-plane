@@ -26,6 +26,7 @@ class AssuranceTests(unittest.TestCase):
         cls.inventory = inventory_snapshot()
 
     def route(self, task: dict, *, mode: str = "audit") -> dict:
+        from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
         from control_plane.routing import resolve_route
 
         return resolve_route(
@@ -39,7 +40,29 @@ class AssuranceTests(unittest.TestCase):
                 invocation_id="assurance-route",
             ),
             mode=mode,
+            host_capability=HOST_ADAPTER_UNAVAILABLE,
         )
+
+    def test_compact_manifest_contains_only_gate_metadata_and_digests(
+        self,
+    ) -> None:
+        import json
+
+        from control_plane.routing import compact_route_manifest
+
+        manifest = compact_route_manifest(self.route(task_envelope()))
+        payload = json.loads(manifest)
+        clarification = payload["clarification"]
+
+        self.assertLess(len(manifest.encode("utf-8")), 4096)
+        self.assertEqual(
+            set(clarification),
+            {"level", "status", "decision_ready", "reason_codes"},
+        )
+        serialized = manifest.lower()
+        self.assertNotIn("question", serialized)
+        self.assertNotIn("response", serialized)
+        self.assertEqual(payload["project_profile"]["evidence"], [])
 
     def test_fifteen_golden_scenarios(self) -> None:
         scenarios = (
@@ -184,6 +207,7 @@ class AssuranceTests(unittest.TestCase):
         self.assertLess(trivial_mandatory_false_activations / 40, 0.10)
 
     def test_ten_thousand_resource_registry_meets_local_budget(self) -> None:
+        from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
         from control_plane.routing import resolve_route
 
         registry = copy.deepcopy(self.registry)
@@ -264,6 +288,7 @@ class AssuranceTests(unittest.TestCase):
                 registry,
                 observed_inventory,
                 mode="audit",
+                host_capability=HOST_ADAPTER_UNAVAILABLE,
             )
             times.append(time.perf_counter() - started)
         tracemalloc.start()
@@ -279,6 +304,7 @@ class AssuranceTests(unittest.TestCase):
             registry,
             observed_inventory,
             mode="audit",
+            host_capability=HOST_ADAPTER_UNAVAILABLE,
         )
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()

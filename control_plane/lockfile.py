@@ -67,8 +67,25 @@ def validate_lock(root: Path) -> list[LockIssue]:
     issues: list[LockIssue] = []
     if lock.get("schema_version") != 1:
         issues.append(LockIssue("L_SCHEMA", "schema_version", "Only lock schema 1 is supported."))
-    if lock.get("product_version") != "2.0.0":
-        issues.append(LockIssue("L_VERSION", "product_version", "Lock does not select control-plane v2.0.0."))
+    if lock.get("product_version") != "2.1.0":
+        issues.append(LockIssue("L_VERSION", "product_version", "Lock does not select control-plane v2.1.0."))
+    for schema_name in (
+        "policy_schema",
+        "registry_schema",
+        "task_schema",
+        "route_schema",
+        "receipt_schema",
+        "clarification_schema",
+        "risk_schema",
+    ):
+        if lock.get(schema_name) != 1:
+            issues.append(
+                LockIssue(
+                    "L_SCHEMA",
+                    schema_name,
+                    f"{schema_name} must select schema 1.",
+                )
+            )
     layout = lock.get("runtime_layout")
     package = lock.get("runtime_package")
     expected_package = {
@@ -103,6 +120,8 @@ def validate_lock(root: Path) -> list[LockIssue]:
         "resource_registry": root / ".codex" / "resource-registry.toml",
         "hooks": root / ".codex" / "hooks.json",
         "hook_entrypoint": root / ".codex" / "hooks" / "control_plane_hook.py",
+        "git_pre_commit": root / ".codex" / "git-hooks" / "pre-commit",
+        "git_pre_push": root / ".codex" / "git-hooks" / "pre-push",
         "entrypoint": root / "scripts" / "control-plane",
     }
     digests = lock.get("digests", {})

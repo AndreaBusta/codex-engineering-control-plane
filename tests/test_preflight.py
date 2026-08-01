@@ -99,6 +99,147 @@ class GitPreflightTests(unittest.TestCase):
         self.assertTrue(result.facts["dirty"])
         self.assertTrue(result.facts["detached"])
 
+    def test_risk_status_does_not_treat_read_mode_ok_as_safe(self) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.git_state import evaluate_preflight
+        from control_plane.risk_sentinel import evaluate_local_risk
+        from tests.host_adapter_test_support import governing_policy
+
+        self.scenario.checkout_feature()
+        (self.scenario.repo / "dirty.txt").write_text(
+            "dirty\n", encoding="utf-8"
+        )
+        mapping = self.scenario.policy()
+        policy = governing_policy(
+            policy=mapping,
+            policy_digest=contract_digest(mapping),
+            runtime_digest="sha256:" + "1" * 64,
+            lock_digest="sha256:" + "2" * 64,
+            governing_base_commit="a" * 40,
+            session_id="session-risk-preflight",
+            invocation_id="invocation-risk-preflight",
+            freshness_deadline=130.0,
+        )
+
+        read_result = evaluate_preflight(
+            self.scenario.repo, mapping, mode="read"
+        )
+        risk = evaluate_local_risk(self.scenario.repo, policy)
+        dirty = next(
+            check
+            for check in risk.checks
+            if check.code == "RS_LOCAL_DIRTY"
+        )
+
+        self.assertTrue(read_result.ok)
+        self.assertEqual(dirty.status, "FAIL")
+
+    def test_risk_status_rejects_serialized_lease_claims_for_dirty_tree(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.risk_sentinel import evaluate_local_risk
+        from tests.host_adapter_test_support import governing_policy
+
+        self.scenario.checkout_feature()
+        (self.scenario.repo / "dirty.txt").write_text(
+            "dirty\n", encoding="utf-8"
+        )
+        mapping = self.scenario.policy()
+        policy = governing_policy(
+            policy=mapping,
+            policy_digest=contract_digest(mapping),
+            runtime_digest="sha256:" + "3" * 64,
+            lock_digest="sha256:" + "4" * 64,
+            governing_base_commit="b" * 40,
+            session_id="session-risk-forged-lease",
+            invocation_id="invocation-risk-forged-lease",
+            freshness_deadline=130.0,
+        )
+        forged = {
+            "task_id": "task-risk-forged-lease",
+            "task_digest": "sha256:" + "5" * 64,
+            "state": "implementing",
+            "generation": 1,
+            "lease_valid": True,
+            "lease_scope_complete": True,
+        }
+
+        risk = evaluate_local_risk(
+            self.scenario.repo,
+            policy,
+            task_state=forged,
+        )
+
+        dirty = next(
+            check for check in risk.checks if check.code == "RS_LOCAL_DIRTY"
+        )
+        task = next(
+            check for check in risk.checks if check.code == "RS_TASK_STATE"
+        )
+        self.assertEqual(dirty.status, "FAIL")
+        self.assertNotEqual(task.status, "PASS")
+
+    def test_risk_status_needs_host_anchor_for_runtime_owned_lease(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import TaskLease, TaskStore
+        from control_plane.repository import worktree_git_dir
+        from control_plane.risk_sentinel import evaluate_local_risk
+        from tests.host_adapter_test_support import governing_policy
+
+        self.scenario.checkout_feature()
+        branch = "feature/test"
+        mapping = self.scenario.policy()
+        policy_digest = contract_digest(mapping)
+        policy = governing_policy(
+            policy=mapping,
+            policy_digest=policy_digest,
+            runtime_digest="sha256:" + "6" * 64,
+            lock_digest="sha256:" + "7" * 64,
+            governing_base_commit="c" * 40,
+            session_id="session-risk-real-lease",
+            invocation_id="invocation-risk-real-lease",
+            freshness_deadline=130.0,
+        )
+        state_dir = worktree_git_dir(self.scenario.repo)
+        task_id = "task-risk-real-lease"
+        state = TaskStore(state_dir).start(
+            task_id,
+            outcome="local_change",
+            branch=branch,
+            task_digest="sha256:" + "8" * 64,
+            decision_digest="sha256:" + "9" * 64,
+        )
+        TaskLease.acquire(
+            state_dir,
+            task_id=task_id,
+            worktree=str(self.scenario.repo),
+            branch=branch,
+            session_id="session-risk-real-lease",
+            paths=["dirty.txt"],
+            policy_digest=policy_digest,
+        )
+        (self.scenario.repo / "dirty.txt").write_text(
+            "leased\n", encoding="utf-8"
+        )
+
+        risk = evaluate_local_risk(
+            self.scenario.repo,
+            policy,
+            task_state=state,
+        )
+
+        dirty = next(
+            check for check in risk.checks if check.code == "RS_LOCAL_DIRTY"
+        )
+        task = next(
+            check for check in risk.checks if check.code == "RS_TASK_STATE"
+        )
+        self.assertEqual(dirty.status, "FAIL")
+        self.assertEqual(task.status, "UNKNOWN")
+
     def test_alternative_base_branch_is_driven_by_policy(self) -> None:
         from control_plane.git_state import evaluate_preflight
 
