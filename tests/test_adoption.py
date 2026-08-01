@@ -1838,6 +1838,7 @@ class AdoptionTests(unittest.TestCase):
 
     def test_isolated_safe_read_matches_source_decisions(self) -> None:
         from control_plane.adoption import adoption_apply, adoption_plan
+        from control_plane.hooks import _safe_read_rg_executable
 
         plan = adoption_plan(
             ROOT,
@@ -1849,6 +1850,7 @@ class AdoptionTests(unittest.TestCase):
         installed = self.scenario.repo / "scripts" / "control-plane"
         pilot = (self.scenario.repo / "pilot.md").resolve()
         pilot.write_text("Closed pilot charter.\n", encoding="utf-8")
+        rg_expected = 1 if _safe_read_rg_executable() is not None else 126
 
         for argv, expected in (
             (("git", "diff", "--check"), 0),
@@ -1863,7 +1865,7 @@ class AdoptionTests(unittest.TestCase):
                     "--",
                     str(pilot),
                 ),
-                1,
+                rg_expected,
             ),
             (("secret-scan-governing", "--", str(pilot)), 1),
         ):

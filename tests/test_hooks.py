@@ -1001,64 +1001,72 @@ class HookTests(unittest.TestCase):
 
         scenario = GitScenario()
         try:
-            allowed = execute_safe_read(
-                (
-                    "rg",
-                    "--no-config",
-                    "--quiet",
-                    "-e",
-                    "baseline",
-                    "--",
-                    "baseline.txt",
-                ),
-                root=scenario.repo.resolve(),
-                worktree_inventory=self.worktree_inventory(
-                    scenario.repo, "inventory-safe-read-rg"
-                ),
-                timeout_seconds=2,
-                output_limit_bytes=4096,
-            )
-            rejected = execute_safe_read(
-                (
-                    "rg",
-                    "--no-config",
-                    "--quiet",
-                    "-e",
-                    "baseline",
-                    "--",
-                    "baseline.txt",
-                    "second.txt",
-                ),
-                root=scenario.repo.resolve(),
-                worktree_inventory=self.worktree_inventory(
-                    scenario.repo, "inventory-safe-read-rg-reject"
-                ),
-                timeout_seconds=2,
-                output_limit_bytes=4096,
-            )
-            self.assertEqual(allowed.status, "completed")
-            self.assertEqual(allowed.exit_code, 0)
-            self.assertEqual(rejected.status, "rejected")
+            with tempfile.TemporaryDirectory() as temporary:
+                fake_rg = Path(temporary) / "rg"
+                fake_rg.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                fake_rg.chmod(0o700)
+                with patch(
+                    "control_plane.hooks._safe_read_rg_executable",
+                    return_value=str(fake_rg),
+                ):
+                    allowed = execute_safe_read(
+                        (
+                            "rg",
+                            "--no-config",
+                            "--quiet",
+                            "-e",
+                            "baseline",
+                            "--",
+                            "baseline.txt",
+                        ),
+                        root=scenario.repo.resolve(),
+                        worktree_inventory=self.worktree_inventory(
+                            scenario.repo, "inventory-safe-read-rg"
+                        ),
+                        timeout_seconds=2,
+                        output_limit_bytes=4096,
+                    )
+                    rejected = execute_safe_read(
+                        (
+                            "rg",
+                            "--no-config",
+                            "--quiet",
+                            "-e",
+                            "baseline",
+                            "--",
+                            "baseline.txt",
+                            "second.txt",
+                        ),
+                        root=scenario.repo.resolve(),
+                        worktree_inventory=self.worktree_inventory(
+                            scenario.repo, "inventory-safe-read-rg-reject"
+                        ),
+                        timeout_seconds=2,
+                        output_limit_bytes=4096,
+                    )
+                    self.assertEqual(allowed.status, "completed")
+                    self.assertEqual(allowed.exit_code, 0)
+                    self.assertEqual(rejected.status, "rejected")
 
-            absolute = execute_safe_read(
-                (
-                    "rg",
-                    "--no-config",
-                    "--quiet",
-                    "-e",
-                    "baseline",
-                    "--",
-                    str((scenario.repo / "baseline.txt").resolve()),
-                ),
-                root=scenario.repo.resolve(),
-                worktree_inventory=self.worktree_inventory(
-                    scenario.repo, "inventory-safe-read-rg-absolute"
-                ),
-                timeout_seconds=2,
-                output_limit_bytes=4096,
-            )
-            self.assertEqual(absolute.status, "completed")
-            self.assertEqual(absolute.exit_code, 0)
+                    absolute = execute_safe_read(
+                        (
+                            "rg",
+                            "--no-config",
+                            "--quiet",
+                            "-e",
+                            "baseline",
+                            "--",
+                            str((scenario.repo / "baseline.txt").resolve()),
+                        ),
+                        root=scenario.repo.resolve(),
+                        worktree_inventory=self.worktree_inventory(
+                            scenario.repo, "inventory-safe-read-rg-absolute"
+                        ),
+                        timeout_seconds=2,
+                        output_limit_bytes=4096,
+                    )
+                    self.assertEqual(absolute.status, "completed")
+                    self.assertEqual(absolute.exit_code, 0)
         finally:
             scenario.close()
 
