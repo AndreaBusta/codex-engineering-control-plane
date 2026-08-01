@@ -159,6 +159,20 @@ class AdoptionTests(unittest.TestCase):
             (install / "manifest.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["source_commit"], plan["source_commit"])
+        self.assertNotIn("remote_url", manifest["git"])
+        self.assertEqual(
+            manifest["git"]["remote_url_digest"],
+            "sha256:"
+            + sha256(
+                git(
+                    self.scenario.repo,
+                    "remote",
+                    "get-url",
+                    "--push",
+                    "origin",
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
         self.assertEqual(
             manifest["governing_base_commit"],
             subprocess.run(
@@ -643,6 +657,9 @@ class AdoptionTests(unittest.TestCase):
             "https://placeholder-user:placeholder-token@example.invalid/repo.git",
             "https://example.invalid/repo.git?temporary-marker",
             "https://example.invalid/repo.git#temporary-marker",
+            "ssh://placeholder-user:placeholder-token@example.invalid/repo.git",
+            "ssh://git@example.invalid/repo.git?temporary-marker",
+            "ssh://git@example.invalid/repo.git#temporary-marker",
         ):
             with self.subTest(shape=remote_url.split("example", 1)[0]):
                 git(
@@ -1531,6 +1548,77 @@ class AdoptionTests(unittest.TestCase):
             _digest(transaction["manifest_path"]), manifest_digest
         )
         _recover_owner_transaction(peer)
+
+    def test_owner_pointer_symlink_is_rejected_before_read(self) -> None:
+        from control_plane.adoption import (
+            _begin_transaction,
+            _owner_pointer_path,
+            _recover_owner_transaction,
+        )
+
+        scenario, peer = self._recovery_scenario("owner-pointer-symlink")
+        _begin_transaction(
+            scenario.repo,
+            operation="adopt",
+            records=[],
+        )
+        pointer_path = _owner_pointer_path(peer)
+        external_pointer = peer / "outside-owner-pointer.json"
+        external_pointer.write_bytes(pointer_path.read_bytes())
+        pointer_path.unlink()
+        pointer_path.symlink_to(external_pointer)
+
+        with self.assertRaisesRegex(
+            ValueError, "E_ADOPT_RECOVERY_UNKNOWN"
+        ):
+            _recover_owner_transaction(peer)
+
+        self.assertTrue(pointer_path.is_symlink())
+
+    def test_owner_pointer_is_opened_nonblocking(self) -> None:
+        import control_plane.adoption as adoption
+
+        pointer_path = adoption._owner_pointer_path(self.scenario.repo)
+        pointer_path.write_text("{}\n", encoding="utf-8")
+        original_open = adoption.os.open
+        observed_flags: list[int] = []
+
+        def inspect_open(path: object, flags: int, *args: object, **kwargs: object):
+            if Path(path) == pointer_path:
+                observed_flags.append(flags)
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            patch("control_plane.adoption.os.open", side_effect=inspect_open),
+            self.assertRaisesRegex(
+                ValueError, "E_ADOPT_RECOVERY_UNKNOWN"
+            ),
+        ):
+            adoption._recover_owner_transaction(self.scenario.repo)
+
+        self.assertEqual(len(observed_flags), 1)
+        self.assertTrue(observed_flags[0] & os.O_NONBLOCK)
+
+    def test_owner_pointer_rejects_fifo_directory_and_oversize(self) -> None:
+        import control_plane.adoption as adoption
+
+        for case in ("fifo", "directory", "oversize"):
+            with self.subTest(case=case):
+                scenario = GitScenario()
+                self.addCleanup(scenario.close)
+                scenario.checkout_feature(f"codex/owner-pointer-{case}")
+                pointer_path = adoption._owner_pointer_path(scenario.repo)
+                if case == "fifo":
+                    os.mkfifo(pointer_path)
+                elif case == "directory":
+                    pointer_path.mkdir()
+                else:
+                    pointer_path.write_bytes(b"x" * 65_537)
+
+                with self.assertRaisesRegex(
+                    ValueError, "E_ADOPT_RECOVERY_UNKNOWN"
+                ):
+                    adoption._recover_owner_transaction(scenario.repo)
 
     def test_broken_wal_chain_or_ambiguous_generation_fails_closed(
         self,

@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 import fcntl
 from hashlib import sha256
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -35,7 +34,6 @@ from control_plane.contracts import (
 from control_plane.scopes import normalize_scope, scope_owns, scopes_overlap
 from control_plane.host_bridge import (
     GoverningRuntimeObservation,
-    HostContextMetrics,
     ValidatedCandidateWorktreeObservation,
     ValidatedGitHubObservation,
     ValidatedGoverningBaseWorktreeObservation,
@@ -48,8 +46,6 @@ from control_plane.host_bridge import (
     _governing_runtime_observation_is_live,
     _register_runtime_host_object,
     _runtime_host_object_is_live,
-    consume_clarification_entry_bindings,
-    consume_clarification_resolution_bindings,
     consume_lease_recovery_authorization,
     consume_lifecycle_observation,
     observe_worktree_inventory,
@@ -75,7 +71,6 @@ ORDERED_STATES = (
     "observed",
     "closed",
 )
-LATERAL_STATES = frozenset({"clarification_required", "blocked"})
 LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     "framed": frozenset({"planned", "blocked"}),
     "planned": frozenset({"ready", "blocked"}),
@@ -93,7 +88,6 @@ LEGAL_TRANSITIONS: dict[str, frozenset[str]] = {
     "released": frozenset({"observed", "blocked"}),
     "observed": frozenset({"closed", "blocked"}),
     "closed": frozenset(),
-    "clarification_required": frozenset(),
     "blocked": frozenset(),
 }
 OUTCOME_LIMITS = {
@@ -118,36 +112,6 @@ TRANSITION_EVIDENCE = {
     "released": frozenset({"provider_build"}),
     "observed": frozenset({"observation"}),
 }
-CLARIFICATION_ACTIVE_FIELDS = frozenset(
-    {
-        "clarification_resume_state",
-        "clarification_request",
-        "clarification_request_digest",
-        "clarification_context_digest",
-        "clarification_question_digest",
-        "clarification_repository_status",
-        "clarification_repository_observation_digest",
-        "clarification_repository_evidence_digest",
-        "clarification_task_digest",
-        "clarification_decision_digest",
-        "clarification_prompt_view_path",
-        "clarification_prompt_view_generation",
-        "clarification_presentation_digest",
-        "clarification_repository_identity",
-        "clarification_worktree_identity",
-        "clarification_branch",
-        "clarification_head",
-        "clarification_session_id",
-        "clarification_invocation_id",
-        "clarification_lease_digest",
-        "clarification_lease_owner_session",
-        "clarification_lease_scope",
-        "clarification_lease_policy_digest",
-        "clarification_changed_paths",
-        "clarification_changed_paths_digest",
-        "clarification_blocked_effects",
-    }
-)
 GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{7,64}$", re.ASCII)
 BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$", re.ASCII)
 VERIFICATION_PROFILES = frozenset(
@@ -1402,346 +1366,6 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _prompt_view_relative_path(task_id: str, generation: int) -> Path:
-    if not validate_task_id(task_id) or generation < 0:
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: invalid prompt generation"
-        )
-    return (
-        Path("codex-control-plane")
-        / "clarification-prompt-views"
-        / task_id
-        / f"generation-{generation:08d}.json"
-    )
-
-
-def _prompt_path_relative(
-    state_dir: Path,
-    path: Path,
-    *,
-    directory: bool,
-) -> Path:
-    """Validate one closed prompt path without resolving its filesystem target."""
-
-    anchor = Path(state_dir).absolute()
-    candidate = Path(path).absolute()
-    try:
-        relative = candidate.relative_to(anchor)
-    except ValueError as error:
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: prompt path escapes the Git directory"
-        ) from error
-    if (
-        len(relative.parts) < 3
-        or relative.parts[:2]
-        != ("codex-control-plane", "clarification-prompt-views")
-        or any(part in {"", ".", ".."} for part in relative.parts)
-        or not validate_task_id(relative.parts[2])
-    ):
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: prompt path is outside its closed root"
-        )
-    if directory:
-        if len(relative.parts) != 3:
-            raise ValueError(
-                "C_PRESENTATION_UNAVAILABLE: prompt directory is invalid"
-            )
-    elif (
-        len(relative.parts) != 4
-        or re.fullmatch(
-            r"generation-[0-9]{8}\.json", relative.parts[3]
-        )
-        is None
-    ):
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: prompt sidecar is invalid"
-        )
-    return relative
-
-
-def _prompt_directory_flags() -> int:
-    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: safe directory traversal is unsupported"
-        )
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    return flags
-
-
-@contextmanager
-def _open_prompt_directory(
-    state_dir: Path,
-    directory: Path,
-    *,
-    create: bool,
-    allow_missing: bool = False,
-):
-    """Open a prompt directory by anchored, no-follow descriptor traversal."""
-
-    relative = _prompt_path_relative(
-        state_dir,
-        directory,
-        directory=True,
-    )
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            os.fspath(Path(state_dir).absolute()),
-            _prompt_directory_flags(),
-        )
-    except OSError as error:
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: Git directory is unavailable"
-        ) from error
-    try:
-        for component in relative.parts:
-            next_descriptor = -1
-            try:
-                next_descriptor = os.open(
-                    component,
-                    _prompt_directory_flags(),
-                    dir_fd=descriptor,
-                )
-            except FileNotFoundError:
-                if not create:
-                    if allow_missing:
-                        os.close(descriptor)
-                        descriptor = -1
-                        yield None
-                        return
-                    raise ValueError(
-                        "C_PRESENTATION_UNAVAILABLE: prompt directory is unavailable"
-                    ) from None
-                try:
-                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
-                    os.fsync(descriptor)
-                except FileExistsError:
-                    pass
-                except OSError as error:
-                    raise ValueError(
-                        "C_PRESENTATION_UNAVAILABLE: prompt directory is unavailable"
-                    ) from error
-                try:
-                    next_descriptor = os.open(
-                        component,
-                        _prompt_directory_flags(),
-                        dir_fd=descriptor,
-                    )
-                except OSError as error:
-                    raise ValueError(
-                        "C_PRESENTATION_UNAVAILABLE: prompt directory is unsafe"
-                    ) from error
-            except OSError as error:
-                raise ValueError(
-                    "C_PRESENTATION_UNAVAILABLE: prompt directory is unsafe"
-                ) from error
-            if not stat.S_ISDIR(os.fstat(next_descriptor).st_mode):
-                os.close(next_descriptor)
-                raise ValueError(
-                    "C_PRESENTATION_UNAVAILABLE: prompt directory is unsafe"
-                )
-            os.close(descriptor)
-            descriptor = next_descriptor
-        yield descriptor
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _write_all(descriptor: int, payload: bytes) -> None:
-    offset = 0
-    while offset < len(payload):
-        try:
-            written = os.write(descriptor, payload[offset:])
-        except InterruptedError:
-            continue
-        if written <= 0:
-            raise OSError("prompt sidecar write made no progress")
-        offset += written
-
-
-def _atomic_bytes(state_dir: Path, path: Path, payload: bytes) -> None:
-    """Durably publish bounded bytes without re-resolving prompt ancestors."""
-
-    if not isinstance(payload, bytes) or len(payload) > 1024:
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: prompt view exceeds 1 KiB"
-        )
-    relative = _prompt_path_relative(state_dir, path, directory=False)
-    temporary_name = f".{relative.name}.{uuid4().hex}.tmp"
-    descriptor = -1
-    with _open_prompt_directory(
-        state_dir,
-        path.parent,
-        create=True,
-    ) as directory_descriptor:
-        assert directory_descriptor is not None
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        try:
-            descriptor = os.open(
-                temporary_name,
-                flags,
-                0o600,
-                dir_fd=directory_descriptor,
-            )
-            os.fchmod(descriptor, 0o600)
-            _write_all(descriptor, payload)
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = -1
-            os.replace(
-                temporary_name,
-                relative.name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-            )
-            os.fsync(directory_descriptor)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            try:
-                os.unlink(temporary_name, dir_fd=directory_descriptor)
-            except FileNotFoundError:
-                pass
-
-
-def _read_prompt_bytes(
-    state_dir: Path,
-    path: Path,
-) -> tuple[bytes, os.stat_result]:
-    relative = _prompt_path_relative(state_dir, path, directory=False)
-    with _open_prompt_directory(
-        state_dir,
-        path.parent,
-        create=False,
-    ) as directory_descriptor:
-        assert directory_descriptor is not None
-        flags = os.O_RDONLY | os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        try:
-            descriptor = os.open(
-                relative.name,
-                flags,
-                dir_fd=directory_descriptor,
-            )
-            try:
-                metadata = os.fstat(descriptor)
-                payload = os.read(descriptor, 1025)
-            finally:
-                os.close(descriptor)
-        except OSError as error:
-            raise ValueError(
-                "C_PRESENTATION_UNAVAILABLE: durable prompt view is unavailable"
-            ) from error
-    return payload, metadata
-
-
-def _unlink_prompt_entry(directory_descriptor: int, name: str) -> bool:
-    try:
-        metadata = os.stat(
-            name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return False
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: prompt sidecar is unsafe"
-        )
-    os.unlink(name, dir_fd=directory_descriptor)
-    os.fsync(directory_descriptor)
-    return True
-
-
-def _unlink_prompt_file(state_dir: Path, path: Path) -> bool:
-    relative = _prompt_path_relative(state_dir, path, directory=False)
-    with _open_prompt_directory(
-        state_dir,
-        path.parent,
-        create=False,
-        allow_missing=True,
-    ) as directory_descriptor:
-        if directory_descriptor is None:
-            return False
-        return _unlink_prompt_entry(directory_descriptor, relative.name)
-
-
-def _canonical_prompt_view_bytes(
-    prompt_view: Mapping[str, object],
-) -> bytes:
-    payload = json.dumps(
-        prompt_view,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if len(payload) > 1024:
-        raise ValueError(
-            "C_PRESENTATION_UNAVAILABLE: prompt view exceeds 1 KiB"
-        )
-    return payload
-
-
-def _changed_paths(worktree: Path | str) -> list[str]:
-    root = Path(worktree).resolve()
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_")
-    }
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
-    commands = (
-        ["git", "-C", str(root), "diff", "--name-only", "-z", "HEAD"],
-        [
-            "git",
-            "-C",
-            str(root),
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ],
-    )
-    values: set[str] = set()
-    for command in commands:
-        completed = subprocess.run(
-            command,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=environment,
-        )
-        if completed.returncode != 0:
-            raise ValueError(
-                "E_CLARIFICATION_LEASE_DRIFT: changed paths are unavailable"
-            )
-        try:
-            values.update(
-                item.decode("utf-8", errors="strict")
-                for item in completed.stdout.split(b"\0")
-                if item
-            )
-        except UnicodeDecodeError as error:
-            raise ValueError(
-                "E_CLARIFICATION_LEASE_DRIFT: changed paths are invalid"
-            ) from error
-    normalized = sorted(values)
-    if any(
-        normalize_scope(item) is None or normalize_scope(item) != item
-        for item in normalized
-    ):
-        raise ValueError(
-            "E_CLARIFICATION_LEASE_DRIFT: changed paths are unsafe"
-        )
-    return normalized
-
-
 @contextmanager
 def _common_lease_lock(common_dir: Path):
     """Serialize lease scans across every worktree sharing one common Git dir."""
@@ -2069,951 +1693,6 @@ class TaskStore:
     def status(self, task_id: str) -> dict[str, Any]:
         return self._read(task_id)
 
-    def _clarification_sidecar(
-        self, task_id: str, state: Mapping[str, Any]
-    ) -> Path:
-        supplied = state.get("clarification_prompt_view_path")
-        if not isinstance(supplied, str):
-            raise ValueError(
-                "C_PRESENTATION_UNAVAILABLE: prompt view reference is absent"
-            )
-        relative = Path(supplied)
-        expected_root = (
-            Path("codex-control-plane")
-            / "clarification-prompt-views"
-            / task_id
-        )
-        if (
-            relative.is_absolute()
-            or relative.parent != expected_root
-            or not re.fullmatch(
-                r"generation-[0-9]{8}\.json", relative.name
-            )
-        ):
-            raise ValueError(
-                "C_PRESENTATION_UNAVAILABLE: prompt view reference is invalid"
-            )
-        return self.state_dir / relative
-
-    def _unlink_clarification_sidecar(self, sidecar: Path) -> None:
-        _unlink_prompt_file(self.state_dir, sidecar)
-
-    @staticmethod
-    def _clear_clarification_fields(state: dict[str, Any]) -> None:
-        for key in CLARIFICATION_ACTIVE_FIELDS:
-            state.pop(key, None)
-        state.pop("clarification_resolution_invalidated", None)
-
-    def clarification_status(self, task_id: str) -> dict[str, Any]:
-        """Return only the durable request and its exact safe presentation."""
-
-        with _task_guard(self.state_dir, task_id):
-            state = self._read(task_id)
-            self._assert_runtime_owner(state)
-            if state.get("state") != "clarification_required":
-                raise ValueError(
-                    "C_PRESENTATION_UNAVAILABLE: task is not awaiting clarification"
-                )
-            request, prompt_view = self._read_clarification_presentation(
-                task_id, state
-            )
-            return {
-                "task_id": task_id,
-                "state": "clarification_required",
-                "generation": state.get("generation"),
-                "request": copy.deepcopy(request),
-                "prompt_view": copy.deepcopy(prompt_view),
-                "presentation_digest": state.get(
-                    "clarification_presentation_digest"
-                ),
-            }
-
-    def _read_clarification_presentation(
-        self,
-        task_id: str,
-        state: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        from control_plane.clarification import validate_clarification_request
-
-        sidecar = self._clarification_sidecar(task_id, state)
-        payload, metadata = _read_prompt_bytes(self.state_dir, sidecar)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-            or len(payload) > 1024
-        ):
-            raise ValueError(
-                "C_PRESENTATION_UNAVAILABLE: durable prompt view is unsafe"
-            )
-        try:
-            prompt_view = json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError(
-                "C_PRESENTATION_UNAVAILABLE: durable prompt view is invalid"
-            ) from error
-        request = state.get("clarification_request")
-        if (
-            not isinstance(prompt_view, dict)
-            or not isinstance(request, dict)
-            or _canonical_prompt_view_bytes(prompt_view) != payload
-            or contract_digest(prompt_view)
-            != state.get("clarification_presentation_digest")
-            or request.get("presentation_digest")
-            != state.get("clarification_presentation_digest")
-            or contract_digest(request)
-            != state.get("clarification_request_digest")
-            or validate_clarification_request(request)
-        ):
-            raise ValueError(
-                "C_PRESENTATION_UNAVAILABLE: durable prompt binding is invalid"
-            )
-        return request, prompt_view
-
-    def gc_clarification_prompt_views(
-        self,
-        task_id: str,
-        *,
-        expected_generation: int | None = None,
-    ) -> dict[str, Any]:
-        """Remove only unreferenced prompt-view generations under task flock."""
-
-        with _task_guard(self.state_dir, task_id):
-            state = self._read(task_id)
-            self._assert_runtime_owner(state)
-            generation = int(state.get("generation", -1))
-            if (
-                expected_generation is not None
-                and generation != expected_generation
-            ):
-                raise ValueError(
-                    "E_STATE_CAS: task generation changed before prompt GC"
-                )
-            current: Path | None = None
-            if state.get("state") == "clarification_required":
-                current = self._clarification_sidecar(task_id, state)
-            directory = (
-                self.state_dir
-                / "codex-control-plane"
-                / "clarification-prompt-views"
-                / task_id
-            )
-            removed: list[str] = []
-            with _open_prompt_directory(
-                self.state_dir,
-                directory,
-                create=False,
-                allow_missing=True,
-            ) as directory_descriptor:
-                if current is not None and directory_descriptor is None:
-                    raise ValueError(
-                        "C_PRESENTATION_UNAVAILABLE: current prompt view is unavailable"
-                    )
-                if directory_descriptor is None:
-                    names: list[str] = []
-                else:
-                    names = sorted(os.listdir(directory_descriptor))
-                for name in names:
-                    if (
-                        re.fullmatch(r"generation-[0-9]{8}\.json", name)
-                        is None
-                    ):
-                        continue
-                    candidate = directory / name
-                    if current is not None and candidate == current:
-                        continue
-                    assert directory_descriptor is not None
-                    if _unlink_prompt_entry(directory_descriptor, name):
-                        removed.append(str(candidate))
-            return {
-                "task_id": task_id,
-                "generation": generation,
-                "removed": removed,
-            }
-
-    def require_clarification(
-        self,
-        task_id: str,
-        *,
-        request: object,
-        route_context: object,
-        expected_generation: int,
-        current_branch: str,
-        task_digest: str,
-        decision_digest: str,
-    ) -> dict[str, Any]:
-        """Publish one durable lateral gate; generic transitions cannot enter it."""
-
-        pre_state = self._read(task_id)
-        self._assert_runtime_owner(pre_state)
-        if (
-            not isinstance(expected_generation, int)
-            or isinstance(expected_generation, bool)
-            or expected_generation < 0
-        ):
-            raise ValueError(
-                "E_STATE_CAS: expected clarification generation is invalid"
-            )
-        if int(pre_state.get("generation", -1)) != expected_generation:
-            raise ValueError(
-                "E_STATE_CAS: task changed before clarification"
-            )
-        if (
-            pre_state.get("state") == "clarification_required"
-            and pre_state.get("clarification_resolution_invalidated")
-            not in {
-                "question_changed",
-                "repository_evidence_changed",
-                "context_changed",
-            }
-        ):
-            raise ValueError(
-                "E_STATE_LATERAL: clarification refresh is not authorized"
-            )
-        pre_changed_paths: list[str] | None = None
-        pre_resume_source = (
-            str(pre_state.get("clarification_resume_state", ""))
-            if pre_state.get("state") == "clarification_required"
-            else str(pre_state.get("state", ""))
-        )
-        if pre_resume_source == "implementing":
-            if pre_state.get("state") == "clarification_required":
-                observed_worktree = pre_state.get(
-                    "clarification_worktree_identity"
-                )
-            else:
-                pre_lease = self._read_owner_lease(task_id)
-                observed_worktree = (
-                    pre_lease.get("worktree")
-                    if isinstance(pre_lease, Mapping)
-                    else None
-                )
-            if not isinstance(observed_worktree, str):
-                raise ValueError(
-                    "E_CLARIFICATION_LEASE_DRIFT: writer worktree is unavailable"
-                )
-            pre_changed_paths = _changed_paths(observed_worktree)
-        common_dir = _common_git_dir(self.state_dir)
-        with _common_lease_lock(common_dir):
-            with _task_guard(self.state_dir, task_id):
-                state = self._read(task_id)
-                self._assert_runtime_owner(state)
-                source = str(state.get("state"))
-                if int(state.get("generation", -1)) != expected_generation:
-                    raise ValueError(
-                        "E_STATE_CAS: task changed before clarification"
-                    )
-                if (
-                    source == "clarification_required"
-                    and (
-                        not isinstance(
-                            state.get(
-                                "clarification_resolution_invalidated"
-                            ),
-                            str,
-                        )
-                        or state.get("clarification_resume_state")
-                        not in {
-                            "framed",
-                            "planned",
-                            "ready",
-                            "implementing",
-                            "verifying",
-                            "review_ready",
-                        }
-                    )
-                ) or (
-                    source
-                    not in {
-                        "framed",
-                        "planned",
-                        "ready",
-                        "implementing",
-                        "verifying",
-                        "review_ready",
-                        "clarification_required",
-                    }
-                    or state.get("resume_forbidden")
-                ):
-                    raise ValueError(
-                        "E_STATE_LATERAL: task cannot require clarification"
-                    )
-                if (
-                    source == "clarification_required"
-                    and state.get("clarification_resolution_invalidated")
-                    not in {
-                        "question_changed",
-                        "repository_evidence_changed",
-                        "context_changed",
-                    }
-                ):
-                    raise ValueError(
-                        "E_STATE_LATERAL: clarification refresh is not authorized"
-                    )
-                if (
-                    current_branch != state.get("branch")
-                    or task_digest != state.get("task_digest")
-                    or decision_digest != state.get("decision_digest")
-                    or SHA256_DIGEST.fullmatch(task_digest) is None
-                    or SHA256_DIGEST.fullmatch(decision_digest) is None
-                ):
-                    raise ValueError(
-                        "C_ROUTE_CONTEXT_UNTRUSTED: task binding changed"
-                    )
-                reissuing = source == "clarification_required"
-                resume_source = (
-                    str(state["clarification_resume_state"])
-                    if reissuing
-                    else source
-                )
-                if resume_source != pre_resume_source:
-                    raise ValueError(
-                        "E_STATE_CAS: clarification resume state changed"
-                    )
-                prior_sidecar: Path | None = None
-                if reissuing:
-                    self._read_clarification_presentation(task_id, state)
-                    prior_sidecar = self._clarification_sidecar(
-                        task_id, state
-                    )
-                bindings = consume_clarification_entry_bindings(
-                    request=request,
-                    route_context=route_context,
-                    expected_task_digest=task_digest,
-                    expected_decision_digest=decision_digest,
-                    expected_branch=current_branch,
-                )
-                repository_binding = {
-                    "status": bindings["repository_status"],
-                    "evidence_digest": bindings[
-                        "repository_evidence_digest"
-                    ],
-                }
-                next_generation = int(state.get("generation", 0)) + 1
-                relative_sidecar = _prompt_view_relative_path(
-                    task_id, next_generation
-                )
-                sidecar = self.state_dir / relative_sidecar
-                prompt_view = bindings["prompt_view"]
-                if not isinstance(prompt_view, Mapping):
-                    raise ValueError(
-                        "C_PRESENTATION_UNAVAILABLE: safe prompt is absent"
-                    )
-                lease_fields: dict[str, Any] = {}
-                if resume_source == "implementing":
-                    changed_paths = pre_changed_paths
-                    lease = self._read_owner_lease(task_id)
-                    semantic = (
-                        {
-                            key: value
-                            for key, value in lease.items()
-                            if key != "lease_digest"
-                        }
-                        if isinstance(lease, dict)
-                        else {}
-                    )
-                    owner_changed = (
-                        reissuing
-                        and isinstance(lease, Mapping)
-                        and lease.get("session_id")
-                        != bindings["session_id"]
-                    )
-                    lease_invalid = (
-                        lease is None
-                        or lease.get("lease_digest")
-                        != contract_digest(semantic)
-                        or lease.get("worktree")
-                        != bindings["worktree_identity"]
-                        or lease.get("branch") != current_branch
-                        or (
-                            not reissuing
-                            and lease.get("session_id")
-                            != bindings["session_id"]
-                        )
-                        or not isinstance(lease.get("paths"), list)
-                        or changed_paths is None
-                        or any(
-                            not any(
-                                scope_owns(scope, path)
-                                for scope in lease["paths"]
-                            )
-                            for path in changed_paths
-                        )
-                    )
-                    if lease_invalid:
-                        if reissuing:
-                            return self._publish_clarification_block(
-                                task_id=task_id,
-                                state=state,
-                                expected_generation=expected_generation,
-                                sidecar=prior_sidecar,
-                                reason=(
-                                    "E_CLARIFICATION_OWNER_CHANGED"
-                                    if owner_changed
-                                    else "E_CLARIFICATION_LEASE_DRIFT"
-                                ),
-                            )
-                        raise ValueError(
-                            "E_CLARIFICATION_LEASE_DRIFT: writer lease is invalid"
-                        )
-                    lease_fields = {
-                        "clarification_lease_digest": lease[
-                            "lease_digest"
-                        ],
-                        "clarification_lease_owner_session": lease[
-                            "session_id"
-                        ],
-                        "clarification_lease_scope": copy.deepcopy(
-                            lease["paths"]
-                        ),
-                        "clarification_lease_policy_digest": lease[
-                            "policy_digest"
-                        ],
-                        "clarification_changed_paths": list(changed_paths),
-                        "clarification_changed_paths_digest": (
-                            contract_digest(changed_paths)
-                        ),
-                        "clarification_blocked_effects": list(
-                            bindings["blocked_effects"]
-                        ),
-                        "lease_digest": lease["lease_digest"],
-                    }
-                    if reissuing:
-                        owner_changed = owner_changed or (
-                            bindings["session_id"]
-                            != state.get(
-                                "clarification_lease_owner_session"
-                            )
-                        )
-                        refresh_drift = (
-                            lease["lease_digest"]
-                            != state.get("clarification_lease_digest")
-                            or lease["policy_digest"]
-                            != state.get(
-                                "clarification_lease_policy_digest"
-                            )
-                            or lease["paths"]
-                            != state.get("clarification_lease_scope")
-                            or changed_paths
-                            != state.get("clarification_changed_paths")
-                            or contract_digest(changed_paths)
-                            != state.get(
-                                "clarification_changed_paths_digest"
-                            )
-                        )
-                        if owner_changed or refresh_drift:
-                            return self._publish_clarification_block(
-                                task_id=task_id,
-                                state=state,
-                                expected_generation=expected_generation,
-                                sidecar=prior_sidecar,
-                                reason=(
-                                    "E_CLARIFICATION_OWNER_CHANGED"
-                                    if owner_changed
-                                    else "E_CLARIFICATION_LEASE_DRIFT"
-                                ),
-                            )
-                _atomic_bytes(
-                    self.state_dir,
-                    sidecar,
-                    _canonical_prompt_view_bytes(prompt_view),
-                )
-                self._clear_clarification_fields(state)
-                state.update(
-                    {
-                        "state": "clarification_required",
-                        "resume_state": None,
-                        "clarification_resume_state": resume_source,
-                        "clarification_request": copy.deepcopy(
-                            bindings["request"]
-                        ),
-                        "clarification_request_digest": bindings[
-                            "request_digest"
-                        ],
-                        "clarification_context_digest": bindings[
-                            "context_digest"
-                        ],
-                        "clarification_question_digest": bindings[
-                            "request"
-                        ]["question_digest"],
-                        "clarification_repository_status": bindings[
-                            "repository_status"
-                        ],
-                        "clarification_repository_observation_digest": (
-                            bindings["repository_evidence_digest"]
-                        ),
-                        "clarification_repository_evidence_digest": (
-                            contract_digest(repository_binding)
-                        ),
-                        "clarification_task_digest": task_digest,
-                        "clarification_decision_digest": decision_digest,
-                        "clarification_prompt_view_path": str(
-                            relative_sidecar
-                        ),
-                        "clarification_prompt_view_generation": (
-                            next_generation
-                        ),
-                        "clarification_presentation_digest": bindings[
-                            "request"
-                        ]["presentation_digest"],
-                        "clarification_repository_identity": bindings[
-                            "repository_identity"
-                        ],
-                        "clarification_worktree_identity": bindings[
-                            "worktree_identity"
-                        ],
-                        "clarification_branch": bindings["branch"],
-                        "clarification_head": bindings["head"],
-                        "clarification_session_id": bindings[
-                            "session_id"
-                        ],
-                        "clarification_invocation_id": bindings[
-                            "invocation_id"
-                        ],
-                        "clarification_blocked_effects": list(
-                            bindings["blocked_effects"]
-                        ),
-                        "generation": next_generation,
-                        "block_reason": None,
-                        "updated_at": _utc_now(),
-                        **lease_fields,
-                    }
-                )
-                state.pop(
-                    "clarification_resolution_invalidated", None
-                )
-                _atomic_json(self._path(task_id), state)
-                if prior_sidecar is not None and prior_sidecar != sidecar:
-                    self._unlink_clarification_sidecar(prior_sidecar)
-                return state
-
-    def _publish_clarification_block(
-        self,
-        *,
-        task_id: str,
-        state: dict[str, Any],
-        expected_generation: int,
-        sidecar: Path | None,
-        reason: str,
-    ) -> dict[str, Any]:
-        self._clear_clarification_fields(state)
-        state.update(
-            {
-                "state": "blocked",
-                "resume_state": None,
-                "block_reason": reason,
-                "resume_forbidden": True,
-                "clarification_block_digest": contract_digest(
-                    {
-                        "reason": reason,
-                        "task_id": task_id,
-                        "generation": expected_generation,
-                    }
-                ),
-                "generation": expected_generation + 1,
-                "updated_at": _utc_now(),
-            }
-        )
-        _atomic_json(self._path(task_id), state)
-        if sidecar is not None:
-            self._unlink_clarification_sidecar(sidecar)
-        return state
-
-    def _publish_clarification_destination(
-        self,
-        *,
-        task_id: str,
-        state: dict[str, Any],
-        destination: str,
-        expected_generation: int,
-        resolution_digest: str,
-        sidecar: Path,
-        block_reason: str | None = None,
-        resume_forbidden: bool = False,
-    ) -> dict[str, Any]:
-        self._clear_clarification_fields(state)
-        state.update(
-            {
-                "state": destination,
-                "resume_state": None,
-                "block_reason": block_reason,
-                "resume_forbidden": resume_forbidden,
-                "clarification_resolution_digest": resolution_digest,
-                "generation": expected_generation + 1,
-                "updated_at": _utc_now(),
-            }
-        )
-        _atomic_json(self._path(task_id), state)
-        self._unlink_clarification_sidecar(sidecar)
-        return state
-
-    def resolve_and_resume_clarification(
-        self,
-        task_id: str,
-        *,
-        interaction: object,
-        route_context: object,
-        repository_context: object,
-        expected_generation: int,
-        current_branch: str,
-        expected_head: str,
-        task_digest: str,
-        decision_digest: str,
-        context_digest: str,
-        question_digest: str,
-    ) -> dict[str, Any]:
-        """Consume native resolution evidence and publish the exact final state."""
-
-        pre_state = self._read(task_id)
-        self._assert_runtime_owner(pre_state)
-        current_changed_paths: list[str] | None = None
-        if (
-            pre_state.get("state") == "clarification_required"
-            and pre_state.get("clarification_resume_state")
-            == "implementing"
-        ):
-            current_changed_paths = _changed_paths(
-                str(pre_state.get("clarification_worktree_identity", ""))
-            )
-        common_dir = _common_git_dir(self.state_dir)
-        with _common_lease_lock(common_dir) as token:
-            dirty_reframe: dict[str, Any] | None = None
-            with _task_guard(self.state_dir, task_id):
-                state = self._read(task_id)
-                self._assert_runtime_owner(state)
-                if (
-                    state.get("state") != "clarification_required"
-                    or state.get("generation") != expected_generation
-                    or state.get("branch") != current_branch
-                    or state.get("resume_forbidden")
-                ):
-                    raise ValueError(
-                        "E_STATE_CAS: clarification state changed"
-                    )
-                if state.get("clarification_resolution_invalidated"):
-                    raise ValueError(
-                        "C_CLARIFICATION_REQUEST_REQUIRED: "
-                        "invalidated clarification must be reframed"
-                    )
-                durable_request = state.get("clarification_request")
-                if (
-                    not isinstance(durable_request, Mapping)
-                    or contract_digest(durable_request)
-                    != state.get("clarification_request_digest")
-                    or SHA256_DIGEST.fullmatch(task_digest) is None
-                    or SHA256_DIGEST.fullmatch(decision_digest) is None
-                    or SHA256_DIGEST.fullmatch(context_digest) is None
-                    or SHA256_DIGEST.fullmatch(question_digest) is None
-                ):
-                    raise ValueError(
-                        "C_TASK_DIGEST: durable clarification binding is invalid"
-                    )
-                self._read_clarification_presentation(task_id, state)
-                resume_state = str(
-                    state.get("clarification_resume_state", "")
-                )
-                bindings = consume_clarification_resolution_bindings(
-                    interaction=interaction,
-                    route_context=route_context,
-                    repository_context=repository_context,
-                    durable_request=durable_request,
-                    expected_request_digest=str(
-                        state["clarification_request_digest"]
-                    ),
-                    expected_original_task_digest=str(
-                        state["clarification_task_digest"]
-                    ),
-                    expected_current_task_digest=task_digest,
-                    expected_decision_digest=decision_digest,
-                    expected_repository_identity=str(
-                        state["clarification_repository_identity"]
-                    ),
-                    expected_worktree_identity=str(
-                        state["clarification_worktree_identity"]
-                    ),
-                    expected_branch=current_branch,
-                    expected_head=expected_head,
-                    current_question_digest=question_digest,
-                )
-                if context_digest != bindings["context_digest"]:
-                    raise ValueError(
-                        "C_CONTEXT_DIGEST: current context digest changed"
-                    )
-                sidecar = self._clarification_sidecar(task_id, state)
-                task_digest_changed = (
-                    task_digest != state.get("clarification_task_digest")
-                )
-                decision_digest_changed = (
-                    decision_digest
-                    != state.get("clarification_decision_digest")
-                )
-                current_repository_binding = contract_digest(
-                    {
-                        "status": bindings["repository_status"],
-                        "evidence_digest": bindings[
-                            "repository_evidence_digest"
-                        ],
-                    }
-                )
-                question_changed = (
-                    question_digest
-                    != state.get("clarification_question_digest")
-                )
-                repository_changed = (
-                    current_repository_binding
-                    != state.get(
-                        "clarification_repository_evidence_digest"
-                    )
-                )
-                context_changed = (
-                    context_digest
-                    != state.get("clarification_context_digest")
-                )
-                material_frame_changed = task_digest_changed or (
-                    decision_digest_changed and context_changed
-                )
-                resolution_digest = str(
-                    bindings["resolution_digest"]
-                )
-                if resume_state == "implementing":
-                    owner_session = state.get(
-                        "clarification_lease_owner_session"
-                    )
-                    if bindings["session_id"] != owner_session:
-                        return self._publish_clarification_destination(
-                            task_id=task_id,
-                            state=state,
-                            destination="blocked",
-                            expected_generation=expected_generation,
-                            resolution_digest=resolution_digest,
-                            sidecar=sidecar,
-                            block_reason=(
-                                "E_CLARIFICATION_OWNER_CHANGED"
-                            ),
-                            resume_forbidden=True,
-                        )
-                    lease = self._read_owner_lease(task_id)
-                    lease_semantic = (
-                        {
-                            key: value
-                            for key, value in lease.items()
-                            if key != "lease_digest"
-                        }
-                        if isinstance(lease, dict)
-                        else {}
-                    )
-                    lease_drift = (
-                        lease is None
-                        or lease.get("lease_digest")
-                        != contract_digest(lease_semantic)
-                        or lease.get("lease_digest")
-                        != state.get("clarification_lease_digest")
-                        or lease.get("session_id") != owner_session
-                        or lease.get("worktree")
-                        != state.get(
-                            "clarification_worktree_identity"
-                        )
-                        or lease.get("branch") != current_branch
-                        or lease.get("policy_digest")
-                        != state.get(
-                            "clarification_lease_policy_digest"
-                        )
-                        or lease.get("paths")
-                        != state.get("clarification_lease_scope")
-                        or current_changed_paths
-                        != state.get("clarification_changed_paths")
-                        or contract_digest(
-                            current_changed_paths
-                            if current_changed_paths is not None
-                            else []
-                        )
-                        != state.get(
-                            "clarification_changed_paths_digest"
-                        )
-                        or expected_head
-                        != state.get("clarification_head")
-                    )
-                    if lease_drift:
-                        return self._publish_clarification_destination(
-                            task_id=task_id,
-                            state=state,
-                            destination="blocked",
-                            expected_generation=expected_generation,
-                            resolution_digest=resolution_digest,
-                            sidecar=sidecar,
-                            block_reason=(
-                                "E_CLARIFICATION_LEASE_DRIFT"
-                            ),
-                            resume_forbidden=True,
-                        )
-                    if material_frame_changed:
-                        marker = dict(state)
-                        marker.update(
-                            {
-                                "state": "finalizing_suspend",
-                                "resume_state": None,
-                                "resume_forbidden": True,
-                                "finalization": {
-                                    "destination": "blocked",
-                                    "reason_code": "E_REFRAME_REQUIRED",
-                                    "prior_generation": (
-                                        expected_generation
-                                    ),
-                                    "task_id": task_id,
-                                    "worktree": lease["worktree"],
-                                    "branch": lease["branch"],
-                                    "session_id": lease["session_id"],
-                                    "policy_digest": lease[
-                                        "policy_digest"
-                                    ],
-                                    "lease_digest": lease[
-                                        "lease_digest"
-                                    ],
-                                    "clarification_reframe": True,
-                                    "clarification_sidecar": str(sidecar),
-                                    "resolution_digest": (
-                                        resolution_digest
-                                    ),
-                                },
-                                "updated_at": _utc_now(),
-                            }
-                        )
-                        _atomic_json(self._path(task_id), marker)
-                        dirty_reframe = {
-                            "marker": marker,
-                            "lease": lease,
-                            "sidecar": sidecar,
-                            "resolution_digest": resolution_digest,
-                        }
-                    elif question_changed or repository_changed or context_changed:
-                        reason = (
-                            "question_changed"
-                            if question_changed
-                            else (
-                                "repository_evidence_changed"
-                                if repository_changed
-                                else "context_changed"
-                            )
-                        )
-                        state[
-                            "clarification_resolution_invalidated"
-                        ] = reason
-                        state["generation"] = expected_generation + 1
-                        state["updated_at"] = _utc_now()
-                        _atomic_json(self._path(task_id), state)
-                        return state
-                    else:
-                        state["decision_digest"] = decision_digest
-                        return self._publish_clarification_destination(
-                            task_id=task_id,
-                            state=state,
-                            destination="implementing",
-                            expected_generation=expected_generation,
-                            resolution_digest=resolution_digest,
-                            sidecar=sidecar,
-                        )
-                elif material_frame_changed:
-                    invalidated_from = resume_state
-                    for evidence_state in (
-                        "ready",
-                        "verifying",
-                        "review_ready",
-                    ):
-                        state.get("evidence", {}).pop(
-                            evidence_state, None
-                        )
-                    self._clear_clarification_fields(state)
-                    state.update(
-                        {
-                            "state": "planned",
-                            "task_digest": task_digest,
-                            "decision_digest": decision_digest,
-                            "resume_state": None,
-                            "block_reason": None,
-                            "resume_forbidden": False,
-                            "clarification_resolution_digest": (
-                                resolution_digest
-                            ),
-                            "clarification_invalidation": {
-                                "invalidated_from": invalidated_from,
-                                "prior_task_digest": durable_request[
-                                    "task_digest"
-                                ],
-                                "new_task_digest": task_digest,
-                                "new_decision_digest": decision_digest,
-                            },
-                            "generation": expected_generation + 1,
-                            "updated_at": _utc_now(),
-                        }
-                    )
-                    _atomic_json(self._path(task_id), state)
-                    self._unlink_clarification_sidecar(sidecar)
-                    return state
-                elif question_changed or repository_changed or context_changed:
-                    reason = (
-                        "question_changed"
-                        if question_changed
-                        else (
-                            "repository_evidence_changed"
-                            if repository_changed
-                            else "context_changed"
-                        )
-                    )
-                    state[
-                        "clarification_resolution_invalidated"
-                    ] = reason
-                    state["generation"] = expected_generation + 1
-                    state["updated_at"] = _utc_now()
-                    _atomic_json(self._path(task_id), state)
-                    return state
-                else:
-                    state["decision_digest"] = decision_digest
-                    return self._publish_clarification_destination(
-                        task_id=task_id,
-                        state=state,
-                        destination=resume_state,
-                        expected_generation=expected_generation,
-                        resolution_digest=resolution_digest,
-                        sidecar=sidecar,
-                    )
-            if dirty_reframe is None:
-                raise ValueError(
-                    "E_STATE_CAS: clarification resolution did not publish"
-                )
-            lease = dirty_reframe["lease"]
-            TaskLease._release_locked(
-                token,
-                state_dir=self.state_dir,
-                task_id=task_id,
-                worktree=str(lease["worktree"]),
-                branch=str(lease["branch"]),
-                session_id=str(lease["session_id"]),
-                policy_digest=str(lease["policy_digest"]),
-                lease_digest=str(lease["lease_digest"]),
-            )
-            with _task_guard(self.state_dir, task_id):
-                current = self._read(task_id)
-                marker = dirty_reframe["marker"]
-                if (
-                    current.get("state") != "finalizing_suspend"
-                    or current.get("finalization")
-                    != marker.get("finalization")
-                ):
-                    raise ValueError(
-                        "E_STATE_CAS: clarification reframe marker changed"
-                    )
-                current.pop("finalization", None)
-                return self._publish_clarification_destination(
-                    task_id=task_id,
-                    state=current,
-                    destination="blocked",
-                    expected_generation=expected_generation,
-                    resolution_digest=str(
-                        dirty_reframe["resolution_digest"]
-                    ),
-                    sidecar=dirty_reframe["sidecar"],
-                    block_reason="E_REFRAME_REQUIRED",
-                    resume_forbidden=True,
-                )
 
     def _metrics_dir(self, task_id: str) -> Path:
         if not validate_task_id(task_id):
@@ -3034,17 +1713,15 @@ class TaskStore:
         invocation_id: str,
         subject_digest: str,
         runtime_metrics: Mapping[str, Any],
-        host_metrics: object | None,
     ) -> dict[str, Any]:
-        """Record deduplicated runtime and host metrics under the task flock."""
+        """Record deduplicated local runtime metrics under the task flock."""
 
-        runtime_metric_keys = {
+        metric_keys = {
             "router_manifest_bytes",
             "novice_brief_bytes",
             "hook_output_bytes",
             "context_units_selected",
         }
-        runtime_context_keys = {"tool_use_id"}
         if (
             not validate_task_id(task_id)
             or SHA256_DIGEST.fullmatch(task_digest) is None
@@ -3052,144 +1729,51 @@ class TaskStore:
             or not validate_task_id(invocation_id)
             or SHA256_DIGEST.fullmatch(subject_digest) is None
             or not isinstance(runtime_metrics, Mapping)
-            or not set(runtime_metrics).issubset(
-                runtime_metric_keys | runtime_context_keys
-            )
+            or not set(runtime_metrics).issubset(metric_keys | {"tool_use_id"})
         ):
             raise ValueError("M_METRIC_BINDING: metric identity is invalid")
-        for key in runtime_metric_keys.intersection(runtime_metrics):
-            value = runtime_metrics[key]
+        tool_use_id = runtime_metrics.get("tool_use_id")
+        if tool_use_id is not None and not validate_task_id(tool_use_id):
+            raise ValueError("M_METRIC_BINDING: runtime identity is invalid")
+        for metric in metric_keys.intersection(runtime_metrics):
+            value = runtime_metrics[metric]
             if (
                 not isinstance(value, int)
                 or isinstance(value, bool)
                 or value < 0
             ):
                 raise ValueError("M_METRIC_BINDING: runtime metric is invalid")
-        for key in runtime_context_keys.intersection(runtime_metrics):
-            value = runtime_metrics[key]
-            if value is not None and not validate_task_id(value):
-                raise ValueError("M_METRIC_BINDING: runtime identity is invalid")
 
-        host_payload: dict[str, Any] | None = None
-        host_metrics_consumed = False
-        if host_metrics is not None:
-            if (
-                type(host_metrics) is not HostContextMetrics
-                or host_metrics.task_digest != task_digest
-                or host_metrics.session_id != session_id
-                or host_metrics.invocation_id != invocation_id
-                or host_metrics.subject_digest != subject_digest
-                or contract_digest(host_metrics.payload)
-                != host_metrics.payload_digest
-            ):
-                raise ValueError(
-                    "M_METRIC_UNTRUSTED_CHANNEL: host metrics wrapper required"
-                )
-            host_metrics_consumed = host_metrics._consumed
-            if (
-                not host_metrics_consumed
-                and not _runtime_host_object_is_live(
-                    host_metrics, "host_context_metrics"
-                )
-            ):
-                raise ValueError(
-                    "M_METRIC_UNTRUSTED_CHANNEL: host metrics wrapper required"
-                )
-            host_payload = copy.deepcopy(host_metrics.payload)
-
-        def metric_observation(
-            *, source: str, metric: str, tool_use_id: object, value: object
-        ) -> dict[str, Any]:
+        observations: list[dict[str, Any]] = []
+        for metric in sorted(metric_keys.intersection(runtime_metrics)):
             observation = {
                 "schema_version": 1,
-                "source": source,
+                "source": "runtime",
                 "metric": metric,
                 "task_digest": task_digest,
                 "session_id": session_id,
                 "invocation_id": invocation_id,
                 "subject_digest": subject_digest,
                 "tool_use_id": tool_use_id,
-                "value": copy.deepcopy(value),
+                "value": runtime_metrics[metric],
             }
-            observation["observation_digest"] = contract_digest(
-                observation
-            )
-            return observation
-
-        runtime_observations = [
-            metric_observation(
-                source="runtime",
-                metric=metric,
-                tool_use_id=runtime_metrics.get("tool_use_id"),
-                value=runtime_metrics[metric],
-            )
-            for metric in sorted(
-                runtime_metric_keys.intersection(runtime_metrics)
-            )
-        ]
-        host_observations: list[dict[str, Any]] = []
-        if host_payload is not None:
-            host_values = {
-                "required_resource_bytes": host_payload[
-                    "required_resource_bytes"
-                ],
-                "recommended_resource_bytes": host_payload[
-                    "recommended_resource_bytes"
-                ],
-                "worker_id": host_payload["worker_id"],
-                "retry_count": host_payload["retry_count"],
-                "worker_interval": {
-                    "started_at_monotonic": host_payload[
-                        "started_at_monotonic"
-                    ],
-                    "ended_at_monotonic": host_payload[
-                        "ended_at_monotonic"
-                    ],
-                },
-            }
-            rows: list[dict[str, Any]] = []
-            for metric, value in sorted(host_values.items()):
-                row = {
-                    "source": "host",
-                    "metric": metric,
-                    "task_digest": task_digest,
-                    "session_id": session_id,
-                    "invocation_id": invocation_id,
-                    "subject_digest": subject_digest,
-                    "tool_use_id": host_payload["tool_use_id"],
-                    "value": copy.deepcopy(value),
-                }
-                row["row_digest"] = contract_digest(row)
-                rows.append(row)
-            host_observations = [
-                metric_observation(
-                    source="host",
-                    metric="host_metric_batch",
-                    tool_use_id=host_payload["tool_use_id"],
-                    value={
-                        "rows": rows,
-                        "rows_digest": contract_digest(rows),
-                    },
-                )
-            ]
+            observation["observation_digest"] = contract_digest(observation)
+            observations.append(observation)
 
         with _task_guard(self.state_dir, task_id):
             directory = self._metrics_dir(task_id)
             directory.mkdir(parents=True, exist_ok=True)
-            observations = runtime_observations + host_observations
-            prepared: list[tuple[dict[str, Any], Path, bool]] = []
             for observation in observations:
                 identity = contract_digest(
                     {
-                        "source": observation["source"],
+                        "source": "runtime",
                         "invocation_id": invocation_id,
-                        "tool_use_id": observation["tool_use_id"],
+                        "tool_use_id": tool_use_id,
                         "metric": observation["metric"],
-                        "subject_digest": observation["subject_digest"],
+                        "subject_digest": subject_digest,
                     }
                 ).removeprefix("sha256:")
-                path = directory / f"{observation['source']}-{identity}.json"
-                exists_identically = False
+                path = directory / f"runtime-{identity}.json"
                 if path.exists():
                     if path.is_symlink():
                         raise ValueError(
@@ -3205,39 +1789,12 @@ class TaskStore:
                         raise ValueError(
                             "M_METRIC_REPLAY_CONFLICT: observation identity changed"
                         )
-                    exists_identically = True
-                prepared.append((observation, path, exists_identically))
-            if host_metrics is not None:
-                prepared_host = [
-                    exists_identically
-                    for observation, _, exists_identically in prepared
-                    if observation["source"] == "host"
-                ]
-                host_already_recorded = bool(prepared_host) and all(
-                    prepared_host
-                )
-                if host_metrics_consumed and not host_already_recorded:
-                    raise ValueError(
-                        "M_METRIC_UNTRUSTED_CHANNEL: host metrics were consumed"
-                    )
-            for observation, path, exists_identically in prepared:
-                if not exists_identically:
-                    _atomic_json(path, observation)
-            if (
-                host_metrics is not None
-                and not host_metrics_consumed
-            ):
-                if not _consume_runtime_host_object(
-                    host_metrics, "host_context_metrics"
-                ):
-                    raise ValueError(
-                        "M_METRIC_UNTRUSTED_CHANNEL: host metrics were consumed"
-                    )
-                host_metrics._consumed = True
+                    continue
+                _atomic_json(path, observation)
         return self.context_metrics(task_id)
 
     def context_metrics(self, task_id: str) -> dict[str, Any]:
-        """Aggregate unique metric observations independently of arrival order."""
+        """Aggregate only observed local runtime metrics."""
 
         observation_keys = {
             "schema_version",
@@ -3257,154 +1814,6 @@ class TaskStore:
             "hook_output_bytes",
             "context_units_selected",
         }
-        host_metric_keys = {
-            "required_resource_bytes",
-            "recommended_resource_bytes",
-            "worker_id",
-            "retry_count",
-            "worker_interval",
-        }
-        host_row_keys = {
-            "source",
-            "metric",
-            "task_digest",
-            "session_id",
-            "invocation_id",
-            "subject_digest",
-            "tool_use_id",
-            "value",
-            "row_digest",
-        }
-
-        def valid_observation(observation: Mapping[str, Any]) -> bool:
-            if (
-                set(observation) != observation_keys
-                or observation.get("schema_version") != 1
-                or SHA256_DIGEST.fullmatch(
-                    str(observation.get("task_digest"))
-                )
-                is None
-                or not validate_task_id(observation.get("session_id"))
-                or not validate_task_id(observation.get("invocation_id"))
-                or SHA256_DIGEST.fullmatch(
-                    str(observation.get("subject_digest"))
-                )
-                is None
-                or (
-                    observation.get("tool_use_id") is not None
-                    and not validate_task_id(
-                        observation.get("tool_use_id")
-                    )
-                )
-            ):
-                return False
-            source = observation.get("source")
-            metric = observation.get("metric")
-            value = observation.get("value")
-            if source == "runtime":
-                return bool(
-                    metric in runtime_metric_keys
-                    and isinstance(value, int)
-                    and not isinstance(value, bool)
-                    and value >= 0
-                )
-            if (
-                source != "host"
-                or metric != "host_metric_batch"
-                or not isinstance(value, Mapping)
-                or set(value) != {"rows", "rows_digest"}
-                or not isinstance(value.get("rows"), list)
-                or len(value["rows"]) != len(host_metric_keys)
-                or value.get("rows_digest")
-                != contract_digest(value["rows"])
-            ):
-                return False
-            seen_metrics: set[str] = set()
-            for row in value["rows"]:
-                if not isinstance(row, Mapping) or set(row) != host_row_keys:
-                    return False
-                semantic_row = {
-                    key: item
-                    for key, item in row.items()
-                    if key != "row_digest"
-                }
-                row_metric = row.get("metric")
-                row_value = row.get("value")
-                if (
-                    row.get("row_digest") != contract_digest(semantic_row)
-                    or row.get("source") != "host"
-                    or row_metric not in host_metric_keys
-                    or row_metric in seen_metrics
-                    or row.get("task_digest")
-                    != observation.get("task_digest")
-                    or row.get("session_id")
-                    != observation.get("session_id")
-                    or row.get("invocation_id")
-                    != observation.get("invocation_id")
-                    or row.get("subject_digest")
-                    != observation.get("subject_digest")
-                    or row.get("tool_use_id")
-                    != observation.get("tool_use_id")
-                ):
-                    return False
-                seen_metrics.add(str(row_metric))
-                if row_metric in {
-                    "required_resource_bytes",
-                    "recommended_resource_bytes",
-                }:
-                    if not (
-                        row_value is None
-                        or (
-                            isinstance(row_value, int)
-                            and not isinstance(row_value, bool)
-                            and row_value >= 0
-                        )
-                    ):
-                        return False
-                elif row_metric == "worker_id":
-                    if not validate_task_id(row_value):
-                        return False
-                elif row_metric == "retry_count":
-                    if not (
-                        isinstance(row_value, int)
-                        and not isinstance(row_value, bool)
-                        and row_value >= 0
-                    ):
-                        return False
-                elif not (
-                    isinstance(row_value, Mapping)
-                    and set(row_value)
-                    == {
-                        "started_at_monotonic",
-                        "ended_at_monotonic",
-                    }
-                    and isinstance(
-                        row_value.get("started_at_monotonic"),
-                        (int, float),
-                    )
-                    and not isinstance(
-                        row_value.get("started_at_monotonic"), bool
-                    )
-                    and math.isfinite(
-                        float(row_value["started_at_monotonic"])
-                    )
-                    and float(row_value["started_at_monotonic"]) >= 0
-                    and isinstance(
-                        row_value.get("ended_at_monotonic"),
-                        (int, float),
-                    )
-                    and not isinstance(
-                        row_value.get("ended_at_monotonic"), bool
-                    )
-                    and math.isfinite(
-                        float(row_value["ended_at_monotonic"])
-                    )
-                    and float(row_value["ended_at_monotonic"])
-                    >= float(row_value["started_at_monotonic"])
-                ):
-                    return False
-            return seen_metrics == host_metric_keys
-
         with _task_guard(self.state_dir, task_id):
             directory = self._metrics_dir(task_id)
             observations: list[dict[str, Any]] = []
@@ -3436,61 +1845,52 @@ class TaskStore:
                         for key, value in observation.items()
                         if key != "observation_digest"
                     }
-                    if observation.get("observation_digest") != contract_digest(
-                        semantic
-                    ):
-                        raise ValueError(
-                            "M_METRIC_REPLAY_CONFLICT: metric digest mismatch"
+                    if (
+                        set(observation) != observation_keys
+                        or observation.get("schema_version") != 1
+                        or observation.get("source") != "runtime"
+                        or observation.get("metric") not in runtime_metric_keys
+                        or not isinstance(observation.get("value"), int)
+                        or isinstance(observation.get("value"), bool)
+                        or int(observation["value"]) < 0
+                        or SHA256_DIGEST.fullmatch(
+                            str(observation.get("task_digest"))
                         )
-                    if not valid_observation(observation):
+                        is None
+                        or not validate_task_id(observation.get("session_id"))
+                        or not validate_task_id(observation.get("invocation_id"))
+                        or SHA256_DIGEST.fullmatch(
+                            str(observation.get("subject_digest"))
+                        )
+                        is None
+                        or (
+                            observation.get("tool_use_id") is not None
+                            and not validate_task_id(
+                                observation.get("tool_use_id")
+                            )
+                        )
+                        or observation.get("observation_digest")
+                        != contract_digest(semantic)
+                    ):
                         raise ValueError(
                             "M_METRIC_REPLAY_CONFLICT: metric schema mismatch"
                         )
                     observations.append(observation)
 
-        runtime = [
-            item for item in observations if item.get("source") == "runtime"
-        ]
-        host: list[dict[str, Any]] = []
-        for item in observations:
-            if item.get("source") != "host":
-                continue
-            for row in item["value"]["rows"]:
-                host.append(
-                    {
-                        **item,
-                        "metric": row["metric"],
-                        "value": row["value"],
-                    }
-                )
-
-        def metric_values(
-            source: list[dict[str, Any]], metric: str
-        ) -> list[object]:
+        def numeric(metric: str) -> list[int]:
             return [
-                item.get("value")
-                for item in source
+                int(item["value"])
+                for item in observations
                 if item.get("metric") == metric
             ]
 
-        def numeric_values(
-            source: list[dict[str, Any]], metric: str
-        ) -> list[int]:
-            return [
-                int(value)
-                for value in metric_values(source, metric)
-                if isinstance(value, int) and not isinstance(value, bool)
-            ]
-
-        def metric_values_by_invocation(
-            source: list[dict[str, Any]], metric: str
-        ) -> list[object]:
-            grouped: dict[str, object] = {}
-            for item in source:
+        def per_invocation(metric: str) -> list[int]:
+            grouped: dict[str, int] = {}
+            for item in observations:
                 if item.get("metric") != metric:
                     continue
-                invocation = str(item.get("invocation_id"))
-                value = item.get("value")
+                invocation = str(item["invocation_id"])
+                value = int(item["value"])
                 if invocation in grouped and grouped[invocation] != value:
                     raise ValueError(
                         "M_METRIC_REPLAY_CONFLICT: "
@@ -3499,101 +1899,15 @@ class TaskStore:
                 grouped[invocation] = value
             return [grouped[key] for key in sorted(grouped)]
 
-        def numeric_values_by_invocation(
-            source: list[dict[str, Any]], metric: str
-        ) -> list[int]:
-            return [
-                int(value)
-                for value in metric_values_by_invocation(source, metric)
-                if isinstance(value, int) and not isinstance(value, bool)
-            ]
-
         def total_and_max(metric: str) -> tuple[int, int]:
-            collected = numeric_values(runtime, metric)
-            return sum(collected), max(collected, default=0)
+            values = numeric(metric)
+            return sum(values), max(values, default=0)
 
         router_total, router_max = total_and_max("router_manifest_bytes")
         brief_total, brief_max = total_and_max("novice_brief_bytes")
         hook_total, hook_max = total_and_max("hook_output_bytes")
-        units = numeric_values_by_invocation(
-            runtime, "context_units_selected"
-        )
-        units_total, units_max = sum(units), max(units, default=0)
-        required = numeric_values(host, "required_resource_bytes")
-        recommended = numeric_values(
-            host, "recommended_resource_bytes"
-        )
-        workers = {
-            str(value)
-            for value in metric_values(host, "worker_id")
-            if validate_task_id(value)
-        }
-        retries = numeric_values_by_invocation(host, "retry_count")
-        intervals = [
-            (
-                float(value["started_at_monotonic"]),
-                float(value["ended_at_monotonic"]),
-            )
-            for value in metric_values_by_invocation(
-                host, "worker_interval"
-            )
-            if isinstance(value, Mapping)
-            and isinstance(
-                value.get("started_at_monotonic"), (int, float)
-            )
-            and not isinstance(value.get("started_at_monotonic"), bool)
-            and isinstance(
-                value.get("ended_at_monotonic"), (int, float)
-            )
-            and not isinstance(value.get("ended_at_monotonic"), bool)
-            and float(value["ended_at_monotonic"])
-            >= float(value["started_at_monotonic"])
-        ]
-        runtime_identities = {
-            (str(item.get("invocation_id")), item.get("tool_use_id"))
-            for item in runtime
-        }
-        host_identities = {
-            (str(item.get("invocation_id")), item.get("tool_use_id"))
-            for item in host
-        }
-        host_invocations = {
-            invocation_id for invocation_id, _ in host_identities
-        }
-        required_host_metrics = {
-            "required_resource_bytes",
-            "recommended_resource_bytes",
-            "worker_id",
-            "retry_count",
-            "worker_interval",
-        }
-        host_complete = bool(runtime_identities) and (
-            runtime_identities == host_identities
-            and all(
-                sum(
-                    1
-                    for item in host
-                    if (
-                        str(item.get("invocation_id")),
-                        item.get("tool_use_id"),
-                    )
-                    == identity
-                    and item.get("metric") == metric
-                )
-                == 1
-                for identity in host_identities
-                for metric in required_host_metrics
-            )
-            and len(required) == len(host_identities)
-            and len(recommended) == len(host_identities)
-            and len(metric_values_by_invocation(host, "worker_id"))
-            == len(host_invocations)
-            and len(retries) == len(host_invocations)
-            and len(intervals) == len(host_invocations)
-        )
-        invocations = {
-            str(item.get("invocation_id")) for item in observations
-        }
+        units = per_invocation("context_units_selected")
+        invocations = {str(item["invocation_id"]) for item in observations}
         hook_invocations = {
             str(item["tool_use_id"])
             for item in observations
@@ -3602,47 +1916,17 @@ class TaskStore:
         return {
             "schema_version": 1,
             "task_id": task_id,
-            "metrics_status": "complete" if host_complete else "partial",
+            "metrics_status": "local",
             "router_manifest_bytes_total": router_total,
             "router_manifest_bytes_max": router_max,
             "novice_brief_bytes_total": brief_total,
             "novice_brief_bytes_max": brief_max,
             "hook_output_bytes_total": hook_total,
             "hook_output_bytes_max": hook_max,
-            "required_resource_bytes_total": (
-                sum(required) if host_complete else None
-            ),
-            "required_resource_bytes_max": (
-                max(required, default=0) if host_complete else None
-            ),
-            "recommended_resource_bytes_total": (
-                sum(recommended) if host_complete else None
-            ),
-            "recommended_resource_bytes_max": (
-                max(recommended, default=0) if host_complete else None
-            ),
+            "context_units_selected_total": sum(units),
+            "context_units_selected_max": max(units, default=0),
             "invocation_count_unique": len(invocations),
             "hook_invocation_count_unique": len(hook_invocations),
-            "context_units_selected_total": units_total,
-            "context_units_selected_max": units_max,
-            "workers_unique": len(workers) if host_complete else None,
-            "retry_count_total": sum(retries) if host_complete else None,
-            "worker_time_ms_total": (
-                round(sum(end - start for start, end in intervals) * 1000)
-                if host_complete
-                else None
-            ),
-            "task_elapsed_ms": (
-                round(
-                    (
-                        max(end for _, end in intervals)
-                        - min(start for start, _ in intervals)
-                    )
-                    * 1000
-                )
-                if host_complete and intervals
-                else None
-            ),
         }
 
     def transition(
@@ -3691,13 +1975,6 @@ class TaskStore:
         if current_branch != state["branch"]:
             raise ValueError("E_STATE_BRANCH: current branch differs from task branch")
         source = str(state["state"])
-        if (
-            source == "clarification_required"
-            or target == "clarification_required"
-        ):
-            raise ValueError(
-                "E_STATE_LATERAL: clarification requires the specialized host API"
-            )
         if target not in ORDERED_STATES and target != "blocked":
             raise ValueError(
                 f"E_STATE_TRANSITION: {source} -> {target} is illegal"
@@ -4178,18 +2455,6 @@ class TaskStore:
                 ):
                     raise ValueError("E_STATE_CAS: recovery marker changed")
                 destination = str(finalization["destination"])
-                clarification_sidecar: Path | None = None
-                if finalization.get("clarification_reframe") is True:
-                    clarification_sidecar = self._clarification_sidecar(
-                        task_id, current
-                    )
-                    if str(clarification_sidecar) != finalization.get(
-                        "clarification_sidecar"
-                    ):
-                        raise ValueError(
-                            "E_STATE_RECOVERY: clarification sidecar binding changed"
-                        )
-                    self._clear_clarification_fields(current)
                 current.update(
                     {
                         "state": destination,
@@ -4209,17 +2474,9 @@ class TaskStore:
                         "updated_at": _utc_now(),
                     }
                 )
-                if finalization.get("clarification_reframe") is True:
-                    current["clarification_resolution_digest"] = finalization.get(
-                        "resolution_digest"
-                    )
                 current.pop("finalization", None)
                 current.pop("finalizing_lease_digest", None)
                 _atomic_json(state_path, current)
-                if clarification_sidecar is not None:
-                    self._unlink_clarification_sidecar(
-                        clarification_sidecar
-                    )
                 return current
 
     @staticmethod

@@ -374,23 +374,22 @@ def _validate_snapshot(
         or set(git_policy) != {
             "base_branch",
             "remote_name",
-            "remote_url",
+            "remote_url_digest",
             "remote_repository",
         }
     ):
         raise _invalid("manifest identity binding is invalid")
     base_branch = git_policy.get("base_branch")
     remote_name = git_policy.get("remote_name")
-    remote_url = git_policy.get("remote_url")
+    remote_url_digest = git_policy.get("remote_url_digest")
     remote_repository = git_policy.get("remote_repository")
     if (
         not isinstance(base_branch, str)
         or _SAFE_GIT_NAME.fullmatch(base_branch) is None
         or not isinstance(remote_name, str)
         or _SAFE_GIT_NAME.fullmatch(remote_name) is None
-        or not isinstance(remote_url, str)
-        or not remote_url
-        or "\n" in remote_url
+        or not isinstance(remote_url_digest, str)
+        or _DIGEST.fullmatch(remote_url_digest) is None
         or not isinstance(remote_repository, str)
         or not remote_repository
     ):
@@ -436,7 +435,7 @@ class ProtectedGitPolicy:
         "runtime_digest",
         "base_branch",
         "remote_name",
-        "remote_url",
+        "remote_url_digest",
         "remote_repository",
         "source_commit",
         "governing_base_commit",
@@ -460,7 +459,7 @@ _PROTECTED_BINDINGS = (
     "runtime_digest",
     "base_branch",
     "remote_name",
-    "remote_url",
+    "remote_url_digest",
     "remote_repository",
     "source_commit",
     "governing_base_commit",
@@ -554,7 +553,7 @@ def load_protected_git_policy(
     result.runtime_digest = _runtime_digest(records)
     result.base_branch = git_policy["base_branch"]
     result.remote_name = git_policy["remote_name"]
-    result.remote_url = git_policy["remote_url"]
+    result.remote_url_digest = git_policy["remote_url_digest"]
     result.remote_repository = git_policy["remote_repository"]
     result.source_commit = manifest["source_commit"]
     result.governing_base_commit = manifest["governing_base_commit"]
@@ -705,9 +704,14 @@ def guard_pre_push(
             repo, protected_policy
         )
         errors: list[dict[str, str]] = []
+        observed_remote_digest = (
+            f"sha256:{sha256(remote_url.encode('utf-8')).hexdigest()}"
+            if isinstance(remote_url, str)
+            else None
+        )
         if (
             remote_name != protected_policy.remote_name
-            or remote_url != protected_policy.remote_url
+            or observed_remote_digest != protected_policy.remote_url_digest
         ):
             errors.append(
                 _error(

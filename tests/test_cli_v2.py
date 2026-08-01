@@ -770,97 +770,6 @@ class CliV2Tests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["ok"])
 
-    def test_task_clarification_status_reemits_only_durable_request_and_view(
-        self,
-    ) -> None:
-        from control_plane.contracts import contract_digest
-        from control_plane.lifecycle import TaskStore, _atomic_json
-        from control_plane.repository import worktree_git_dir
-
-        scenario = GitScenario()
-        self.addCleanup(scenario.close)
-        state_dir = worktree_git_dir(scenario.repo)
-        task_id = "TASK-CLI-CLARIFICATION"
-        store = TaskStore(state_dir)
-        state = store.start(
-            task_id,
-            outcome="local_change",
-            branch="main",
-            task_digest=self.digest,
-            decision_digest=self.digest,
-        )
-        prompt_view = {
-            "schema_version": 1,
-            "request_id": "clarify-cli-request",
-            "question_text": "Continue with the safe option?",
-            "options": [
-                {"id": "safe", "label": "Use safe option"},
-                {"id": "stop", "label": "Stop"},
-            ],
-            "recommended_option_id": "safe",
-            "consequence_text": "The task remains blocked until answered.",
-        }
-        presentation_digest = contract_digest(prompt_view)
-        request = {
-            "schema_version": 1,
-            "request_id": "clarify-cli-request",
-            "task_digest": self.digest,
-            "session_id": "session-cli-clarification",
-            "issue_kind": "decision_approval",
-            "severity": "high",
-            "question_digest": contract_digest({"question": "cli"}),
-            "presentation_digest": presentation_digest,
-            "repository_check": {
-                "status": "not_checked",
-                "evidence_digest": None,
-            },
-            "option_ids": ["safe", "stop"],
-            "recommended_option_id": "safe",
-        }
-        relative_sidecar = (
-            "codex-control-plane/clarification-prompt-views/"
-            f"{task_id}/generation-00000001.json"
-        )
-        sidecar = state_dir / relative_sidecar
-        sidecar.parent.mkdir(parents=True)
-        sidecar.write_bytes(
-            json.dumps(
-                prompt_view,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        )
-        sidecar.chmod(0o600)
-        state.update(
-            {
-                "state": "clarification_required",
-                "clarification_resume_state": "framed",
-                "clarification_request": request,
-                "clarification_request_digest": contract_digest(request),
-                "clarification_prompt_view_path": relative_sidecar,
-                "clarification_presentation_digest": presentation_digest,
-                "generation": 1,
-            }
-        )
-        _atomic_json(store._path(task_id), state)
-
-        result = run_cli(
-            "task",
-            "clarification-status",
-            "--repo",
-            str(scenario.repo),
-            "--task-id",
-            task_id,
-            "--json",
-        )
-
-        payload = json.loads(result.stdout)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["task"]["state"], "clarification_required")
-        self.assertEqual(payload["task"]["request"], request)
-        self.assertEqual(payload["task"]["prompt_view"], prompt_view)
-        self.assertNotIn("resolution", payload["task"])
 
     def test_task_cli_has_no_serialized_clarification_resolution_path(
         self,
@@ -878,7 +787,7 @@ class CliV2Tests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid choice", result.stderr)
 
-    def test_task_transition_rejects_lateral_clarification_state(self) -> None:
+    def test_task_transition_rejects_removed_clarification_state(self) -> None:
         scenario = GitScenario()
         self.addCleanup(scenario.close)
         started = run_cli(
@@ -913,7 +822,7 @@ class CliV2Tests(unittest.TestCase):
         self.assertEqual(started.returncode, 0, started.stderr)
         self.assertNotEqual(transitioned.returncode, 0)
         self.assertIn(
-            "E_STATE_LATERAL",
+            "E_STATE_TRANSITION",
             {
                 item["code"]
                 for item in json.loads(transitioned.stdout)["errors"]

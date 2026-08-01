@@ -443,12 +443,12 @@ def _snapshot_remote_url(remote_url: str) -> str:
     except ValueError as error:
         raise ValueError("E_ADOPT_REMOTE: push URL is invalid") from error
     if (
-        parsed.scheme.lower() in {"http", "https"}
-        and (
-            parsed.username is not None
-            or parsed.password is not None
-            or bool(parsed.query)
-            or bool(parsed.fragment)
+        parsed.password is not None
+        or bool(parsed.query)
+        or bool(parsed.fragment)
+        or (
+            parsed.scheme.lower() in {"http", "https"}
+            and parsed.username is not None
         )
     ):
         raise ValueError(
@@ -651,7 +651,7 @@ def _installed_snapshot(
         "git": {
             "base_branch": str(git_facts["base_branch"]),
             "remote_name": remote_name,
-            "remote_url": remote_url,
+            "remote_url_digest": _digest_bytes(remote_url.encode("utf-8")),
             "remote_repository": _remote_repository_identity(
                 remote_url, target_root
             ),
@@ -1398,12 +1398,14 @@ def _render_lock(rendered: Mapping[str, bytes]) -> bytes:
     digest = lambda relative: _digest_bytes(rendered[relative])
     lines = [
         "schema_version = 1",
-        'product_version = "2.0.0"',
+        'product_version = "2.1.0"',
         "policy_schema = 1",
         "registry_schema = 1",
         "task_schema = 1",
         "route_schema = 1",
         "receipt_schema = 1",
+        "clarification_schema = 1",
+        "risk_schema = 1",
         'hook_mode = "audit"',
         'hook_trust = "pending_hook_trust"',
         f'runtime_package = "{RUNTIME_PACKAGE}"',
@@ -1703,6 +1705,50 @@ def _owner_pointer_path(target: Path) -> Path:
     return transactions / "adoption-owner.json"
 
 
+def _read_owner_pointer(path: Path) -> dict[str, Any] | None:
+    """Read one bounded regular pointer without following filesystem links."""
+
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: safe owner pointer reads are unsupported"
+        )
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: owner pointer is unsafe"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65_536:
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: owner pointer is unsafe"
+            )
+        payload = os.read(descriptor, 65_537)
+        if len(payload) > 65_536:
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: owner pointer exceeds cap"
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: owner pointer is invalid"
+        ) from error
+    if not isinstance(value, dict):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: owner pointer is invalid"
+        )
+    return value
+
+
 def _registered_worktree_owners(target: Path) -> dict[str, Path]:
     """Resolve every registered worktree to its exact worktree Git directory."""
 
@@ -1859,11 +1905,11 @@ def _commit_transaction(
 
 def _recover_owner_transaction(target: Path) -> None:
     pointer_path = _owner_pointer_path(target)
-    if not pointer_path.exists():
+    pointer = _read_owner_pointer(pointer_path)
+    if pointer is None:
         return
     try:
         registered_owners = _registered_worktree_owners(target)
-        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
         if (
             set(pointer)
             != {

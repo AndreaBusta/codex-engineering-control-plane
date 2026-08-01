@@ -11,14 +11,13 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).parents[1]
 SCENARIOS = (
     "warning_once",
-    "sessionstart_compact_to_post_compact",
+    "sessionstart_compact_fallback",
     "safe_read_explicit_repo",
     "feature_commit_push",
     "base_detached_force_denied",
@@ -256,148 +255,77 @@ def _stop_receipt_and_no_loop_are_exact(
     return receipt == expected and no_loop == expected
 
 
-def _setup_current_warning(
+def _expected_unknown_warning(
+    *, trigger: str, framing_status: str
+) -> dict[str, object]:
+    return {
+        "title": "CONTROL PLANE RISK",
+        "local": "UNKNOWN",
+        "remote": "UNKNOWN",
+        "action": "PAUSE_AND_VERIFY",
+        "reason_code": "RS_WARNING_STATE_UNKNOWN",
+        "safe_path": "feature→commit→push-feature→PR→checks→authorized-merge",
+        "interaction": "pending_framing",
+        "automatic_change": False,
+        "trigger": trigger,
+        "framing_status": framing_status,
+    }
+
+
+def _setup_local_task_state(
     root: Path,
     *,
     session_id: str,
     task_id: str,
 ) -> dict[str, object]:
-    """Use only the adopted runtime to publish host-bound smoke state."""
+    """Create only the local task and receipt consumed by installed hooks."""
 
-    import importlib
-    import importlib.util
-
-    lock = tomllib.loads(
-        (root / ".codex" / "control-plane.lock").read_text(
-            encoding="utf-8"
-        )
+    del session_id
+    git_dir = Path(
+        _git(root, "rev-parse", "--path-format=absolute", "--git-dir")
+    ).resolve()
+    state_root = git_dir / "codex-control-plane"
+    task_digest = f"sha256:{sha256(task_id.encode('utf-8')).hexdigest()}"
+    decision_digest = (
+        f"sha256:{sha256(('route:' + task_id).encode('utf-8')).hexdigest()}"
     )
-    package_name = str(lock.get("runtime_package", ""))
-    layout = str(lock.get("runtime_layout", ""))
-    runtime = (
-        root / "control_plane"
-        if layout == "source" and package_name == "control_plane"
-        else root / ".codex" / "runtime" / package_name
-    )
-    spec = importlib.util.spec_from_file_location(
-        package_name,
-        runtime / "__init__.py",
-        submodule_search_locations=[str(runtime)],
-    )
-    if (
-        not package_name
-        or spec is None
-        or spec.loader is None
-        or runtime.is_symlink()
-        or not runtime.is_dir()
+    task = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "task_digest": task_digest,
+        "decision_digest": decision_digest,
+        "state": "framed",
+        "generation": 1,
+    }
+    receipt_core = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "decision_digest": decision_digest,
+    }
+    receipt = {
+        **receipt_core,
+        "receipt_digest": (
+            "sha256:"
+            + sha256(
+                json.dumps(
+                    receipt_core,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        ),
+    }
+    for directory, name, value in (
+        ("tasks", f"{task_id}.json", task),
+        ("receipts", f"{task_id}.json", receipt),
     ):
-        raise RuntimeError("smoke runtime bootstrap failed")
-    package = importlib.util.module_from_spec(spec)
-    sys.modules[package_name] = package
-    spec.loader.exec_module(package)
-    contracts = importlib.import_module(f"{package_name}.contracts")
-    hooks = importlib.import_module(f"{package_name}.hooks")
-    intake = importlib.import_module(f"{package_name}.intake")
-    lifecycle = importlib.import_module(f"{package_name}.lifecycle")
-    policy_module = importlib.import_module(f"{package_name}.policy")
-    repository_module = importlib.import_module(
-        f"{package_name}.repository"
-    )
-    risk_sentinel = importlib.import_module(
-        f"{package_name}.risk_sentinel"
-    )
-
-    contract_digest = contracts.contract_digest
-    policy = policy_module.load_policy(
-        root / ".codex" / "project-policy.toml"
-    )
-    policy_digest = contract_digest(policy)
-    task_digest = contract_digest({"task_id": task_id})
-    decision_digest = contract_digest({"decision": task_id})
-    runtime_digest = str(lock.get("digests", {}).get("runtime", ""))
-    governing_base_commit = _git(
-        root, "rev-parse", "refs/remotes/origin/main"
-    )
-    remote_repository = _git(
-        root, "config", "--get", "remote.origin.url"
-    )
-    governing = object.__new__(policy_module.GoverningPolicy)
-    governing._consumed = False
-    governing.policy = policy
-    governing.policy_digest = policy_digest
-    governing.runtime_digest = runtime_digest
-    governing.lock_digest = _digest(
-        root / ".codex" / "control-plane.lock"
-    )
-    governing.governing_base_commit = governing_base_commit
-    governing.remote_repository = remote_repository
-    governing.session_id = session_id
-    governing.invocation_id = f"setup-{task_id}"
-    governing.freshness_deadline = time.monotonic() + 60.0
-    governing.binding_digest = contract_digest(
-        {
-            "policy_digest": governing.policy_digest,
-            "runtime_digest": governing.runtime_digest,
-            "lock_digest": governing.lock_digest,
-            "governing_base_commit": governing.governing_base_commit,
-            "remote_repository": governing.remote_repository,
-            "session_id": governing.session_id,
-            "invocation_id": governing.invocation_id,
-        }
-    )
-    policy_module._register_governing_policy(governing)
-
-    state_root = (
-        repository_module.worktree_git_dir(root)
-        / "codex-control-plane"
-    )
-    lifecycle._atomic_json(
-        state_root / "tasks" / f"{task_id}.json",
-        {
-            "schema_version": 1,
-            "task_id": task_id,
-            "task_digest": task_digest,
-            "decision_digest": decision_digest,
-            "state": "framed",
-            "generation": 1,
-        },
-    )
-    receipt = lifecycle.create_resource_receipt(
-        task_id=task_id,
-        decision_digest=decision_digest,
-        digests={
-            "task": task_digest,
-            "policy": policy_digest,
-            "registry": contract_digest({"registry": "installed"}),
-            "inventory": contract_digest({"inventory": "installed"}),
-        },
-        used=[],
-        resource_digests={},
-        omitted=[],
-        gates=[],
-        effects=[],
-    )
-    lifecycle._atomic_json(
-        state_root / "receipts" / f"{task_id}.json",
-        receipt,
-    )
-    os.environ["CODEX_CONTROL_PLANE_TASK_ID"] = task_id
-    risk_status = risk_sentinel.evaluate_risk_status(root, governing)
-    interaction = intake.render_interaction_recommendation(
-        "plan", ["MODE_COMPLEX_OR_UNCERTAIN"]
-    )
-    current = hooks.publish_framed_current_warning_view(
-        root,
-        session_id,
-        risk_status=risk_status,
-        interaction=interaction,
-        governing_policy=governing,
-        task_digest=task_digest,
-        route_digest=decision_digest,
-        generation=1,
-    )
+        destination = state_root / directory / name
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination.write_text(
+            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
     return {
-        "payload": current.payload.as_dict(),
         "task_id": task_id,
         "receipt_digest": receipt["receipt_digest"],
     }
@@ -426,7 +354,7 @@ def _child_payload(root: Path) -> dict[str, object]:
                         "-I",
                         "-B",
                         str(Path(__file__).resolve()),
-                        "--setup-current-warning",
+                        "--setup-local-task",
                         "--repo",
                         str(target.resolve()),
                         "--session-id",
@@ -440,13 +368,15 @@ def _child_payload(root: Path) -> dict[str, object]:
                     setup_payload = json.loads(
                         setup.stdout.decode("utf-8")
                     )
-                    expected_current = setup_payload["payload"]
+                    expected_compact = _expected_unknown_warning(
+                        trigger="post_compact",
+                        framing_status="pending_framing",
+                    )
                     setup_exact = (
                         setup.returncode == 0
                         and set(setup_payload)
-                        == {"payload", "task_id", "receipt_digest"}
+                        == {"task_id", "receipt_digest"}
                         and setup_payload.get("task_id") == task_id
-                        and isinstance(expected_current, dict)
                         and str(
                             setup_payload.get("receipt_digest", "")
                         ).startswith("sha256:")
@@ -457,7 +387,7 @@ def _child_payload(root: Path) -> dict[str, object]:
                     UnicodeDecodeError,
                     json.JSONDecodeError,
                 ):
-                    expected_current = None
+                    expected_compact = None
                     setup_exact = False
                 if setup_exact:
                     prompt_payload = {
@@ -495,13 +425,11 @@ def _child_payload(root: Path) -> dict[str, object]:
                     compact_pass = (
                         compact.returncode == 0
                         and _compact_matches_current(
-                            compact.stdout, expected_current
+                            compact.stdout, expected_compact
                         )
                     )
-                    cases[
-                        "sessionstart_compact_to_post_compact"
-                    ] = _completed_case(
-                        "sessionstart_compact_to_post_compact",
+                    cases["sessionstart_compact_fallback"] = _completed_case(
+                        "sessionstart_compact_fallback",
                         "PASS" if compact_pass else "FAIL",
                         compact,
                     )
@@ -583,7 +511,7 @@ def _child_payload(root: Path) -> dict[str, object]:
                 else:
                     for case_id in (
                         "warning_once",
-                        "sessionstart_compact_to_post_compact",
+                        "sessionstart_compact_fallback",
                         "safe_read_explicit_repo",
                         "stop_receipt",
                     ):
@@ -909,7 +837,7 @@ class MacOSHookSmokeTests(unittest.TestCase):
         self.assertEqual(before["tree"], after["tree"])
         self.assertNotEqual(before["index"], after["index"])
 
-    def test_adopted_runtime_rehydrates_exact_current_compact_view(
+    def test_adopted_runtime_emits_exact_minimal_compact_fallback(
         self,
     ) -> None:
         source = (self.temp_root / "exact-compact-source").resolve()
@@ -959,7 +887,7 @@ class MacOSHookSmokeTests(unittest.TestCase):
                 "-I",
                 "-B",
                 str(Path(__file__).resolve()),
-                "--setup-current-warning",
+                "--setup-local-task",
                 "--repo",
                 str(target.resolve()),
                 "--session-id",
@@ -970,12 +898,15 @@ class MacOSHookSmokeTests(unittest.TestCase):
             cwd=target,
         )
         self.assertEqual(setup.returncode, 0, setup.stderr)
-        expected = json.loads(setup.stdout.decode("utf-8"))["payload"]
-        from control_plane.hooks import (
-            _task_warning_bindings,
-            current_warning_view_path,
-            risk_fingerprint,
+        setup_payload = json.loads(setup.stdout.decode("utf-8"))
+        self.assertEqual(
+            set(setup_payload), {"task_id", "receipt_digest"}
         )
+        expected = _expected_unknown_warning(
+            trigger="post_compact",
+            framing_status="pending_framing",
+        )
+        from control_plane.hooks import _task_warning_bindings
 
         with patch.dict(
             os.environ,
@@ -983,20 +914,7 @@ class MacOSHookSmokeTests(unittest.TestCase):
             clear=False,
         ):
             bindings = _task_warning_bindings(target)
-            observed_fingerprint = risk_fingerprint(target)
-        current_path = current_warning_view_path(target, session_id)
-        current_raw = json.loads(
-            current_path.read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            current_raw["fingerprint"],
-            observed_fingerprint,
-            {
-                "bindings": bindings,
-                "current": current_raw["fingerprint"],
-                "observed": observed_fingerprint,
-            },
-        )
+        self.assertIsNotNone(bindings)
         compact = _invoke_hook(
             target,
             {
@@ -1252,9 +1170,7 @@ class MacOSHookSmokeTests(unittest.TestCase):
             (item.case_id, item.status, item.exit_code)
             for item in completed.cases
         ]
-        self.assertEqual(
-            completed.mechanical_result, "UNKNOWN", case_summary
-        )
+        self.assertEqual(completed.mechanical_result, "PASS", case_summary)
         self.assertEqual(
             tuple(item.case_id for item in completed.cases), SCENARIOS
         )
@@ -1265,10 +1181,10 @@ class MacOSHookSmokeTests(unittest.TestCase):
             },
             {
                 "warning_once": "PASS",
-                "sessionstart_compact_to_post_compact": "PASS",
+                "sessionstart_compact_fallback": "PASS",
                 "safe_read_explicit_repo": "PASS",
-                "feature_commit_push": "UNKNOWN",
-                "base_detached_force_denied": "UNKNOWN",
+                "feature_commit_push": "PASS",
+                "base_detached_force_denied": "PASS",
                 "stop_receipt": "PASS",
                 "rollback_byte_exact": "PASS",
                 "source_isolated_parity": "PASS",
@@ -1358,11 +1274,8 @@ class MacOSHookSmokeTests(unittest.TestCase):
     ) -> None:
         from control_plane.contracts import contract_digest
         from control_plane.host_bridge import (
-            ValidatedHookReviewObservation,
             _atomic_receipt_json,
-            _register_runtime_host_object,
             frame_verification_task_context,
-            publish_hook_review_receipt,
             publish_macos_hook_smoke_receipt,
             run_macos_hook_smoke,
         )
@@ -1592,90 +1505,6 @@ class MacOSHookSmokeTests(unittest.TestCase):
             result.task_context.generation, state["generation"] + 1
         )
         self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
-
-        review = object.__new__(ValidatedHookReviewObservation)
-        review._consumed = False
-        review._clock = lambda: 100.0
-        review.event_id = "event-task7-hook-review"
-        review.smoke_receipt_digest = result.receipt.receipt_digest
-        review.repository = result.receipt.repository
-        review.head = result.receipt.head
-        review.artifact_digests = completed.artifact_digests
-        review.session_id = result.receipt.session_id
-        review.invocation_id = "invocation-task7-hook-review"
-        review.freshness_deadline = 130.0
-        review.observation_digest = contract_digest(
-            {
-                "event_id": review.event_id,
-                "smoke_receipt_digest": review.smoke_receipt_digest,
-                "repository": review.repository,
-                "head": review.head,
-                "artifact_digests": review.artifact_digests,
-                "session_id": review.session_id,
-                "invocation_id": review.invocation_id,
-                "freshness_deadline": review.freshness_deadline,
-            }
-        )
-        _register_runtime_host_object(review, "validated_hook_review")
-        review_receipt_path = receipt_path.with_name(
-            "HookReviewReceipt.json"
-        )
-
-        def fail_review_receipt(path: Path, payload: object) -> None:
-            if Path(path) == review_receipt_path:
-                raise OSError("injected review receipt write failure")
-            real_receipt_atomic_json(path, payload)
-
-        with patch(
-            "control_plane.host_bridge._atomic_receipt_json",
-            side_effect=fail_review_receipt,
-        ):
-            with self.assertRaisesRegex(
-                OSError, "injected review receipt write failure"
-            ):
-                publish_hook_review_receipt(
-                    review,
-                    task_store=store,
-                    task_context=result.task_context,
-                    expected_generation=result.task_context.generation,
-                )
-        self.assertFalse(review._consumed)
-        self.assertFalse(result.task_context._consumed)
-
-        def fail_review_state(path: Path, payload: object) -> None:
-            if Path(path) == store._path(task_id):
-                raise OSError("injected review state write failure")
-            real_atomic_json(path, payload)
-
-        with patch(
-            "control_plane.lifecycle._atomic_json",
-            side_effect=fail_review_state,
-        ):
-            with self.assertRaisesRegex(
-                OSError, "injected review state write failure"
-            ):
-                publish_hook_review_receipt(
-                    review,
-                    task_store=store,
-                    task_context=result.task_context,
-                    expected_generation=result.task_context.generation,
-                )
-        self.assertFalse(review._consumed)
-        self.assertFalse(result.task_context._consumed)
-        self.assertTrue(review_receipt_path.is_file())
-
-        reviewed = publish_hook_review_receipt(
-            review,
-            task_store=store,
-            task_context=result.task_context,
-            expected_generation=result.task_context.generation,
-        )
-        self.assertTrue(reviewed.receipt.reviewed)
-        self.assertFalse(reviewed.receipt.authorizes)
-        self.assertEqual(
-            reviewed.task_context.generation,
-            result.task_context.generation + 1,
-        )
         with self.assertRaisesRegex(ValueError, "E_MACOS_SMOKE_REPLAY"):
             publish_macos_hook_smoke_receipt(
                 completed,
@@ -1724,7 +1553,7 @@ class MacOSHookSmokeTests(unittest.TestCase):
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-macos-hook-smoke", action="store_true")
-    parser.add_argument("--setup-current-warning", action="store_true")
+    parser.add_argument("--setup-local-task", action="store_true")
     parser.add_argument("--repo")
     parser.add_argument("--session-id")
     parser.add_argument("--task-id")
@@ -1733,10 +1562,10 @@ def _parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     parsed = _parser().parse_args()
-    if parsed.setup_current_warning:
+    if parsed.setup_local_task:
         if not parsed.repo or not parsed.session_id or not parsed.task_id:
             raise SystemExit(2)
-        setup_payload = _setup_current_warning(
+        setup_payload = _setup_local_task_state(
             Path(parsed.repo).resolve(),
             session_id=parsed.session_id,
             task_id=parsed.task_id,

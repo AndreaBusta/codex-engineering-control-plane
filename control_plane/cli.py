@@ -69,8 +69,8 @@ from control_plane.host_bridge import (
 )
 from control_plane.routing import (
     compact_route_manifest,
-    diagnose_serialized_route_receipt,
     resolve_route,
+    verify_route,
 )
 
 
@@ -734,7 +734,6 @@ def command_route(arguments: argparse.Namespace) -> int:
                         ),
                         "tool_use_id": None,
                     },
-                    host_metrics=None,
                 )
         payload["command"] = "route"
         return _emit(payload, arguments.json)
@@ -755,7 +754,7 @@ def command_route(arguments: argparse.Namespace) -> int:
 
 def command_route_verify(arguments: argparse.Namespace) -> int:
     try:
-        payload = diagnose_serialized_route_receipt(
+        payload = verify_route(
             _read_json(arguments.decision),
             _read_json(arguments.receipt),
             mode=arguments.mode,
@@ -867,8 +866,6 @@ def command_risk_status(arguments: argparse.Namespace) -> int:
             governing_policy,
             task_state=task_state,
             route_decision_hint=decision_hint,
-            host_context=None,
-            remote=None,
         )
         payload = status.to_dict()
         payload["facts"]["governing_policy_source"] = (
@@ -903,8 +900,7 @@ def command_task(arguments: argparse.Namespace) -> int:
         store = TaskStore(state_dir)
         current_branch = (
             _git_current_branch(root)
-            if arguments.task_action
-            not in {"status", "clarification-status"}
+            if arguments.task_action != "status"
             else None
         )
         if arguments.task_action == "lease-release":
@@ -943,8 +939,6 @@ def command_task(arguments: argparse.Namespace) -> int:
                 )
         elif arguments.task_action == "status":
             result = store.status(arguments.task_id)
-        elif arguments.task_action == "clarification-status":
-            result = store.clarification_status(arguments.task_id)
         elif arguments.task_action == "resume":
             result = store.resume(
                 arguments.task_id, current_branch=str(current_branch)
@@ -1558,7 +1552,6 @@ def build_parser() -> argparse.ArgumentParser:
         "start",
         "resume",
         "status",
-        "clarification-status",
         "transition",
         "close",
         "lease-release",

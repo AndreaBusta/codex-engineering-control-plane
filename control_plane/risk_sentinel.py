@@ -223,7 +223,6 @@ def _unanchored_local_dimension(
     repo: Path | str,
     *,
     task_state: Mapping[str, Any] | None,
-    host_context: object | None,
     message: str,
 ) -> RiskDimension:
     """Observe anchor-independent facts while base policy remains UNKNOWN."""
@@ -232,9 +231,7 @@ def _unanchored_local_dimension(
         _unknown_local_dimension(
             message,
             task_state=task_state,
-            authority_not_applicable=(
-                task_state is None and host_context is None
-            ),
+            authority_not_applicable=task_state is None,
         ).checks
     )
     replacements: dict[str, RiskCheck] = {}
@@ -337,20 +334,8 @@ def _unanchored_local_dimension(
         dirty=dirty,
         lease_valid=lease_valid,
     )
-    clarification, authority, host_evidence = _consume_host_context(
-        host_context,
-        task_state=task_state,
-        repo=root,
-        branch=(
-            branch.stdout.strip()
-            if branch is not None and branch.returncode == 0
-            else None
-        ),
-        head=(
-            head.stdout.strip()
-            if head is not None and head.returncode == 0
-            else None
-        ),
+    clarification, authority, host_evidence = _local_authority_checks(
+        task_state
     )
     replacements[clarification.code] = clarification
     replacements[authority.code] = authority
@@ -679,157 +664,31 @@ def _lease_covers_dirty_tree(
     )
 
 
-def _consume_host_context(
-    host_context: object | None,
-    *,
+def _local_authority_checks(
     task_state: Mapping[str, Any] | None,
-    repo: Path | None = None,
-    branch: object = None,
-    head: object = None,
-    expected_session_id: str | None = None,
-    expected_invocation_id: str | None = None,
-) -> tuple[RiskCheck, RiskCheck, dict[str, Any] | None]:
-    if host_context is None:
-        clarification = _check(
-            "RS_CLARIFICATION_REQUIRED",
-            UNKNOWN,
-            "Clarification cannot be proven from serialized task or route data.",
-        )
-        authority = (
-            _check(
-                "RS_AUTHORITY_REQUIRED",
-                PASS,
-                "No task, route, or protected effect was requested.",
-                reason="NOT_APPLICABLE",
-            )
-            if task_state is None
-            else _check(
-                "RS_AUTHORITY_REQUIRED",
-                UNKNOWN,
-                "Authority cannot be proven from serialized task or route data.",
-            )
-        )
-        return clarification, authority, None
-    try:
-        task_id = (
-            task_state.get("task_id")
-            if isinstance(task_state, Mapping)
-            else None
-        )
-        task_digest = (
-            task_state.get("task_digest")
-            if isinstance(task_state, Mapping)
-            else None
-        )
-        task_state_digest = (
-            contract_digest(dict(task_state))
-            if isinstance(task_state, Mapping)
-            else None
-        )
-    except (TypeError, ValueError):
-        task_id = task_digest = task_state_digest = None
-    if (
-        repo is None
-        or not isinstance(branch, str)
-        or not branch
-        or not isinstance(head, str)
-        or not head
-        or not isinstance(expected_session_id, str)
-        or not expected_session_id
-        or not isinstance(expected_invocation_id, str)
-        or not expected_invocation_id
-    ):
-        return (
-            _check(
-                "RS_CLARIFICATION_REQUIRED",
-                UNKNOWN,
-                "Native clarification context lacks current governing bindings.",
-            ),
-            _check(
-                "RS_AUTHORITY_REQUIRED",
-                UNKNOWN,
-                "Native authority context lacks current governing bindings.",
-            ),
-            {},
-        )
-    try:
-        from control_plane.host_bridge import consume_validated_host_risk_context
+) -> tuple[RiskCheck, RiskCheck, None]:
+    """Return honest local-audit authority state without a host adapter."""
 
-        facts = consume_validated_host_risk_context(
-            host_context,
-            expected_repository_identity=repo,
-            expected_worktree_identity=repo,
-            expected_branch=branch,
-            expected_head=head,
-            expected_session_id=expected_session_id,
-            expected_invocation_id=expected_invocation_id,
-            expected_task_id=task_id,
-            expected_task_digest=task_digest,
-            expected_task_state_digest=task_state_digest,
-        )
-    except (AttributeError, TypeError, ValueError):
-        return (
-            _check(
-                "RS_CLARIFICATION_REQUIRED",
-                UNKNOWN,
-                "Native clarification context is invalid, stale, or replayed.",
-            ),
-            _check(
-                "RS_AUTHORITY_REQUIRED",
-                UNKNOWN,
-                "Native authority context is invalid, stale, or replayed.",
-            ),
-            {},
-        )
-    clarification_status = str(facts["clarification_status"])
-    protected_effect_requested = bool(facts["protected_effect_requested"])
-    authorization_status = str(facts["authorization_status"])
-    clarification_state = {
-        "pending": FAIL,
-        "resolved": PASS,
-        "not_required": PASS,
-    }.get(clarification_status, UNKNOWN)
     clarification = _check(
         "RS_CLARIFICATION_REQUIRED",
-        clarification_state,
-        {
-            FAIL: "A high-risk clarification remains pending.",
-            PASS: "Native host context proves clarification is not pending.",
-            UNKNOWN: "Native clarification state is inconclusive.",
-        }[clarification_state],
-        reason=clarification_status,
+        UNKNOWN,
+        "Clarification cannot be proven without a native host capability.",
     )
-    if not protected_effect_requested:
-        authority = _check(
+    authority = (
+        _check(
             "RS_AUTHORITY_REQUIRED",
             PASS,
-            "Native host context proves no protected effect is requested.",
+            "No active task or protected effect was supplied.",
             reason="NOT_APPLICABLE",
         )
-    elif authorization_status == "granted":
-        authority = _check(
-            "RS_AUTHORITY_REQUIRED",
-            PASS,
-            "Native host context proves current protected-effect authority.",
-            reason="GRANTED",
-            effect=facts.get("effect"),
-        )
-    elif authorization_status in {"absent", "rejected"}:
-        authority = _check(
-            "RS_AUTHORITY_REQUIRED",
-            FAIL,
-            "A protected effect lacks current native authority.",
-            reason=authorization_status.upper(),
-            effect=facts.get("effect"),
-        )
-    else:
-        authority = _check(
+        if task_state is None
+        else _check(
             "RS_AUTHORITY_REQUIRED",
             UNKNOWN,
-            "Protected-effect authority is not observable.",
-            reason="UNKNOWN",
+            "Protected-effect authority is not observable in local-audit mode.",
         )
-    return clarification, authority, facts
+    )
+    return clarification, authority, None
 
 
 def evaluate_local_risk(
@@ -838,7 +697,6 @@ def evaluate_local_risk(
     *,
     task_state: Mapping[str, Any] | None = None,
     route_decision_hint: Mapping[str, Any] | None = None,
-    host_context: object | None = None,
 ) -> RiskDimension:
     """Evaluate every normative local check without treating read mode as safe."""
 
@@ -848,7 +706,6 @@ def evaluate_local_risk(
             return _unanchored_local_dimension(
                 repo,
                 task_state=task_state,
-                host_context=host_context,
                 message=(
                     "A host-bound governing policy observation is unavailable."
                 ),
@@ -970,14 +827,8 @@ def evaluate_local_risk(
     )
     branch = facts.get("branch")
     base_branch = policy_mapping["git"]["base_branch"]
-    clarification, authority, host_evidence = _consume_host_context(
-        host_context,
-        task_state=task_state,
-        repo=root,
-        branch=branch,
-        head=facts.get("head"),
-        expected_session_id=policy.session_id,
-        expected_invocation_id=policy.invocation_id,
+    clarification, authority, host_evidence = _local_authority_checks(
+        task_state
     )
     checks.append(
         _check(
@@ -1241,8 +1092,6 @@ def evaluate_risk_status(
     *,
     task_state: Mapping[str, Any] | None = None,
     route_decision_hint: Mapping[str, Any] | None = None,
-    host_context: object | None = None,
-    remote: RiskDimension | None = None,
 ) -> RiskStatus:
     """Return separate local and remote dimensions with a closed aggregate."""
 
@@ -1251,21 +1100,19 @@ def evaluate_risk_status(
         policy,
         task_state=task_state,
         route_decision_hint=route_decision_hint,
-        host_context=host_context,
     )
-    if remote is None:
-        remote = RiskDimension(
-            status=UNKNOWN,
-            checks=(),
-            errors=(
-                {
-                    "code": "RS_REMOTE_NOT_OBSERVED",
-                    "message": (
-                        "Remote protection or provenance has not been observed."
-                    ),
-                },
-            ),
-        )
+    remote = RiskDimension(
+        status=UNKNOWN,
+        checks=(),
+        errors=(
+            {
+                "code": "RS_REMOTE_NOT_OBSERVED",
+                "message": (
+                    "Remote protection or provenance is deferred in local-audit mode."
+                ),
+            },
+        ),
+    )
     profile_facts: dict[str, Any] = {}
     for check in local.checks:
         if check.code == "RS_PROFILE":

@@ -112,7 +112,7 @@ class InstalledGuardScenario:
             "git": {
                 "base_branch": "main",
                 "remote_name": "origin",
-                "remote_url": REMOTE_URL,
+                "remote_url_digest": _digest(REMOTE_URL.encode("utf-8")),
                 "remote_repository": "example/control-plane",
             },
             "artifacts": sorted(
