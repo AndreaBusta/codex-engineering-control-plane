@@ -16,6 +16,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -456,7 +457,7 @@ def _bounded_process(
     status = "completed"
     deadline = started + timeout_seconds
     try:
-        while selector.get_map():
+        while selector.get_map() or process.poll() is None:
             now = time.monotonic()
             if now >= deadline and status == "completed":
                 status = "timeout"
@@ -464,7 +465,12 @@ def _bounded_process(
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            events = selector.select(max(0.0, min(0.05, deadline - now)))
+            wait_seconds = max(0.0, min(0.05, deadline - now))
+            if selector.get_map():
+                events = selector.select(wait_seconds)
+            else:
+                time.sleep(wait_seconds)
+                events = []
             if not events and process.poll() is not None:
                 events = [
                     (key, selectors.EVENT_READ)
@@ -560,6 +566,70 @@ def _safe_read_rg_executable() -> str | None:
         ):
             return str(resolved)
     return None
+
+
+_SAFE_READ_REGEX_FALLBACK = """\
+import io
+import os
+import re
+import stat
+import sys
+
+try:
+    limit = int(sys.argv[1])
+    expressions = [re.compile(value.encode("utf-8")) for value in sys.argv[2:-1]]
+    with open(sys.argv[-1], "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise SystemExit(2)
+        payload = source.read(limit + 1)
+        after = os.fstat(source.fileno())
+        if (
+            len(payload) > limit
+            or len(payload) != before.st_size
+            or after.st_size != before.st_size
+        ):
+            raise SystemExit(2)
+        for line in io.BytesIO(payload):
+            if any(expression.search(line) for expression in expressions):
+                raise SystemExit(0)
+except (IndexError, OSError, UnicodeEncodeError, ValueError, re.error):
+    raise SystemExit(2)
+raise SystemExit(1)
+"""
+
+
+def _safe_read_python_executable() -> str | None:
+    """Resolve the already-running interpreter without consulting PATH."""
+
+    candidate = Path(sys.executable)
+    if not candidate.is_absolute():
+        return None
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return None
+    return str(resolved)
+
+
+def _safe_read_regex_fallback_command(
+    patterns: Sequence[str], target: str
+) -> list[str] | None:
+    executable = _safe_read_python_executable()
+    if executable is None or not patterns:
+        return None
+    return [
+        executable,
+        "-I",
+        "-S",
+        "-c",
+        _SAFE_READ_REGEX_FALLBACK,
+        str(MAX_INPUT_BYTES),
+        *patterns,
+        target,
+    ]
 
 
 def _trusted_git_environment() -> dict[str, str]:
@@ -839,13 +909,12 @@ def execute_safe_read(
         }
         if executable_kind in {"rg", "secret-scan-governing"}:
             executable = _safe_read_rg_executable()
-            if executable is None:
-                return _safe_read_rejected(
-                    argv_digest,
-                    binding_digest,
-                    pattern_set_digest=governing_pattern_digest,
-                )
             if executable_kind == "rg":
+                target = _safe_read_target(repository, closed_argv[6])
+                if target is None:
+                    return _safe_read_rejected(argv_digest, binding_digest)
+                if executable is None:
+                    return _safe_read_rejected(argv_digest, binding_digest)
                 command = [executable, *closed_argv[1:]]
             else:
                 target = _safe_read_target(repository, closed_argv[2])
@@ -855,15 +924,29 @@ def execute_safe_read(
                         binding_digest,
                         pattern_set_digest=governing_pattern_digest,
                     )
-                command = [
-                    executable,
-                    "--no-config",
-                    "--quiet",
-                    "-e",
-                    "|".join(f"(?:{pattern})" for pattern in SECRET_PATTERNS),
-                    "--",
-                    str(repository / target),
-                ]
+                command = (
+                    [
+                        executable,
+                        "--no-config",
+                        "--quiet",
+                        "-e",
+                        "|".join(
+                            f"(?:{pattern})" for pattern in SECRET_PATTERNS
+                        ),
+                        "--",
+                        str(repository / target),
+                    ]
+                    if executable is not None
+                    else _safe_read_regex_fallback_command(
+                        SECRET_PATTERNS, str(repository / target)
+                    )
+                )
+            if command is None:
+                return _safe_read_rejected(
+                    argv_digest,
+                    binding_digest,
+                    pattern_set_digest=governing_pattern_digest,
+                )
         else:
             executable = _safe_read_git_executable()
             if executable is None:

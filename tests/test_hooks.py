@@ -5,6 +5,7 @@ import os
 from hashlib import sha256
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -840,10 +841,13 @@ class HookTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 fake_git = Path(temporary) / "git"
                 fake_git.write_text(
-                    "#!/bin/sh\n"
-                    "exec 1>&-\n"
-                    "exec 2>&-\n"
-                    "sleep 2\n",
+                    f"#!{sys.executable}\n"
+                    "import os\n"
+                    "import time\n"
+                    "time.sleep(0.05)\n"
+                    "os.close(1)\n"
+                    "os.close(2)\n"
+                    "time.sleep(2)\n",
                     encoding="utf-8",
                 )
                 fake_git.chmod(0o700)
@@ -859,12 +863,12 @@ class HookTests(unittest.TestCase):
                             scenario.repo,
                             "inventory-safe-read-closed-output",
                         ),
-                        timeout_seconds=0.05,
+                        timeout_seconds=0.25,
                         output_limit_bytes=4096,
                     )
 
                 self.assertEqual(result.status, "timeout")
-                self.assertLess(time.monotonic() - started, 0.2)
+                self.assertLess(time.monotonic() - started, 0.5)
         finally:
             scenario.close()
 
@@ -1055,6 +1059,94 @@ class HookTests(unittest.TestCase):
             )
             self.assertEqual(absolute.status, "completed")
             self.assertEqual(absolute.exit_code, 0)
+        finally:
+            scenario.close()
+
+    def test_safe_read_rg_rejects_without_host_executable(self) -> None:
+        from control_plane.hooks import execute_safe_read
+
+        scenario = GitScenario()
+        try:
+            with patch(
+                "control_plane.hooks._safe_read_rg_executable",
+                return_value=None,
+            ):
+                result = execute_safe_read(
+                    (
+                        "rg",
+                        "--no-config",
+                        "--quiet",
+                        "-e",
+                        "baseline",
+                        "--",
+                        "baseline.txt",
+                    ),
+                    root=scenario.repo.resolve(),
+                    worktree_inventory=self.worktree_inventory(
+                        scenario.repo, "inventory-safe-read-rg-missing"
+                    ),
+                    timeout_seconds=2,
+                    output_limit_bytes=4096,
+                )
+
+            self.assertEqual((result.status, result.exit_code), ("rejected", None))
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(result.stderr, b"")
+        finally:
+            scenario.close()
+
+    def test_safe_read_secret_scan_falls_back_without_host_executable(self) -> None:
+        from control_plane.hooks import execute_safe_read
+
+        scenario = GitScenario()
+        try:
+            clean_path = (scenario.repo / "clean-fallback.md").resolve()
+            finding_path = (scenario.repo / "finding-fallback.md").resolve()
+            oversized_path = (scenario.repo / "oversized-fallback.md").resolve()
+            clean_path.write_text("No credentials here.\n", encoding="utf-8")
+            finding_path.write_text(
+                "pass" + "word: replace-me-not-a-real-credential\n",
+                encoding="utf-8",
+            )
+            oversized_path.write_bytes(b"x" * 1_048_577)
+            with patch(
+                "control_plane.hooks._safe_read_rg_executable",
+                return_value=None,
+            ):
+                result = execute_safe_read(
+                    ("secret-scan-governing", "--", str(clean_path)),
+                    root=scenario.repo.resolve(),
+                    worktree_inventory=self.worktree_inventory(
+                        scenario.repo, "inventory-secret-scan-fallback"
+                    ),
+                    timeout_seconds=2,
+                    output_limit_bytes=4096,
+                )
+                finding = execute_safe_read(
+                    ("secret-scan-governing", "--", str(finding_path)),
+                    root=scenario.repo.resolve(),
+                    worktree_inventory=self.worktree_inventory(
+                        scenario.repo, "inventory-secret-scan-fallback-finding"
+                    ),
+                    timeout_seconds=2,
+                    output_limit_bytes=4096,
+                )
+                oversized = execute_safe_read(
+                    ("secret-scan-governing", "--", str(oversized_path)),
+                    root=scenario.repo.resolve(),
+                    worktree_inventory=self.worktree_inventory(
+                        scenario.repo, "inventory-secret-scan-fallback-oversized"
+                    ),
+                    timeout_seconds=2,
+                    output_limit_bytes=4096,
+                )
+
+            self.assertEqual((result.status, result.exit_code), ("completed", 1))
+            self.assertEqual((finding.status, finding.exit_code), ("completed", 0))
+            self.assertEqual((oversized.status, oversized.exit_code), ("completed", 2))
+            for completed in (result, finding, oversized):
+                self.assertEqual(completed.stdout, b"")
+                self.assertEqual(completed.stderr, b"")
         finally:
             scenario.close()
 
