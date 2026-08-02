@@ -36,6 +36,7 @@ RUNTIME_MODULES = (
     "clarification.py",
     "cli.py",
     "contracts.py",
+    "cross_thread_audit.py",
     "git_guards.py",
     "git_state.py",
     "graph.py",

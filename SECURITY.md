@@ -54,6 +54,8 @@ un gate ni modifica la precedencia.
 | Bucle de `Stop` | chequeo `stop_hook_active` | test de reentrada | fallo del host |
 | Oversharing tras compactación | `SessionStart(compact)` y manifiesto menor de 4 KiB sin prompt | test de presupuesto | otros hooks pueden añadir contexto |
 | Receipt filtra información | solo IDs, digests, gates y efectos | contrato v1 | quien escriba fuera del runtime |
+| Transcript de otra tarea inyecta instrucciones o filtra datos | referencia exacta y cápsula cerrada `UNKNOWN` de 4 KiB; sin consumer, prompt, findings ni output crudo | `authorizes=false` + digest semántico | un futuro consumer nativo mal implementado |
+| Payload forjado parece una auditoría vigente | recurso unresolved sin evidencia runtime; no hay API de observación; renderer rechaza `VALID`, `STALE`, `PASS`, IDs/estados observados y resúmenes | tests de invariantes aun con digest recalculado | un futuro evento nativo no ligado al subject |
 | JSON simula una aclaración resuelta | el request es diagnóstico y el gate material queda `pending_host_capability` | contrato puro + tests de ausencia de autoridad | host sin adapter nativo |
 | Evidencia ausente parece éxito | `risk-status` separa `PASS`, `FAIL` y `UNKNOWN` | exit codes 0/1/2 + checks locales | observaciones externas pendientes |
 | Instalación destruye config | plan inmutable, lock de proceso, transacción, backup y rollback en dos fases | tests con fault injection y drift | caída del sistema operativo durante fsync |

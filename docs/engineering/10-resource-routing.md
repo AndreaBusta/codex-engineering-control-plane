@@ -107,6 +107,40 @@ Tiene un único schema compartido por constructor, plantilla y `route-verify`;
 todos los digests se recomputan y un objeto vacío falla cerrado. No conserva
 prompt, transcript, documentos enteros ni output de MCP.
 
+### CrossThreadAuditCapsule shadow
+
+La auto-consulta entre tareas solo se selecciona al normalizar una referencia
+completa `codex://threads/<uuid>` mediante
+`prepare_cross_thread_audit_lookup()`. El helper añade al `TaskEnvelope` el
+recurso explícito `agent.cross-thread-audit-read-shadow`; no interpreta prompts
+ni habilita búsqueda global, fuzzy o steering.
+
+La lectura pertenece a la superficie nativa del host. Como todavía no existe
+un consumidor productivo que pruebe `read_thread`, el recurso usa un locator
+`agent://`, confianza no verificada y selección recomendada. El inventario
+local exige evidencia de runtime, por lo que routing lo conserva `unresolved`
+con `R_RUNTIME_EVIDENCE_REQUIRED`. El runtime Python no llama, simula ni
+reenvuelve resultados del host y no expone constructores de observaciones.
+
+En esta fase la única cápsula schema 1 serializable es un JSON canónico
+`UNKNOWN` de como máximo 4096 bytes. Conserva la referencia exacta y la
+identidad del consumidor; proyecto, repositorio, HEAD, base, diff y subject se
+mantienen explícitamente desconocidos. El renderer rechaza `VALID`, `STALE`,
+`PASS`, findings/tests, IDs observados o estados incompatibles aunque el caller
+recalcule el digest. No acepta transcript, prompt, hidden reasoning ni output
+crudo y siempre fija `authorizes=false`. `VALID` y `STALE` quedan reservados
+hasta que exista un evento nativo de lectura, attested y ligado al subject.
+
+Un `ResourceUseReceipt` puede acreditar que el recurso shadow fue consultado,
+pero la cápsula no es gate result ni publisher de `IndependentReviewReceipt`.
+Por tanto no satisface `gate.independent-review`, no cambia lifecycle y no
+concede commit, red, steering ni otro efecto. Esta costura aplica las fronteras
+ya decididas por ADR 0001 y ADR 0003; no introduce una arquitectura paralela.
+
+La reversión de esta fase es retirar módulo, registro y documentación en un
+diff local. No existe migración, estado durable, hook, dato remoto ni efecto
+externo que restaurar.
+
 ## Comandos
 
 ```bash

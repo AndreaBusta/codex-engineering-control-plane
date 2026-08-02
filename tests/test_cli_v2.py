@@ -44,7 +44,7 @@ class CliV2Tests(unittest.TestCase):
         payload = json.loads(inventory.stdout)
         self.assertEqual(inventory.returncode, 0, inventory.stderr)
         self.assertTrue(payload["ok"])
-        self.assertEqual(len(payload["resources"]), 28)
+        self.assertEqual(len(payload["resources"]), 29)
 
     def test_registry_check_validates_policy_gate_references(self) -> None:
         result = run_cli(
