@@ -200,6 +200,26 @@ Revisar después de varias tareas:
 - si el grafo redujo tiempo;
 - si el handoff fue suficiente.
 
+## Continuidad entre tareas
+
+La tarea padre u orquestadora es el destino normal donde el usuario escribe y
+desde el que se dirige el trabajo. Una tarea hija o ejecutora entrega evidencia
+acotada, pero no se convierte por ello en el buzón predeterminado del usuario.
+
+En cada cierre lógico o checkpoint:
+
+1. indicar la tarea de continuación, su rol y la siguiente acción;
+2. dar un mensaje exacto que el usuario pueda copiar;
+3. señalar otra tarea solo después de comprobar su identidad visible, estado
+   activo y recepción del checkpoint completo;
+4. verificar por separado la tarea Codex y el estado Git;
+5. usar `este hilo` si el host no ofrece un ID exacto verificable;
+6. declarar qué transición no debe ejecutarse todavía.
+
+Una rama o worktree conserva código, no demuestra que una tarea Codex exista.
+No inventar IDs, no enviar al usuario a una tarea solo histórica y no crear una
+tarea nueva si la actual puede seguir orquestando el mismo objetivo.
+
 ## Conversaciones largas
 
 Crear un hilo o handoff nuevo cuando:

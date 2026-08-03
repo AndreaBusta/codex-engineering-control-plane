@@ -80,6 +80,24 @@ Evalúa impacto documental antes de cerrar. Crea:
 
 No conviertas `PROJECT_STATE`, planes o ADR en diarios redundantes.
 
+## Continuation Pointer
+
+En cada cierre lógico o checkpoint, termina con un bloque `## Continuación`
+autocontenido con estos campos:
+
+- Escribe en: enlace e ID exactos de la tarea o `este hilo` si el host no
+  expone una identidad verificable.
+- Rol: orquestadora, ejecutora o relevo.
+- Para continuar: siguiente acción concreta en una frase.
+- Mensaje exacto: texto breve listo para copiar y enviar.
+- Estado de partida: repositorio, worktree, rama, HEAD, PR y gate relevantes.
+- No hacer todavía: transiciones o efectos aún no autorizados.
+
+Usa la tarea padre u orquestadora como destino normal del usuario. Señala otra
+tarea solo tras verificar por separado de Git su identidad visible, estado activo
+y recepción del checkpoint completo. Git no demuestra que una tarea Codex
+exista; una rama o worktree tampoco. Nunca inventes un ID.
+
 ## Seguridad
 
 - No leas, copies ni imprimas secretos.
