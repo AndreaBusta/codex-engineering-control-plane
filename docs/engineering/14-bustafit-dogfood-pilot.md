@@ -31,8 +31,10 @@ evidence counted by this scorecard.
 | Control Plane baseline | 404/404 tests PASS on 2026-08-02 |
 | Historical pre-integration candidate suite | 64/64 focused routing/profile/lock tests and 407/407 full-suite tests PASS after the profile-phase fix; full suite completed in 149.373 s |
 | Current integration candidate suite | 73/73 focused routing/profile/lock tests and 418/418 full-suite tests PASS after N5 hardening; full suite completed in 159.795 s |
+| First clean integration checkpoint | `f698d1158e113e335d41c0a4f3096b75bddae274`; clean feature branch, `ahead=4`, `behind=0` against refreshed `origin/main@0538535a34faf27fa1d4d4b1df70f15a770c0a8d` |
 | Fresh remote refs | `git ls-remote` confirmed Control Plane `38becc3` and BUSTAFIT `dd42097` on 2026-08-02 |
 | Pre-commit source-risk checkpoint | `FAIL/1`: the intentionally dirty source tree lacked governing host-bound policy/lock evidence; the clean-commit result is a final integration gate, while an adopted local-audit target without remote evidence remains `UNKNOWN/2` |
+| Clean-commit source risk | `UNKNOWN/2`: repository, attached branch and clean tree PASS; governing installed policy, host capability and remote evidence remain deliberately unobserved in the source checkout |
 
 The active coordinating task is
 `TASK-CONTROL-PLANE-BUSTAFIT-DOGFOOD-R3`, session
@@ -558,7 +560,7 @@ byte-exact and no registry route is added.
 | Router | T3/controlled, `decision_ready=true`, `plan_then_goal` | PASS |
 | Preflight write | clean branch, ahead 0, behind 0 | PASS |
 | Control Plane baseline | `bash tests/run.sh`: 404/404 | PASS |
-| Current integration candidate verification | focused routing/profile/lock suites: 73/73; `bash tests/run.sh`: 418/418 in 159.795 s; policy, registry, doctor and diff PASS; remote preflight repeats on the clean commit | PASS tests; clean-commit gate pending |
+| Current integration candidate verification | focused routing/profile/lock suites: 73/73; `bash tests/run.sh`: 418/418 in 159.795 s; policy, registry, doctor and diff PASS; refreshed write preflight passed on clean `f698d11` | PASS |
 | Compact receipt reproducibility | all four normalized TaskEnvelope JSON records recompute the recorded task digests exactly | PASS |
 | Original four read-only scenarios | B1 omitted affected iOS/Android shell profiles | FAIL, round invalid |
 | First final replacement routed scenarios | four fresh agents and four content/authority passes, but R2 omitted detected profile resources | INVALIDATED |
@@ -569,13 +571,14 @@ byte-exact and no registry route is added.
 | Post-Firebase N1 restart | four fresh agents, four fresh clones, exact four-profile manifests, correct outcome/authority boundaries and exact rollback | 4/4 OBSERVATIONAL PASS |
 | Simplicity promotion | pre-N1 A/B is diagnostic only; evidence did not meet the threshold and the candidate was discarded | CLOSED: NO_PROMOTE, no causal claim |
 | Pre-commit `risk-status` checkpoint | exact task/lease hint returned local `FAIL`, remote `UNKNOWN` | expected FAIL during intentionally dirty source work; repeat on the clean commit |
+| Clean-commit `risk-status` | attached repository and clean-tree checks PASS; aggregate remains `UNKNOWN/2` because no installed governing policy, native host capability or remote evidence was fabricated | EXPECTED UNKNOWN |
 | R3/R4 real tasks | PR #92 and PR #97 replayed only as post-N1 read-only shadows; implementation/gates were not relabeled causal | 2/2 OBSERVATIONAL PASS; R4 host unproved |
 | Six-scenario acceptance | 6/6 routing/profile/authority boundaries correct; zero fabricated authority; B2 required block plus one R4 host limitation | PASS within frozen threshold |
 | Source verification | linked Ponytail audit reviewed; plugin/hooks rejected; canonical skill digest rechecked | PASS |
 | Independent candidate code review | found shared-alias filtering, scorecard wording, and hybrid-budget coverage defects; all findings were fixed and the affected paths re-reviewed | PASS |
 | Independent checkpoint review | found profile-gate contradiction and current risk FAIL | findings accepted in part |
 | Independent final reviews | scorecard review approved after historical/observed wording fixes; N5 code/integration review approved after canonical-gate, T0-contract and no-content-read corrections | PASS |
-| Native macOS hook smoke | focused real-Darwin child contract: 1/1 PASS; native adapter remains absent and the manual GitHub workflow is still a release gate | PASS local; remote manual smoke pending |
+| Native macOS hook smoke | clean `f698d11` source: 8/8 scenarios PASS, including feature commit/push, base/detached/force denial, compact fallback, stop receipt, source parity and byte-exact rollback; native adapter remains absent | PASS local; remote manual smoke pending |
 | BUSTAFIT lab rollback/no drift | all six post-Firebase N1/N4 adoptions verified and rolled back; exact HEAD, empty Git status and hooksPath absence restored | PASS |
 
 ### Candidate B1 evidence
