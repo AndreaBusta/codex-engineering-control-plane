@@ -26,6 +26,13 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Bind manual verification to main
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+
       - name: Run local control-plane gates
         shell: bash
         run: |
@@ -45,8 +52,50 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Bind manual smoke to main
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+
       - name: Run smoke verification
         shell: bash
         run: |
           bash tests/run.sh
           scripts/control-plane policy-check --policy .codex/project-policy.toml
+          python3 -m unittest -v \
+            tests.macos_hook_smoke.MacOSHookSmokeTests.test_real_darwin_child_emits_closed_audit_only_contract
+
+  release-candidate:
+    name: release-candidate
+    if: github.event_name == 'workflow_dispatch'
+    needs: [verify, macos-smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out full remote-base history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind release candidate to manual main SHA
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+
+      - name: Build reproducible non-authorizing candidate
+        shell: bash
+        run: |
+          git switch -C main --track origin/main
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          scripts/control-plane preflight --mode release --refresh
+          python3 -m unittest -v tests.test_supported_adoption_acceptance
+          candidate_parent="$RUNNER_TEMP/control-plane-release-${GITHUB_RUN_ID}"
+          mkdir -m 700 "$candidate_parent"
+          scripts/build-release-candidate \
+            --repo "$PWD" \
+            --output-dir "$candidate_parent/candidate" \
+            --workflow-url \
+              "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

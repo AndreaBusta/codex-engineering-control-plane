@@ -160,6 +160,33 @@ Antes de cualquier upload o deploy:
 
 La autorización para implementar no implica autorización para publicar.
 
+## Candidata reproducible v2.1.0
+
+El workflow manual ejecuta suite, smoke Darwin, preflight de release y matriz
+de adopción antes de construir la candidata desde `origin/main`. Mantiene
+`contents: read` y no publica ni sube assets. El log conserva los SHA-256
+generados por el runner remoto.
+
+Después de ese PASS, los mismos bytes pueden regenerarse fuera del repositorio:
+
+```bash
+candidate_parent=/ruta/privada/control-plane-release
+mkdir -m 700 "$candidate_parent"
+scripts/build-release-candidate \
+  --repo "$PWD" \
+  --output-dir "$candidate_parent/candidate" \
+  --workflow-url https://github.com/OWNER/REPO/actions/runs/RUN_ID
+```
+
+La regeneración solo acepta una checkout limpia de `main` idéntica a
+`origin/main` y un directorio padre controlado por el usuario, no escribible
+por grupo u otros. Antes de publicar, sus hashes deben coincidir con el log
+del workflow. El manifest y el receipt siguen declarando `authorizes=false`,
+`release_authorized=false` y `pending_external_evidence`, incluso cuando los
+gates precedentes pasaron: el JSON local no puede autoatestiguar el estado del
+host. Se verifica el workflow por separado y únicamente una autorización
+posterior permite crear tag o GitHub Release y adjuntar esos assets.
+
 ## Observación posterior
 
 Definir antes de release:
