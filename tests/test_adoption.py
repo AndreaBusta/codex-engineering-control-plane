@@ -895,6 +895,7 @@ class AdoptionTests(unittest.TestCase):
         managed = rendered.split(AGENTS_START, 1)[1].split(
             AGENTS_END, 1
         )[0]
+        normalized_managed = " ".join(managed.split())
 
         for field in (
             "- Escribe en:",
@@ -908,13 +909,15 @@ class AdoptionTests(unittest.TestCase):
                 self.assertIn(field, managed)
 
         for rule in (
+            "tarea padre u orquestadora como destino normal del usuario",
+            "`este hilo` si el host no expone una identidad verificable",
             "identidad visible",
             "estado activo",
             "checkpoint completo",
             "Git no demuestra",
         ):
             with self.subTest(rule=rule):
-                self.assertIn(rule, managed)
+                self.assertIn(rule, normalized_managed)
 
         self.assertNotIn("templates/HANDOFF.md", managed)
 
