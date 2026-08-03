@@ -187,6 +187,17 @@ gates precedentes pasaron: el JSON local no puede autoatestiguar el estado del
 host. Se verifica el workflow por separado y únicamente una autorización
 posterior permite crear tag o GitHub Release y adjuntar esos assets.
 
+El tarball contiene `.codex/release-source.json`, generado desde los objetos
+inmutables del commit. La cápsula vincula versión, commit, objeto commit, árbol,
+paths, modos, tamaños, OID de blob y SHA-256. El productor y el consumidor
+comparten límites de entradas y bytes; además reconstruyen el OID del árbol y
+comprueban que el objeto commit referencia ese árbol. El tar se compone desde
+esos blobs verificados, por lo que `export-ignore` y `export-subst` no pueden
+omitir ni transformar su contenido. Tras comprobar
+`SHA256SUMS`, una extracción sin `.git` puede usarse directamente como
+`--source`; `adopt plan` y `adopt apply` vuelven a validar la cápsula y fallan
+cerrados ante bytes, modos, paths, identidades Git o schema extra.
+
 ## Observación posterior
 
 Definir antes de release:

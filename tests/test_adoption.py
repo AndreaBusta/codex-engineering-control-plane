@@ -2073,6 +2073,7 @@ class AdoptionTests(unittest.TestCase):
         for module in (
             "host_bridge.py",
             "intake.py",
+            "release_source.py",
             "risk_sentinel.py",
             "scopes.py",
         ):

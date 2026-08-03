@@ -14,13 +14,34 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from control_plane.contracts import canonical_json, contract_digest
 from control_plane.policy import load_policy
 from control_plane.project_profiles import detect_project_profile
+from control_plane.release_source import (
+    RELEASE_SOURCE_KIND,
+    RELEASE_SOURCE_MARKER,
+    RELEASE_SOURCE_MAX_ENTRIES,
+    RELEASE_SOURCE_MAX_FILE_BYTES,
+    RELEASE_SOURCE_MAX_MARKER_BYTES,
+    RELEASE_SOURCE_MAX_TOTAL_BYTES,
+    RELEASE_SOURCE_MAX_TREE_NODES,
+    RELEASE_SOURCE_MODES,
+    RELEASE_SOURCE_OBJECT_FORMAT,
+    ReleaseSourceError,
+    canonical_release_path,
+    commit_object_identity,
+    decode_commit_object,
+    git_tree_oid,
+    hash_bounded_regular_file,
+    read_bounded_regular_file,
+    validate_release_paths,
+)
 from control_plane.repository import (
+    RepositoryError,
     discover_repository,
     git_common_dir,
     git_environment,
@@ -47,6 +68,7 @@ RUNTIME_MODULES = (
     "policy.py",
     "project_profiles.py",
     "repository.py",
+    "release_source.py",
     "resource_registry.py",
     "risk_sentinel.py",
     "routing.py",
@@ -106,6 +128,8 @@ MANAGED_FILES = (
 )
 AGENTS_START = "<!-- BEGIN CODEX_CONTROL_PLANE_V2 -->"
 AGENTS_END = "<!-- END CODEX_CONTROL_PLANE_V2 -->"
+_RELEASE_OID = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
+_RELEASE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
 
 
 def _digest_bytes(value: bytes) -> str:
@@ -674,7 +698,7 @@ def _installed_snapshot(
     git_facts: Mapping[str, Any],
     rendered: Mapping[str, bytes],
 ) -> tuple[dict[str, Any], dict[str, tuple[bytes, int]]]:
-    source_root = discover_repository(source_root)
+    source_root = source_root.resolve(strict=True)
     target_root = discover_repository(target_root)
     remote_name = str(git_facts["remote"])
     remote_url = _snapshot_remote_url(
@@ -1173,6 +1197,224 @@ def _source_identity(source_root: Path) -> tuple[str, bool]:
     return commit, dirty
 
 
+def _release_tree_entries(
+    source_root: Path,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    entries: list[dict[str, Any]] = []
+    directories: set[str] = set()
+    pending = [source_root]
+    observed_nodes = 0
+    total_bytes = 0
+    marker_seen = False
+    try:
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as scanner:
+                children = []
+                for child in scanner:
+                    observed_nodes += 1
+                    if observed_nodes > RELEASE_SOURCE_MAX_TREE_NODES:
+                        raise ReleaseSourceError(
+                            "release tree has too many filesystem nodes"
+                        )
+                    children.append(child)
+            for child in sorted(children, key=lambda item: item.name, reverse=True):
+                path = Path(child.path)
+                relative = path.relative_to(source_root).as_posix()
+                canonical_release_path(relative)
+                metadata = child.stat(follow_symlinks=False)
+                if relative == RELEASE_SOURCE_MARKER:
+                    if marker_seen or not stat.S_ISREG(metadata.st_mode):
+                        raise ReleaseSourceError("release marker is not a regular file")
+                    marker_seen = True
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    _safe_target(source_root, relative)
+                    directories.add(relative)
+                    pending.append(path)
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ReleaseSourceError(
+                        "release tree contains a non-regular entry"
+                    )
+                source_path = _safe_target(source_root, relative)
+                record = hash_bounded_regular_file(source_path)
+                total_bytes += int(record["size_bytes"])
+                if total_bytes > RELEASE_SOURCE_MAX_TOTAL_BYTES:
+                    raise ReleaseSourceError("release tree exceeds its total byte bound")
+                entries.append({"path": relative, **record})
+                if len(entries) > RELEASE_SOURCE_MAX_ENTRIES:
+                    raise ReleaseSourceError("release tree has too many entries")
+    except OSError as error:
+        raise ReleaseSourceError("release tree cannot be traversed safely") from error
+    if not marker_seen:
+        raise ReleaseSourceError("release marker is unavailable")
+    validate_release_paths(str(entry["path"]) for entry in entries)
+    return sorted(entries, key=lambda item: str(item["path"])), directories
+
+
+def _expected_release_directories(paths: list[str]) -> set[str]:
+    expected: set[str] = set()
+    for path in [*paths, RELEASE_SOURCE_MARKER]:
+        parts = PurePosixPath(path).parts
+        for index in range(1, len(parts)):
+            expected.add(PurePosixPath(*parts[:index]).as_posix())
+    return expected
+
+
+def _validate_release_source(source_root: Path) -> str:
+    marker_path = _safe_target(source_root, RELEASE_SOURCE_MARKER)
+    try:
+        marker_bytes, _ = read_bounded_regular_file(
+            marker_path,
+            limit=RELEASE_SOURCE_MAX_MARKER_BYTES,
+        )
+        if not marker_bytes:
+            raise ReleaseSourceError("release marker is empty")
+        marker = json.loads(marker_bytes.decode("utf-8"))
+    except (ReleaseSourceError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release marker is invalid") from error
+    required_keys = {
+        "entries",
+        "product_version",
+        "release_tag",
+        "schema_version",
+        "source_commit",
+        "source_commit_object_base64",
+        "source_kind",
+        "source_object_format",
+        "source_tree",
+    }
+    if not isinstance(marker, dict) or set(marker) != required_keys:
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release marker schema is invalid")
+    version = marker.get("product_version")
+    source_commit = marker.get("source_commit")
+    source_tree = marker.get("source_tree")
+    if (
+        marker.get("schema_version") != 1
+        or marker.get("source_kind") != RELEASE_SOURCE_KIND
+        or marker.get("source_object_format") != RELEASE_SOURCE_OBJECT_FORMAT
+        or not isinstance(version, str)
+        or marker.get("release_tag") != f"v{version}"
+        or not isinstance(source_commit, str)
+        or _RELEASE_OID.fullmatch(source_commit) is None
+        or not isinstance(source_tree, str)
+        or _RELEASE_OID.fullmatch(source_tree) is None
+    ):
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release marker identity is invalid")
+    declared = marker.get("entries")
+    if (
+        not isinstance(declared, list)
+        or not declared
+        or len(declared) > RELEASE_SOURCE_MAX_ENTRIES
+    ):
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release entries are invalid")
+    paths: list[str] = []
+    for entry in declared:
+        if not isinstance(entry, dict) or set(entry) != {
+            "git_oid",
+            "mode",
+            "path",
+            "sha256",
+            "size_bytes",
+        }:
+            raise ValueError("E_ADOPT_RELEASE_SOURCE: release entry schema is invalid")
+        path = entry.get("path")
+        size = entry.get("size_bytes")
+        digest = entry.get("sha256")
+        git_oid = entry.get("git_oid")
+        if (
+            not isinstance(path, str)
+            or path == RELEASE_SOURCE_MARKER
+            or not isinstance(entry.get("mode"), str)
+            or entry.get("mode") not in RELEASE_SOURCE_MODES
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not isinstance(digest, str)
+            or _RELEASE_DIGEST.fullmatch(digest) is None
+            or not isinstance(git_oid, str)
+            or _RELEASE_OID.fullmatch(git_oid) is None
+        ):
+            raise ValueError("E_ADOPT_RELEASE_SOURCE: release entry is invalid")
+        _safe_target(source_root, path)
+        paths.append(path)
+    try:
+        validated_paths = validate_release_paths(paths)
+    except ReleaseSourceError as error:
+        raise ValueError(
+            "E_ADOPT_RELEASE_SOURCE: release entries are not canonical"
+        ) from error
+    if list(validated_paths) != sorted(paths):
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release entries are not canonical")
+    try:
+        observed, observed_directories = _release_tree_entries(source_root)
+    except ReleaseSourceError as error:
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release tree is invalid") from error
+    if observed != declared:
+        raise ValueError(
+            "E_ADOPT_RELEASE_SOURCE: release tree does not match its marker"
+        )
+    if observed_directories != _expected_release_directories(paths):
+        raise ValueError(
+            "E_ADOPT_RELEASE_SOURCE: release directories do not match its marker"
+        )
+    try:
+        observed_tree = git_tree_oid(observed)
+        commit_object = decode_commit_object(
+            marker.get("source_commit_object_base64")
+        )
+        observed_commit, commit_tree = commit_object_identity(commit_object)
+    except ReleaseSourceError as error:
+        raise ValueError(
+            "E_ADOPT_RELEASE_SOURCE: release Git identity is invalid"
+        ) from error
+    if observed_tree != source_tree or commit_tree != source_tree:
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release tree identity is false")
+    if observed_commit != source_commit:
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release commit identity is false")
+    try:
+        lock_bytes, _ = read_bounded_regular_file(
+            _safe_target(source_root, ".codex/control-plane.lock"),
+            limit=RELEASE_SOURCE_MAX_FILE_BYTES,
+        )
+        lock = tomllib.loads(lock_bytes.decode("utf-8"))
+    except (ReleaseSourceError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release lock is invalid") from error
+    if lock.get("product_version") != version:
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: release version is inconsistent")
+    return source_commit
+
+
+def _resolve_adoption_source(source: Path) -> tuple[Path, str, bool]:
+    if source.is_symlink():
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: source root cannot be a symlink")
+    try:
+        requested_root = source.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: source root is unavailable") from error
+    if not requested_root.is_dir():
+        raise ValueError("E_ADOPT_RELEASE_SOURCE: source root must be a directory")
+    marker_path = requested_root / RELEASE_SOURCE_MARKER
+    try:
+        git_root = discover_repository(requested_root)
+    except RepositoryError as error:
+        if error.code != "E_GIT_NOT_REPOSITORY":
+            raise
+        git_root = None
+    if git_root == requested_root:
+        commit, dirty = _source_identity(git_root)
+        return git_root, commit, dirty
+    if marker_path.is_file() and not marker_path.is_symlink():
+        return requested_root, _validate_release_source(requested_root), False
+    if git_root is not None:
+        commit, dirty = _source_identity(git_root)
+        return git_root, commit, dirty
+    raise ValueError(
+        "E_ADOPT_RELEASE_SOURCE: source is neither a Git worktree nor a release tree"
+    )
+
+
 def _target_git_facts(
     target_root: Path,
     *,
@@ -1621,9 +1863,8 @@ def adoption_plan(
 ) -> dict[str, Any]:
     """Build a read-only, target-specific immutable adoption plan."""
 
-    source_root = discover_repository(source)
+    source_root, source_commit, source_dirty = _resolve_adoption_source(source)
     target_root = discover_repository(target)
-    source_commit, source_dirty = _source_identity(source_root)
     git_facts = _target_git_facts(
         target_root,
         requested_remote=remote,
@@ -2353,7 +2594,7 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Apply an approved plan transactionally with automatic failure recovery."""
 
     _validate_approved_plan(plan)
-    source_root = discover_repository(Path(str(plan["source"])))
+    source_root, _, _ = _resolve_adoption_source(Path(str(plan["source"])))
     target_root = discover_repository(Path(str(plan["target"])))
     with _ProcessLock(_lock_path(target_root)):
         _recover_owner_transaction(target_root)
@@ -2583,7 +2824,7 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Apply an immutable upgrade plan without losing the original rollback."""
 
     _validate_upgrade_plan(plan)
-    source_root = discover_repository(Path(str(plan["source"])))
+    source_root, _, _ = _resolve_adoption_source(Path(str(plan["source"])))
     target_root = discover_repository(Path(str(plan["target"])))
     journal = _journal_path(target_root)
     with _ProcessLock(_lock_path(target_root)):

@@ -152,8 +152,13 @@ class RepositoryContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn('"-c",\n        "tar.umask=0022",\n        "archive"', builder)
-        self.assertIn('"cat-file", "blob"', builder)
+        self.assertIn('"cat-file", object_type, object_id', builder)
+        self.assertIn("git_tree_oid(entries)", builder)
+        self.assertIn("commit_object_identity(commit_object)", builder)
+        self.assertIn("RELEASE_SOURCE_MAX_TOTAL_BYTES", builder)
+        self.assertIn("format=tarfile.PAX_FORMAT", builder)
+        self.assertIn("archive.addfile(member, BytesIO(payload))", builder)
+        self.assertNotIn('"export-ignore"', builder)
         self.assertIn('"log", "--format=%s", commit', builder)
         self.assertIn("dir_fd=parent_descriptor", builder)
         self.assertIn("src_dir_fd=output_descriptor", builder)
