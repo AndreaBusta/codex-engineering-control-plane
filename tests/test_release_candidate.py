@@ -12,6 +12,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from control_plane.release_source import (
+    commit_object_identity,
+    decode_commit_object,
+    git_tree_oid,
+)
+
 
 ROOT = Path(__file__).parents[1]
 BUILDER = ROOT / "scripts" / "build-release-candidate"
@@ -186,6 +192,13 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertEqual(checksum_line, f"{expected_digest.removeprefix('sha256:')}  {archive.name}\n")
         with tarfile.open(archive, mode="r:gz") as packaged:
             names = packaged.getnames()
+            marker_member = packaged.getmember(
+                "codex-engineering-control-plane-2.1.0/"
+                ".codex/release-source.json"
+            )
+            marker_stream = packaged.extractfile(marker_member)
+            self.assertIsNotNone(marker_stream)
+            marker = json.loads(marker_stream.read())
         self.assertTrue(names)
         self.assertTrue(
             all(
@@ -197,6 +210,35 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertIn(
             "codex-engineering-control-plane-2.1.0/control_plane/__init__.py",
             names,
+        )
+        self.assertEqual(marker["schema_version"], 1)
+        self.assertEqual(marker["source_kind"], "control-plane-release-tree")
+        self.assertEqual(marker["product_version"], "2.1.0")
+        self.assertEqual(marker["release_tag"], "v2.1.0")
+        self.assertEqual(marker["source_commit"], expected_commit)
+        self.assertEqual(marker["source_tree"], expected_tree)
+        self.assertEqual(marker["source_object_format"], "sha1")
+        observed_commit, commit_tree = commit_object_identity(
+            decode_commit_object(marker["source_commit_object_base64"])
+        )
+        self.assertEqual(observed_commit, expected_commit)
+        self.assertEqual(commit_tree, expected_tree)
+        self.assertEqual(git_tree_oid(marker["entries"]), expected_tree)
+        self.assertEqual(
+            [entry["path"] for entry in marker["entries"]],
+            [
+                ".codex/control-plane.lock",
+                "README.md",
+                "control_plane/__init__.py",
+                "nested/.keep",
+            ],
+        )
+        self.assertNotIn(
+            ".codex/release-source.json",
+            [entry["path"] for entry in marker["entries"]],
+        )
+        self.assertTrue(
+            all(len(entry["git_oid"]) == 40 for entry in marker["entries"])
         )
 
     def test_candidate_fails_closed_on_version_or_source_drift(self) -> None:
@@ -222,6 +264,141 @@ class ReleaseCandidateTests(unittest.TestCase):
         wrong_branch = self.build(self.root / "wrong-branch")
         self.assertNotEqual(wrong_branch.returncode, 0)
         self.assertIn("E_RELEASE_SOURCE", wrong_branch.stderr)
+
+    def test_candidate_enforces_the_consumer_entry_limit(self) -> None:
+        namespace = runpy.run_path(
+            str(BUILDER),
+            run_name="release_candidate_entry_limit_test_module",
+        )
+        release_entries = namespace["_release_source_entries"]
+        release_error = namespace["ReleaseCandidateError"]
+        release_entries.__globals__["RELEASE_SOURCE_MAX_ENTRIES"] = 2
+
+        with self.assertRaisesRegex(release_error, "E_RELEASE_SOURCE_LIMIT"):
+            release_entries(
+                self.repository,
+                _git(self.repository, "rev-parse", "HEAD"),
+            )
+
+    def test_candidate_bounds_version_metadata_before_parsing(self) -> None:
+        namespace = runpy.run_path(
+            str(BUILDER),
+            run_name="release_candidate_metadata_limit_test_module",
+        )
+        committed_text = namespace["_committed_text"]
+        release_error = namespace["ReleaseCandidateError"]
+        committed_text.__globals__["RELEASE_SOURCE_MAX_FILE_BYTES"] = 1
+
+        with self.assertRaisesRegex(release_error, "E_RELEASE_SOURCE_LIMIT"):
+            committed_text(
+                self.repository,
+                _git(self.repository, "rev-parse", "HEAD"),
+                "README.md",
+            )
+
+    def test_candidate_rejects_oversized_release_source_blob(self) -> None:
+        oversized = self.repository / "oversized.bin"
+        with oversized.open("wb") as handle:
+            handle.truncate(8 * 1024 * 1024 + 1)
+        _git(self.repository, "add", oversized.name)
+        _git(self.repository, "commit", "-m", "test: oversized source")
+        _git(self.repository, "remote", "set-url", "origin", str(self.remote))
+        _git(self.repository, "push", "origin", "main")
+        _git(
+            self.repository,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/AndreaBusta/codex-engineering-control-plane.git",
+        )
+
+        result = self.build(self.root / "oversized-output")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("E_RELEASE_SOURCE_LIMIT", result.stderr)
+
+    def test_candidate_rejects_reserved_marker_descendants(self) -> None:
+        collision = (
+            self.repository
+            / ".codex"
+            / "release-source.json"
+            / "child.txt"
+        )
+        collision.parent.mkdir()
+        collision.write_text("collision\n", encoding="utf-8")
+        _git(self.repository, "add", ".")
+        _git(self.repository, "commit", "-m", "test: marker descendant")
+        _git(self.repository, "remote", "set-url", "origin", str(self.remote))
+        _git(self.repository, "push", "origin", "main")
+        _git(
+            self.repository,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/AndreaBusta/codex-engineering-control-plane.git",
+        )
+
+        result = self.build(self.root / "marker-descendant-output")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("E_RELEASE_SOURCE_PATH", result.stderr)
+
+    def test_candidate_rejects_casefold_marker_collisions(self) -> None:
+        collision = self.repository / ".codex" / "RELEASE-SOURCE.JSON"
+        collision.write_text("collision\n", encoding="utf-8")
+        _git(self.repository, "add", ".")
+        _git(self.repository, "commit", "-m", "test: marker casefold collision")
+        _git(self.repository, "remote", "set-url", "origin", str(self.remote))
+        _git(self.repository, "push", "origin", "main")
+        _git(
+            self.repository,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/AndreaBusta/codex-engineering-control-plane.git",
+        )
+
+        result = self.build(self.root / "marker-casefold-output")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("E_RELEASE_SOURCE_PATH", result.stderr)
+
+    def test_candidate_packages_exact_git_blobs_despite_export_attributes(self) -> None:
+        (self.repository / ".gitattributes").write_text(
+            "README.md export-ignore\n"
+            "nested/.keep export-subst\n",
+            encoding="utf-8",
+        )
+        literal = b"release $Format:%H$\n"
+        (self.repository / "nested" / ".keep").write_bytes(literal)
+        _git(self.repository, "add", ".")
+        _git(self.repository, "commit", "-m", "test: export attributes")
+        _git(self.repository, "remote", "set-url", "origin", str(self.remote))
+        _git(self.repository, "push", "origin", "main")
+        _git(
+            self.repository,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/AndreaBusta/codex-engineering-control-plane.git",
+        )
+
+        output = self.root / "export-attributes-output"
+        result = self.build(output)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archive = output / "codex-engineering-control-plane-2.1.0.tar.gz"
+        with tarfile.open(archive, mode="r:gz") as packaged:
+            readme = packaged.extractfile(
+                "codex-engineering-control-plane-2.1.0/README.md"
+            )
+            substituted = packaged.extractfile(
+                "codex-engineering-control-plane-2.1.0/nested/.keep"
+            )
+            self.assertIsNotNone(readme)
+            self.assertIsNotNone(substituted)
+            self.assertEqual(readme.read(), b"release fixture\n")
+            self.assertEqual(substituted.read(), literal)
 
     def test_candidate_refuses_nonempty_or_symlink_output(self) -> None:
         nonempty = self.root / "nonempty"

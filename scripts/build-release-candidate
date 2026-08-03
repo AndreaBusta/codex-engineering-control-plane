@@ -5,19 +5,43 @@ from __future__ import annotations
 
 import argparse
 import ast
-from hashlib import sha256
+from hashlib import sha1, sha256
 import gzip
 from io import BytesIO
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import stat
 import subprocess
 import sys
+import tarfile
 import tomllib
 from typing import NoReturn
+
+
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from control_plane.release_source import (  # noqa: E402
+    RELEASE_SOURCE_KIND,
+    RELEASE_SOURCE_MARKER,
+    RELEASE_SOURCE_MAX_COMMIT_BYTES,
+    RELEASE_SOURCE_MAX_ENTRIES,
+    RELEASE_SOURCE_MAX_FILE_BYTES,
+    RELEASE_SOURCE_MAX_MARKER_BYTES,
+    RELEASE_SOURCE_MAX_PATH_BYTES,
+    RELEASE_SOURCE_MAX_TOTAL_BYTES,
+    RELEASE_SOURCE_MODES,
+    RELEASE_SOURCE_OBJECT_FORMAT,
+    ReleaseSourceError,
+    commit_object_identity,
+    encode_commit_object,
+    git_tree_oid,
+    validate_release_paths,
+)
 
 
 RELEASE_GATES = (
@@ -78,6 +102,83 @@ def _run_git(repository: Path, *arguments: str, binary: bool = False):
     return completed.stdout if binary else completed.stdout.strip()
 
 
+def _run_git_binary_bounded(
+    repository: Path,
+    *arguments: str,
+    limit: int,
+) -> bytes:
+    process = subprocess.Popen(
+        ["git", "-C", str(repository), *arguments],
+        env=_git_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert process.stdout is not None
+    try:
+        payload = process.stdout.read(limit + 1)
+        if len(payload) > limit:
+            process.kill()
+            process.wait(timeout=5)
+            _fail("E_RELEASE_SOURCE_LIMIT", "Git output exceeds its byte bound")
+        return_code = process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+        _fail("E_RELEASE_GIT", f"git {' '.join(arguments[:2])} timed out")
+    finally:
+        process.stdout.close()
+    if return_code != 0:
+        _fail("E_RELEASE_GIT", f"git {' '.join(arguments[:2])} failed")
+    return payload
+
+
+def _read_git_object(
+    repository: Path,
+    *,
+    object_type: str,
+    object_id: str,
+    expected_size: int,
+    limit: int,
+) -> tuple[bytes, str, str]:
+    if expected_size < 0 or expected_size > limit:
+        _fail("E_RELEASE_SOURCE_LIMIT", "Git object exceeds its byte bound")
+    process = subprocess.Popen(
+        ["git", "-C", str(repository), "cat-file", object_type, object_id],
+        env=_git_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert process.stdout is not None
+    sha256_hasher = sha256()
+    sha1_hasher = sha1(usedforsecurity=False)
+    sha1_hasher.update(f"{object_type} {expected_size}\0".encode("ascii"))
+    chunks: list[bytes] = []
+    observed = 0
+    try:
+        while True:
+            chunk = process.stdout.read(min(1024 * 1024, limit + 1 - observed))
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > limit:
+                process.kill()
+                process.wait(timeout=5)
+                _fail("E_RELEASE_SOURCE_LIMIT", "Git object exceeds its byte bound")
+            sha256_hasher.update(chunk)
+            sha1_hasher.update(chunk)
+            chunks.append(chunk)
+        return_code = process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+        _fail("E_RELEASE_GIT", "git cat-file timed out")
+    finally:
+        process.stdout.close()
+    if return_code != 0 or observed != expected_size:
+        _fail("E_RELEASE_SOURCE_IDENTITY", "Git object bytes are inconsistent")
+    return b"".join(chunks), sha256_hasher.hexdigest(), sha1_hasher.hexdigest()
+
+
 def _repository_identity(remote_url: str) -> tuple[str, str]:
     for pattern in GITHUB_REMOTE_PATTERNS:
         matched = pattern.fullmatch(remote_url)
@@ -90,13 +191,26 @@ def _repository_identity(remote_url: str) -> tuple[str, str]:
 
 def _committed_text(repository: Path, commit: str, relative_path: str) -> str:
     try:
-        return _run_git(
+        object_id = _run_git(
             repository,
-            "cat-file", "blob", f"{commit}:{relative_path}",
-            binary=True,
-        ).decode("utf-8")
+            "rev-parse",
+            f"{commit}:{relative_path}",
+        )
+        size = int(_run_git(repository, "cat-file", "-s", object_id))
+        payload, _, observed_oid = _read_git_object(
+            repository,
+            object_type="blob",
+            object_id=object_id,
+            expected_size=size,
+            limit=RELEASE_SOURCE_MAX_FILE_BYTES,
+        )
+        if observed_oid != object_id:
+            _fail("E_RELEASE_SOURCE_IDENTITY", "release metadata identity is false")
+        return payload.decode("utf-8")
     except UnicodeError:
         _fail("E_RELEASE_SOURCE", "committed release metadata is not UTF-8")
+    except ValueError:
+        _fail("E_RELEASE_SOURCE", "committed release metadata size is invalid")
 
 
 def _runtime_version(source: str) -> str:
@@ -151,6 +265,8 @@ def _validate_source(repository: Path) -> tuple[str, str, str, str, str]:
     branch = _run_git(repository, "symbolic-ref", "--quiet", "--short", "HEAD")
     if branch != "main":
         _fail("E_RELEASE_SOURCE", "release source must be the local main branch")
+    if _run_git(repository, "rev-parse", "--show-object-format") != RELEASE_SOURCE_OBJECT_FORMAT:
+        _fail("E_RELEASE_SOURCE", "release source requires the sha1 Git object format")
     head = _run_git(repository, "rev-parse", "HEAD^{commit}")
     remote_main = _run_git(repository, "rev-parse", "refs/remotes/origin/main^{commit}")
     if head != remote_main:
@@ -190,17 +306,209 @@ def _pull_requests(
     ]
 
 
-def _archive_bytes(repository: Path, commit: str, prefix: str) -> bytes:
-    tar_bytes = _run_git(
+def _release_source_entries(
+    repository: Path, commit: str
+) -> list[dict[str, object]]:
+    raw_tree = _run_git_binary_bounded(
         repository,
-        "-c",
-        "tar.umask=0022",
-        "archive",
-        "--format=tar",
-        f"--prefix={prefix}/",
+        "ls-tree",
+        "-r",
+        "-z",
+        "-l",
+        "--full-tree",
         commit,
-        binary=True,
+        limit=(RELEASE_SOURCE_MAX_ENTRIES + 1)
+        * (RELEASE_SOURCE_MAX_PATH_BYTES + 160),
     )
+    metadata: list[tuple[str, str, str, int]] = []
+    total_bytes = 0
+    for record in raw_tree.split(b"\0"):
+        if not record:
+            continue
+        try:
+            header, raw_path = record.split(b"\t", 1)
+            mode, object_type, object_id, raw_size = header.decode("ascii").split()
+            size = int(raw_size)
+            path = raw_path.decode("utf-8")
+        except (UnicodeError, ValueError):
+            _fail("E_RELEASE_SOURCE", "release tree contains an unsupported path")
+        if (
+            object_type != "blob"
+            or mode not in RELEASE_SOURCE_MODES
+            or re.fullmatch(r"[0-9a-f]{40}", object_id) is None
+        ):
+            _fail("E_RELEASE_SOURCE", "release tree contains an unsupported entry")
+        if len(metadata) >= RELEASE_SOURCE_MAX_ENTRIES:
+            _fail("E_RELEASE_SOURCE_LIMIT", "release source has too many entries")
+        if size < 0 or size > RELEASE_SOURCE_MAX_FILE_BYTES:
+            _fail("E_RELEASE_SOURCE_LIMIT", "release source blob exceeds its bound")
+        total_bytes += size
+        if total_bytes > RELEASE_SOURCE_MAX_TOTAL_BYTES:
+            _fail("E_RELEASE_SOURCE_LIMIT", "release source exceeds its total byte bound")
+        metadata.append((mode, path, object_id, size))
+    try:
+        validate_release_paths(path for _, path, _, _ in metadata)
+    except ReleaseSourceError as error:
+        _fail("E_RELEASE_SOURCE_PATH", str(error))
+
+    entries: list[dict[str, object]] = []
+    for mode, path, object_id, size in metadata:
+        _, sha256_digest, observed_oid = _read_git_object(
+            repository,
+            object_type="blob",
+            object_id=object_id,
+            expected_size=size,
+            limit=RELEASE_SOURCE_MAX_FILE_BYTES,
+        )
+        if observed_oid != object_id:
+            _fail("E_RELEASE_SOURCE_IDENTITY", "Git blob identity is false")
+        entries.append(
+            {
+                "git_oid": object_id,
+                "mode": mode,
+                "path": path,
+                "sha256": f"sha256:{sha256_digest}",
+                "size_bytes": size,
+            }
+        )
+    return sorted(entries, key=lambda item: str(item["path"]))
+
+
+def _release_source_marker(
+    repository: Path,
+    *,
+    commit: str,
+    tree: str,
+    version: str,
+    entries: list[dict[str, object]],
+) -> bytes:
+    try:
+        observed_tree = git_tree_oid(entries)
+    except ReleaseSourceError as error:
+        _fail("E_RELEASE_SOURCE_IDENTITY", str(error))
+    if observed_tree != tree:
+        _fail("E_RELEASE_SOURCE_IDENTITY", "Git tree identity is false")
+    try:
+        commit_size = int(_run_git(repository, "cat-file", "-s", commit))
+    except ValueError:
+        _fail("E_RELEASE_SOURCE_IDENTITY", "Git commit size is invalid")
+    commit_object, _, _ = _read_git_object(
+        repository,
+        object_type="commit",
+        object_id=commit,
+        expected_size=commit_size,
+        limit=RELEASE_SOURCE_MAX_COMMIT_BYTES,
+    )
+    try:
+        observed_commit, commit_tree = commit_object_identity(commit_object)
+        encoded_commit = encode_commit_object(commit_object)
+    except ReleaseSourceError as error:
+        _fail("E_RELEASE_SOURCE_IDENTITY", str(error))
+    if observed_commit != commit or commit_tree != tree:
+        _fail("E_RELEASE_SOURCE_IDENTITY", "Git commit identity is false")
+    marker = _json_bytes(
+        {
+            "entries": entries,
+            "product_version": version,
+            "release_tag": f"v{version}",
+            "schema_version": 1,
+            "source_commit": commit,
+            "source_commit_object_base64": encoded_commit,
+            "source_kind": RELEASE_SOURCE_KIND,
+            "source_object_format": RELEASE_SOURCE_OBJECT_FORMAT,
+            "source_tree": tree,
+        }
+    )
+    if len(marker) > RELEASE_SOURCE_MAX_MARKER_BYTES:
+        _fail("E_RELEASE_SOURCE_LIMIT", "release marker exceeds its byte bound")
+    return marker
+
+
+def _archive_bytes(
+    repository: Path,
+    prefix: str,
+    release_source_marker: bytes,
+    entries: list[dict[str, object]],
+) -> bytes:
+    tar_stream = BytesIO()
+    with tarfile.open(
+        fileobj=tar_stream,
+        mode="w:",
+        format=tarfile.PAX_FORMAT,
+    ) as archive:
+        def add_directory(name: str) -> None:
+            directory = tarfile.TarInfo(name)
+            directory.type = tarfile.DIRTYPE
+            directory.size = 0
+            directory.mode = 0o755
+            directory.mtime = 0
+            directory.uid = 0
+            directory.gid = 0
+            directory.uname = ""
+            directory.gname = ""
+            archive.addfile(directory)
+
+        add_directory(prefix)
+        directories: set[str] = set()
+        for entry in entries:
+            parts = PurePosixPath(str(entry["path"])).parts
+            for index in range(1, len(parts)):
+                directories.add(PurePosixPath(*parts[:index]).as_posix())
+        marker_parts = PurePosixPath(RELEASE_SOURCE_MARKER).parts
+        for index in range(1, len(marker_parts)):
+            directories.add(PurePosixPath(*marker_parts[:index]).as_posix())
+        for directory in sorted(
+            directories,
+            key=lambda value: (len(PurePosixPath(value).parts), value),
+        ):
+            add_directory(f"{prefix}/{directory}")
+
+        for entry in entries:
+            object_id = str(entry["git_oid"])
+            size = int(entry["size_bytes"])
+            payload, digest, observed_oid = _read_git_object(
+                repository,
+                object_type="blob",
+                object_id=object_id,
+                expected_size=size,
+                limit=RELEASE_SOURCE_MAX_FILE_BYTES,
+            )
+            if (
+                observed_oid != object_id
+                or f"sha256:{digest}" != entry["sha256"]
+                or len(payload) != size
+            ):
+                _fail(
+                    "E_RELEASE_SOURCE_IDENTITY",
+                    "archive blob no longer matches the release marker",
+                )
+            member = tarfile.TarInfo(f"{prefix}/{entry['path']}")
+            member.size = size
+            member.mode = 0o755 if entry["mode"] == "100755" else 0o644
+            member.mtime = 0
+            member.uid = 0
+            member.gid = 0
+            member.uname = ""
+            member.gname = ""
+            archive.addfile(member, BytesIO(payload))
+
+        marker = tarfile.TarInfo(f"{prefix}/{RELEASE_SOURCE_MARKER}")
+        marker.size = len(release_source_marker)
+        marker.mode = 0o644
+        marker.mtime = 0
+        marker.uid = 0
+        marker.gid = 0
+        marker.uname = ""
+        marker.gname = ""
+        archive.addfile(marker, BytesIO(release_source_marker))
+    tar_payload = tar_stream.getvalue()
+    archive_limit = (
+        RELEASE_SOURCE_MAX_TOTAL_BYTES
+        + (RELEASE_SOURCE_MAX_ENTRIES + 1) * 4096
+        + RELEASE_SOURCE_MAX_MARKER_BYTES
+    )
+    if len(tar_payload) > archive_limit:
+        _fail("E_RELEASE_SOURCE_LIMIT", "release archive exceeds its byte bound")
     compressed = BytesIO()
     with gzip.GzipFile(
         filename="",
@@ -209,7 +517,7 @@ def _archive_bytes(repository: Path, commit: str, prefix: str) -> bytes:
         compresslevel=9,
         mtime=0,
     ) as stream:
-        stream.write(tar_bytes)
+        stream.write(tar_payload)
     return compressed.getvalue()
 
 
@@ -407,7 +715,20 @@ def build_candidate(repository: Path, output: Path, workflow_url: str) -> dict[s
     archive_name = f"{stem}.tar.gz"
     manifest_name = f"{stem}.manifest.json"
     receipt_name = f"{stem}.receipt.json"
-    archive = _archive_bytes(repository, head, stem)
+    release_source_entries = _release_source_entries(repository, head)
+    release_source_marker = _release_source_marker(
+        repository,
+        commit=head,
+        tree=tree,
+        version=version,
+        entries=release_source_entries,
+    )
+    archive = _archive_bytes(
+        repository,
+        stem,
+        release_source_marker,
+        release_source_entries,
+    )
     archive_record = {
         **_file_record(archive_name, archive),
         "media_type": "application/gzip",

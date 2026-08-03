@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from hashlib import sha1, sha256
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import tarfile
 import tempfile
 import tomllib
 import unittest
@@ -70,6 +73,7 @@ class SupportedAdoptionRunbookContractTests(unittest.TestCase):
         required_in_order = (
             "## Recorrido soportado v2.1 para un proyecto nuevo",
             "checkout limpia del Control Plane",
+            "release-source.json",
             "`adopt plan`",
             "revisar el JSON",
             "`adopt apply`",
@@ -126,6 +130,53 @@ class SupportedAdoptionAcceptanceTests(unittest.TestCase):
         )
         git(cls.source_seed, "add", ".")
         git(cls.source_seed, "commit", "-m", "test: source v2.1")
+        cls.source_remote = Path(cls._source_temporary.name) / "source-remote.git"
+        source_remote = _run(
+            [
+                "git",
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                str(cls.source_remote),
+            ],
+            cwd=Path(cls._source_temporary.name),
+        )
+        if source_remote.returncode != 0:
+            raise AssertionError(source_remote.stderr)
+        git(cls.source_seed, "remote", "add", "origin", str(cls.source_remote))
+        git(cls.source_seed, "push", "-u", "origin", "main")
+        git(
+            cls.source_seed,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/AndreaBusta/codex-engineering-control-plane.git",
+        )
+        cls.release_output = Path(cls._source_temporary.name) / "release-output"
+        built = _run(
+            [
+                sys.executable,
+                str(cls.source_seed / "scripts" / "build-release-candidate"),
+                "--repo",
+                str(cls.source_seed),
+                "--output-dir",
+                str(cls.release_output),
+                "--workflow-url",
+                "https://github.com/AndreaBusta/"
+                "codex-engineering-control-plane/actions/runs/123456",
+            ],
+            cwd=cls.source_seed,
+        )
+        if built.returncode != 0:
+            raise AssertionError(built.stdout + built.stderr)
+        archive = cls.release_output / "codex-engineering-control-plane-2.1.0.tar.gz"
+        cls.release_extract = Path(cls._source_temporary.name) / "release-extract"
+        cls.release_extract.mkdir()
+        with tarfile.open(archive, mode="r:gz") as packaged:
+            packaged.extractall(cls.release_extract, filter="data")
+        cls.release_source = (
+            cls.release_extract / "codex-engineering-control-plane-2.1.0"
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -614,6 +665,204 @@ class SupportedAdoptionAcceptanceTests(unittest.TestCase):
                 "document.profile-web-pwa",
             ),
         )
+
+    def test_extracted_release_tree_is_a_reversible_adoption_source(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/adopt-release-tree")
+        source = self.release_source
+        target = scenario.repo
+        self.assertTrue((source / ".codex" / "release-source.json").is_file())
+        self.assertFalse((source / ".git").exists())
+        before_tree = _tree_snapshot(target)
+        before_status = git(target, "status", "--porcelain")
+        before_hook_config = _hook_config(target)
+        before_head = git(target, "rev-parse", "HEAD")
+        marker = json.loads(
+            (source / ".codex" / "release-source.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        plan_result = self._source_cli(
+            source,
+            "adopt",
+            "plan",
+            "--source",
+            str(source),
+            "--target",
+            str(target),
+            "--json",
+        )
+        self.assertEqual(
+            plan_result.returncode,
+            0,
+            plan_result.stdout + plan_result.stderr,
+        )
+        plan = json.loads(plan_result.stdout)
+        self.assertTrue(plan["ok"], plan)
+        self.assertFalse(plan["source_dirty"])
+        self.assertEqual(plan["source_commit"], marker["source_commit"])
+        self.assertEqual(_tree_snapshot(target), before_tree)
+
+        state_root = scenario.root / "release-tree-acceptance"
+        state_root.mkdir()
+        plan_path = state_root / "plan.json"
+        plan_path.write_text(
+            json.dumps(plan, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self._json_cli(
+            source,
+            "adopt",
+            "apply",
+            "--plan",
+            str(plan_path),
+            "--json",
+        )
+        launcher = target / "scripts" / "control-plane"
+        verified = _run(
+            [str(launcher), "adopt", "verify", "--target", str(target), "--json"],
+            cwd=target,
+        )
+        self.assertEqual(
+            verified.returncode,
+            0,
+            verified.stdout + verified.stderr,
+        )
+        self.assertTrue(json.loads(verified.stdout)["ok"])
+        rolled_back = _run(
+            [
+                str(launcher),
+                "adopt",
+                "rollback",
+                "--target",
+                str(target),
+                "--json",
+            ],
+            cwd=target,
+        )
+        self.assertEqual(
+            rolled_back.returncode,
+            0,
+            rolled_back.stdout + rolled_back.stderr,
+        )
+        self.assertTrue(json.loads(rolled_back.stdout)["ok"])
+        self.assertEqual(_tree_snapshot(target), before_tree)
+        self.assertEqual(git(target, "status", "--porcelain"), before_status)
+        self.assertEqual(_hook_config(target), before_hook_config)
+        self.assertEqual(git(target, "rev-parse", "HEAD"), before_head)
+
+    def test_extracted_release_tree_tampering_fails_closed(self) -> None:
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature("codex/adopt-tampered-release-tree")
+        target = scenario.repo
+        before_tree = _tree_snapshot(target)
+        before_hook_config = _hook_config(target)
+
+        def changed_bytes(source: Path) -> None:
+            profile = source / "docs" / "profiles" / "generic.md"
+            profile.write_bytes(profile.read_bytes() + b"tampered\n")
+
+        def recomputed_file_record(source: Path) -> None:
+            profile = source / "docs" / "profiles" / "generic.md"
+            profile.write_bytes(profile.read_bytes() + b"coherent-tamper\n")
+            payload = profile.read_bytes()
+            marker = source / ".codex" / "release-source.json"
+            document = json.loads(marker.read_text(encoding="utf-8"))
+            record = next(
+                item
+                for item in document["entries"]
+                if item["path"] == "docs/profiles/generic.md"
+            )
+            blob = sha1(usedforsecurity=False)
+            blob.update(f"blob {len(payload)}\0".encode("ascii"))
+            blob.update(payload)
+            record["git_oid"] = blob.hexdigest()
+            record["sha256"] = f"sha256:{sha256(payload).hexdigest()}"
+            record["size_bytes"] = len(payload)
+            marker.write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+        def extra_file(source: Path) -> None:
+            (source / "unmanifested.txt").write_text("extra\n", encoding="utf-8")
+
+        def extra_empty_directory(source: Path) -> None:
+            (source / "unmanifested-empty-directory").mkdir()
+
+        def changed_mode(source: Path) -> None:
+            profile = source / "docs" / "profiles" / "generic.md"
+            profile.chmod(profile.stat().st_mode | 0o111)
+
+        def unknown_marker_key(source: Path) -> None:
+            marker = source / ".codex" / "release-source.json"
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            payload["trusted"] = True
+            marker.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+        def forged_commit(source: Path) -> None:
+            marker = source / ".codex" / "release-source.json"
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            payload["source_commit"] = "0" * 40
+            marker.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+        def forged_tree(source: Path) -> None:
+            marker = source / ".codex" / "release-source.json"
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            payload["source_tree"] = "0" * 40
+            marker.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+        def linked_marker(source: Path) -> None:
+            marker = source / ".codex" / "release-source.json"
+            marker.unlink()
+            marker.symlink_to(
+                self.release_source / ".codex" / "release-source.json"
+            )
+
+        for label, mutate in (
+            ("bytes", changed_bytes),
+            ("recomputed-file-record", recomputed_file_record),
+            ("extra", extra_file),
+            ("extra-directory", extra_empty_directory),
+            ("mode", changed_mode),
+            ("schema", unknown_marker_key),
+            ("forged-commit", forged_commit),
+            ("forged-tree", forged_tree),
+            ("symlink", linked_marker),
+        ):
+            with self.subTest(label=label):
+                source = scenario.root / f"tampered-{label}"
+                shutil.copytree(self.release_source, source)
+                mutate(source)
+                result = self._source_cli(
+                    source,
+                    "adopt",
+                    "plan",
+                    "--source",
+                    str(source),
+                    "--target",
+                    str(target),
+                    "--json",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "E_ADOPT_RELEASE_SOURCE",
+                    result.stdout + result.stderr,
+                )
+                self.assertEqual(_tree_snapshot(target), before_tree)
+                self.assertEqual(_hook_config(target), before_hook_config)
 
 
 if __name__ == "__main__":

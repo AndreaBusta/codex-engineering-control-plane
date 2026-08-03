@@ -143,8 +143,9 @@ adopción project-local y exigen diff y autorización separados.
 ## Recorrido soportado v2.1 para un proyecto nuevo
 
 Este es el único recorrido soportado. Parte de una
-checkout limpia del Control Plane fijada a un commit o tag y de un proyecto
-que ya tenga commit inicial,
+checkout limpia del Control Plane fijada a un commit o tag, o de una extracción
+del tarball oficial cuyo `.codex/release-source.json` valide exactamente sus
+bytes, límites y procedencia Git interna, y de un proyecto que ya tenga commit inicial,
 remote, rama base observable y una rama de trabajo no protegida. Fuente y
 destino deben estar limpios; el JSON de plan se guarda fuera del destino.
 
