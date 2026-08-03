@@ -311,6 +311,100 @@ class AdoptionTests(unittest.TestCase):
         self.assertEqual(absent.returncode, 1)
         self.assertFalse(install.exists())
 
+    def test_adoption_rollback_prunes_only_directories_it_created(self) -> None:
+        from control_plane.adoption import (
+            adoption_apply,
+            adoption_plan,
+            adoption_rollback,
+        )
+
+        preserved = (
+            self.scenario.repo / ".codex",
+            self.scenario.repo / "docs" / "codex-control-plane",
+        )
+        for directory in preserved:
+            directory.mkdir(parents=True, exist_ok=True)
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption_apply(plan)
+        adoption_rollback(self.scenario.repo)
+
+        for directory in preserved:
+            with self.subTest(directory=directory):
+                self.assertTrue(directory.is_dir())
+                self.assertEqual(list(directory.iterdir()), [])
+        self.assertFalse((self.scenario.repo / "scripts").exists())
+
+    def test_adoption_rollback_rejects_unmanaged_content_in_created_directory(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            adoption_apply,
+            adoption_plan,
+            adoption_rollback,
+        )
+
+        plan = adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption_apply(plan)
+        unmanaged = self.scenario.repo / ".codex" / "runtime" / "owner.txt"
+        unmanaged.write_text("not managed by adoption\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "E_ADOPT_DRIFT"):
+            adoption_rollback(self.scenario.repo)
+
+        self.assertTrue(unmanaged.is_file())
+        self.assertTrue((self.scenario.repo / "AGENTS.md").is_file())
+
+    def test_legacy_journal_requires_rollback_then_fresh_adoption(self) -> None:
+        import control_plane.adoption as adoption
+
+        plan = adoption.adoption_plan(
+            ROOT, self.scenario.repo, allow_dirty_source=True
+        )
+        adoption.adoption_apply(plan)
+        journal = adoption._journal_path(self.scenario.repo)
+        legacy = json.loads(journal.read_text(encoding="utf-8"))
+        legacy.pop("created_directories")
+        journal.write_text(
+            json.dumps(legacy, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        agents_before = (self.scenario.repo / "AGENTS.md").read_bytes()
+        hooks_before = git(
+            self.scenario.repo,
+            "config",
+            "--local",
+            "--get",
+            "core.hooksPath",
+        )
+
+        with self.assertRaisesRegex(ValueError, "E_UPGRADE_ROLLBACK_SCHEMA"):
+            adoption.upgrade_plan(
+                ROOT,
+                self.scenario.repo,
+                allow_dirty_source=True,
+            )
+        with self.assertRaisesRegex(ValueError, "E_ADOPT_ROLLBACK_SCHEMA"):
+            adoption.adoption_rollback(self.scenario.repo)
+
+        self.assertEqual(
+            (self.scenario.repo / "AGENTS.md").read_bytes(), agents_before
+        )
+        self.assertEqual(
+            git(
+                self.scenario.repo,
+                "config",
+                "--local",
+                "--get",
+                "core.hooksPath",
+            ),
+            hooks_before,
+        )
+
     def test_installed_guard_ignores_coordinated_candidate_authority_drift(
         self,
     ) -> None:

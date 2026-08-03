@@ -233,6 +233,109 @@ def _safe_target(root: Path, relative: str) -> Path:
     return target
 
 
+def _missing_managed_directories(
+    root: Path, records: list[Mapping[str, Any]]
+) -> list[str]:
+    """Return only target directories that the upcoming write must create."""
+
+    root_path = root.resolve()
+    missing: set[str] = set()
+    for record in records:
+        target = _safe_target(root_path, str(record["path"]))
+        cursor = target.parent
+        while cursor != root_path:
+            try:
+                metadata = cursor.lstat()
+            except FileNotFoundError:
+                missing.add(cursor.relative_to(root_path).as_posix())
+            else:
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(
+                    metadata.st_mode
+                ):
+                    raise ValueError(
+                        "E_ADOPT_PATH: managed parent is not a directory"
+                    )
+            cursor = cursor.parent
+    return sorted(missing, key=lambda item: (len(PurePosixPath(item).parts), item))
+
+
+def _created_directory_paths(root: Path, values: object) -> list[Path]:
+    if (
+        not isinstance(values, list)
+        or len(values) > 4096
+        or not all(isinstance(item, str) for item in values)
+        or len(set(values)) != len(values)
+    ):
+        raise ValueError(
+            "E_ADOPT_RECOVERY_UNKNOWN: created directories are ambiguous"
+        )
+    root_path = root.resolve()
+    paths: list[Path] = []
+    for relative in values:
+        pure = PurePosixPath(relative)
+        path = _safe_target(root_path, relative)
+        if not pure.parts or path == root_path:
+            raise ValueError(
+                "E_ADOPT_RECOVERY_UNKNOWN: created directory is unsafe"
+            )
+        paths.append(path)
+    return paths
+
+
+def _created_directories_are_prunable(
+    root: Path,
+    values: object,
+    records: list[Mapping[str, Any]],
+) -> bool:
+    try:
+        directories = _created_directory_paths(root, values)
+        allowed = set(directories)
+        allowed.update(
+            _safe_target(root, str(record["path"])) for record in records
+        )
+        observed = 0
+        for directory in directories:
+            try:
+                metadata = directory.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(
+                metadata.st_mode
+            ):
+                return False
+            for path in directory.rglob("*"):
+                observed += 1
+                if observed > 20_000 or path not in allowed or path.is_symlink():
+                    return False
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _remove_created_directories(root: Path, values: object) -> None:
+    directories = _created_directory_paths(root, values)
+    for directory in sorted(
+        directories,
+        key=lambda path: (len(path.parts), path.as_posix()),
+        reverse=True,
+    ):
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(
+                "E_ADOPT_RECOVERY_FAILED: created directory has drift"
+            )
+        try:
+            directory.rmdir()
+        except OSError as error:
+            raise ValueError(
+                "E_ADOPT_RECOVERY_FAILED: created directory is not empty"
+            ) from error
+        _fsync_directory(directory.parent)
+
+
 def _git(root: Path, *arguments: str) -> str:
     completed = subprocess.run(
         ["git", *arguments],
@@ -1025,6 +1128,8 @@ def _restore_external_state(
         raise ValueError(
             "E_ADOPT_RECOVERY_UNKNOWN: snapshot recovery is ambiguous"
         )
+    created_directories = external_state.get("created_directories", [])
+    _created_directory_paths(target_root, created_directories)
     failures: list[Exception] = []
     try:
         _restore_local_hook_config(target_root, list(previous))
@@ -1047,6 +1152,10 @@ def _restore_external_state(
             )
         except Exception as error:
             failures.append(error)
+    try:
+        _remove_created_directories(target_root, created_directories)
+    except Exception as error:
+        failures.append(error)
     if failures:
         grouped = ExceptionGroup(
             "external adoption recovery failures", failures
@@ -1630,6 +1739,12 @@ def upgrade_plan(
     status = adoption_status(target)
     if status.get("status") != "applied":
         raise ValueError("E_UPGRADE_NOT_APPLIED: adopt v2 before upgrading it")
+    if "created_directories" not in status:
+        raise ValueError(
+            "E_UPGRADE_ROLLBACK_SCHEMA: installed adoption predates exact "
+            "directory rollback; roll it back with its installed runtime "
+            "and perform a fresh adoption"
+        )
     adopt = adoption_plan(
         source,
         target,
@@ -2208,14 +2323,10 @@ def _recover_failed_transaction(
     staging_suffix: str,
 ) -> None:
     failures: list[Exception] = []
-    for recovery in (
-        lambda: _restore_records(target_root, records),
-        lambda: _restore_external_state(target_root, external_state),
-    ):
-        try:
-            recovery()
-        except Exception as error:
-            failures.append(error)
+    try:
+        _restore_records(target_root, records)
+    except Exception as error:
+        failures.append(error)
     for record in records:
         try:
             path = _safe_target(target_root, str(record["path"]))
@@ -2224,6 +2335,10 @@ def _recover_failed_transaction(
             )
         except Exception as error:
             failures.append(error)
+    try:
+        _restore_external_state(target_root, external_state)
+    except Exception as error:
+        failures.append(error)
     if failures:
         grouped = ExceptionGroup(
             "adoption failure and recovery failures",
@@ -2257,6 +2372,9 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
                 raise ValueError("E_ADOPT_ALREADY_APPLIED: use upgrade for a new plan")
             if current.get("status") == "preparing":
                 _restore_records(target_root, current.get("records", []))
+                _remove_created_directories(
+                    target_root, current.get("created_directories", [])
+                )
                 current["status"] = "recovered"
                 _atomic_json(journal, current)
         current_plan = adoption_plan(
@@ -2303,12 +2421,16 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "E_ADOPT_SNAPSHOT_DRIFT: planned snapshot path has drift"
             )
+        created_directories = _missing_managed_directories(
+            target_root, list(plan["changes"])
+        )
         external_state = {
             "git_config_change": config_change,
             "snapshot": {
                 **installed_snapshot,
                 "created": not snapshot_preexisting,
             },
+            "created_directories": created_directories,
         }
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
         _control_state_directory(
@@ -2361,6 +2483,7 @@ def adoption_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             "initial_git_config_values": list(
                 config_change["previous_local_values"]
             ),
+            "created_directories": created_directories,
             "warnings": list(plan.get("warnings", [])),
         }
         transaction = _begin_transaction(
@@ -2468,6 +2591,10 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
         status = adoption_status(target_root)
         if status.get("status") == "upgrading":
             _restore_records(target_root, list(status.get("upgrade_records", [])))
+            _remove_created_directories(
+                target_root,
+                status.get("upgrade_created_directories", []),
+            )
             previous = status.get("previous_state")
             if not isinstance(previous, Mapping):
                 raise ValueError("E_UPGRADE_RECOVERY: prior state is unavailable")
@@ -2529,12 +2656,16 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "E_ADOPT_SNAPSHOT_DRIFT: planned snapshot path has drift"
             )
+        upgrade_created_directories = _missing_managed_directories(
+            target_root, list(plan["changes"])
+        )
         external_state = {
             "git_config_change": config_change,
             "snapshot": {
                 **installed_snapshot,
                 "created": not snapshot_preexisting,
             },
+            "created_directories": upgrade_created_directories,
         }
         for change in plan["changes"]:
             if _digest(
@@ -2589,6 +2720,7 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             "plan_id": plan["plan_id"],
             "previous_state": previous_state,
             "upgrade_records": upgrade_records,
+            "upgrade_created_directories": upgrade_created_directories,
             "git_config_changes": [config_change],
             "installed_snapshot": installed_snapshot,
         }
@@ -2714,6 +2846,22 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
                     "created": not snapshot_preexisting,
                 }
             )
+        previous_created_directories = previous_state.get(
+            "created_directories", []
+        )
+        _created_directory_paths(
+            target_root, previous_created_directories
+        )
+        created_directories = sorted(
+            {
+                *previous_created_directories,
+                *upgrade_created_directories,
+            },
+            key=lambda item: (
+                len(PurePosixPath(str(item)).parts),
+                str(item),
+            ),
+        )
         final = {
             "schema_version": 2,
             "status": "applied",
@@ -2729,6 +2877,7 @@ def upgrade_apply(plan: Mapping[str, Any]) -> dict[str, Any]:
             "initial_git_config_values": list(
                 previous_state.get("initial_git_config_values", [])
             ),
+            "created_directories": created_directories,
             "warnings": list(plan.get("warnings", [])),
             "upgrade_history": [
                 *previous_state.get("upgrade_history", []),
@@ -2830,6 +2979,12 @@ def adoption_rollback(target: Path) -> dict[str, Any]:
         status = adoption_status(root)
         if status.get("status") not in {"applied", "rolling_back"}:
             raise ValueError("E_ADOPT_NOT_APPLIED: no adoption to roll back")
+        if "created_directories" not in status:
+            raise ValueError(
+                "E_ADOPT_ROLLBACK_SCHEMA: installed adoption predates exact "
+                "directory rollback; use its installed runtime before a "
+                "fresh adoption"
+            )
         records = list(status["records"])
         if status.get("status") == "applied":
             drift = [
@@ -2852,6 +3007,7 @@ def adoption_rollback(target: Path) -> dict[str, Any]:
             snapshot_records = status.get("snapshot_records")
             config_changes = status.get("git_config_changes")
             initial_config = status.get("initial_git_config_values")
+            created_directories = status.get("created_directories", [])
             external_errors = []
             if (
                 not isinstance(snapshot_records, list)
@@ -2867,6 +3023,9 @@ def adoption_rollback(target: Path) -> dict[str, Any]:
                     root, config_changes[0]
                 )
                 or not isinstance(initial_config, list)
+                or not _created_directories_are_prunable(
+                    root, created_directories, records
+                )
             ):
                 external_errors.append("installed guard state")
             if drift or backup_errors or external_errors:
@@ -2893,6 +3052,9 @@ def adoption_rollback(target: Path) -> dict[str, Any]:
                         str(snapshot_record["common_git_dir"])
                     ),
                 )
+        _remove_created_directories(
+            root, status.get("created_directories", [])
+        )
         state = {
             key: value
             for key, value in adoption_status(root).items()
