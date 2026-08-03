@@ -46,14 +46,14 @@ scripts/control-plane task start \
   --scope-path 'control_plane/**'
 
 scripts/control-plane task transition --task-id TASK-2026-001 --state planned
-scripts/control-plane task transition \
-  --task-id TASK-2026-001 \
-  --state ready \
-  --evidence preflight-evidence.json
 scripts/control-plane task status --task-id TASK-2026-001
 scripts/control-plane task resume --task-id TASK-2026-001
 scripts/control-plane task close --task-id TASK-2026-001
 ```
+
+Las transiciones que exigen evidencia no aceptan un archivo declarativo por
+CLI. Solo una capacidad host cerrada puede suministrar esa evidencia; un JSON
+local no debe poder simularla.
 
 ## TaskLease
 

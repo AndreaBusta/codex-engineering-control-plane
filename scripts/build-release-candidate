@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Build a deterministic, non-authorizing Control Plane release candidate."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+from hashlib import sha256
+import gzip
+from io import BytesIO
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import tomllib
+from typing import NoReturn
+
+
+RELEASE_GATES = (
+    "adoption-matrix",
+    "macos-smoke",
+    "release-preflight",
+    "verify",
+)
+GIT_ENVIRONMENT_PREFIX = "GIT_"
+VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$", re.ASCII)
+PULL_REQUEST_PATTERN = re.compile(r"\(#([1-9][0-9]*)\)$", re.ASCII)
+GITHUB_REMOTE_PATTERNS = (
+    re.compile(
+        r"^https://github\.com/"
+        r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?$"
+    ),
+    re.compile(
+        r"^git@github\.com:"
+        r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?$"
+    ),
+    re.compile(
+        r"^ssh://git@github\.com/"
+        r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?$"
+    ),
+)
+
+
+class ReleaseCandidateError(RuntimeError):
+    """Closed error surfaced without a traceback or sensitive environment."""
+
+
+def _fail(code: str, message: str) -> NoReturn:
+    raise ReleaseCandidateError(f"{code}: {message}")
+
+
+def _git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(GIT_ENVIRONMENT_PREFIX)
+    }
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment
+
+
+def _run_git(repository: Path, *arguments: str, binary: bool = False):
+    completed = subprocess.run(
+        ["git", "-C", str(repository), *arguments],
+        env=_git_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=not binary,
+        check=False,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        _fail("E_RELEASE_GIT", f"git {' '.join(arguments[:2])} failed")
+    return completed.stdout if binary else completed.stdout.strip()
+
+
+def _repository_identity(remote_url: str) -> tuple[str, str]:
+    for pattern in GITHUB_REMOTE_PATTERNS:
+        matched = pattern.fullmatch(remote_url)
+        if matched is not None:
+            owner = matched.group("owner")
+            repository = matched.group("repo")
+            return f"{owner}/{repository}", f"https://github.com/{owner}/{repository}"
+    _fail("E_RELEASE_SOURCE", "origin must be an explicit GitHub repository URL")
+
+
+def _committed_text(repository: Path, commit: str, relative_path: str) -> str:
+    try:
+        return _run_git(
+            repository,
+            "cat-file", "blob", f"{commit}:{relative_path}",
+            binary=True,
+        ).decode("utf-8")
+    except UnicodeError:
+        _fail("E_RELEASE_SOURCE", "committed release metadata is not UTF-8")
+
+
+def _runtime_version(source: str) -> str:
+    try:
+        parsed = ast.parse(source, filename="control_plane/__init__.py")
+    except SyntaxError:
+        _fail("E_RELEASE_VERSION", "runtime version source is unavailable")
+    versions: list[str] = []
+    for statement in parsed.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "__version__"
+            for target in statement.targets
+        ):
+            continue
+        if isinstance(statement.value, ast.Constant) and isinstance(
+            statement.value.value, str
+        ):
+            versions.append(statement.value.value)
+    if len(versions) != 1:
+        _fail("E_RELEASE_VERSION", "runtime must declare one literal __version__")
+    return versions[0]
+
+
+def _product_version(repository: Path, commit: str) -> str:
+    try:
+        lock = tomllib.loads(
+            _committed_text(
+                repository,
+                commit,
+                ".codex/control-plane.lock",
+            )
+        )
+    except tomllib.TOMLDecodeError:
+        _fail("E_RELEASE_VERSION", "control-plane lock is unavailable")
+    version = lock.get("product_version")
+    if not isinstance(version, str) or VERSION_PATTERN.fullmatch(version) is None:
+        _fail("E_RELEASE_VERSION", "locked product version is invalid")
+    if _runtime_version(
+        _committed_text(repository, commit, "control_plane/__init__.py")
+    ) != version:
+        _fail("E_RELEASE_VERSION", "runtime and locked product versions differ")
+    return version
+
+
+def _validate_source(repository: Path) -> tuple[str, str, str, str, str]:
+    if repository.is_symlink() or not repository.is_dir():
+        _fail("E_RELEASE_SOURCE", "repository must be a real directory")
+    if _run_git(repository, "status", "--porcelain=v1"):
+        _fail("E_RELEASE_SOURCE", "release source worktree must be clean")
+    branch = _run_git(repository, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch != "main":
+        _fail("E_RELEASE_SOURCE", "release source must be the local main branch")
+    head = _run_git(repository, "rev-parse", "HEAD^{commit}")
+    remote_main = _run_git(repository, "rev-parse", "refs/remotes/origin/main^{commit}")
+    if head != remote_main:
+        _fail("E_RELEASE_SOURCE", "HEAD must equal the observed origin/main")
+    tree = _run_git(repository, "rev-parse", "HEAD^{tree}")
+    slug, repository_url = _repository_identity(
+        _run_git(repository, "remote", "get-url", "origin")
+    )
+    return head, tree, slug, repository_url, branch
+
+
+def _validate_workflow_url(workflow_url: str, slug: str) -> None:
+    expected = re.compile(
+        rf"^https://github\.com/{re.escape(slug)}/actions/runs/[1-9][0-9]*$",
+        re.ASCII,
+    )
+    if expected.fullmatch(workflow_url) is None:
+        _fail("E_RELEASE_WORKFLOW", "workflow URL does not bind the source repository")
+
+
+def _pull_requests(
+    repository: Path,
+    repository_url: str,
+    commit: str,
+) -> list[dict[str, object]]:
+    subjects = _run_git(repository, "log", "--format=%s", commit).splitlines()
+    numbers = sorted(
+        {
+            int(matched.group(1))
+            for subject in subjects
+            if (matched := PULL_REQUEST_PATTERN.search(subject)) is not None
+        }
+    )
+    return [
+        {"number": number, "url": f"{repository_url}/pull/{number}"}
+        for number in numbers
+    ]
+
+
+def _archive_bytes(repository: Path, commit: str, prefix: str) -> bytes:
+    tar_bytes = _run_git(
+        repository,
+        "-c",
+        "tar.umask=0022",
+        "archive",
+        "--format=tar",
+        f"--prefix={prefix}/",
+        commit,
+        binary=True,
+    )
+    compressed = BytesIO()
+    with gzip.GzipFile(
+        filename="",
+        mode="wb",
+        fileobj=compressed,
+        compresslevel=9,
+        mtime=0,
+    ) as stream:
+        stream.write(tar_bytes)
+    return compressed.getvalue()
+
+
+def _json_bytes(value: object) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _file_record(name: str, payload: bytes) -> dict[str, object]:
+    return {
+        "name": name,
+        "sha256": f"sha256:{sha256(payload).hexdigest()}",
+        "size_bytes": len(payload),
+    }
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_real_directory(path: Path) -> int:
+    try:
+        resolved = path.resolve(strict=True)
+        expected = resolved.stat()
+    except OSError:
+        _fail("E_RELEASE_OUTPUT", "output parent must be a real existing directory")
+    if not resolved.is_absolute():
+        _fail("E_RELEASE_OUTPUT", "output parent must be absolute")
+    descriptor = os.open(resolved.anchor, _directory_flags())
+    try:
+        for component in resolved.parts[1:]:
+            next_descriptor = os.open(
+                component,
+                _directory_flags() | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        observed = os.fstat(descriptor)
+        if (observed.st_dev, observed.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            _fail("E_RELEASE_OUTPUT", "output parent changed during resolution")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_file_at(
+    output_descriptor: int,
+    name: str,
+    payload: bytes,
+) -> None:
+    temporary_name = f".{name}.{secrets.token_hex(16)}.tmp"
+    descriptor = os.open(
+        temporary_name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o644,
+        dir_fd=output_descriptor,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.rename(
+            temporary_name,
+            name,
+            src_dir_fd=output_descriptor,
+            dst_dir_fd=output_descriptor,
+        )
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary_name, dir_fd=output_descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def _directory_identity_at(parent_descriptor: int, name: str) -> tuple[int, int] | None:
+    try:
+        observed = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return None
+    if not stat.S_ISDIR(observed.st_mode):
+        return None
+    return observed.st_dev, observed.st_ino
+
+
+def _write_candidate(output: Path, files: dict[str, bytes]) -> None:
+    parent_descriptor = _open_real_directory(output.parent)
+    output_descriptor: int | None = None
+    published: list[str] = []
+    created_identity: tuple[int, int] | None = None
+    try:
+        parent_status = os.fstat(parent_descriptor)
+        if (
+            parent_status.st_uid != os.geteuid()
+            or stat.S_IMODE(parent_status.st_mode) & 0o022
+        ):
+            _fail(
+                "E_RELEASE_OUTPUT",
+                "output parent must be owner-controlled and not group/world writable",
+            )
+        try:
+            os.mkdir(output.name, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            _fail("E_RELEASE_OUTPUT", "output directory must not already exist")
+        created_identity = _directory_identity_at(parent_descriptor, output.name)
+        if created_identity is None:
+            _fail("E_RELEASE_OUTPUT", "created output directory is unavailable")
+        output_descriptor = os.open(
+            output.name,
+            _directory_flags() | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(output_descriptor)
+        if (opened.st_dev, opened.st_ino) != created_identity:
+            _fail("E_RELEASE_OUTPUT", "output directory changed before open")
+        for name, payload in files.items():
+            _write_file_at(output_descriptor, name, payload)
+            published.append(name)
+        final_descriptor = os.fstat(output_descriptor)
+        if (
+            (final_descriptor.st_dev, final_descriptor.st_ino) != created_identity
+            or _directory_identity_at(parent_descriptor, output.name)
+            != created_identity
+        ):
+            _fail("E_RELEASE_OUTPUT", "output directory changed during publication")
+        os.fsync(output_descriptor)
+        os.fsync(parent_descriptor)
+    except BaseException:
+        if output_descriptor is not None:
+            for name in reversed(published):
+                try:
+                    os.unlink(name, dir_fd=output_descriptor)
+                except OSError:
+                    pass
+        if (
+            created_identity is not None
+            and _directory_identity_at(parent_descriptor, output.name)
+            == created_identity
+        ):
+            try:
+                os.rmdir(output.name, dir_fd=parent_descriptor)
+            except OSError:
+                pass
+        raise
+    finally:
+        if output_descriptor is not None:
+            os.close(output_descriptor)
+        os.close(parent_descriptor)
+
+
+def _resolve_output(repository: Path, supplied: Path) -> Path:
+    output = supplied.absolute()
+    if output.name in {"", ".", ".."} or output.is_symlink() or output.exists():
+        _fail("E_RELEASE_OUTPUT", "output directory must not already exist")
+    try:
+        parent = output.parent.resolve(strict=True)
+    except OSError:
+        _fail("E_RELEASE_OUTPUT", "output parent must be a real existing directory")
+    resolved = parent / output.name
+    if resolved == repository or repository in resolved.parents:
+        _fail("E_RELEASE_OUTPUT", "output must remain outside the source repository")
+    return resolved
+
+
+def build_candidate(repository: Path, output: Path, workflow_url: str) -> dict[str, object]:
+    repository = repository.resolve(strict=True)
+    output = _resolve_output(repository, output)
+    source = _validate_source(repository)
+    head, tree, slug, repository_url, branch = source
+    _validate_workflow_url(workflow_url, slug)
+    version = _product_version(repository, head)
+    tag = f"v{version}"
+    stem = f"codex-engineering-control-plane-{version}"
+    archive_name = f"{stem}.tar.gz"
+    manifest_name = f"{stem}.manifest.json"
+    receipt_name = f"{stem}.receipt.json"
+    archive = _archive_bytes(repository, head, stem)
+    archive_record = {
+        **_file_record(archive_name, archive),
+        "media_type": "application/gzip",
+    }
+    pull_requests = _pull_requests(repository, repository_url, head)
+    gates = [
+        {"name": name, "result": "pending_external_evidence"}
+        for name in RELEASE_GATES
+    ]
+    manifest = {
+        "schema_version": 1,
+        "release_tag": tag,
+        "product_version": version,
+        "source": {
+            "repository": repository_url,
+            "remote": "origin",
+            "base_branch": branch,
+            "commit": head,
+            "tree": tree,
+            "pull_requests": pull_requests,
+        },
+        "workflow": {"url": workflow_url, "event": "workflow_dispatch"},
+        "gates": gates,
+        "artifacts": [archive_record],
+        "authorizes": False,
+    }
+    latest_pull_request = pull_requests[-1]["url"] if pull_requests else ""
+    receipt = {
+        "schema_version": 1,
+        "status": "candidate",
+        "source": {
+            "repository": repository_url,
+            "base_branch": branch,
+            "commit": head,
+            "pull_request_url": latest_pull_request,
+            "merge_commit": head,
+        },
+        "artifact": {
+            "kind": "source-tarball",
+            "version": version,
+            "build": tag,
+            "workflow_url": workflow_url,
+            "archive_sha256": archive_record["sha256"],
+        },
+        "verification": {
+            "required_gates": [gate["name"] for gate in gates],
+            "external_state": "pending_external_evidence",
+            "smoke_result": "pending_external_evidence",
+            "observed_at_utc": "",
+        },
+        "approvals": {
+            "release_authorized": False,
+            "authorized_by": "",
+            "authorized_at_utc": "",
+        },
+    }
+    manifest_bytes = _json_bytes(manifest)
+    receipt_bytes = _json_bytes(receipt)
+    checksums = (
+        f"{archive_record['sha256'].removeprefix('sha256:')}  {archive_name}\n"
+    ).encode("ascii")
+    files = {
+        "SHA256SUMS": checksums,
+        manifest_name: manifest_bytes,
+        receipt_name: receipt_bytes,
+        archive_name: archive,
+    }
+    if _validate_source(repository) != source:
+        _fail("E_RELEASE_SOURCE", "release source changed during candidate build")
+    _write_candidate(output, files)
+    return {
+        "ok": True,
+        "release_tag": tag,
+        "source_commit": head,
+        "source_tree": tree,
+        "workflow_url": workflow_url,
+        "authorizes": False,
+        "files": [
+            _file_record(name, payload) for name, payload in sorted(files.items())
+        ],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Build a deterministic, non-authorizing release candidate."
+    )
+    parser.add_argument("--repo", default=".")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--workflow-url", required=True)
+    arguments = parser.parse_args()
+    try:
+        result = build_candidate(
+            Path(arguments.repo),
+            Path(arguments.output_dir),
+            arguments.workflow_url,
+        )
+    except (OSError, ReleaseCandidateError, subprocess.SubprocessError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

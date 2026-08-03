@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -74,6 +75,7 @@ class RepositoryContractTests(unittest.TestCase):
             "docs/profiles/saas-backend.md",
             "docs/profiles/ai-text-pipeline.md",
             "scripts/control-plane",
+            "scripts/build-release-candidate",
             "templates/HANDOFF.md",
             "templates/RELEASE_RECEIPT.json",
             "templates/TASK.md",
@@ -94,6 +96,58 @@ class RepositoryContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertEqual(ci_contract_issues(workflow), [])
+
+    def test_manual_workflow_runs_real_macos_smoke_and_release_candidate(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "control-plane.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "tests.macos_hook_smoke.MacOSHookSmokeTests."
+            "test_real_darwin_child_emits_closed_audit_only_contract",
+            workflow,
+        )
+        self.assertIn("release-candidate:", workflow)
+        self.assertIn("needs: [verify, macos-smoke]", workflow)
+        self.assertIn("scripts/build-release-candidate", workflow)
+        self.assertNotIn("upload-artifact", workflow)
+        self.assertGreaterEqual(
+            workflow.count('test "$GITHUB_REF" = "refs/heads/main"'),
+            3,
+        )
+        self.assertGreaterEqual(
+            workflow.count('test "$GITHUB_SHA" = "$(git rev-parse HEAD)"'),
+            4,
+        )
+
+    def test_release_builder_uses_immutable_git_objects_and_anchored_output(self) -> None:
+        builder = (ROOT / "scripts" / "build-release-candidate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('"-c",\n        "tar.umask=0022",\n        "archive"', builder)
+        self.assertIn('"cat-file", "blob"', builder)
+        self.assertIn('"log", "--format=%s", commit', builder)
+        self.assertIn("dir_fd=parent_descriptor", builder)
+        self.assertIn("src_dir_fd=output_descriptor", builder)
+        self.assertNotIn("tempfile.mkdtemp", builder)
+        self.assertNotIn("shutil.rmtree", builder)
+
+    def test_runtime_identity_matches_locked_product_version(self) -> None:
+        from control_plane import __version__
+
+        lock = tomllib.loads(
+            (ROOT / ".codex" / "control-plane.lock").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(__version__, lock["product_version"])
+
+    def test_documented_task_transition_uses_the_supported_cli(self) -> None:
+        lifecycle = (
+            ROOT / "docs" / "engineering" / "11-lifecycle-hooks-adoption.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("--evidence preflight-evidence.json", lifecycle)
 
     def test_ci_contract_rejects_unpinned_actions_and_permission_escalation(
         self,
@@ -251,7 +305,11 @@ jobs:
         self.assertEqual(validate_policy(policy), [])
 
     def test_shell_entrypoints_are_executable(self) -> None:
-        for relative_path in ("scripts/control-plane", "tests/run.sh"):
+        for relative_path in (
+            "scripts/control-plane",
+            "scripts/build-release-candidate",
+            "tests/run.sh",
+        ):
             path = ROOT / relative_path
             self.assertTrue(
                 path.is_file() and os.access(path, os.X_OK),
