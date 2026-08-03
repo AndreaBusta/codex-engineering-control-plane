@@ -110,6 +110,33 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("release-candidate:", workflow)
         self.assertIn("needs: [verify, macos-smoke]", workflow)
         self.assertIn("scripts/build-release-candidate", workflow)
+        refresh_step = workflow.split(
+            "      - name: Refresh release gate against private main", 1
+        )[1].split("      - name: Build reproducible non-authorizing candidate", 1)[0]
+        build_step = workflow.split(
+            "      - name: Build reproducible non-authorizing candidate", 1
+        )[1]
+
+        self.assertIn(
+            "CONTROL_PLANE_GITHUB_TOKEN: ${{ github.token }}",
+            refresh_step,
+        )
+        self.assertIn(
+            "GIT_CONFIG_KEY_0=http.https://github.com/.extraheader",
+            refresh_step,
+        )
+        self.assertIn(
+            'GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"',
+            refresh_step,
+        )
+        self.assertIn('echo "::add-mask::$authorization"', refresh_step)
+        self.assertIn("scripts/control-plane preflight --mode release --refresh", refresh_step)
+        self.assertNotIn("scripts/build-release-candidate", refresh_step)
+        self.assertNotIn("github.token", build_step)
+        self.assertNotIn("CONTROL_PLANE_GITHUB_TOKEN", build_step)
+        self.assertIn("scripts/build-release-candidate", build_step)
+        self.assertEqual(workflow.count("${{ github.token }}"), 1)
+        self.assertEqual(workflow.count("persist-credentials: false"), 3)
         self.assertNotIn("upload-artifact", workflow)
         self.assertGreaterEqual(
             workflow.count('test "$GITHUB_REF" = "refs/heads/main"'),

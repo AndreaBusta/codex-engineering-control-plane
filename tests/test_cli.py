@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
 import subprocess
 import sys
 import unittest
@@ -12,13 +15,16 @@ from tests.git_test_support import FIXTURE_POLICY, GitScenario
 ROOT = Path(__file__).parents[1]
 
 
-def run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+def run_cli(
+    *arguments: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "control_plane.cli", *arguments],
         cwd=ROOT,
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -162,6 +168,61 @@ class CliContractTests(unittest.TestCase):
         codes = {error["code"] for error in payload["errors"]}
         self.assertEqual(result.returncode, 1)
         self.assertIn("E_FETCH_FAILED", codes)
+
+    def test_online_preflight_forwards_ephemeral_git_auth_config_to_fetch(self) -> None:
+        self.scenario.checkout_feature()
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        wrapper_dir = self.scenario.root / "wrapped-bin"
+        wrapper_dir.mkdir()
+        capture_path = self.scenario.root / "fetch-env.txt"
+        wrapper = wrapper_dir / "git"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "fetch" ]; then\n'
+            "  printf '%s\\n' \"${GIT_CONFIG_COUNT-}\" "
+            '"${GIT_CONFIG_KEY_0-}" "${GIT_CONFIG_VALUE_0-}" '
+            ' > "$CAPTURE_PATH"\n'
+            "fi\n"
+            f"exec {shlex.quote(str(real_git))} \"$@\"\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{wrapper_dir}{os.pathsep}{env['PATH']}",
+                "CAPTURE_PATH": str(capture_path),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                "GIT_CONFIG_VALUE_0": "AUTHORIZATION: basic masked-test-value",
+            }
+        )
+
+        result = run_cli(
+            "preflight",
+            "--mode",
+            "write",
+            "--repo",
+            str(self.scenario.repo),
+            "--policy",
+            str(FIXTURE_POLICY),
+            "--refresh",
+            "--json",
+            env=env,
+        )
+
+        payload = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(
+            capture_path.read_text(encoding="utf-8").splitlines(),
+            [
+                "1",
+                "http.https://github.com/.extraheader",
+                "AUTHORIZATION: basic masked-test-value",
+            ],
+        )
 
     def test_default_preflight_does_not_contact_remote(self) -> None:
         self.scenario.checkout_feature()
