@@ -140,6 +140,58 @@ valor o ausencia anterior de `core.hooksPath`.
 Cambios globales de `AGENTS.md`, `config.toml`, plugins o MCP quedan fuera de la
 adopción project-local y exigen diff y autorización separados.
 
+## Recorrido soportado v2.1 para un proyecto nuevo
+
+Este es el único recorrido soportado. Parte de una
+checkout limpia del Control Plane fijada a un commit o tag y de un proyecto
+que ya tenga commit inicial,
+remote, rama base observable y una rama de trabajo no protegida. Fuente y
+destino deben estar limpios; el JSON de plan se guarda fuera del destino.
+
+1. Ejecutar `adopt plan` con fuente y destino explícitos y guardar su salida
+   JSON sin mutar el proyecto:
+
+   ```bash
+   /ruta/control-plane/scripts/control-plane adopt plan \
+     --source /ruta/control-plane \
+     --target /ruta/proyecto \
+     --json > /ruta/segura/adoption-plan.json
+   ```
+
+2. Antes de escribir, revisar el JSON: `ok`, `source_commit`, `target_git`,
+   `changes`, `git_config_changes`, `warnings`, `preflight_errors`, digests y
+   acciones manuales. Un error o un hecho ambiguo detiene el recorrido.
+3. Ejecutar `adopt apply` únicamente con ese plan exacto:
+
+   ```bash
+   /ruta/control-plane/scripts/control-plane adopt apply \
+     --plan /ruta/segura/adoption-plan.json
+   ```
+
+4. Ejecutar `adopt verify` y después los gates reales del proyecto. La suite
+   del Control Plane no sustituye tests, build o smoke propios del destino.
+5. Abrir `/hooks`, revisar fuente, comando y hashes, y confiar manualmente solo
+   si coinciden. La instalación permanece `pending_hook_trust` hasta entonces.
+6. Antes del primer commit, ejecutar una vez `adopt rollback` y comprobar la
+   restauración exacta del árbol de trabajo, modos, refs y `core.hooksPath`
+   respecto al estado previo.
+7. Si el ensayo pasa, volver a ejecutar `adopt plan`, revisar el nuevo JSON,
+   aplicar, verificar y repetir los gates. Entonces se prepara la
+   Pull Request del proyecto como cambio normal, revisable y reversible.
+8. Para una versión posterior, partir de una nueva fuente limpia y usar
+   `upgrade plan`, revisar su JSON y ejecutar `upgrade apply`. `adopt verify`
+   debe volver a pasar; el rollback original se conserva. Una instalación
+   previa que no tenga inventario de directorios recibe
+   `E_UPGRADE_ROLLBACK_SCHEMA`: debe revertirse con su runtime instalado y
+   volver a entrar mediante una adopción fresca.
+
+La adopción project-local no instala dependencias, no modifica el remote y
+no instala workflows de CI; no publica ni despliega ni cambia configuración
+global, plugins o MCP. `adopt rollback` restaura bytes, modos, snapshots y la
+configuración local gestionada, pero no revierte commits Git, PRs ni efectos
+externos: esos se recuperan con el flujo normal del proyecto. El journal de
+auditoría se conserva bajo el Git dir y no forma parte del árbol gobernado.
+
 ## Upgrade
 
 ```bash
@@ -151,3 +203,7 @@ scripts/control-plane upgrade apply --plan /ruta/segura/upgrade-plan.json
 El upgrade queda ligado al `plan_id` instalado, conserva el rollback original
 y mantiene historial. Una migración de schema deberá añadir transformación
 explícita; nunca se simula mediante un alias de `adopt apply`.
+
+El inventario `created_directories` es obligatorio para nuevos upgrades. Si un
+journal pre-release no lo contiene, el runtime nuevo falla antes de mutar: no
+puede inferir con seguridad qué directorios existían antes de la adopción.

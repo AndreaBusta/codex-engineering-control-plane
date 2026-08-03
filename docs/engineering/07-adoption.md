@@ -174,6 +174,10 @@ Nivel 1 `local-audit` v2.1:
 - provider GitHub, workflow de procedencia y policy remota diferidos;
 - GitHub, CI y release permanecen `pending_external_evidence` cuando una tarea
   concreta los requiera;
-- la adopción en otros repositorios exige piloto separado y reversible.
+- la adopción project-local en repositorios nuevos está soportada únicamente
+  mediante el recorrido reversible de
+  `docs/engineering/11-lifecycle-hooks-adoption.md`;
+- BUSTAFIT continúa como laboratorio aislado: el piloto no equivale a una
+  instalación permanente en su checkout real.
 
 Estas limitaciones son estados explícitos, no permisos implícitos.
