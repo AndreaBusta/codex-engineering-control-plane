@@ -61,6 +61,29 @@ class ProjectProfileTests(unittest.TestCase):
 
         self.assertEqual(profile["kind"], "saas_backend")
 
+    def test_firebase_functions_repository_uses_saas_backend_profile(self) -> None:
+        profile = self.detect(("firebase.json", "functions/package.json"))
+
+        self.assertEqual(profile["kind"], "saas_backend")
+        self.assertEqual(profile["profiles"], ["saas_backend"])
+        self.assertEqual(
+            profile["evidence"],
+            ["firebase.json", "functions/package.json"],
+        )
+
+    def test_firebase_function_markers_are_not_individually_backend_evidence(
+        self,
+    ) -> None:
+        for markers in (
+            ("firebase.json",),
+            ("functions/package.json",),
+            ("nested/firebase.json", "nested/functions/package.json"),
+        ):
+            with self.subTest(markers=markers):
+                profile = self.detect(markers)
+
+                self.assertEqual(profile["profiles"], ["generic"])
+
     def test_ai_text_pipeline_uses_prompts_evals_and_pipeline_markers(self) -> None:
         profile = self.detect(
             ("pyproject.toml", "prompts/", "evals/", "pipelines/")
@@ -325,7 +348,7 @@ class ProjectProfileTests(unittest.TestCase):
                         {resource_id},
                     )
 
-    def test_bustafit_hybrid_t2_answer_requires_three_profiles_at_eight_units(
+    def test_bustafit_hybrid_t2_answer_requires_four_profiles_at_seven_units(
         self,
     ) -> None:
         from control_plane.contracts import contract_digest
@@ -342,9 +365,11 @@ class ProjectProfileTests(unittest.TestCase):
             "project_profile": {
                 "schema_version": 1,
                 "kind": "hybrid",
-                "profiles": ["android", "ios", "web_pwa"],
+                "profiles": ["android", "ios", "saas_backend", "web_pwa"],
                 "evidence": [
                     "android/app/src/main/AndroidManifest.xml",
+                    "firebase.json",
+                    "functions/package.json",
                     "ios/App/App.xcodeproj",
                     "sw.js",
                 ],
@@ -379,7 +404,7 @@ class ProjectProfileTests(unittest.TestCase):
             goals=[
                 {
                     "id": "plan-bustafit-shared-ui",
-                    "summary": "Cover all three detected BUSTAFIT profiles.",
+                    "summary": "Cover all four detected BUSTAFIT profiles.",
                     "domains": ["product_ui"],
                     "depends_on": [],
                 }
@@ -413,7 +438,7 @@ class ProjectProfileTests(unittest.TestCase):
             "E_CONTEXT_BUDGET_REQUIRED",
             {error["code"] for error in decision["errors"]},
         )
-        self.assertEqual(decision["summary"]["selected_context_units"], 8)
+        self.assertEqual(decision["summary"]["selected_context_units"], 7)
         self.assertEqual(
             {
                 required
@@ -423,6 +448,7 @@ class ProjectProfileTests(unittest.TestCase):
             {
                 "document.profile-android",
                 "document.profile-ios",
+                "document.profile-saas-backend",
                 "document.profile-web-pwa",
             },
         )
@@ -435,11 +461,12 @@ class ProjectProfileTests(unittest.TestCase):
             {
                 "quality-profile-android",
                 "quality-profile-ios",
+                "quality-profile-saas-backend",
                 "quality-profile-web-pwa",
             },
         )
 
-    def test_only_bustafit_profile_guides_use_tiny_context(self) -> None:
+    def test_only_compact_project_profile_guides_use_tiny_context(self) -> None:
         from control_plane.resource_registry import load_registry
 
         registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
@@ -447,12 +474,12 @@ class ProjectProfileTests(unittest.TestCase):
         tiny_profile_ids = {
             "document.profile-android",
             "document.profile-ios",
+            "document.profile-saas-backend",
             "document.profile-web-pwa",
         }
         all_profile_ids = tiny_profile_ids.union(
             {
                 "document.profile-generic",
-                "document.profile-saas-backend",
                 "document.profile-ai-text",
             }
         )

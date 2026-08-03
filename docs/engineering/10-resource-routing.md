@@ -86,6 +86,9 @@ marque operativo.
 También incluye `project_profile`: detecta por marcadores iOS, Android, PWA,
 SaaS/backend, IA textual, híbrido o genérico. El resolver usa esos perfiles
 como dominios demostrados y carga sus guías de calidad obligatorias.
+Firebase Functions cuenta como backend solo cuando existen juntos, desde la
+raíz, `firebase.json` y `functions/package.json`; ninguno de los dos por sí
+solo concede ese perfil y el detector no abre sus contenidos.
 
 ### RouteDecision
 
@@ -107,8 +110,9 @@ la policy no repita ese alias. Una policy puede declararlo, pero no puede
 hacerlo aparecer por debajo de `release` ni eliminar el invariant universal.
 En repos híbridos, cada guía de perfil detectada continúa siendo obligatoria
 en todas las fases del lifecycle, incluidas `research` y `observe`.
-Las guías compactas iOS, Android y web/PWA se contabilizan como contexto `tiny`
-para poder cargarlas juntas en T2 sin elevar artificialmente el riesgo.
+Las guías compactas iOS, Android, web/PWA y SaaS/backend se contabilizan como
+contexto `tiny` para poder cargarlas juntas en T2 sin elevar artificialmente el
+riesgo.
 
 ### ResourceUseReceipt
 

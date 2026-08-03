@@ -15,6 +15,14 @@ exist as BUSTAFIT PR #92 and PR #97, but both await fresh shadow replay before
 N4 can close. The simplicity decision remains `NO_PROMOTE`; no candidate remains
 installed or routed.
 
+The first current-main R3/R4 route attempt stopped before any evaluator was
+created: BUSTAFIT declared `saas_backend`, while the marker-only detector saw
+only Android, iOS and web/PWA. A focused RED reproduced the omission for the
+root pair `firebase.json` + `functions/package.json`; GREEN now requires that
+exact pair, rejects either marker alone and detects four profiles. Those first
+route snapshots are invalid, and R3/R4 still require clean re-adoption and fresh
+shadow evaluators.
+
 ## Frozen experiment identity
 
 | Input | Frozen value |
@@ -27,7 +35,7 @@ installed or routed.
 | Existing simplicity skill | `sha256:6e22cc54cb02a5e98ae42d06d9d7292db0c1b43894831b32879beb0166b2aea7` |
 | Control Plane baseline | 404/404 tests PASS on 2026-08-02 |
 | Historical pre-integration candidate suite | 64/64 focused routing/profile/lock tests and 407/407 full-suite tests PASS after the profile-phase fix; full suite completed in 149.373 s |
-| Current integration candidate suite | 68/68 focused routing/profile/lock tests and 413/413 full-suite tests PASS after contract hardening; full suite completed in 157.315 s |
+| Current integration candidate suite | 70/70 focused routing/profile/lock tests and 415/415 full-suite tests PASS after Firebase Functions profile hardening; full suite completed in 160.007 s |
 | Fresh remote refs | `git ls-remote` confirmed Control Plane `38becc3` and BUSTAFIT `dd42097` on 2026-08-02 |
 | Current source risk | `FAIL/1`: dirty source tree lacks governing host-bound policy/lock evidence; final local-audit target remains `UNKNOWN/2` |
 
@@ -506,11 +514,12 @@ byte-exact and no registry route is added.
 | Router | T3/controlled, `decision_ready=true`, `plan_then_goal` | PASS |
 | Preflight write | clean branch, ahead 0, behind 0 | PASS |
 | Control Plane baseline | `bash tests/run.sh`: 404/404 | PASS |
-| Current integration candidate verification | focused routing/profile/lock suites: 68/68; `bash tests/run.sh`: 413/413 in 157.315 s; final policy, registry, doctor and remote preflight repeat before PR | PASS tests; remaining final gates pending |
+| Current integration candidate verification | focused routing/profile/lock suites: 70/70; `bash tests/run.sh`: 415/415 in 160.007 s; final policy, registry, doctor and remote preflight repeat before PR | PASS tests; remaining final gates pending |
 | Compact receipt reproducibility | all four normalized TaskEnvelope JSON records recompute the recorded task digests exactly | PASS |
 | Original four read-only scenarios | B1 omitted affected iOS/Android shell profiles | FAIL, round invalid |
 | First final replacement routed scenarios | four fresh agents and four content/authority passes, but R2 omitted detected profile resources | INVALIDATED |
 | Profile lifecycle TDD | RED: `research` and `observe` each selected context `7/8` without profile docs; GREEN: both select all three profile docs at `8/8`, focused suites 64/64 | PASS |
+| Firebase Functions profile TDD | RED: the root Firebase Functions pair fell back to `generic`; GREEN: exact pair selects `saas_backend`, isolated/nested markers do not, and BUSTAFIT becomes four-profile hybrid at `7/8` T2 context units | PASS; R3/R4 routes must be repeated |
 | Second final replacement routed scenarios | four fresh agents, four isolated clones, complete profile manifests, four content/authority passes | OBSERVATIONAL PASS |
 | Simplicity promotion | pre-N1 A/B is diagnostic only; evidence did not meet the threshold and the candidate was discarded | CLOSED: NO_PROMOTE, no causal claim |
 | Current `risk-status` | exact task/lease hint returns local `FAIL`, remote `UNKNOWN` | FAIL during dirty source work |
