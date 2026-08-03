@@ -342,6 +342,39 @@ jobs:
             with self.subTest(rule=rule):
                 self.assertIn(rule, reasoning)
 
+    def test_cross_thread_lookup_is_host_native_bounded_and_non_authorizing(
+        self,
+    ) -> None:
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        normalized = " ".join(agents.split())
+
+        for contract in (
+            "`codex://threads/<UUID>`",
+            "`read_thread`",
+            "adapter Python",
+            "una sola tarea",
+            "`FOUND`",
+            "`STALE`",
+            "`UNKNOWN`",
+            "`authorizes=false`",
+            "4 KiB",
+            "proyecto/worktree",
+            "Continuation Pointer",
+            "transcript, prompts, razonamiento, tool output o secretos",
+            "despiertes, escribas, dirijas, archives ni modifiques",
+            "gates de revisión ni autorización",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, normalized)
+
+        self.assertFalse(
+            (ROOT / "control_plane" / "cross_thread_audit.py").exists()
+        )
+        registry = (
+            ROOT / ".codex" / "resource-registry.toml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("cross-thread", registry)
+
     def test_no_unresolved_placeholders(self) -> None:
         forbidden = re.compile(
             r"\bT[B]D\b|\bT[O]DO\b|"
