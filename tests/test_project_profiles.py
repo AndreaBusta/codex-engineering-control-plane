@@ -71,6 +71,33 @@ class ProjectProfileTests(unittest.TestCase):
             ["firebase.json", "functions/package.json"],
         )
 
+    def test_firebase_functions_detection_never_reads_marker_contents(
+        self,
+    ) -> None:
+        from control_plane.project_profiles import detect_project_profile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            markers = (root / "firebase.json", root / "functions/package.json")
+            for marker in markers:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("untrusted manifest contents\n", encoding="utf-8")
+                marker.chmod(0)
+
+            content_access = AssertionError("manifest content access is forbidden")
+            with (
+                patch.object(Path, "open", side_effect=content_access),
+                patch.object(Path, "read_bytes", side_effect=content_access),
+                patch.object(Path, "read_text", side_effect=content_access),
+            ):
+                profile = detect_project_profile(root)
+
+        self.assertEqual(profile["profiles"], ["saas_backend"])
+        self.assertEqual(
+            profile["evidence"],
+            ["firebase.json", "functions/package.json"],
+        )
+
     def test_firebase_function_markers_are_not_individually_backend_evidence(
         self,
     ) -> None:
@@ -221,7 +248,7 @@ class ProjectProfileTests(unittest.TestCase):
         self.assertNotIn("document.profile-ios", decision["summary"]["required"])
         self.assertEqual(decision["summary"]["profile_mismatch"], ["ios"])
 
-    def test_all_six_profile_routes_cover_research_and_observe(self) -> None:
+    def test_all_six_t1_profile_routes_cover_research_and_observe(self) -> None:
         from control_plane.contracts import contract_digest
         from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
         from control_plane.policy import load_policy

@@ -918,6 +918,55 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(decision["summary"]["tier"], "T3")
         self.assertIn("gate.release-proof", decision["required_gates"])
 
+    def test_release_invariant_uses_canonical_gate_when_alias_owner_mutates(
+        self,
+    ) -> None:
+        registry = copy.deepcopy(self.registry)
+        resources = {
+            resource["id"]: resource for resource in registry["resources"]
+        }
+        resources["gate.release-proof"]["aliases"] = []
+        resources["gate.security-review"]["aliases"].append("release_proof")
+        self.registry = registry
+
+        decision = self.route(
+            task_envelope(
+                intent="release",
+                phase="release",
+                requested_outcome="release",
+                signals=[],
+                effects=[{"name": "release", "source": "user_explicit"}],
+            )
+        )
+
+        self.assertEqual(decision["summary"]["tier"], "T3")
+        self.assertIn("gate.release-proof", decision["required_gates"])
+
+    def test_pull_request_invariant_uses_canonical_gate_when_alias_owner_mutates(
+        self,
+    ) -> None:
+        registry = copy.deepcopy(self.registry)
+        resources = {
+            resource["id"]: resource for resource in registry["resources"]
+        }
+        resources["gate.pull-request"]["aliases"] = []
+        resources["gate.security-review"]["aliases"].append("pull_request")
+        self.registry = registry
+
+        decision = self.route(
+            task_envelope(
+                intent="integrate",
+                phase="integrate",
+                requested_outcome="pull_request",
+                signals=[],
+                effects=[
+                    {"name": "pull_request", "source": "user_explicit"}
+                ],
+            )
+        )
+
+        self.assertIn("gate.pull-request", decision["required_gates"])
+
     def test_outcome_filter_preserves_shared_security_gate_alias(self) -> None:
         registry = copy.deepcopy(self.registry)
         resources = {

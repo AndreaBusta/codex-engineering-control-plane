@@ -2,26 +2,21 @@
 
 ## Status
 
-`n1_observational_pass_genuine_tasks_identified` — the original round and the
-first final replacement remain invalid historical evidence. The latter exposed
-that `research` did not select the three detected quality profiles. Controlled
-RED reproduced the omission in both `research` and `observe`; the registry fix
-made all six quality profiles lifecycle-complete. A second final round then
-repeated B1, B2, R1 and R2 from the beginning with four fresh evaluators, four
-isolated clones and four exact rollbacks. Those evaluator results passed the
-frozen routing, profile, authority and quality rubric as observational evidence;
-they do not prove that the Control Plane caused the outcomes. Genuine tasks now
-exist as BUSTAFIT PR #92 and PR #97, but both await fresh shadow replay before
-N4 can close. The simplicity decision remains `NO_PROMOTE`; no candidate remains
-installed or routed.
+`n1_revalidated_n4_observational_pass` — a focused RED showed that Firebase
+Functions was missing from the marker-only detector. GREEN now requires the
+root pair `firebase.json` + `functions/package.json`, rejects isolated or nested
+markers and detects BUSTAFIT as Android + iOS + SaaS/backend + web/PWA. Because
+that changed runtime behavior, the protocol restarted N1 before N4: six fresh
+evaluators, six isolated clones and six exact rollbacks produced 6/6 correct
+routing, profile and authority boundaries. B1/B2/R1/R2 remain observational;
+the PR #92 and PR #97 shadow replays are also observational and cannot prove
+retroactive causality. R4 honestly remains `pending_host_capability`; no JSON
+or merge was treated as host authority. The simplicity decision is still
+`NO_PROMOTE`, and no candidate remains installed in BUSTAFIT.
 
-The first current-main R3/R4 route attempt stopped before any evaluator was
-created: BUSTAFIT declared `saas_backend`, while the marker-only detector saw
-only Android, iOS and web/PWA. A focused RED reproduced the omission for the
-root pair `firebase.json` + `functions/package.json`; GREEN now requires that
-exact pair, rejects either marker alone and detects four profiles. Those first
-route snapshots are invalid, and R3/R4 still require clean re-adoption and fresh
-shadow evaluators.
+All R3/R4 outputs generated before the post-fix N1 restart are diagnostic only.
+The final N4 receipts below were produced after N1 passed and are the only N4
+evidence counted by this scorecard.
 
 ## Frozen experiment identity
 
@@ -35,9 +30,9 @@ shadow evaluators.
 | Existing simplicity skill | `sha256:6e22cc54cb02a5e98ae42d06d9d7292db0c1b43894831b32879beb0166b2aea7` |
 | Control Plane baseline | 404/404 tests PASS on 2026-08-02 |
 | Historical pre-integration candidate suite | 64/64 focused routing/profile/lock tests and 407/407 full-suite tests PASS after the profile-phase fix; full suite completed in 149.373 s |
-| Current integration candidate suite | 70/70 focused routing/profile/lock tests and 415/415 full-suite tests PASS after Firebase Functions profile hardening; full suite completed in 160.007 s |
+| Current integration candidate suite | 73/73 focused routing/profile/lock tests and 418/418 full-suite tests PASS after N5 hardening; full suite completed in 159.795 s |
 | Fresh remote refs | `git ls-remote` confirmed Control Plane `38becc3` and BUSTAFIT `dd42097` on 2026-08-02 |
-| Current source risk | `FAIL/1`: dirty source tree lacks governing host-bound policy/lock evidence; final local-audit target remains `UNKNOWN/2` |
+| Pre-commit source-risk checkpoint | `FAIL/1`: the intentionally dirty source tree lacked governing host-bound policy/lock evidence; the clean-commit result is a final integration gate, while an adopted local-audit target without remote evidence remains `UNKNOWN/2` |
 
 The active coordinating task is
 `TASK-CONTROL-PLANE-BUSTAFIT-DOGFOOD-R3`, session
@@ -87,7 +82,7 @@ from shell-specific gates, and never invent a command or external effect.
 
 ### R3 — Genuine bounded security task selected by the roadmap
 
-`legacy-account / BUSTAFIT PR #92 — awaiting_shadow_replay`
+`legacy-account / BUSTAFIT PR #92 — observational_shadow_pass`
 
 The user requested TDD for legacy account compatibility in
 `functions/coachSecurity.js`: missing accounts and accounts without `status`
@@ -98,7 +93,7 @@ authority case. A later replay cannot become retroactive causal evidence.
 
 ### R4 — Genuine shared-core task
 
-`Coach Console runtime/sync / BUSTAFIT PR #97 — awaiting_shadow_replay`
+`Coach Console runtime/sync / BUSTAFIT PR #97 — observational_shadow_pass`
 
 The user requested a responsive Coach Console consuming the secure callable
 contracts, with truthful pending/success/error/offline state and no unsafe
@@ -150,8 +145,8 @@ after a task already finished is observational even when its route is correct.
 | B2 | T3/controlled; iOS + Android/TWA + web; publication separated | 5/5 | 5/5 | ≈5 min, 6 batches/≈24 read-only commands, 0 changes | PASS |
 | R1 | read-only audit; no authority or profile claim required | 5/5 | 5/5 | ≈80 s, ≈19 read-only commands, 1 doc/8 lines proposed | PASS |
 | R2 | hybrid: web/PWA + iOS + Android; gates selected by surface | 5/5 | 5/5 | ≈15 min, ≈33 read-only commands, 0 changes | PASS with efficiency note |
-| R3 | PR #92 legacy-account identified; stricter than original no-auth eligibility | — | — | — | awaiting shadow replay |
-| R4 | PR #97 shared Coach runtime/sync identified | — | — | — | awaiting shadow replay |
+| R3 | PR #92 already integrated; T3 controlled; SaaS/auth governs the focal check; no authority claim | 5/5 | 5/5 | read-only shadow; runtime not instrumented | OBSERVATIONAL PASS |
+| R4 | PR #97 already integrated; T3 controlled; four profiles; host capability kept unresolved | 5/5 | 5/5 | read-only shadow; runtime not instrumented | OBSERVATIONAL PASS; host unproved |
 
 ### B1 evidence
 
@@ -303,9 +298,12 @@ A new characterization test failed with context `7/8` in both `research` and
 `observe`. The minimum registry correction added those two phases to every
 quality-profile route, focused verification returned 64/64, and a new detached
 attestor captured the corrected eight-path candidate. The replacement results
-below are the subsequent four-agent rerun, not the invalidated evidence.
+below were the subsequent four-agent rerun at that checkpoint. The later
+Firebase Functions detector correction changed runtime behavior and invalidated
+this entire pre-Firebase section; none of it contributes to the final 6/6
+acceptance result.
 
-## Replacement N1 results
+## Historical pre-Firebase N1 results — invalidated
 
 | ID | Routed decision | Profiles | Evaluator result | Rollback | Verdict |
 |---|---|---|---|---|---|
@@ -314,7 +312,11 @@ below are the subsequent four-agent rerun, not the invalidated evidence.
 | R1 | `sha256:d182b457b0550f92d418b1261aacdcc89fbed56e5cf77066235caa75feb30c9d` | android, ios, web_pwa | two stale blocks only; minimal doc delta; external state kept unverified | clean HEAD, hooksPath absent | PASS; fresh evaluator |
 | R2 | `sha256:7602ff2a1cde9971b4778855c8ed294605d18ac864f8ae3f9cb2c12e3aefd98a` | android, ios, web_pwa | real common/shell/provider gate matrix; no commands executed | clean HEAD, hooksPath absent | PASS; fresh evaluator |
 
-### Final N1 compact receipts
+### Historical pre-Firebase N1 compact receipts — invalidated
+
+These receipts remain only as an audit trail for the defect sequence. They are
+not final evidence, are not combined with the post-Firebase runs, and cannot
+satisfy N1 or N4.
 
 All four routes bind policy
 `sha256:b99e70e0e7e060239264082c64d7a4c69ef3d30f8a4c6f2bb045e05a2e9408d3`,
@@ -479,6 +481,48 @@ managed bytes, Git entries, hooks or product changes remain. Their unique local
 branches were confined to the disposable clones and never pushed. The user's
 real BUSTAFIT checkout was not adopted or modified.
 
+## Post-Firebase N1/N4 restart receipts
+
+The runtime correction is commit
+`e33bf1c30d5169beb905e4427ecc526828d49fa6`. N1 used the frozen BUSTAFIT
+`dd42097dfb8caf433852fec7f0294d4462010ca3`; N4 used the locally observed
+current-main snapshot `e9281c929b14c695d4ad507d17c0266bcf9f4f4c`. Every run
+used a fresh isolated clone and a fresh `gpt-5.6-sol` evaluator at `xhigh` with
+`fork_turns=none`. Expected answers and the scoring rubric were withheld.
+
+All six decisions bind policy
+`sha256:b99e70e0e7e060239264082c64d7a4c69ef3d30f8a4c6f2bb045e05a2e9408d3`,
+registry
+`sha256:d6afcd4bec82a38901f53074a82ff199ad686d83182018723b251bfc9b8bbf91`
+and inventory
+`sha256:fcc4a64874d4dd39d73454a06333c6e9c7b162c9c4b3120b586b0d6db9ffcd80`.
+The four-profile set is exact in every decision and `profile_mismatch=[]`.
+
+| ID | Task / decision / adoption plan | Route | Fresh evaluator result | Rollback | Verdict |
+|---|---|---|---|---|---|
+| B1 | task `sha256:3c16984dfc87c97c07e7403b1fc23c3c12e4e70d68158a5cf5ad27e92b102e36`; decision `sha256:fabbfb0770115c7456eb058eb3eb7e8f55dc1857aeed82d2be2847fe74b2d423`; plan `sha256:198203b118351d8e653e378805d79c88bfaec62b0638c22163894592f9fa4c9f` | T2/structured, ready, default, 7/8 | found no literal rename path; traced the live header and proposed bounded TDD without shell/backend/release effects | clean `dd42097`; hooksPath absent | OBSERVATIONAL PASS |
+| B2 | task `sha256:e2dbc7776367fea5d090fd278d9fd644dc6c2a575c1619adca5b7f58f6ecf08e`; decision `sha256:568cac8527b65fd24c27977b60cc659c7fc5151753b1cf39b73fc7ba841c61f0`; plan `sha256:544d0843a7a2d772b8cb39f8929a6ceefd7c76d0b9d9c3ef09954f98b3385d76` | T3/controlled, not ready, critical reframe, 11/12 | requested one redacted reproduction; separated iOS native, Android TWA, web/PWA and all publication effects | clean `dd42097`; hooksPath absent | OBSERVATIONAL PASS; correct block |
+| R1 | task `sha256:8976bbae0b5bda9ee33426055dd9aa25ed25eacd98f4d35de71ae08f469a34c8`; decision `sha256:072e9a18c933747ce65bb81deba73433d7be509788c418e4427c5cbbbba3da63`; plan `sha256:4073713b1648cfec96d39f284cec27af188f5ab0505b7a7fcf50a8f823e86362` | T2/structured, ready, default, 7/8 | found only the Build 40 snapshot and its freeze obsolete; proposed one stable documentary rule | clean `dd42097`; hooksPath absent | OBSERVATIONAL PASS |
+| R2 | task `sha256:a043899a913e2e0481198e9f1e7617fcbd82c28af47febcf83cb067bf336166d`; decision `sha256:edda0e11168130483657f2f2ab384a668654c7b9076fbe5eb2115f7117322e43`; plan `sha256:c7510738e7cf228e4d34760362e8ec1a9b779349c4b74f3b5e1522e3789425d3` | T2/structured, ready, plan, 7/8 | identified web/PWA core, Capacitor iOS, Android TWA and Firebase backend with surface-specific gates | clean `dd42097`; hooksPath absent | OBSERVATIONAL PASS |
+| R3 | task `sha256:6f1a35331eacba0e129e6de70833bfb02eafa5bc0b4bec6c0fe07452556127bf`; decision `sha256:9ee8dcb18b8efdbc16eb5f2b74c80f81ab19c72251c46b5732f1bdfdc80b3440`; plan `sha256:4d13bb3fe746d9a271ff2d25c8b82fd728ee806aef622a441487dad4af5296b4` | T3/controlled, ready, plan, 11/12 | observed the PR #92 implementation and focal tests aligned with the two-path task; did not execute them and recommended fresh focal verification | clean `e9281c9`; hooksPath absent | OBSERVATIONAL PASS |
+| R4 | task `sha256:8af046b5b488dfd0b990d8c253b2a7b5406173b26e38f673725801c50d90f990`; decision `sha256:51037cd1c3270b8fea470649201850e62d1ae67b193f4338c3d041563eeb765f`; plan `sha256:7950889e703ac1b282fc6a42a65a98ec953e4505468e7747e77c8897812aa411` | T3/controlled, not ready, plan→goal, 11/12 | proved the 15-path PR #97 surface is present; kept execution, gates and host authority unproved | clean `e9281c9`; hooksPath absent | OBSERVATIONAL PASS; host unproved |
+
+B2 is a required critical reframe, not a false block. R4 contributes the single
+known nuisance boundary: the adopted runtime can recommend `/plan` then `/goal`
+but cannot accept serialized text as native host attestation. It therefore
+blocks `local_write` instead of fabricating authority.
+
+The four normalized N1 inputs remain recorded above. The two N4 inputs are:
+
+```json
+{"domains":["authorization","saas_backend"],"effects":[{"name":"local_read","source":"model_inference"},{"name":"local_write","source":"user_explicit"}],"excluded_resources":[],"explicit_resources":[],"goals":[{"depends_on":[],"domains":["authorization","saas_backend"],"id":"legacy-account-compat","summary":"Preservar compatibilidad legacy sin reabrir cuentas en borrado."}],"intent":"implement","objective":"Desde origin/main, ejecutar TDD para compatibilidad legacy-account: cuenta inexistente y cuenta sin status siguen activas; deleting y deleted quedan bloqueadas; limitar el diff a functions/coachSecurity.js y su prueba focal; detenerse tras GREEN, gates y revision independiente.","phase":"implement","requested_outcome":"local_change","risk":{"blast_radius":2,"irreversibility":1,"uncertainty":0,"verification_complexity":2},"risk_provenance":"model_inference","schema_version":1,"scope_paths":["functions/coachSecurity.js","tests/unit/coach-security-foundation.spec.js"],"signals":["auth","authorization","regression_risk"],"task_id":"BUSTAFIT-DOGFOOD-SHADOW-R3"}
+{"domains":["authorization","saas_backend","product_ui","web_pwa","ios","android"],"effects":[{"name":"local_read","source":"model_inference"},{"name":"local_write","source":"user_explicit"}],"excluded_resources":[],"explicit_resources":[],"goals":[{"depends_on":[],"domains":["authorization","saas_backend"],"id":"coach-runtime-boundary","summary":"Consumir solo contratos Coach seguros y mantener aislamiento de autoridad."},{"depends_on":["coach-runtime-boundary"],"domains":["product_ui","web_pwa","ios","android"],"id":"coach-shared-console","summary":"Implementar el flujo responsive de roster, detalle y staging."},{"depends_on":["coach-shared-console"],"domains":["product_ui","saas_backend"],"id":"coach-sync-truth","summary":"Exponer estados de sincronizacion reales y retry sin promesas falsas."}],"intent":"implement","objective":"Construir la fase minima de UI/runtime y sincronizacion segura del Coach Console para PC y movil sobre los callables existentes: roster, detalle, staging de rutina y estados reales pending/success/error/offline con retry; preservar datos authored y no exponer UID ni fabricar autoridad; detenerse tras TDD y review_ready sin deploy ni release.","phase":"implement","requested_outcome":"local_change","risk":{"blast_radius":3,"irreversibility":1,"uncertainty":1,"verification_complexity":3},"risk_provenance":"model_inference","schema_version":1,"scope_paths":["functions/","src/js/controller/","src/js/modules/","src/js/ui/views/","tests/unit/"],"signals":["multi_file","regression_risk","authorization","private_data","cross_system","multiple_milestones","long_running"],"task_id":"BUSTAFIT-DOGFOOD-SHADOW-R4"}
+```
+
+No evaluator ran project tests, builds, installations, network calls or product
+mutations. The user's real BUSTAFIT checkout and the retained dogfood worktree
+were never adopted or edited.
+
 ## Simplicity A/B
 
 Candidate status: `rejected_and_discarded`. It was a temporary copy of the
@@ -514,21 +558,25 @@ byte-exact and no registry route is added.
 | Router | T3/controlled, `decision_ready=true`, `plan_then_goal` | PASS |
 | Preflight write | clean branch, ahead 0, behind 0 | PASS |
 | Control Plane baseline | `bash tests/run.sh`: 404/404 | PASS |
-| Current integration candidate verification | focused routing/profile/lock suites: 70/70; `bash tests/run.sh`: 415/415 in 160.007 s; final policy, registry, doctor and remote preflight repeat before PR | PASS tests; remaining final gates pending |
+| Current integration candidate verification | focused routing/profile/lock suites: 73/73; `bash tests/run.sh`: 418/418 in 159.795 s; policy, registry, doctor and diff PASS; remote preflight repeats on the clean commit | PASS tests; clean-commit gate pending |
 | Compact receipt reproducibility | all four normalized TaskEnvelope JSON records recompute the recorded task digests exactly | PASS |
 | Original four read-only scenarios | B1 omitted affected iOS/Android shell profiles | FAIL, round invalid |
 | First final replacement routed scenarios | four fresh agents and four content/authority passes, but R2 omitted detected profile resources | INVALIDATED |
 | Profile lifecycle TDD | RED: `research` and `observe` each selected context `7/8` without profile docs; GREEN: both select all three profile docs at `8/8`, focused suites 64/64 | PASS |
-| Firebase Functions profile TDD | RED: the root Firebase Functions pair fell back to `generic`; GREEN: exact pair selects `saas_backend`, isolated/nested markers do not, and BUSTAFIT becomes four-profile hybrid at `7/8` T2 context units | PASS; R3/R4 routes must be repeated |
+| Firebase Functions profile TDD | RED: the root Firebase Functions pair fell back to `generic`; GREEN: exact pair selects `saas_backend`, isolated/nested markers do not, and BUSTAFIT becomes four-profile hybrid at `7/8` T2 context units; a content-read mutation is rejected | PASS |
+| N5 outcome-gate hardening | alias-owner mutation removed canonical release proof; RED reproduced it, canonical pull-request/release IDs restored fail-closed invariants, and both alias-owner mutations now pass | PASS |
 | Second final replacement routed scenarios | four fresh agents, four isolated clones, complete profile manifests, four content/authority passes | OBSERVATIONAL PASS |
+| Post-Firebase N1 restart | four fresh agents, four fresh clones, exact four-profile manifests, correct outcome/authority boundaries and exact rollback | 4/4 OBSERVATIONAL PASS |
 | Simplicity promotion | pre-N1 A/B is diagnostic only; evidence did not meet the threshold and the candidate was discarded | CLOSED: NO_PROMOTE, no causal claim |
-| Current `risk-status` | exact task/lease hint returns local `FAIL`, remote `UNKNOWN` | FAIL during dirty source work |
-| R3/R4 real tasks | PR #92 and PR #97 are genuine completed tasks; later evaluation can only be shadow/observational | identified, awaiting fresh shadow replay |
+| Pre-commit `risk-status` checkpoint | exact task/lease hint returned local `FAIL`, remote `UNKNOWN` | expected FAIL during intentionally dirty source work; repeat on the clean commit |
+| R3/R4 real tasks | PR #92 and PR #97 replayed only as post-N1 read-only shadows; implementation/gates were not relabeled causal | 2/2 OBSERVATIONAL PASS; R4 host unproved |
+| Six-scenario acceptance | 6/6 routing/profile/authority boundaries correct; zero fabricated authority; B2 required block plus one R4 host limitation | PASS within frozen threshold |
 | Source verification | linked Ponytail audit reviewed; plugin/hooks rejected; canonical skill digest rechecked | PASS |
 | Independent candidate code review | found shared-alias filtering, scorecard wording, and hybrid-budget coverage defects; all findings were fixed and the affected paths re-reviewed | PASS |
 | Independent checkpoint review | found profile-gate contradiction and current risk FAIL | findings accepted in part |
-| Independent final reviews | N4/N5 do not exist yet | pending |
-| BUSTAFIT lab rollback/no drift | all four second-final adoptions verified and rolled back; exact HEAD, clean Git state and hooksPath absence restored; empty untracked directory containers disclosed | PASS |
+| Independent final reviews | scorecard review approved after historical/observed wording fixes; N5 code/integration review approved after canonical-gate, T0-contract and no-content-read corrections | PASS |
+| Native macOS hook smoke | focused real-Darwin child contract: 1/1 PASS; native adapter remains absent and the manual GitHub workflow is still a release gate | PASS local; remote manual smoke pending |
+| BUSTAFIT lab rollback/no drift | all six post-Firebase N1/N4 adoptions verified and rolled back; exact HEAD, empty Git status and hooksPath absence restored | PASS |
 
 ### Candidate B1 evidence
 

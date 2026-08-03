@@ -109,7 +109,9 @@ invariant fail-closed de toda tarea cuyo resultado pedido sea `release`, aunque
 la policy no repita ese alias. Una policy puede declararlo, pero no puede
 hacerlo aparecer por debajo de `release` ni eliminar el invariant universal.
 En repos híbridos, cada guía de perfil detectada continúa siendo obligatoria
-en todas las fases del lifecycle, incluidas `research` y `observe`.
+en los tiers de ingeniería T1–T3 durante todas sus fases, incluidas `research`
+y `observe`. T0 queda deliberadamente fuera: una respuesta directa y trivial
+no carga guías de calidad ni se presenta como trabajo de ingeniería gobernado.
 Las guías compactas iOS, Android, web/PWA y SaaS/backend se contabilizan como
 contexto `tiny` para poder cargarlas juntas en T2 sin elevar artificialmente el
 riesgo.
