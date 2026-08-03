@@ -882,6 +882,45 @@ class AdoptionTests(unittest.TestCase):
             managed,
         )
 
+    def test_render_agents_includes_self_contained_continuation_pointer(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            AGENTS_END,
+            AGENTS_START,
+            _render_agents,
+        )
+
+        rendered = _render_agents(ROOT, self.scenario.repo).decode("utf-8")
+        managed = rendered.split(AGENTS_START, 1)[1].split(
+            AGENTS_END, 1
+        )[0]
+        normalized_managed = " ".join(managed.split())
+
+        for field in (
+            "- Escribe en:",
+            "- Rol:",
+            "- Para continuar:",
+            "- Mensaje exacto:",
+            "- Estado de partida:",
+            "- No hacer todavía:",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, managed)
+
+        for rule in (
+            "tarea padre u orquestadora como destino normal del usuario",
+            "`este hilo` si el host no expone una identidad verificable",
+            "identidad visible",
+            "estado activo",
+            "checkpoint completo",
+            "Git no demuestra",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, normalized_managed)
+
+        self.assertNotIn("templates/HANDOFF.md", managed)
+
     def test_adopted_cli_reports_local_validated_lease_as_unknown(self) -> None:
         from control_plane.adoption import adoption_apply, adoption_plan
 

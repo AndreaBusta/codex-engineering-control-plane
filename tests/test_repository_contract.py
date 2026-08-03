@@ -305,6 +305,43 @@ jobs:
         self.assertIn("preflight --mode write", agents)
         self.assertIn("No hagas commit", agents)
 
+    def test_logical_close_requires_a_verified_continuation_pointer(
+        self,
+    ) -> None:
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        handoff = (ROOT / "templates" / "HANDOFF.md").read_text(
+            encoding="utf-8"
+        )
+        reasoning = (
+            ROOT / "docs" / "engineering" / "03-reasoning-context-agents.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Continuation Pointer", agents)
+        self.assertIn("cada cierre lógico o checkpoint", agents)
+        self.assertIn("`## Continuación`", agents)
+
+        for field in (
+            "## Continuación",
+            "- Escribe en:",
+            "- Rol:",
+            "- Para continuar:",
+            "- Mensaje exacto:",
+            "- Estado de partida:",
+            "- No hacer todavía:",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, handoff)
+
+        for rule in (
+            "tarea padre u orquestadora",
+            "tarea hija o ejecutora",
+            "identidad visible",
+            "este hilo",
+            "rama o worktree",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, reasoning)
+
     def test_no_unresolved_placeholders(self) -> None:
         forbidden = re.compile(
             r"\bT[B]D\b|\bT[O]DO\b|"

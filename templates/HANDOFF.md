@@ -37,3 +37,12 @@ Describe el resultado pendiente en una frase comprobable.
 
 Incluye únicamente comandos seguros, deterministas y específicos del proyecto.
 No incluyas credenciales ni salidas extensas.
+
+## Continuación
+
+- Escribe en: `este hilo` o enlace e ID exactos de la tarea verificada.
+- Rol: orquestadora, ejecutora o relevo.
+- Para continuar: siguiente acción concreta en una frase.
+- Mensaje exacto: texto breve listo para copiar y enviar.
+- Estado de partida: repositorio, worktree, rama, HEAD, PR y gate relevantes.
+- No hacer todavía: transiciones o efectos aún no autorizados.
