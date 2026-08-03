@@ -921,6 +921,36 @@ class AdoptionTests(unittest.TestCase):
 
         self.assertNotIn("templates/HANDOFF.md", managed)
 
+    def test_render_agents_includes_self_contained_cross_thread_lookup(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            AGENTS_END,
+            AGENTS_START,
+            _render_agents,
+        )
+
+        rendered = _render_agents(ROOT, self.scenario.repo).decode("utf-8")
+        managed = rendered.split(AGENTS_START, 1)[1].split(
+            AGENTS_END, 1
+        )[0]
+        normalized = " ".join(managed.split())
+
+        for contract in (
+            "`codex://threads/<UUID>`",
+            "`read_thread`",
+            "`FOUND`",
+            "`STALE`",
+            "`UNKNOWN`",
+            "`authorizes=false`",
+            "4 KiB",
+            "Continuation Pointer",
+            "transcript, prompts, razonamiento, tool output o secretos",
+            "gates de revisión ni autorización",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, normalized)
+
     def test_adopted_cli_reports_local_validated_lease_as_unknown(self) -> None:
         from control_plane.adoption import adoption_apply, adoption_plan
 
