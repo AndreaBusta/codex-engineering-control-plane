@@ -453,9 +453,14 @@ def resolve_route(
         if resource.get("kind") == "gate":
             for alias in resource.get("aliases", []):
                 gate_aliases[str(alias)] = str(resource["id"])
+    outcome_scoped_gate_aliases = {
+        "pull_request": OUTCOME_RANK["pull_request"],
+        "release_proof": OUTCOME_RANK["release"],
+    }
     required_gates = _unique_sorted(
         gate_aliases.get(str(gate), f"unresolved:{gate}")
         for gate in policy.get("gates", {}).get(tier, {}).get("required", [])
+        if outcome_rank >= outcome_scoped_gate_aliases.get(str(gate), 0)
     )
     if outcome_rank >= OUTCOME_RANK["pull_request"] and policy.get(
         "git", {}

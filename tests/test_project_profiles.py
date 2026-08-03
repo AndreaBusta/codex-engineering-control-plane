@@ -140,11 +140,11 @@ class ProjectProfileTests(unittest.TestCase):
         self.assertEqual(profile["confidence"], "bounded_scan_incomplete")
 
     def test_router_loads_android_quality_profile_without_ios_profile(self) -> None:
+        from control_plane.contracts import contract_digest
         from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
         from control_plane.policy import load_policy
         from control_plane.resource_registry import load_registry
         from control_plane.routing import resolve_route
-        from control_plane.contracts import contract_digest
 
         registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
         policy = load_policy(ROOT / ".codex" / "project-policy.toml")
@@ -197,6 +197,146 @@ class ProjectProfileTests(unittest.TestCase):
         self.assertIn("document.profile-android", decision["summary"]["required"])
         self.assertNotIn("document.profile-ios", decision["summary"]["required"])
         self.assertEqual(decision["summary"]["profile_mismatch"], ["ios"])
+
+    def test_hybrid_t2_answer_requires_all_profiles_across_lifecycle_phases(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
+        from control_plane.policy import load_policy
+        from control_plane.resource_registry import load_registry
+        from control_plane.routing import resolve_route
+
+        registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
+        policy = load_policy(ROOT / ".codex" / "project-policy.toml")
+        inventory: dict = {
+            "schema_version": 1,
+            "source": "hybrid-profile-test",
+            "project_profile": {
+                "schema_version": 1,
+                "kind": "hybrid",
+                "profiles": ["android", "ios", "web_pwa"],
+                "evidence": [
+                    "android/app/src/main/AndroidManifest.xml",
+                    "ios/App/App.xcodeproj",
+                    "sw.js",
+                ],
+                "confidence": "marker_evidence",
+                "truncated": False,
+            },
+            "resources": [
+                {
+                    "id": resource["id"],
+                    "availability": "available",
+                    "discovered": True,
+                    "enabled": True,
+                    "trusted": True,
+                    "authenticated": "not_applicable",
+                    "healthy": "available",
+                    "authorized_for_task": False,
+                    "ready": True,
+                    "locator_digest": f"sha256:{index:064x}",
+                    "size_bytes": 256,
+                    "reason_codes": [],
+                }
+                for index, resource in enumerate(registry["resources"])
+            ],
+        }
+        inventory["snapshot_digest"] = contract_digest(inventory)
+        cases = (
+            {
+                "name": "plan",
+                "objective": "Plan a bounded shared-core UI change.",
+                "intent": "plan",
+                "phase": "plan",
+                "domains": ["product_ui"],
+                "signals": ["multi_file", "regression_risk"],
+            },
+            {
+                "name": "research",
+                "objective": "Audit the hybrid architecture and its quality gates.",
+                "intent": "audit",
+                "phase": "research",
+                "domains": ["architecture"],
+                "signals": ["cross_system", "regression_risk"],
+            },
+            {
+                "name": "observe",
+                "objective": "Observe a shared hybrid runtime after integration.",
+                "intent": "audit",
+                "phase": "observe",
+                "domains": ["architecture"],
+                "signals": ["cross_system", "regression_risk"],
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                task = task_envelope(
+                    objective=case["objective"],
+                    intent=case["intent"],
+                    phase=case["phase"],
+                    requested_outcome="answer",
+                    domains=case["domains"],
+                    goals=[
+                        {
+                            "id": f"{case['name']}-shared-ui",
+                            "summary": "Cover every detected quality profile.",
+                            "domains": case["domains"],
+                            "depends_on": [],
+                        }
+                    ],
+                    signals=case["signals"],
+                    risk={
+                        "uncertainty": 0,
+                        "blast_radius": 1,
+                        "irreversibility": 0,
+                        "verification_complexity": 1,
+                    },
+                    effects=[
+                        {"name": "local_read", "source": "model_inference"}
+                    ],
+                )
+
+                decision = resolve_route(
+                    task,
+                    policy,
+                    registry,
+                    validated_inventory(
+                        inventory,
+                        registry=registry,
+                        task=task,
+                        invocation_id=f"hybrid-profile-{case['name']}-route",
+                    ),
+                    mode="audit",
+                    host_capability=HOST_ADAPTER_UNAVAILABLE,
+                )
+
+                self.assertEqual(decision["summary"]["tier"], "T2")
+                self.assertTrue(decision["decision_ready"])
+                self.assertNotIn(
+                    "E_CONTEXT_BUDGET_REQUIRED",
+                    {error["code"] for error in decision["errors"]},
+                )
+                self.assertEqual(
+                    decision["summary"]["selected_context_units"], 8
+                )
+                self.assertTrue(
+                    {
+                        "document.profile-android",
+                        "document.profile-ios",
+                        "document.profile-web-pwa",
+                    }.issubset(decision["summary"]["required"])
+                )
+        resources = {resource["id"]: resource for resource in registry["resources"]}
+        for resource_id in (
+            "document.profile-android",
+            "document.profile-ios",
+            "document.profile-web-pwa",
+        ):
+            resource = resources[resource_id]
+            self.assertEqual(resource["context_class"], "tiny")
+            path = ROOT / str(resource["locator"]).removeprefix("repo://")
+            self.assertLessEqual(path.stat().st_size, 1024)
 
 
 if __name__ == "__main__":

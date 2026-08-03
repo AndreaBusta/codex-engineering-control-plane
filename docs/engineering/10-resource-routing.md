@@ -95,6 +95,18 @@ presupuesto y digests. En `audit`, un recurso remoto desconocido deja
 `interaction` recomienda `default`, `plan`, `goal` o `plan_then_goal`, pero no
 cambia la interfaz ni amplía autoridad.
 
+Los gates también respetan el techo de `requested_outcome`: una tarea que solo
+pide `answer` o `local_change` no puede heredar `gate.pull-request`, y
+`gate.release-proof` solo aparece para `release`. Esto no concede efectos; un
+resultado superior sigue necesitando la policy y autoridad correspondientes.
+El filtro se aplica al alias declarado por policy antes de resolver el recurso;
+si un gate ofrece varios aliases, uno acotado por outcome no elimina otro gate
+de seguridad que resuelva al mismo recurso.
+En repos híbridos, cada guía de perfil detectada continúa siendo obligatoria
+en todas las fases del lifecycle, incluidas `research` y `observe`.
+Las guías compactas iOS, Android y web/PWA se contabilizan como contexto `tiny`
+para poder cargarlas juntas en T2 sin elevar artificialmente el riesgo.
+
 ### ResourceUseReceipt
 
 Registra IDs, digests, recursos usados u omitidos, gates y efectos. Cada uso se

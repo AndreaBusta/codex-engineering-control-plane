@@ -852,6 +852,61 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(decision["authorization"]["local_write"])
         self.assertIn("local_write", decision["approval_boundaries"])
 
+    def test_answer_outcome_does_not_inherit_pull_request_gate(self) -> None:
+        decision = self.route(
+            task_envelope(
+                intent="plan",
+                phase="plan",
+                requested_outcome="answer",
+                signals=["multi_file", "regression_risk"],
+                risk={
+                    "uncertainty": 0,
+                    "blast_radius": 1,
+                    "irreversibility": 0,
+                    "verification_complexity": 1,
+                },
+                effects=[
+                    {"name": "local_read", "source": "model_inference"}
+                ],
+            )
+        )
+
+        self.assertEqual(decision["summary"]["tier"], "T2")
+        self.assertNotIn("gate.pull-request", decision["required_gates"])
+
+    def test_outcome_filter_preserves_shared_security_gate_alias(self) -> None:
+        registry = copy.deepcopy(self.registry)
+        resources = {
+            resource["id"]: resource for resource in registry["resources"]
+        }
+        resources["gate.security-review"]["aliases"] = [
+            "security_review",
+            "pull_request",
+        ]
+        resources["gate.pull-request"]["aliases"] = []
+        self.registry = registry
+
+        decision = self.route(
+            task_envelope(
+                intent="audit",
+                phase="research",
+                requested_outcome="answer",
+                signals=["security"],
+                risk={
+                    "uncertainty": 0,
+                    "blast_radius": 0,
+                    "irreversibility": 0,
+                    "verification_complexity": 0,
+                },
+                effects=[
+                    {"name": "local_read", "source": "user_explicit"}
+                ],
+            )
+        )
+
+        self.assertEqual(decision["summary"]["tier"], "T3")
+        self.assertIn("gate.security-review", decision["required_gates"])
+
     def test_interaction_mode_recommends_plan_goal_or_both_without_switching(
         self,
     ) -> None:
