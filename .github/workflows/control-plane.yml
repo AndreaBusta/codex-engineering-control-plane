@@ -85,12 +85,27 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/main"
           test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
 
-      - name: Build reproducible non-authorizing candidate
+      - name: Refresh release gate against private main
         shell: bash
+        env:
+          CONTROL_PLANE_GITHUB_TOKEN: ${{ github.token }}
         run: |
           git switch -C main --track origin/main
           test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
-          scripts/control-plane preflight --mode release --refresh
+          authorization="$(
+            printf 'x-access-token:%s' "$CONTROL_PLANE_GITHUB_TOKEN" |
+              base64 | tr -d '\n'
+          )"
+          echo "::add-mask::$authorization"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization" \
+            scripts/control-plane preflight --mode release --refresh
+          unset CONTROL_PLANE_GITHUB_TOKEN authorization
+
+      - name: Build reproducible non-authorizing candidate
+        shell: bash
+        run: |
           python3 -m unittest -v tests.test_supported_adoption_acceptance
           candidate_parent="$RUNNER_TEMP/control-plane-release-${GITHUB_RUN_ID}"
           mkdir -m 700 "$candidate_parent"
