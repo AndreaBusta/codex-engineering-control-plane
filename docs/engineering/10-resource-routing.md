@@ -86,6 +86,9 @@ marque operativo.
 También incluye `project_profile`: detecta por marcadores iOS, Android, PWA,
 SaaS/backend, IA textual, híbrido o genérico. El resolver usa esos perfiles
 como dominios demostrados y carga sus guías de calidad obligatorias.
+Firebase Functions cuenta como backend solo cuando existen juntos, desde la
+raíz, `firebase.json` y `functions/package.json`; ninguno de los dos por sí
+solo concede ese perfil y el detector no abre sus contenidos.
 
 ### RouteDecision
 
@@ -94,6 +97,24 @@ presupuesto y digests. En `audit`, un recurso remoto desconocido deja
 `decision_ready=false` sin fingir bloqueo autoritativo. En `enforce`, bloquea.
 `interaction` recomienda `default`, `plan`, `goal` o `plan_then_goal`, pero no
 cambia la interfaz ni amplía autoridad.
+
+Los gates también respetan el techo de `requested_outcome`: una tarea que solo
+pide `answer` o `local_change` no puede heredar `gate.pull-request`, y
+`gate.release-proof` solo aparece para `release`. Esto no concede efectos; un
+resultado superior sigue necesitando la policy y autoridad correspondientes.
+El filtro se aplica al alias declarado por policy antes de resolver el recurso;
+si un gate ofrece varios aliases, uno acotado por outcome no elimina otro gate
+de seguridad que resuelva al mismo recurso. Además, `gate.release-proof` es un
+invariant fail-closed de toda tarea cuyo resultado pedido sea `release`, aunque
+la policy no repita ese alias. Una policy puede declararlo, pero no puede
+hacerlo aparecer por debajo de `release` ni eliminar el invariant universal.
+En repos híbridos, cada guía de perfil detectada continúa siendo obligatoria
+en los tiers de ingeniería T1–T3 durante todas sus fases, incluidas `research`
+y `observe`. T0 queda deliberadamente fuera: una respuesta directa y trivial
+no carga guías de calidad ni se presenta como trabajo de ingeniería gobernado.
+Las guías compactas iOS, Android, web/PWA y SaaS/backend se contabilizan como
+contexto `tiny` para poder cargarlas juntas en T2 sin elevar artificialmente el
+riesgo.
 
 ### ResourceUseReceipt
 

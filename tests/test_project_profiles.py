@@ -61,6 +61,56 @@ class ProjectProfileTests(unittest.TestCase):
 
         self.assertEqual(profile["kind"], "saas_backend")
 
+    def test_firebase_functions_repository_uses_saas_backend_profile(self) -> None:
+        profile = self.detect(("firebase.json", "functions/package.json"))
+
+        self.assertEqual(profile["kind"], "saas_backend")
+        self.assertEqual(profile["profiles"], ["saas_backend"])
+        self.assertEqual(
+            profile["evidence"],
+            ["firebase.json", "functions/package.json"],
+        )
+
+    def test_firebase_functions_detection_never_reads_marker_contents(
+        self,
+    ) -> None:
+        from control_plane.project_profiles import detect_project_profile
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            markers = (root / "firebase.json", root / "functions/package.json")
+            for marker in markers:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("untrusted manifest contents\n", encoding="utf-8")
+                marker.chmod(0)
+
+            content_access = AssertionError("manifest content access is forbidden")
+            with (
+                patch.object(Path, "open", side_effect=content_access),
+                patch.object(Path, "read_bytes", side_effect=content_access),
+                patch.object(Path, "read_text", side_effect=content_access),
+            ):
+                profile = detect_project_profile(root)
+
+        self.assertEqual(profile["profiles"], ["saas_backend"])
+        self.assertEqual(
+            profile["evidence"],
+            ["firebase.json", "functions/package.json"],
+        )
+
+    def test_firebase_function_markers_are_not_individually_backend_evidence(
+        self,
+    ) -> None:
+        for markers in (
+            ("firebase.json",),
+            ("functions/package.json",),
+            ("nested/firebase.json", "nested/functions/package.json"),
+        ):
+            with self.subTest(markers=markers):
+                profile = self.detect(markers)
+
+                self.assertEqual(profile["profiles"], ["generic"])
+
     def test_ai_text_pipeline_uses_prompts_evals_and_pipeline_markers(self) -> None:
         profile = self.detect(
             ("pyproject.toml", "prompts/", "evals/", "pipelines/")
@@ -140,11 +190,11 @@ class ProjectProfileTests(unittest.TestCase):
         self.assertEqual(profile["confidence"], "bounded_scan_incomplete")
 
     def test_router_loads_android_quality_profile_without_ios_profile(self) -> None:
+        from control_plane.contracts import contract_digest
         from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
         from control_plane.policy import load_policy
         from control_plane.resource_registry import load_registry
         from control_plane.routing import resolve_route
-        from control_plane.contracts import contract_digest
 
         registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
         policy = load_policy(ROOT / ".codex" / "project-policy.toml")
@@ -197,6 +247,282 @@ class ProjectProfileTests(unittest.TestCase):
         self.assertIn("document.profile-android", decision["summary"]["required"])
         self.assertNotIn("document.profile-ios", decision["summary"]["required"])
         self.assertEqual(decision["summary"]["profile_mismatch"], ["ios"])
+
+    def test_all_six_t1_profile_routes_cover_research_and_observe(self) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
+        from control_plane.policy import load_policy
+        from control_plane.resource_registry import load_registry
+        from control_plane.routing import resolve_route
+
+        registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
+        policy = load_policy(ROOT / ".codex" / "project-policy.toml")
+        profile_routes = {
+            "generic": (
+                "quality-profile-generic",
+                "document.profile-generic",
+            ),
+            "ios": ("quality-profile-ios", "document.profile-ios"),
+            "android": (
+                "quality-profile-android",
+                "document.profile-android",
+            ),
+            "web_pwa": (
+                "quality-profile-web-pwa",
+                "document.profile-web-pwa",
+            ),
+            "saas_backend": (
+                "quality-profile-saas-backend",
+                "document.profile-saas-backend",
+            ),
+            "ai_text_pipeline": (
+                "quality-profile-ai-text",
+                "document.profile-ai-text",
+            ),
+        }
+        inventory_resources = [
+            {
+                "id": resource["id"],
+                "availability": "available",
+                "discovered": True,
+                "enabled": True,
+                "trusted": True,
+                "authenticated": "not_applicable",
+                "healthy": "available",
+                "authorized_for_task": False,
+                "ready": True,
+                "locator_digest": f"sha256:{index:064x}",
+                "size_bytes": 256,
+                "reason_codes": [],
+            }
+            for index, resource in enumerate(registry["resources"])
+        ]
+
+        for phase in ("research", "observe"):
+            for profile, (route_id, resource_id) in profile_routes.items():
+                with self.subTest(phase=phase, profile=profile):
+                    inventory: dict = {
+                        "schema_version": 1,
+                        "source": "all-profile-lifecycle-test",
+                        "project_profile": {
+                            "schema_version": 1,
+                            "kind": profile,
+                            "profiles": [profile],
+                            "evidence": [f"{profile}-marker"],
+                            "confidence": "marker_evidence",
+                            "truncated": False,
+                        },
+                        "resources": inventory_resources,
+                    }
+                    inventory["snapshot_digest"] = contract_digest(inventory)
+                    task = task_envelope(
+                        objective=f"Audit the {profile} profile during {phase}.",
+                        intent="audit",
+                        phase=phase,
+                        requested_outcome="answer",
+                        domains=["architecture"],
+                        goals=[
+                            {
+                                "id": f"{phase}-{profile}",
+                                "summary": "Apply the detected quality profile.",
+                                "domains": ["architecture"],
+                                "depends_on": [],
+                            }
+                        ],
+                        signals=["cross_system"],
+                        risk={
+                            "uncertainty": 0,
+                            "blast_radius": 1,
+                            "irreversibility": 0,
+                            "verification_complexity": 1,
+                        },
+                        effects=[
+                            {"name": "local_read", "source": "user_explicit"}
+                        ],
+                    )
+
+                    decision = resolve_route(
+                        task,
+                        policy,
+                        registry,
+                        validated_inventory(
+                            inventory,
+                            registry=registry,
+                            task=task,
+                            invocation_id=f"{phase}-{profile}-route",
+                        ),
+                        mode="audit",
+                        host_capability=HOST_ADAPTER_UNAVAILABLE,
+                    )
+
+                    self.assertEqual(decision["summary"]["tier"], "T1")
+                    self.assertTrue(decision["decision_ready"])
+                    self.assertEqual(decision["errors"], [])
+                    self.assertEqual(
+                        {
+                            matched
+                            for matched in decision["matched_routes"]
+                            if matched.startswith("quality-profile-")
+                        },
+                        {route_id},
+                    )
+                    self.assertEqual(
+                        {
+                            required
+                            for required in decision["summary"]["required"]
+                            if required.startswith("document.profile-")
+                        },
+                        {resource_id},
+                    )
+
+    def test_bustafit_hybrid_t2_answer_requires_four_profiles_at_seven_units(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
+        from control_plane.policy import load_policy
+        from control_plane.resource_registry import load_registry
+        from control_plane.routing import resolve_route
+
+        registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
+        policy = load_policy(ROOT / ".codex" / "project-policy.toml")
+        inventory: dict = {
+            "schema_version": 1,
+            "source": "hybrid-profile-test",
+            "project_profile": {
+                "schema_version": 1,
+                "kind": "hybrid",
+                "profiles": ["android", "ios", "saas_backend", "web_pwa"],
+                "evidence": [
+                    "android/app/src/main/AndroidManifest.xml",
+                    "firebase.json",
+                    "functions/package.json",
+                    "ios/App/App.xcodeproj",
+                    "sw.js",
+                ],
+                "confidence": "marker_evidence",
+                "truncated": False,
+            },
+            "resources": [
+                {
+                    "id": resource["id"],
+                    "availability": "available",
+                    "discovered": True,
+                    "enabled": True,
+                    "trusted": True,
+                    "authenticated": "not_applicable",
+                    "healthy": "available",
+                    "authorized_for_task": False,
+                    "ready": True,
+                    "locator_digest": f"sha256:{index:064x}",
+                    "size_bytes": 256,
+                    "reason_codes": [],
+                }
+                for index, resource in enumerate(registry["resources"])
+            ],
+        }
+        inventory["snapshot_digest"] = contract_digest(inventory)
+        task = task_envelope(
+            objective="Plan a bounded BUSTAFIT shared-core UI change.",
+            intent="plan",
+            phase="plan",
+            requested_outcome="answer",
+            domains=["product_ui"],
+            goals=[
+                {
+                    "id": "plan-bustafit-shared-ui",
+                    "summary": "Cover all four detected BUSTAFIT profiles.",
+                    "domains": ["product_ui"],
+                    "depends_on": [],
+                }
+            ],
+            signals=["multi_file", "regression_risk"],
+            risk={
+                "uncertainty": 0,
+                "blast_radius": 1,
+                "irreversibility": 0,
+                "verification_complexity": 1,
+            },
+            effects=[{"name": "local_read", "source": "model_inference"}],
+        )
+        decision = resolve_route(
+            task,
+            policy,
+            registry,
+            validated_inventory(
+                inventory,
+                registry=registry,
+                task=task,
+                invocation_id="bustafit-hybrid-profile-route",
+            ),
+            mode="audit",
+            host_capability=HOST_ADAPTER_UNAVAILABLE,
+        )
+
+        self.assertEqual(decision["summary"]["tier"], "T2")
+        self.assertTrue(decision["decision_ready"])
+        self.assertNotIn(
+            "E_CONTEXT_BUDGET_REQUIRED",
+            {error["code"] for error in decision["errors"]},
+        )
+        self.assertEqual(decision["summary"]["selected_context_units"], 7)
+        self.assertEqual(
+            {
+                required
+                for required in decision["summary"]["required"]
+                if required.startswith("document.profile-")
+            },
+            {
+                "document.profile-android",
+                "document.profile-ios",
+                "document.profile-saas-backend",
+                "document.profile-web-pwa",
+            },
+        )
+        self.assertEqual(
+            {
+                matched
+                for matched in decision["matched_routes"]
+                if matched.startswith("quality-profile-")
+            },
+            {
+                "quality-profile-android",
+                "quality-profile-ios",
+                "quality-profile-saas-backend",
+                "quality-profile-web-pwa",
+            },
+        )
+
+    def test_only_compact_project_profile_guides_use_tiny_context(self) -> None:
+        from control_plane.resource_registry import load_registry
+
+        registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
+        resources = {resource["id"]: resource for resource in registry["resources"]}
+        tiny_profile_ids = {
+            "document.profile-android",
+            "document.profile-ios",
+            "document.profile-saas-backend",
+            "document.profile-web-pwa",
+        }
+        all_profile_ids = tiny_profile_ids.union(
+            {
+                "document.profile-generic",
+                "document.profile-ai-text",
+            }
+        )
+
+        self.assertEqual(
+            {
+                resource_id
+                for resource_id in all_profile_ids
+                if resources[resource_id]["context_class"] == "tiny"
+            },
+            tiny_profile_ids,
+        )
+        for resource_id in tiny_profile_ids:
+            resource = resources[resource_id]
+            path = ROOT / str(resource["locator"]).removeprefix("repo://")
+            self.assertLessEqual(path.stat().st_size, 1024)
 
 
 if __name__ == "__main__":

@@ -71,6 +71,10 @@ OUTCOME_RANK = {
     "integration": 4,
     "release": 5,
 }
+CANONICAL_OUTCOME_GATES = {
+    "pull_request": "gate.pull-request",
+    "release": "gate.release-proof",
+}
 EFFECT_MINIMUM_OUTCOME = {
     "network_read": 0,
     "local_write": 1,
@@ -453,20 +457,21 @@ def resolve_route(
         if resource.get("kind") == "gate":
             for alias in resource.get("aliases", []):
                 gate_aliases[str(alias)] = str(resource["id"])
+    outcome_scoped_gate_aliases = {
+        "pull_request": OUTCOME_RANK["pull_request"],
+        "release_proof": OUTCOME_RANK["release"],
+    }
     required_gates = _unique_sorted(
         gate_aliases.get(str(gate), f"unresolved:{gate}")
         for gate in policy.get("gates", {}).get(tier, {}).get("required", [])
+        if outcome_rank >= outcome_scoped_gate_aliases.get(str(gate), 0)
     )
     if outcome_rank >= OUTCOME_RANK["pull_request"] and policy.get(
         "git", {}
     ).get("require_pull_request"):
-        required_gates.append(
-            gate_aliases.get("pull_request", "unresolved:pull_request")
-        )
+        required_gates.append(CANONICAL_OUTCOME_GATES["pull_request"])
     if outcome_rank >= OUTCOME_RANK["release"]:
-        required_gates.append(
-            gate_aliases.get("release_proof", "unresolved:release_proof")
-        )
+        required_gates.append(CANONICAL_OUTCOME_GATES["release"])
     required_gates = _unique_sorted(required_gates)
     required.extend(
         gate for gate in required_gates if not gate.startswith("unresolved:")

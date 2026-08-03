@@ -131,6 +131,10 @@ def detect_project_profile(repo_root: Path) -> dict:
     if web:
         evidence["web_pwa"] = web
 
+    firebase_functions = {
+        "firebase.json",
+        "functions/package.json",
+    }.issubset(files)
     backend_markers = sorted(
         {
             *_basename_matches(
@@ -150,6 +154,11 @@ def detect_project_profile(repo_root: Path) -> dict:
                 if PurePosixPath(path).name
                 in {"api", "server", "migrations", "prisma"}
             ),
+            *(
+                {"firebase.json", "functions/package.json"}
+                if firebase_functions
+                else set()
+            ),
         }
     )
     backend_dirs = {
@@ -157,7 +166,9 @@ def detect_project_profile(repo_root: Path) -> dict:
         for path in backend_markers
         if path in directories
     }
-    if backend_dirs.intersection({"api", "server", "migrations", "prisma"}):
+    if firebase_functions or backend_dirs.intersection(
+        {"api", "server", "migrations", "prisma"}
+    ):
         evidence["saas_backend"] = backend_markers
 
     ai_markers = sorted(
