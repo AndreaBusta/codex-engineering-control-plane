@@ -164,6 +164,12 @@ Apply TDD to behavior changes and run BUSTAFIT-owned gates. Preserve authored
 content and product configuration. Stop locally at `review_ready` and prove
 rollback/no drift.
 
+If a qualifying genuine task finished before this candidate was available,
+replay its exact prompt only as a read-only shadow route in a fresh isolated
+clone. Give the evaluator no expected answer, preserve rollback/no drift, and
+label the result `observational`. A later shadow replay never proves that the
+Control Plane caused the historical implementation or its quality.
+
 ### N5 — Control Plane integration
 
 Consolidate the scorecard, evidence-backed fixes, and any qualifying optional
@@ -183,6 +189,8 @@ required checks from the merged `origin/main` before closing the pilot.
 - all applicable product gates green.
 - `risk-status=UNKNOWN/2` is expected when remote evidence is absent.
 - rollback is rehearsed and leaves no BUSTAFIT drift.
+- every claim is labeled causal, observational or not proved; no shadow replay
+  is relabeled as retroactive causal evidence.
 
 ## Threat model
 
@@ -210,7 +218,8 @@ required checks from the merged `origin/main` before closing the pilot.
 
 ## Deliverable
 
-The completed scorecard identifies what was measured, what improved, what did
-not justify promotion, all remaining limitations, and the exact gate before
-the two genuine BUSTAFIT tasks. BUSTAFIT remains a testbed; Develope remains
-the product and sole owner of pilot evidence.
+The completed scorecard identifies what was measured, which runtime defects
+were causally reproduced, which observations did not justify promotion, all
+remaining unproved limits, and the exact gate for the two genuine BUSTAFIT
+tasks or their shadow replays. BUSTAFIT remains a testbed; Develope remains the
+product and sole owner of pilot evidence.

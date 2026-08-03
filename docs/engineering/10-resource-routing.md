@@ -101,7 +101,10 @@ pide `answer` o `local_change` no puede heredar `gate.pull-request`, y
 resultado superior sigue necesitando la policy y autoridad correspondientes.
 El filtro se aplica al alias declarado por policy antes de resolver el recurso;
 si un gate ofrece varios aliases, uno acotado por outcome no elimina otro gate
-de seguridad que resuelva al mismo recurso.
+de seguridad que resuelva al mismo recurso. Además, `gate.release-proof` es un
+invariant fail-closed de toda tarea cuyo resultado pedido sea `release`, aunque
+la policy no repita ese alias. Una policy puede declararlo, pero no puede
+hacerlo aparecer por debajo de `release` ni eliminar el invariant universal.
 En repos híbridos, cada guía de perfil detectada continúa siendo obligatoria
 en todas las fases del lifecycle, incluidas `research` y `observe`.
 Las guías compactas iOS, Android y web/PWA se contabilizan como contexto `tiny`

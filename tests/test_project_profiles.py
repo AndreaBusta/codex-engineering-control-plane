@@ -198,7 +198,134 @@ class ProjectProfileTests(unittest.TestCase):
         self.assertNotIn("document.profile-ios", decision["summary"]["required"])
         self.assertEqual(decision["summary"]["profile_mismatch"], ["ios"])
 
-    def test_hybrid_t2_answer_requires_all_profiles_across_lifecycle_phases(
+    def test_all_six_profile_routes_cover_research_and_observe(self) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.host_bridge import HOST_ADAPTER_UNAVAILABLE
+        from control_plane.policy import load_policy
+        from control_plane.resource_registry import load_registry
+        from control_plane.routing import resolve_route
+
+        registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
+        policy = load_policy(ROOT / ".codex" / "project-policy.toml")
+        profile_routes = {
+            "generic": (
+                "quality-profile-generic",
+                "document.profile-generic",
+            ),
+            "ios": ("quality-profile-ios", "document.profile-ios"),
+            "android": (
+                "quality-profile-android",
+                "document.profile-android",
+            ),
+            "web_pwa": (
+                "quality-profile-web-pwa",
+                "document.profile-web-pwa",
+            ),
+            "saas_backend": (
+                "quality-profile-saas-backend",
+                "document.profile-saas-backend",
+            ),
+            "ai_text_pipeline": (
+                "quality-profile-ai-text",
+                "document.profile-ai-text",
+            ),
+        }
+        inventory_resources = [
+            {
+                "id": resource["id"],
+                "availability": "available",
+                "discovered": True,
+                "enabled": True,
+                "trusted": True,
+                "authenticated": "not_applicable",
+                "healthy": "available",
+                "authorized_for_task": False,
+                "ready": True,
+                "locator_digest": f"sha256:{index:064x}",
+                "size_bytes": 256,
+                "reason_codes": [],
+            }
+            for index, resource in enumerate(registry["resources"])
+        ]
+
+        for phase in ("research", "observe"):
+            for profile, (route_id, resource_id) in profile_routes.items():
+                with self.subTest(phase=phase, profile=profile):
+                    inventory: dict = {
+                        "schema_version": 1,
+                        "source": "all-profile-lifecycle-test",
+                        "project_profile": {
+                            "schema_version": 1,
+                            "kind": profile,
+                            "profiles": [profile],
+                            "evidence": [f"{profile}-marker"],
+                            "confidence": "marker_evidence",
+                            "truncated": False,
+                        },
+                        "resources": inventory_resources,
+                    }
+                    inventory["snapshot_digest"] = contract_digest(inventory)
+                    task = task_envelope(
+                        objective=f"Audit the {profile} profile during {phase}.",
+                        intent="audit",
+                        phase=phase,
+                        requested_outcome="answer",
+                        domains=["architecture"],
+                        goals=[
+                            {
+                                "id": f"{phase}-{profile}",
+                                "summary": "Apply the detected quality profile.",
+                                "domains": ["architecture"],
+                                "depends_on": [],
+                            }
+                        ],
+                        signals=["cross_system"],
+                        risk={
+                            "uncertainty": 0,
+                            "blast_radius": 1,
+                            "irreversibility": 0,
+                            "verification_complexity": 1,
+                        },
+                        effects=[
+                            {"name": "local_read", "source": "user_explicit"}
+                        ],
+                    )
+
+                    decision = resolve_route(
+                        task,
+                        policy,
+                        registry,
+                        validated_inventory(
+                            inventory,
+                            registry=registry,
+                            task=task,
+                            invocation_id=f"{phase}-{profile}-route",
+                        ),
+                        mode="audit",
+                        host_capability=HOST_ADAPTER_UNAVAILABLE,
+                    )
+
+                    self.assertEqual(decision["summary"]["tier"], "T1")
+                    self.assertTrue(decision["decision_ready"])
+                    self.assertEqual(decision["errors"], [])
+                    self.assertEqual(
+                        {
+                            matched
+                            for matched in decision["matched_routes"]
+                            if matched.startswith("quality-profile-")
+                        },
+                        {route_id},
+                    )
+                    self.assertEqual(
+                        {
+                            required
+                            for required in decision["summary"]["required"]
+                            if required.startswith("document.profile-")
+                        },
+                        {resource_id},
+                    )
+
+    def test_bustafit_hybrid_t2_answer_requires_three_profiles_at_eight_units(
         self,
     ) -> None:
         from control_plane.contracts import contract_digest
@@ -243,98 +370,103 @@ class ProjectProfileTests(unittest.TestCase):
             ],
         }
         inventory["snapshot_digest"] = contract_digest(inventory)
-        cases = (
+        task = task_envelope(
+            objective="Plan a bounded BUSTAFIT shared-core UI change.",
+            intent="plan",
+            phase="plan",
+            requested_outcome="answer",
+            domains=["product_ui"],
+            goals=[
+                {
+                    "id": "plan-bustafit-shared-ui",
+                    "summary": "Cover all three detected BUSTAFIT profiles.",
+                    "domains": ["product_ui"],
+                    "depends_on": [],
+                }
+            ],
+            signals=["multi_file", "regression_risk"],
+            risk={
+                "uncertainty": 0,
+                "blast_radius": 1,
+                "irreversibility": 0,
+                "verification_complexity": 1,
+            },
+            effects=[{"name": "local_read", "source": "model_inference"}],
+        )
+        decision = resolve_route(
+            task,
+            policy,
+            registry,
+            validated_inventory(
+                inventory,
+                registry=registry,
+                task=task,
+                invocation_id="bustafit-hybrid-profile-route",
+            ),
+            mode="audit",
+            host_capability=HOST_ADAPTER_UNAVAILABLE,
+        )
+
+        self.assertEqual(decision["summary"]["tier"], "T2")
+        self.assertTrue(decision["decision_ready"])
+        self.assertNotIn(
+            "E_CONTEXT_BUDGET_REQUIRED",
+            {error["code"] for error in decision["errors"]},
+        )
+        self.assertEqual(decision["summary"]["selected_context_units"], 8)
+        self.assertEqual(
             {
-                "name": "plan",
-                "objective": "Plan a bounded shared-core UI change.",
-                "intent": "plan",
-                "phase": "plan",
-                "domains": ["product_ui"],
-                "signals": ["multi_file", "regression_risk"],
+                required
+                for required in decision["summary"]["required"]
+                if required.startswith("document.profile-")
             },
             {
-                "name": "research",
-                "objective": "Audit the hybrid architecture and its quality gates.",
-                "intent": "audit",
-                "phase": "research",
-                "domains": ["architecture"],
-                "signals": ["cross_system", "regression_risk"],
-            },
-            {
-                "name": "observe",
-                "objective": "Observe a shared hybrid runtime after integration.",
-                "intent": "audit",
-                "phase": "observe",
-                "domains": ["architecture"],
-                "signals": ["cross_system", "regression_risk"],
+                "document.profile-android",
+                "document.profile-ios",
+                "document.profile-web-pwa",
             },
         )
-        for case in cases:
-            with self.subTest(case=case["name"]):
-                task = task_envelope(
-                    objective=case["objective"],
-                    intent=case["intent"],
-                    phase=case["phase"],
-                    requested_outcome="answer",
-                    domains=case["domains"],
-                    goals=[
-                        {
-                            "id": f"{case['name']}-shared-ui",
-                            "summary": "Cover every detected quality profile.",
-                            "domains": case["domains"],
-                            "depends_on": [],
-                        }
-                    ],
-                    signals=case["signals"],
-                    risk={
-                        "uncertainty": 0,
-                        "blast_radius": 1,
-                        "irreversibility": 0,
-                        "verification_complexity": 1,
-                    },
-                    effects=[
-                        {"name": "local_read", "source": "model_inference"}
-                    ],
-                )
+        self.assertEqual(
+            {
+                matched
+                for matched in decision["matched_routes"]
+                if matched.startswith("quality-profile-")
+            },
+            {
+                "quality-profile-android",
+                "quality-profile-ios",
+                "quality-profile-web-pwa",
+            },
+        )
 
-                decision = resolve_route(
-                    task,
-                    policy,
-                    registry,
-                    validated_inventory(
-                        inventory,
-                        registry=registry,
-                        task=task,
-                        invocation_id=f"hybrid-profile-{case['name']}-route",
-                    ),
-                    mode="audit",
-                    host_capability=HOST_ADAPTER_UNAVAILABLE,
-                )
+    def test_only_bustafit_profile_guides_use_tiny_context(self) -> None:
+        from control_plane.resource_registry import load_registry
 
-                self.assertEqual(decision["summary"]["tier"], "T2")
-                self.assertTrue(decision["decision_ready"])
-                self.assertNotIn(
-                    "E_CONTEXT_BUDGET_REQUIRED",
-                    {error["code"] for error in decision["errors"]},
-                )
-                self.assertEqual(
-                    decision["summary"]["selected_context_units"], 8
-                )
-                self.assertTrue(
-                    {
-                        "document.profile-android",
-                        "document.profile-ios",
-                        "document.profile-web-pwa",
-                    }.issubset(decision["summary"]["required"])
-                )
+        registry = load_registry(ROOT / ".codex" / "resource-registry.toml")
         resources = {resource["id"]: resource for resource in registry["resources"]}
-        for resource_id in (
+        tiny_profile_ids = {
             "document.profile-android",
             "document.profile-ios",
             "document.profile-web-pwa",
-        ):
+        }
+        all_profile_ids = tiny_profile_ids.union(
+            {
+                "document.profile-generic",
+                "document.profile-saas-backend",
+                "document.profile-ai-text",
+            }
+        )
+
+        self.assertEqual(
+            {
+                resource_id
+                for resource_id in all_profile_ids
+                if resources[resource_id]["context_class"] == "tiny"
+            },
+            tiny_profile_ids,
+        )
+        for resource_id in tiny_profile_ids:
             resource = resources[resource_id]
-            self.assertEqual(resource["context_class"], "tiny")
             path = ROOT / str(resource["locator"]).removeprefix("repo://")
             self.assertLessEqual(path.stat().st_size, 1024)
 

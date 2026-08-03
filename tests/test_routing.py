@@ -874,6 +874,50 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(decision["summary"]["tier"], "T2")
         self.assertNotIn("gate.pull-request", decision["required_gates"])
 
+    def test_t3_answer_filters_policy_declared_release_proof_alias(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        policy["gates"]["T3"]["required"].append("release_proof")
+        self.policy = policy
+
+        decision = self.route(
+            task_envelope(
+                intent="audit",
+                phase="research",
+                requested_outcome="answer",
+                signals=["security"],
+                risk={
+                    "uncertainty": 0,
+                    "blast_radius": 0,
+                    "irreversibility": 0,
+                    "verification_complexity": 0,
+                },
+                effects=[
+                    {"name": "local_read", "source": "user_explicit"}
+                ],
+            )
+        )
+
+        self.assertEqual(decision["summary"]["tier"], "T3")
+        self.assertNotIn("gate.release-proof", decision["required_gates"])
+
+    def test_release_appends_release_proof_when_policy_omits_alias(self) -> None:
+        self.assertNotIn(
+            "release_proof", self.policy["gates"]["T3"]["required"]
+        )
+
+        decision = self.route(
+            task_envelope(
+                intent="release",
+                phase="release",
+                requested_outcome="release",
+                signals=[],
+                effects=[{"name": "release", "source": "user_explicit"}],
+            )
+        )
+
+        self.assertEqual(decision["summary"]["tier"], "T3")
+        self.assertIn("gate.release-proof", decision["required_gates"])
+
     def test_outcome_filter_preserves_shared_security_gate_alias(self) -> None:
         registry = copy.deepcopy(self.registry)
         resources = {

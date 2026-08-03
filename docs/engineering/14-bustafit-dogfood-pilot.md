@@ -2,16 +2,18 @@
 
 ## Status
 
-`n1_passed_awaiting_genuine_tasks` — the original round and the first final
-replacement remain invalid historical evidence. The latter exposed that
-`research` did not select the three detected quality profiles. RED reproduced
-the omission in both `research` and `observe`; the registry fix made all six
-quality profiles lifecycle-complete. A second final round then repeated B1,
-B2, R1 and R2 from the beginning with four fresh evaluators, four isolated
-clones and four exact rollbacks. All frozen routing, profile, authority and
-quality boundaries passed. R3/R4 are now eligible but still require genuine
-BUSTAFIT requests from the user. The simplicity decision remains `NO_PROMOTE`;
-no candidate remains installed or routed.
+`n1_observational_pass_genuine_tasks_identified` — the original round and the
+first final replacement remain invalid historical evidence. The latter exposed
+that `research` did not select the three detected quality profiles. Controlled
+RED reproduced the omission in both `research` and `observe`; the registry fix
+made all six quality profiles lifecycle-complete. A second final round then
+repeated B1, B2, R1 and R2 from the beginning with four fresh evaluators, four
+isolated clones and four exact rollbacks. Those evaluator results passed the
+frozen routing, profile, authority and quality rubric as observational evidence;
+they do not prove that the Control Plane caused the outcomes. Genuine tasks now
+exist as BUSTAFIT PR #92 and PR #97, but both await fresh shadow replay before
+N4 can close. The simplicity decision remains `NO_PROMOTE`; no candidate remains
+installed or routed.
 
 ## Frozen experiment identity
 
@@ -24,7 +26,8 @@ no candidate remains installed or routed.
 | Final-round temporary attestor | detached `8bb61a699041ff19e3177df91621c2e925f7267b`, tree `5619df7986140f857d9fd5ff27257d9404ac6639`; byte-equivalent to the eight candidate paths at second-final-round start, before this scorecard recorded the results |
 | Existing simplicity skill | `sha256:6e22cc54cb02a5e98ae42d06d9d7292db0c1b43894831b32879beb0166b2aea7` |
 | Control Plane baseline | 404/404 tests PASS on 2026-08-02 |
-| Current candidate suite | 64/64 focused routing/profile/lock tests and 407/407 full-suite tests PASS after the profile-phase fix; full suite completed in 149.373 s |
+| Historical pre-integration candidate suite | 64/64 focused routing/profile/lock tests and 407/407 full-suite tests PASS after the profile-phase fix; full suite completed in 149.373 s |
+| Current integration candidate suite | 68/68 focused routing/profile/lock tests and 413/413 full-suite tests PASS after contract hardening; full suite completed in 157.315 s |
 | Fresh remote refs | `git ls-remote` confirmed Control Plane `38becc3` and BUSTAFIT `dd42097` on 2026-08-02 |
 | Current source risk | `FAIL/1`: dirty source tree lacks governing host-bound policy/lock evidence; final local-audit target remains `UNKNOWN/2` |
 
@@ -74,20 +77,26 @@ Build 40/App Review while the frozen repo contains iOS 1.1 (58).
 Correct boundary: detect all demonstrated profiles, distinguish shared-core
 from shell-specific gates, and never invent a command or external effect.
 
-### R3 — Genuine bounded local task
+### R3 — Genuine bounded security task selected by the roadmap
 
-`awaiting_genuine_user_task`
+`legacy-account / BUSTAFIT PR #92 — awaiting_shadow_replay`
 
-Eligibility: local, reversible, no auth, secrets, migration, CI/CD, release,
-production, or remote effect. Must use TDD and stop at `review_ready`.
+The user requested TDD for legacy account compatibility in
+`functions/coachSecurity.js`: missing accounts and accounts without `status`
+remain active; `deleting` and `deleted` remain blocked. The historical task was
+merged as PR #92. Because it changes an authorization boundary, it exceeds the
+original low-risk/no-auth R3 eligibility and is used only as a stricter shadow
+authority case. A later replay cannot become retroactive causal evidence.
 
 ### R4 — Genuine shared-core task
 
-`awaiting_genuine_user_task`
+`Coach Console runtime/sync / BUSTAFIT PR #97 — awaiting_shadow_replay`
 
-Eligibility: affects the shared core and at least two demonstrated profiles,
-is locally testable and reversible, and has no external effect. Must use TDD
-and stop at `review_ready`.
+The user requested a responsive Coach Console consuming the secure callable
+contracts, with truthful pending/success/error/offline state and no unsafe
+direct writes. The historical task was merged as PR #97. It affects the shared
+web core consumed by multiple profiles and remains eligible for shadow routing;
+the replay must not reimplement or relabel the historical result as causal.
 
 ## Scoring contract
 
@@ -109,6 +118,22 @@ Efficiency is secondary and records elapsed time when observable, files
 inspected, commands, proposed files, and proposed lines. It can select between
 two quality-equivalent results but can never compensate for a quality failure.
 
+## Evidence taxonomy
+
+- **Causal / validated:** only a controlled RED that fails for the targeted
+  defect, the minimum runtime or registry correction, and GREEN against the
+  same contract. The outcome-gate, shared-alias and profile-phase regressions
+  are in this class.
+- **Observational / inferred:** evaluator answers, route manifests, GitHub PRs,
+  manual scores, command counts and non-instrumented elapsed times. They can
+  support a bounded decision but cannot attribute an outcome to Control Plane.
+- **Not proved:** causal improvement over an unguided run, generalization to new
+  projects, native host enforcement, deploy/release readiness, and provider or
+  physical-device behavior not observed by the named gate.
+
+Every later replay must retain one of these labels. Shadow evidence produced
+after a task already finished is observational even when its route is correct.
+
 ## Baseline results
 
 | ID | Route/profile/authority | Novice | Expert | Efficiency | Result |
@@ -117,8 +142,8 @@ two quality-equivalent results but can never compensate for a quality failure.
 | B2 | T3/controlled; iOS + Android/TWA + web; publication separated | 5/5 | 5/5 | ≈5 min, 6 batches/≈24 read-only commands, 0 changes | PASS |
 | R1 | read-only audit; no authority or profile claim required | 5/5 | 5/5 | ≈80 s, ≈19 read-only commands, 1 doc/8 lines proposed | PASS |
 | R2 | hybrid: web/PWA + iOS + Android; gates selected by surface | 5/5 | 5/5 | ≈15 min, ≈33 read-only commands, 0 changes | PASS with efficiency note |
-| R3 | awaiting genuine request | — | — | — | pending by design |
-| R4 | awaiting genuine request | — | — | — | pending by design |
+| R3 | PR #92 legacy-account identified; stricter than original no-auth eligibility | — | — | — | awaiting shadow replay |
+| R4 | PR #97 shared Coach runtime/sync identified | — | — | — | awaiting shadow replay |
 
 ### B1 evidence
 
@@ -456,12 +481,12 @@ The canonical skill remains byte-exact at its frozen digest. No resource or
 route was added.
 
 Post-N1 decision: `NO_PROMOTE`. The pre-N1 runs cannot be relabeled as a valid
-sequential N3 comparison, but they did disqualify the only candidate on its own
-efficiency threshold without showing a needed product correction. Recreating
-the identical discarded artifact after N1 would add two more non-fresh runs
-without a new hypothesis. The conservative action is therefore to keep the
-canonical skill unchanged, make no registry/lock addition, and avoid claiming
-that a formal A/B winner exists.
+sequential N3 comparison. Observational timing and inspection counts did not
+meet the candidate's own promotion threshold and exposed no unique correction.
+Recreating the identical discarded artifact after N1 would add two more
+non-fresh runs without a new hypothesis. The conservative action is therefore
+to keep the canonical skill unchanged, make no registry/lock addition, and
+avoid claiming either a formal A/B winner or a causal simplicity effect.
 
 Promotion requires no quality regression and either avoidance of an unnecessary
 baseline change or at least 15% improvement across comparable efficiency
@@ -481,15 +506,15 @@ byte-exact and no registry route is added.
 | Router | T3/controlled, `decision_ready=true`, `plan_then_goal` | PASS |
 | Preflight write | clean branch, ahead 0, behind 0 | PASS |
 | Control Plane baseline | `bash tests/run.sh`: 404/404 | PASS |
-| Current candidate verification | `bash tests/run.sh`: 407/407 in 149.373 s after the profile-phase fix; policy, registry, doctor, diff-check and base-owned host-bound dirty-lease preflight all pass | PASS |
+| Current integration candidate verification | focused routing/profile/lock suites: 68/68; `bash tests/run.sh`: 413/413 in 157.315 s; final policy, registry, doctor and remote preflight repeat before PR | PASS tests; remaining final gates pending |
 | Compact receipt reproducibility | all four normalized TaskEnvelope JSON records recompute the recorded task digests exactly | PASS |
 | Original four read-only scenarios | B1 omitted affected iOS/Android shell profiles | FAIL, round invalid |
 | First final replacement routed scenarios | four fresh agents and four content/authority passes, but R2 omitted detected profile resources | INVALIDATED |
 | Profile lifecycle TDD | RED: `research` and `observe` each selected context `7/8` without profile docs; GREEN: both select all three profile docs at `8/8`, focused suites 64/64 | PASS |
-| Second final replacement routed scenarios | four fresh agents, four isolated clones, complete profile manifests, four content/authority passes | PASS |
-| Simplicity promotion | pre-N1 A/B is diagnostic only; sole candidate failed its threshold and was discarded | CLOSED: NO_PROMOTE |
+| Second final replacement routed scenarios | four fresh agents, four isolated clones, complete profile manifests, four content/authority passes | OBSERVATIONAL PASS |
+| Simplicity promotion | pre-N1 A/B is diagnostic only; evidence did not meet the threshold and the candidate was discarded | CLOSED: NO_PROMOTE, no causal claim |
 | Current `risk-status` | exact task/lease hint returns local `FAIL`, remote `UNKNOWN` | FAIL during dirty source work |
-| R3/R4 real tasks | N1 is valid; genuine user requests remain absent and are never synthesized by the pilot | eligible, awaiting user tasks |
+| R3/R4 real tasks | PR #92 and PR #97 are genuine completed tasks; later evaluation can only be shadow/observational | identified, awaiting fresh shadow replay |
 | Source verification | linked Ponytail audit reviewed; plugin/hooks rejected; canonical skill digest rechecked | PASS |
 | Independent candidate code review | found shared-alias filtering, scorecard wording, and hybrid-budget coverage defects; all findings were fixed and the affected paths re-reviewed | PASS |
 | Independent checkpoint review | found profile-gate contradiction and current risk FAIL | findings accepted in part |
@@ -550,9 +575,12 @@ Control Plane more complex in order to measure itself. Evidence-backed runtime
 defects may be fixed with TDD; subjective scores and one-off timing remain in
 this document rather than becoming product APIs.
 
-The failed A/B is also a useful result: a plausible simplicity rule did not
-make these tasks simpler in practice. The project therefore avoids a new route,
-registry entry, lock update, and ongoing maintenance burden.
+The incomplete A/B is still useful for a conservative product decision: its
+observations did not justify promotion under the frozen threshold. It does not
+prove that the rule has no value or that it makes tasks slower in general. The
+project therefore avoids a new route, registry entry, lock update and ongoing
+maintenance burden until a fresh hypothesis produces causal or valid forward
+evidence.
 
 ## Deferred context-capsule follow-up
 
