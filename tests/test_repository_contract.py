@@ -16,7 +16,22 @@ from control_plane.policy import load_policy, validate_policy
 ROOT = Path(__file__).parents[1]
 
 
+def _read_python_tree(root: Path) -> str:
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(root.rglob("*.py"))
+    )
+
+
 class RepositoryContractTests(unittest.TestCase):
+    def test_shadow_runtime_scan_is_recursive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime_root = Path(temporary) / "control_plane"
+            nested = runtime_root / "orchestrator" / "tasks.py"
+            nested.parent.mkdir(parents=True)
+            nested.write_text("PENDING_NATIVE_REISSUE = True\n", encoding="utf-8")
+
+            self.assertIn("PENDING_NATIVE_REISSUE", _read_python_tree(runtime_root))
+
     def test_repository_discovery_ignores_git_environment_redirection(self) -> None:
         from control_plane.repository import discover_repository, git_environment
 
@@ -515,10 +530,7 @@ jobs:
             with self.subTest(contract=contract):
                 self.assertIn(contract, normalized)
 
-        runtime = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in (ROOT / "control_plane").glob("*.py")
-        )
+        runtime = _read_python_tree(ROOT / "control_plane")
         support = "\n".join(
             path.read_text(encoding="utf-8")
             for path in (ROOT / "tests").glob("*support.py")
