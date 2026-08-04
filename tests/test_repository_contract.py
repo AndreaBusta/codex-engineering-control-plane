@@ -14,6 +14,7 @@ from control_plane.policy import load_policy, validate_policy
 
 
 ROOT = Path(__file__).parents[1]
+AUTHORIZATION_RECEIPT = re.compile(r"authorization_?receipt", re.IGNORECASE)
 
 
 def _read_python_tree(root: Path, pattern: str = "*.py") -> str:
@@ -23,6 +24,14 @@ def _read_python_tree(root: Path, pattern: str = "*.py") -> str:
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def test_shadow_receipt_detector_covers_factories_and_aliases(self) -> None:
+        for source in (
+            "def issue_authorization_receipt(): ...",
+            "AuthorizationReceipt = dict[str, str]",
+        ):
+            with self.subTest(source=source):
+                self.assertIsNotNone(AUTHORIZATION_RECEIPT.search(source))
+
     def test_shadow_runtime_scan_is_recursive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runtime_root = Path(temporary) / "control_plane"
@@ -549,11 +558,9 @@ jobs:
         )
         project_skills = tuple((ROOT / "skills").glob("**/SKILL.md"))
 
-        self.assertIsNone(
-            re.search(r"class\s+\w*AuthorizationReceipt\b", runtime)
-        )
+        self.assertIsNone(AUTHORIZATION_RECEIPT.search(runtime))
         self.assertNotIn("PENDING_NATIVE_REISSUE", runtime)
-        self.assertNotIn("authorization_receipt", support)
+        self.assertIsNone(AUTHORIZATION_RECEIPT.search(support))
         self.assertNotIn("ponytail", registry.lower())
         self.assertFalse(
             any(
