@@ -5,11 +5,13 @@ import os
 import unittest
 from hashlib import sha256
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import tomllib
 from unittest.mock import patch
 
 from tests.git_test_support import GitScenario, git
@@ -2414,6 +2416,124 @@ class AdoptionTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(configured.returncode, 1)
+
+    def test_v2_1_0_installation_upgrades_to_v2_1_1_and_keeps_original_rollback(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            adoption_apply,
+            adoption_plan,
+            adoption_rollback,
+            adoption_status,
+            adoption_verify,
+            upgrade_apply,
+            upgrade_plan,
+        )
+
+        def make_source(parent: Path, name: str, version: str) -> Path:
+            source = parent / name
+            shutil.copytree(
+                ROOT,
+                source,
+                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            )
+            runtime_version = source / "control_plane" / "__init__.py"
+            runtime_version.write_text(
+                '"""Deterministic local gates for the Codex engineering '
+                'control plane."""\n\n'
+                f'__version__ = "{version}"\n',
+                encoding="utf-8",
+            )
+            lock_path = source / ".codex" / "control-plane.lock"
+            lock_text = lock_path.read_text(encoding="utf-8")
+            lock_path.write_text(
+                re.sub(
+                    r'^product_version = "[0-9]+\.[0-9]+\.[0-9]+"$',
+                    f'product_version = "{version}"',
+                    lock_text,
+                    count=1,
+                    flags=re.MULTILINE,
+                ),
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "init", "-b", "main", str(source)],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Control Plane Tests"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "user.email",
+                    "control-plane@example.invalid",
+                ],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", f"test: source {version}"],
+                cwd=source,
+                check=True,
+                capture_output=True,
+            )
+            return source
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sources = Path(temporary)
+            old_source = make_source(sources, "source-2.1.0", "2.1.0")
+            new_source = make_source(sources, "source-2.1.1", "2.1.1")
+            old_plan = adoption_plan(old_source, self.scenario.repo)
+            self.assertTrue(old_plan["ok"], old_plan)
+            adoption_apply(old_plan)
+            old_lock = tomllib.loads(
+                (self.scenario.repo / ".codex" / "control-plane.lock").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(old_lock["product_version"], "2.1.0")
+            subprocess.run(
+                ["git", "add", "."],
+                cwd=self.scenario.repo,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "--no-verify", "-m", "test: adopt 2.1.0"],
+                cwd=self.scenario.repo,
+                check=True,
+                capture_output=True,
+            )
+
+            upgrade = upgrade_plan(new_source, self.scenario.repo)
+            self.assertTrue(upgrade["ok"], upgrade)
+            result = upgrade_apply(upgrade)
+
+            self.assertTrue(result["ok"])
+            new_lock = tomllib.loads(
+                (self.scenario.repo / ".codex" / "control-plane.lock").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(new_lock["product_version"], "2.1.1")
+            self.assertTrue(adoption_verify(self.scenario.repo)["ok"])
+            self.assertTrue(adoption_rollback(self.scenario.repo)["ok"])
+            self.assertEqual(adoption_status(self.scenario.repo)["status"], "rolled_back")
+            self.assertFalse(Path(old_plan["installed_snapshot"]["path"]).exists())
+            self.assertFalse(Path(upgrade["installed_snapshot"]["path"]).exists())
 
     def test_upgrade_config_fault_restores_prior_snapshot_and_config(
         self,

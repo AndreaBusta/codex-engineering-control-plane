@@ -19,6 +19,8 @@ import sys
 import tarfile
 import tomllib
 from typing import NoReturn
+import urllib.error
+import urllib.request
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +52,8 @@ RELEASE_GATES = (
     "release-preflight",
     "verify",
 )
+WORKFLOW_EVIDENCE_MAX_BYTES = 16 * 1024
+WORKFLOW_OBSERVATION_MAX_BYTES = 2 * 1024 * 1024
 GIT_ENVIRONMENT_PREFIX = "GIT_"
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$", re.ASCII)
 PULL_REQUEST_PATTERN = re.compile(r"\(#([1-9][0-9]*)\)$", re.ASCII)
@@ -278,13 +282,288 @@ def _validate_source(repository: Path) -> tuple[str, str, str, str, str]:
     return head, tree, slug, repository_url, branch
 
 
-def _validate_workflow_url(workflow_url: str, slug: str) -> None:
+def _validate_workflow_url(workflow_url: str, slug: str) -> tuple[int, int]:
     expected = re.compile(
-        rf"^https://github\.com/{re.escape(slug)}/actions/runs/[1-9][0-9]*$",
+        rf"^https://github\.com/{re.escape(slug)}/actions/runs/"
+        r"(?P<run_id>[1-9][0-9]*)/attempts/(?P<run_attempt>[1-9][0-9]*)$",
         re.ASCII,
     )
-    if expected.fullmatch(workflow_url) is None:
+    matched = expected.fullmatch(workflow_url)
+    if matched is None:
         _fail("E_RELEASE_WORKFLOW", "workflow URL does not bind the source repository")
+    return int(matched.group("run_id")), int(matched.group("run_attempt"))
+
+
+def _github_json(url: str) -> dict[str, object]:
+    authorization_value = os.environ.get("CONTROL_PLANE_GITHUB_TOKEN")
+    if not authorization_value:
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow observation requires the ephemeral workflow token",
+        )
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {authorization_value}",
+            "User-Agent": "codex-engineering-control-plane-release-evidence",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="GET",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=15) as response:
+            if response.status != 200:
+                _fail(
+                    "E_RELEASE_EVIDENCE_OBSERVATION",
+                    "GitHub workflow observation was not successful",
+                )
+            declared_size = response.headers.get("Content-Length")
+            if declared_size is not None and int(declared_size) > WORKFLOW_OBSERVATION_MAX_BYTES:
+                _fail(
+                    "E_RELEASE_EVIDENCE_OBSERVATION",
+                    "GitHub workflow observation exceeds its byte bound",
+                )
+            encoded = response.read(WORKFLOW_OBSERVATION_MAX_BYTES + 1)
+    except (OSError, UnicodeError, ValueError, urllib.error.URLError) as error:
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow observation is unavailable",
+        )
+    if len(encoded) > WORKFLOW_OBSERVATION_MAX_BYTES:
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow observation exceeds its byte bound",
+        )
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow observation is invalid",
+        )
+    if not isinstance(payload, dict):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow observation is invalid",
+        )
+    return payload
+
+
+def _successful_job(jobs: dict[str, dict[str, object]], name: str, commit: str) -> None:
+    job = jobs.get(name)
+    if (
+        not isinstance(job, dict)
+        or job.get("head_sha") != commit
+        or job.get("status") != "completed"
+        or job.get("conclusion") != "success"
+    ):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            f"GitHub workflow job {name} is not successful",
+        )
+
+
+def _successful_step(job: dict[str, object], name: str) -> None:
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow step observation is invalid",
+        )
+    matched = [step for step in steps if isinstance(step, dict) and step.get("name") == name]
+    if (
+        len(matched) != 1
+        or matched[0].get("status") != "completed"
+        or matched[0].get("conclusion") != "success"
+    ):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            f"GitHub workflow step {name} is not successful",
+        )
+
+
+def _observe_github_workflow(
+    slug: str,
+    run_id: int,
+    run_attempt: int,
+    commit: str,
+    tree: str,
+    workflow_url: str,
+) -> list[dict[str, str]]:
+    expected_environment = {
+        "GITHUB_ACTIONS": "true",
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_JOB": "release-candidate",
+        "GITHUB_REPOSITORY": slug,
+        "GITHUB_RUN_ATTEMPT": str(run_attempt),
+        "GITHUB_RUN_ID": str(run_id),
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_SHA": commit,
+    }
+    if any(os.environ.get(key) != value for key, value in expected_environment.items()):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "workflow evidence requires the exact current GitHub Actions context",
+        )
+    api_base = f"https://api.github.com/repos/{slug}/actions/runs/{run_id}/attempts/{run_attempt}"
+    run = _github_json(api_base)
+    jobs_payload = _github_json(f"{api_base}/jobs?per_page=100")
+    repository = run.get("repository")
+    head_commit = run.get("head_commit")
+    if (
+        type(run.get("id")) is not int
+        or run.get("id") != run_id
+        or type(run.get("run_attempt")) is not int
+        or run.get("run_attempt") != run_attempt
+        or run.get("event") != "workflow_dispatch"
+        or run.get("head_sha") != commit
+        or run.get("path") != ".github/workflows/control-plane.yml"
+        or not isinstance(repository, dict)
+        or repository.get("full_name") != slug
+        or not isinstance(head_commit, dict)
+        or head_commit.get("id") != commit
+        or head_commit.get("tree_id") != tree
+    ):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow run does not bind the release source",
+        )
+    raw_jobs = jobs_payload.get("jobs")
+    if (
+        type(jobs_payload.get("total_count")) is not int
+        or not isinstance(raw_jobs, list)
+        or jobs_payload.get("total_count") != len(raw_jobs)
+        or not 1 <= len(raw_jobs) <= 100
+    ):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow job observation is incomplete",
+        )
+    jobs: dict[str, dict[str, object]] = {}
+    for job in raw_jobs:
+        if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+            _fail(
+                "E_RELEASE_EVIDENCE_OBSERVATION",
+                "GitHub workflow job observation is invalid",
+            )
+        name = job["name"]
+        if name in jobs:
+            _fail(
+                "E_RELEASE_EVIDENCE_OBSERVATION",
+                "GitHub workflow job observation is ambiguous",
+            )
+        jobs[name] = job
+    _successful_job(jobs, "verify", commit)
+    _successful_job(jobs, "macos-smoke", commit)
+    release_job = jobs.get("release-candidate")
+    if (
+        not isinstance(release_job, dict)
+        or release_job.get("head_sha") != commit
+        or release_job.get("status") != "in_progress"
+        or release_job.get("conclusion") is not None
+    ):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub release-candidate job is not the current in-progress job",
+        )
+    _successful_step(release_job, "Refresh release gate against private main")
+    _successful_step(release_job, "Run supported adoption matrix")
+    expected = [{"name": name, "result": "success"} for name in RELEASE_GATES]
+    if workflow_url != (
+        f"https://github.com/{slug}/actions/runs/{run_id}/attempts/{run_attempt}"
+    ):
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow URL does not bind the observed attempt",
+        )
+    return expected
+
+
+def _workflow_evidence(
+    evidence_path: Path,
+    *,
+    repository_url: str,
+    commit: str,
+    tree: str,
+    workflow_url: str,
+    slug: str,
+    run_id: int,
+    run_attempt: int,
+) -> list[dict[str, str]]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(evidence_path, flags)
+    except OSError as error:
+        _fail("E_RELEASE_EVIDENCE", "workflow evidence is unavailable")
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= WORKFLOW_EVIDENCE_MAX_BYTES:
+            _fail("E_RELEASE_EVIDENCE", "workflow evidence has an invalid size or type")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            payload = stream.read(WORKFLOW_EVIDENCE_MAX_BYTES + 1)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(payload) > WORKFLOW_EVIDENCE_MAX_BYTES:
+        _fail("E_RELEASE_EVIDENCE", "workflow evidence exceeds its byte bound")
+    try:
+        evidence = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        _fail("E_RELEASE_EVIDENCE", "workflow evidence is not valid UTF-8 JSON")
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "authorizes",
+        "gates",
+        "schema_version",
+        "source",
+        "workflow",
+    }:
+        _fail("E_RELEASE_EVIDENCE", "workflow evidence schema is invalid")
+    source = evidence.get("source")
+    workflow = evidence.get("workflow")
+    gates = evidence.get("gates")
+    if (
+        type(evidence.get("schema_version")) is not int
+        or evidence.get("schema_version") != 1
+        or evidence.get("authorizes") is not False
+        or not isinstance(source, dict)
+        or set(source) != {"commit", "repository", "tree"}
+        or source.get("repository") != repository_url
+        or source.get("commit") != commit
+        or source.get("tree") != tree
+        or not isinstance(workflow, dict)
+        or set(workflow) != {"event", "run_attempt", "run_id", "url"}
+        or workflow.get("event") != "workflow_dispatch"
+        or type(workflow.get("run_id")) is not int
+        or workflow.get("run_id") != run_id
+        or type(workflow.get("run_attempt")) is not int
+        or workflow.get("run_attempt") != run_attempt
+        or workflow.get("url") != workflow_url
+        or not isinstance(gates, list)
+        or len(gates) != len(RELEASE_GATES)
+    ):
+        _fail("E_RELEASE_EVIDENCE", "workflow evidence identity is invalid")
+    expected = [
+        {"name": name, "result": "success"} for name in RELEASE_GATES
+    ]
+    if gates != expected:
+        _fail("E_RELEASE_EVIDENCE", "workflow gates are incomplete or unsuccessful")
+    observed = _observe_github_workflow(
+        slug,
+        run_id,
+        run_attempt,
+        commit,
+        tree,
+        workflow_url,
+    )
+    if observed != expected:
+        _fail(
+            "E_RELEASE_EVIDENCE_OBSERVATION",
+            "GitHub workflow gates differ from the submitted evidence",
+        )
+    return observed
 
 
 def _pull_requests(
@@ -703,12 +982,31 @@ def _resolve_output(repository: Path, supplied: Path) -> Path:
     return resolved
 
 
-def build_candidate(repository: Path, output: Path, workflow_url: str) -> dict[str, object]:
+def build_candidate(
+    repository: Path,
+    output: Path,
+    workflow_url: str,
+    workflow_evidence: Path | None = None,
+) -> dict[str, object]:
     repository = repository.resolve(strict=True)
     output = _resolve_output(repository, output)
     source = _validate_source(repository)
     head, tree, slug, repository_url, branch = source
-    _validate_workflow_url(workflow_url, slug)
+    run_id, run_attempt = _validate_workflow_url(workflow_url, slug)
+    reported_gates = (
+        _workflow_evidence(
+            workflow_evidence,
+            repository_url=repository_url,
+            commit=head,
+            tree=tree,
+            workflow_url=workflow_url,
+            slug=slug,
+            run_id=run_id,
+            run_attempt=run_attempt,
+        )
+        if workflow_evidence is not None
+        else None
+    )
     version = _product_version(repository, head)
     tag = f"v{version}"
     stem = f"codex-engineering-control-plane-{version}"
@@ -734,10 +1032,18 @@ def build_candidate(repository: Path, output: Path, workflow_url: str) -> dict[s
         "media_type": "application/gzip",
     }
     pull_requests = _pull_requests(repository, repository_url, head)
-    gates = [
+    gates = reported_gates or [
         {"name": name, "result": "pending_external_evidence"}
         for name in RELEASE_GATES
     ]
+    evidence_state = (
+        "workflow_api_observed"
+        if reported_gates is not None
+        else "pending_external_evidence"
+    )
+    workflow = {"url": workflow_url, "event": "workflow_dispatch"}
+    if reported_gates is not None:
+        workflow["evidence"] = evidence_state
     manifest = {
         "schema_version": 1,
         "release_tag": tag,
@@ -750,7 +1056,7 @@ def build_candidate(repository: Path, output: Path, workflow_url: str) -> dict[s
             "tree": tree,
             "pull_requests": pull_requests,
         },
-        "workflow": {"url": workflow_url, "event": "workflow_dispatch"},
+        "workflow": workflow,
         "gates": gates,
         "artifacts": [archive_record],
         "authorizes": False,
@@ -758,7 +1064,7 @@ def build_candidate(repository: Path, output: Path, workflow_url: str) -> dict[s
     latest_pull_request = pull_requests[-1]["url"] if pull_requests else ""
     receipt = {
         "schema_version": 1,
-        "status": "candidate",
+        "status": "verified_candidate" if reported_gates is not None else "candidate",
         "source": {
             "repository": repository_url,
             "base_branch": branch,
@@ -775,8 +1081,10 @@ def build_candidate(repository: Path, output: Path, workflow_url: str) -> dict[s
         },
         "verification": {
             "required_gates": [gate["name"] for gate in gates],
-            "external_state": "pending_external_evidence",
-            "smoke_result": "pending_external_evidence",
+            "external_state": evidence_state,
+            "smoke_result": (
+                "success" if reported_gates is not None else "pending_external_evidence"
+            ),
             "observed_at_utc": "",
         },
         "approvals": {
@@ -819,12 +1127,18 @@ def main() -> int:
     parser.add_argument("--repo", default=".")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--workflow-url", required=True)
+    parser.add_argument("--workflow-evidence")
     arguments = parser.parse_args()
     try:
         result = build_candidate(
             Path(arguments.repo),
             Path(arguments.output_dir),
             arguments.workflow_url,
+            (
+                Path(arguments.workflow_evidence)
+                if arguments.workflow_evidence is not None
+                else None
+            ),
         )
     except (OSError, ReleaseCandidateError, subprocess.SubprocessError) as error:
         print(str(error), file=sys.stderr)

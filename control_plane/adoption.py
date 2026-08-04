@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from datetime import datetime, timezone
 import fcntl
 from hashlib import sha256
@@ -51,6 +52,7 @@ from control_plane.resource_registry import load_registry
 
 
 RUNTIME_PACKAGE = "codex_control_plane_runtime_v2"
+PRODUCT_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$", re.ASCII)
 RUNTIME_MODULES = (
     "__init__.py",
     "adoption.py",
@@ -1781,7 +1783,39 @@ if __name__ == "__main__":
 '''.encode("utf-8")
 
 
-def _render_lock(rendered: Mapping[str, bytes]) -> bytes:
+def _source_product_version(source_root: Path) -> str:
+    lock_path = _safe_target(source_root, ".codex/control-plane.lock")
+    runtime_path = _safe_target(source_root, "control_plane/__init__.py")
+    try:
+        lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+        runtime = ast.parse(
+            runtime_path.read_text(encoding="utf-8"),
+            filename="control_plane/__init__.py",
+        )
+    except (OSError, UnicodeError, SyntaxError, tomllib.TOMLDecodeError) as error:
+        raise ValueError("E_ADOPT_SOURCE: product version is unavailable") from error
+    locked = lock.get("product_version")
+    versions = [
+        statement.value.value
+        for statement in runtime.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "__version__"
+            for target in statement.targets
+        )
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    ]
+    if (
+        not isinstance(locked, str)
+        or PRODUCT_VERSION_PATTERN.fullmatch(locked) is None
+        or versions != [locked]
+    ):
+        raise ValueError("E_ADOPT_SOURCE: runtime and lock versions differ")
+    return locked
+
+
+def _render_lock(rendered: Mapping[str, bytes], product_version: str) -> bytes:
     runtime_hasher = sha256()
     runtime_prefix = f".codex/runtime/{RUNTIME_PACKAGE}/"
     for relative in sorted(path for path in rendered if path.startswith(runtime_prefix)):
@@ -1792,7 +1826,7 @@ def _render_lock(rendered: Mapping[str, bytes]) -> bytes:
     digest = lambda relative: _digest_bytes(rendered[relative])
     lines = [
         "schema_version = 1",
-        'product_version = "2.1.0"',
+        f'product_version = "{product_version}"',
         "policy_schema = 1",
         "registry_schema = 1",
         "task_schema = 1",
@@ -1825,6 +1859,7 @@ def _render_distribution(
     *,
     git_facts: Mapping[str, Any],
 ) -> dict[str, bytes]:
+    product_version = _source_product_version(source_root)
     rendered: dict[str, bytes] = {}
     for source_relative, target_relative in MANAGED_FILES:
         source_path = _safe_target(source_root, source_relative)
@@ -1849,7 +1884,9 @@ def _render_distribution(
                 raise ValueError(f"E_ADOPT_SOURCE: missing {source_relative}")
             value = source_path.read_bytes()
         rendered[target_relative] = value
-    rendered[".codex/control-plane.lock"] = _render_lock(rendered)
+    rendered[".codex/control-plane.lock"] = _render_lock(
+        rendered, product_version
+    )
     return rendered
 
 

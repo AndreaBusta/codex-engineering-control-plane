@@ -21,7 +21,7 @@ class LockfileTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(lock["product_version"], "2.1.0")
+        self.assertEqual(lock["product_version"], "2.1.1")
         self.assertEqual(lock["clarification_schema"], 1)
         self.assertEqual(lock["risk_schema"], 1)
         self.assertNotIn("risk_workflow", lock["digests"])

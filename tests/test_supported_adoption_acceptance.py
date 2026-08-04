@@ -163,19 +163,19 @@ class SupportedAdoptionAcceptanceTests(unittest.TestCase):
                 str(cls.release_output),
                 "--workflow-url",
                 "https://github.com/AndreaBusta/"
-                "codex-engineering-control-plane/actions/runs/123456",
+                "codex-engineering-control-plane/actions/runs/123456/attempts/1",
             ],
             cwd=cls.source_seed,
         )
         if built.returncode != 0:
             raise AssertionError(built.stdout + built.stderr)
-        archive = cls.release_output / "codex-engineering-control-plane-2.1.0.tar.gz"
+        archive = cls.release_output / "codex-engineering-control-plane-2.1.1.tar.gz"
         cls.release_extract = Path(cls._source_temporary.name) / "release-extract"
         cls.release_extract.mkdir()
         with tarfile.open(archive, mode="r:gz") as packaged:
             packaged.extractall(cls.release_extract, filter="data")
         cls.release_source = (
-            cls.release_extract / "codex-engineering-control-plane-2.1.0"
+            cls.release_extract / "codex-engineering-control-plane-2.1.1"
         )
 
     @classmethod
