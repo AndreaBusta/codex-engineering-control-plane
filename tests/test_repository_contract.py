@@ -16,9 +16,9 @@ from control_plane.policy import load_policy, validate_policy
 ROOT = Path(__file__).parents[1]
 
 
-def _read_python_tree(root: Path) -> str:
+def _read_python_tree(root: Path, pattern: str = "*.py") -> str:
     return "\n".join(
-        path.read_text(encoding="utf-8") for path in sorted(root.rglob("*.py"))
+        path.read_text(encoding="utf-8") for path in sorted(root.rglob(pattern))
     )
 
 
@@ -31,6 +31,18 @@ class RepositoryContractTests(unittest.TestCase):
             nested.write_text("PENDING_NATIVE_REISSUE = True\n", encoding="utf-8")
 
             self.assertIn("PENDING_NATIVE_REISSUE", _read_python_tree(runtime_root))
+
+    def test_shadow_support_scan_is_recursive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            support_root = Path(temporary) / "tests"
+            nested = support_root / "orchestrator" / "authorization_support.py"
+            nested.parent.mkdir(parents=True)
+            nested.write_text("authorization_receipt = True\n", encoding="utf-8")
+
+            self.assertIn(
+                "authorization_receipt",
+                _read_python_tree(support_root, "*support.py"),
+            )
 
     def test_repository_discovery_ignores_git_environment_redirection(self) -> None:
         from control_plane.repository import discover_repository, git_environment
@@ -531,10 +543,7 @@ jobs:
                 self.assertIn(contract, normalized)
 
         runtime = _read_python_tree(ROOT / "control_plane")
-        support = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in (ROOT / "tests").glob("*support.py")
-        )
+        support = _read_python_tree(ROOT / "tests", "*support.py")
         registry = (ROOT / ".codex" / "resource-registry.toml").read_text(
             encoding="utf-8"
         )
