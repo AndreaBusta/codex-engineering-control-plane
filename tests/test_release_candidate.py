@@ -23,7 +23,7 @@ ROOT = Path(__file__).parents[1]
 BUILDER = ROOT / "scripts" / "build-release-candidate"
 WORKFLOW_URL = (
     "https://github.com/AndreaBusta/codex-engineering-control-plane/"
-    "actions/runs/123456"
+    "actions/runs/123456/attempts/1"
 )
 
 
@@ -65,11 +65,11 @@ class ReleaseCandidateTests(unittest.TestCase):
         (self.repository / ".codex").mkdir()
         (self.repository / "control_plane").mkdir()
         (self.repository / ".codex" / "control-plane.lock").write_text(
-            'schema_version = 1\nproduct_version = "2.1.0"\n',
+            'schema_version = 1\nproduct_version = "2.1.1"\n',
             encoding="utf-8",
         )
         (self.repository / "control_plane" / "__init__.py").write_text(
-            '__version__ = "2.1.0"\n', encoding="utf-8"
+            '__version__ = "2.1.1"\n', encoding="utf-8"
         )
         (self.repository / "README.md").write_text(
             "release fixture\n", encoding="utf-8"
@@ -89,8 +89,13 @@ class ReleaseCandidateTests(unittest.TestCase):
             "https://github.com/AndreaBusta/codex-engineering-control-plane.git",
         )
 
-    def build(self, output: Path) -> subprocess.CompletedProcess[str]:
-        return _run(
+    def build(
+        self,
+        output: Path,
+        *,
+        workflow_evidence: Path | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        arguments = [
             sys.executable,
             str(BUILDER),
             "--repo",
@@ -99,8 +104,44 @@ class ReleaseCandidateTests(unittest.TestCase):
             str(output),
             "--workflow-url",
             WORKFLOW_URL,
-            cwd=self.repository,
+        ]
+        if workflow_evidence is not None:
+            arguments.extend(["--workflow-evidence", str(workflow_evidence)])
+        return _run(*arguments, cwd=self.repository)
+
+    def workflow_evidence(self, path: Path) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema_version": 1,
+            "source": {
+                "repository": (
+                    "https://github.com/AndreaBusta/"
+                    "codex-engineering-control-plane"
+                ),
+                "commit": _git(self.repository, "rev-parse", "HEAD"),
+                "tree": _git(self.repository, "rev-parse", "HEAD^{tree}"),
+            },
+            "workflow": {
+                "event": "workflow_dispatch",
+                "run_attempt": 1,
+                "run_id": 123456,
+                "url": WORKFLOW_URL,
+            },
+            "gates": [
+                {"name": name, "result": "success"}
+                for name in (
+                    "adoption-matrix",
+                    "macos-smoke",
+                    "release-preflight",
+                    "verify",
+                )
+            ],
+            "authorizes": False,
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
+        return payload
 
     def test_candidate_is_deterministic_and_binds_source_and_gates(self) -> None:
         first = self.root / "first"
@@ -129,22 +170,22 @@ class ReleaseCandidateTests(unittest.TestCase):
             first_files,
             [
                 "SHA256SUMS",
-                "codex-engineering-control-plane-2.1.0.manifest.json",
-                "codex-engineering-control-plane-2.1.0.receipt.json",
-                "codex-engineering-control-plane-2.1.0.tar.gz",
+                "codex-engineering-control-plane-2.1.1.manifest.json",
+                "codex-engineering-control-plane-2.1.1.receipt.json",
+                "codex-engineering-control-plane-2.1.1.tar.gz",
             ],
         )
         for name in first_files:
             self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
 
-        archive = first / "codex-engineering-control-plane-2.1.0.tar.gz"
+        archive = first / "codex-engineering-control-plane-2.1.1.tar.gz"
         manifest = json.loads(
-            (first / "codex-engineering-control-plane-2.1.0.manifest.json").read_text(
+            (first / "codex-engineering-control-plane-2.1.1.manifest.json").read_text(
                 encoding="utf-8"
             )
         )
         receipt = json.loads(
-            (first / "codex-engineering-control-plane-2.1.0.receipt.json").read_text(
+            (first / "codex-engineering-control-plane-2.1.1.receipt.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -152,7 +193,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         expected_tree = _git(self.repository, "rev-parse", "HEAD^{tree}")
         expected_digest = f"sha256:{sha256(archive.read_bytes()).hexdigest()}"
 
-        self.assertEqual(manifest["release_tag"], "v2.1.0")
+        self.assertEqual(manifest["release_tag"], "v2.1.1")
         self.assertEqual(manifest["source"]["commit"], expected_commit)
         self.assertEqual(manifest["source"]["tree"], expected_tree)
         self.assertEqual(manifest["source"]["pull_requests"], [
@@ -193,7 +234,7 @@ class ReleaseCandidateTests(unittest.TestCase):
         with tarfile.open(archive, mode="r:gz") as packaged:
             names = packaged.getnames()
             marker_member = packaged.getmember(
-                "codex-engineering-control-plane-2.1.0/"
+                "codex-engineering-control-plane-2.1.1/"
                 ".codex/release-source.json"
             )
             marker_stream = packaged.extractfile(marker_member)
@@ -202,19 +243,19 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertTrue(names)
         self.assertTrue(
             all(
-                name == "codex-engineering-control-plane-2.1.0"
-                or name.startswith("codex-engineering-control-plane-2.1.0/")
+                name == "codex-engineering-control-plane-2.1.1"
+                or name.startswith("codex-engineering-control-plane-2.1.1/")
                 for name in names
             )
         )
         self.assertIn(
-            "codex-engineering-control-plane-2.1.0/control_plane/__init__.py",
+            "codex-engineering-control-plane-2.1.1/control_plane/__init__.py",
             names,
         )
         self.assertEqual(marker["schema_version"], 1)
         self.assertEqual(marker["source_kind"], "control-plane-release-tree")
-        self.assertEqual(marker["product_version"], "2.1.0")
-        self.assertEqual(marker["release_tag"], "v2.1.0")
+        self.assertEqual(marker["product_version"], "2.1.1")
+        self.assertEqual(marker["release_tag"], "v2.1.1")
         self.assertEqual(marker["source_commit"], expected_commit)
         self.assertEqual(marker["source_tree"], expected_tree)
         self.assertEqual(marker["source_object_format"], "sha1")
@@ -240,6 +281,286 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertTrue(
             all(len(entry["git_oid"]) == 40 for entry in marker["entries"])
         )
+
+    def test_workflow_evidence_records_real_gates_without_authorizing_release(
+        self,
+    ) -> None:
+        evidence = self.root / "workflow-evidence.json"
+        self.workflow_evidence(evidence)
+        output = self.root / "workflow-output"
+        namespace = runpy.run_path(
+            str(BUILDER),
+            run_name="release_candidate_observed_workflow_test_module",
+        )
+        build_candidate = namespace["build_candidate"]
+        observed: list[tuple[str, int, int, str, str, str]] = []
+
+        def observe_workflow(
+            slug: str,
+            run_id: int,
+            run_attempt: int,
+            commit: str,
+            tree: str,
+            workflow_url: str,
+        ) -> list[dict[str, str]]:
+            observed.append(
+                (slug, run_id, run_attempt, commit, tree, workflow_url)
+            )
+            return [
+                {"name": name, "result": "success"}
+                for name in (
+                    "adoption-matrix",
+                    "macos-smoke",
+                    "release-preflight",
+                    "verify",
+                )
+            ]
+
+        build_candidate.__globals__["_observe_github_workflow"] = observe_workflow
+
+        result = build_candidate(
+            self.repository,
+            output,
+            WORKFLOW_URL,
+            evidence,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            observed,
+            [
+                (
+                    "AndreaBusta/codex-engineering-control-plane",
+                    123456,
+                    1,
+                    _git(self.repository, "rev-parse", "HEAD"),
+                    _git(self.repository, "rev-parse", "HEAD^{tree}"),
+                    WORKFLOW_URL,
+                )
+            ],
+        )
+        manifest = json.loads(
+            (
+                output
+                / "codex-engineering-control-plane-2.1.1.manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        receipt = json.loads(
+            (
+                output
+                / "codex-engineering-control-plane-2.1.1.receipt.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            manifest["gates"],
+            [
+                {"name": name, "result": "success"}
+                for name in (
+                    "adoption-matrix",
+                    "macos-smoke",
+                    "release-preflight",
+                    "verify",
+                )
+            ],
+        )
+        self.assertEqual(manifest["workflow"]["evidence"], "workflow_api_observed")
+        self.assertFalse(manifest["authorizes"])
+        self.assertEqual(receipt["status"], "verified_candidate")
+        self.assertEqual(
+            receipt["verification"]["external_state"], "workflow_api_observed"
+        )
+        self.assertEqual(receipt["verification"]["smoke_result"], "success")
+        self.assertFalse(receipt["approvals"]["release_authorized"])
+
+    def test_local_self_attested_workflow_evidence_is_rejected(self) -> None:
+        evidence = self.root / "self-attested-evidence.json"
+        self.workflow_evidence(evidence)
+
+        result = self.build(
+            self.root / "self-attested-output",
+            workflow_evidence=evidence,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("E_RELEASE_EVIDENCE_OBSERVATION", result.stderr)
+
+    def test_github_api_observation_binds_attempt_source_jobs_and_steps(
+        self,
+    ) -> None:
+        namespace = runpy.run_path(
+            str(BUILDER),
+            run_name="release_candidate_github_observation_test_module",
+        )
+        observe = namespace["_observe_github_workflow"]
+        head = _git(self.repository, "rev-parse", "HEAD")
+        tree = _git(self.repository, "rev-parse", "HEAD^{tree}")
+        run = {
+            "id": 123456,
+            "run_attempt": 1,
+            "event": "workflow_dispatch",
+            "head_sha": head,
+            "path": ".github/workflows/control-plane.yml",
+            "repository": {
+                "full_name": "AndreaBusta/codex-engineering-control-plane"
+            },
+            "head_commit": {"id": head, "tree_id": tree},
+        }
+        jobs = {
+            "total_count": 3,
+            "jobs": [
+                {
+                    "name": "verify",
+                    "head_sha": head,
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "macos-smoke",
+                    "head_sha": head,
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "release-candidate",
+                    "head_sha": head,
+                    "status": "in_progress",
+                    "conclusion": None,
+                    "steps": [
+                        {
+                            "name": "Refresh release gate against private main",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                        {
+                            "name": "Run supported adoption matrix",
+                            "status": "completed",
+                            "conclusion": "success",
+                        },
+                    ],
+                },
+            ],
+        }
+
+        def github_json(url: str) -> dict[str, object]:
+            return jobs if url.endswith("/jobs?per_page=100") else run
+
+        observe.__globals__["_github_json"] = github_json
+        environment = {
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_JOB": "release-candidate",
+            "GITHUB_REPOSITORY": (
+                "AndreaBusta/codex-engineering-control-plane"
+            ),
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_RUN_ID": "123456",
+            "GITHUB_SERVER_URL": "https://github.com",
+            "GITHUB_SHA": head,
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            observed = observe(
+                "AndreaBusta/codex-engineering-control-plane",
+                123456,
+                1,
+                head,
+                tree,
+                WORKFLOW_URL,
+            )
+
+        self.assertEqual(
+            observed,
+            [
+                {"name": name, "result": "success"}
+                for name in (
+                    "adoption-matrix",
+                    "macos-smoke",
+                    "release-preflight",
+                    "verify",
+                )
+            ],
+        )
+
+        jobs["jobs"][2]["steps"][1]["conclusion"] = "failure"
+        with patch.dict(os.environ, environment, clear=False):
+            with self.assertRaisesRegex(
+                namespace["ReleaseCandidateError"],
+                "E_RELEASE_EVIDENCE_OBSERVATION",
+            ):
+                observe(
+                    "AndreaBusta/codex-engineering-control-plane",
+                    123456,
+                    1,
+                    head,
+                    tree,
+                    WORKFLOW_URL,
+                )
+
+    def test_workflow_evidence_is_closed_and_exactly_source_bound(self) -> None:
+        base_path = self.root / "workflow-evidence-base.json"
+        base = self.workflow_evidence(base_path)
+        cases: list[dict[str, object]] = []
+        cases.append({**base, "unexpected": True})
+        cases.append(
+            {
+                **base,
+                "source": {**dict(base["source"]), "commit": "0" * 40},
+            }
+        )
+        cases.append(
+            {
+                **base,
+                "gates": [
+                    *list(base["gates"])[:-1],
+                    {"name": "verify", "result": "failure"},
+                ],
+            }
+        )
+        cases.append({**base, "authorizes": True})
+
+        for index, payload in enumerate(cases):
+            with self.subTest(index=index):
+                evidence = self.root / f"invalid-evidence-{index}.json"
+                evidence.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                result = self.build(
+                    self.root / f"invalid-output-{index}",
+                    workflow_evidence=evidence,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("E_RELEASE_EVIDENCE", result.stderr)
+
+    def test_candidate_packages_install_skill_with_committed_bytes(self) -> None:
+        skill = ROOT / "skills" / "install-control-plane" / "SKILL.md"
+        fixture_skill = self.repository / "skills" / "install-control-plane" / "SKILL.md"
+        fixture_skill.parent.mkdir(parents=True)
+        fixture_skill.write_bytes(skill.read_bytes())
+        _git(self.repository, "add", fixture_skill.relative_to(self.repository).as_posix())
+        _git(self.repository, "commit", "-m", "feat: add install skill (#13)")
+        _git(self.repository, "remote", "set-url", "origin", str(self.remote))
+        _git(self.repository, "push", "origin", "main")
+        _git(
+            self.repository,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/AndreaBusta/codex-engineering-control-plane.git",
+        )
+        output = self.root / "skill-output"
+
+        result = self.build(output)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archive = output / "codex-engineering-control-plane-2.1.1.tar.gz"
+        with tarfile.open(archive, mode="r:gz") as packaged:
+            member = packaged.extractfile(
+                "codex-engineering-control-plane-2.1.1/"
+                "skills/install-control-plane/SKILL.md"
+            )
+            self.assertIsNotNone(member)
+            assert member is not None
+            self.assertEqual(member.read(), skill.read_bytes())
 
     def test_candidate_fails_closed_on_version_or_source_drift(self) -> None:
         (self.repository / "control_plane" / "__init__.py").write_text(
@@ -387,13 +708,13 @@ class ReleaseCandidateTests(unittest.TestCase):
         result = self.build(output)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        archive = output / "codex-engineering-control-plane-2.1.0.tar.gz"
+        archive = output / "codex-engineering-control-plane-2.1.1.tar.gz"
         with tarfile.open(archive, mode="r:gz") as packaged:
             readme = packaged.extractfile(
-                "codex-engineering-control-plane-2.1.0/README.md"
+                "codex-engineering-control-plane-2.1.1/README.md"
             )
             substituted = packaged.extractfile(
-                "codex-engineering-control-plane-2.1.0/nested/.keep"
+                "codex-engineering-control-plane-2.1.1/nested/.keep"
             )
             self.assertIsNotNone(readme)
             self.assertIsNotNone(substituted)

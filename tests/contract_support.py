@@ -56,7 +56,7 @@ def ci_contract_issues(workflow: str) -> list[str]:
             if indent == 0:
                 break
             permission_entries.append(line.strip())
-        if permission_entries != ["contents: read"]:
+        if permission_entries != ["actions: read", "contents: read"]:
             add("CI_TOP_LEVEL_PERMISSIONS")
 
     if any(

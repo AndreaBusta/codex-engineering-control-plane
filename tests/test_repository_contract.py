@@ -112,6 +112,7 @@ class RepositoryContractTests(unittest.TestCase):
             "docs/profiles/ai-text-pipeline.md",
             "scripts/control-plane",
             "scripts/build-release-candidate",
+            "skills/install-control-plane/SKILL.md",
             "templates/HANDOFF.md",
             "templates/RELEASE_RECEIPT.json",
             "templates/TASK.md",
@@ -144,8 +145,19 @@ class RepositoryContractTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("release-candidate:", workflow)
+        self.assertIn("  actions: read", workflow)
         self.assertIn("needs: [verify, macos-smoke]", workflow)
         self.assertIn("scripts/build-release-candidate", workflow)
+        self.assertIn("id: adoption-matrix", workflow)
+        self.assertIn("id: release-preflight", workflow)
+        self.assertIn("--workflow-evidence", workflow)
+        self.assertIn("${{ github.run_attempt }}", workflow)
+        self.assertIn('run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"])', workflow)
+        self.assertIn("${{ needs.verify.result }}", workflow)
+        self.assertIn("${{ needs.macos-smoke.result }}", workflow)
+        self.assertIn("${{ steps.release-preflight.outcome }}", workflow)
+        self.assertIn("${{ steps.adoption-matrix.outcome }}", workflow)
+        self.assertIn("authorizes=False", workflow)
         refresh_step = workflow.split(
             "      - name: Refresh release gate against private main", 1
         )[1].split("      - name: Build reproducible non-authorizing candidate", 1)[0]
@@ -162,16 +174,18 @@ class RepositoryContractTests(unittest.TestCase):
             refresh_step,
         )
         self.assertIn(
+            "CONTROL_PLANE_GITHUB_TOKEN: ${{ github.token }}",
+            build_step,
+        )
+        self.assertIn(
             'GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"',
             refresh_step,
         )
         self.assertIn('echo "::add-mask::$authorization"', refresh_step)
         self.assertIn("scripts/control-plane preflight --mode release --refresh", refresh_step)
         self.assertNotIn("scripts/build-release-candidate", refresh_step)
-        self.assertNotIn("github.token", build_step)
-        self.assertNotIn("CONTROL_PLANE_GITHUB_TOKEN", build_step)
         self.assertIn("scripts/build-release-candidate", build_step)
-        self.assertEqual(workflow.count("${{ github.token }}"), 1)
+        self.assertEqual(workflow.count("${{ github.token }}"), 2)
         self.assertEqual(workflow.count("persist-credentials: false"), 3)
         self.assertNotIn("upload-artifact", workflow)
         self.assertGreaterEqual(
@@ -209,6 +223,20 @@ class RepositoryContractTests(unittest.TestCase):
         )
 
         self.assertEqual(__version__, lock["product_version"])
+        self.assertEqual(__version__, "2.1.1")
+
+    def test_release_documents_distinguish_published_v2_1_0_from_v2_1_1(self) -> None:
+        previous = (ROOT / "docs" / "releases" / "v2.1.0.md").read_text(
+            encoding="utf-8"
+        )
+        current = (ROOT / "docs" / "releases" / "v2.1.1.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("published", previous.lower())
+        self.assertNotIn("not tagged or published", previous.lower())
+        self.assertIn("v2.1.1", current)
+        self.assertIn("release_authorized=false", current)
 
     def test_documented_task_transition_uses_the_supported_cli(self) -> None:
         lifecycle = (

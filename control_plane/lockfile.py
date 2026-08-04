@@ -7,6 +7,8 @@ from hashlib import sha256
 from pathlib import Path
 import tomllib
 
+from . import __version__
+
 
 @dataclass(frozen=True)
 class LockIssue:
@@ -67,8 +69,14 @@ def validate_lock(root: Path) -> list[LockIssue]:
     issues: list[LockIssue] = []
     if lock.get("schema_version") != 1:
         issues.append(LockIssue("L_SCHEMA", "schema_version", "Only lock schema 1 is supported."))
-    if lock.get("product_version") != "2.1.0":
-        issues.append(LockIssue("L_VERSION", "product_version", "Lock does not select control-plane v2.1.0."))
+    if lock.get("product_version") != __version__:
+        issues.append(
+            LockIssue(
+                "L_VERSION",
+                "product_version",
+                f"Lock does not select control-plane v{__version__}.",
+            )
+        )
     for schema_name in (
         "policy_schema",
         "registry_schema",

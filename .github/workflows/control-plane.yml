@@ -8,6 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -38,7 +39,11 @@ jobs:
         run: |
           bash tests/run.sh
           scripts/control-plane policy-check --policy .codex/project-policy.toml
+          scripts/control-plane registry-check \
+            --registry .codex/resource-registry.toml \
+            --policy .codex/project-policy.toml
           scripts/control-plane doctor
+          git diff --check
 
   macos-smoke:
     name: macos-smoke
@@ -86,6 +91,7 @@ jobs:
           test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
 
       - name: Refresh release gate against private main
+        id: release-preflight
         shell: bash
         env:
           CONTROL_PLANE_GITHUB_TOKEN: ${{ github.token }}
@@ -103,14 +109,72 @@ jobs:
             scripts/control-plane preflight --mode release --refresh
           unset CONTROL_PLANE_GITHUB_TOKEN authorization
 
+      - name: Run supported adoption matrix
+        id: adoption-matrix
+        shell: bash
+        run: python3 -m unittest -v tests.test_supported_adoption_acceptance
+
       - name: Build reproducible non-authorizing candidate
         shell: bash
+        env:
+          ADOPTION_MATRIX_RESULT: ${{ steps.adoption-matrix.outcome }}
+          CONTROL_PLANE_GITHUB_TOKEN: ${{ github.token }}
+          MACOS_SMOKE_RESULT: ${{ needs.macos-smoke.result }}
+          RELEASE_PREFLIGHT_RESULT: ${{ steps.release-preflight.outcome }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
         run: |
-          python3 -m unittest -v tests.test_supported_adoption_acceptance
           candidate_parent="$RUNNER_TEMP/control-plane-release-${GITHUB_RUN_ID}"
           mkdir -m 700 "$candidate_parent"
+          export WORKFLOW_EVIDENCE_PATH="$candidate_parent/workflow-evidence.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          results = dict(
+              [
+                  ("adoption-matrix", os.environ["ADOPTION_MATRIX_RESULT"]),
+                  ("macos-smoke", os.environ["MACOS_SMOKE_RESULT"]),
+                  ("release-preflight", os.environ["RELEASE_PREFLIGHT_RESULT"]),
+                  ("verify", os.environ["VERIFY_RESULT"]),
+              ]
+          )
+          if set(results.values()) != {"success"}:
+              raise SystemExit("workflow gate evidence is not fully successful")
+          payload = dict(
+              schema_version=1,
+              source=dict(
+                  repository=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}",
+                  commit=os.environ["GITHUB_SHA"],
+                  tree=subprocess.check_output(
+                      ["git", "rev-parse", "HEAD^{tree}"], text=True
+                  ).strip(),
+              ),
+              workflow=dict(
+                  event="workflow_dispatch",
+                  run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),
+                  run_id=int(os.environ["GITHUB_RUN_ID"]),
+                  url=os.environ["WORKFLOW_URL"],
+              ),
+              gates=[
+                  dict(name=name, result=result)
+                  for name, result in sorted(results.items())
+              ],
+              authorizes=False,
+          )
+          path = Path(os.environ["WORKFLOW_EVIDENCE_PATH"])
+          path.write_text(
+              json.dumps(payload, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          path.chmod(0o600)
+          print("WORKFLOW_EVIDENCE=" + json.dumps(payload, sort_keys=True))
+          PY
           scripts/build-release-candidate \
             --repo "$PWD" \
             --output-dir "$candidate_parent/candidate" \
             --workflow-url \
-              "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              "$WORKFLOW_URL" \
+            --workflow-evidence "$WORKFLOW_EVIDENCE_PATH"
