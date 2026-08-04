@@ -187,7 +187,6 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("scripts/build-release-candidate", build_step)
         self.assertEqual(workflow.count("${{ github.token }}"), 2)
         self.assertEqual(workflow.count("persist-credentials: false"), 3)
-        self.assertNotIn("upload-artifact", workflow)
         self.assertGreaterEqual(
             workflow.count('test "$GITHUB_REF" = "refs/heads/main"'),
             3,
@@ -196,6 +195,57 @@ class RepositoryContractTests(unittest.TestCase):
             workflow.count('test "$GITHUB_SHA" = "$(git rev-parse HEAD)"'),
             4,
         )
+
+    def test_manual_workflow_retains_exact_verified_v2_1_1_assets(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "control-plane.yml"
+        ).read_text(encoding="utf-8")
+        release_doc = (
+            ROOT / "docs" / "engineering" / "05-release-and-observation.md"
+        ).read_text(encoding="utf-8")
+        action = (
+            "actions/upload-artifact@"
+            "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        )
+        upload_marker = "      - name: Upload verified v2.1.1 assets"
+
+        self.assertEqual(workflow.count(action), 1)
+        self.assertIn(upload_marker, workflow)
+        self.assertLess(
+            workflow.index(
+                "      - name: Build reproducible non-authorizing candidate"
+            ),
+            workflow.index(upload_marker),
+        )
+        upload_step = workflow.split(upload_marker, 1)[1]
+        self.assertIn(
+            "name: control-plane-v2.1.1-${{ github.sha }}-"
+            "attempt-${{ github.run_attempt }}",
+            upload_step,
+        )
+        expected_paths = [
+            "${{ runner.temp }}/control-plane-release-"
+            "${{ github.run_id }}/candidate/" + filename
+            for filename in (
+                "codex-engineering-control-plane-2.1.1.tar.gz",
+                "SHA256SUMS",
+                "codex-engineering-control-plane-2.1.1.manifest.json",
+                "codex-engineering-control-plane-2.1.1.receipt.json",
+            )
+        ]
+        path_block = upload_step.split("          path: |\n", 1)[1].split(
+            "          if-no-files-found:", 1
+        )[0]
+        self.assertEqual(
+            [line.strip() for line in path_block.splitlines() if line.strip()],
+            expected_paths,
+        )
+        self.assertIn("if-no-files-found: error", upload_step)
+        self.assertIn("retention-days: 1", upload_step)
+        self.assertIn("compression-level: 0", upload_step)
+        self.assertIn("artefacto efímero de GitHub Actions", release_doc)
+        self.assertIn("exactamente los cuatro assets", release_doc)
+        self.assertNotIn("no publica ni sube assets", release_doc)
 
     def test_release_builder_uses_immutable_git_objects_and_anchored_output(self) -> None:
         builder = (ROOT / "scripts" / "build-release-candidate").read_text(

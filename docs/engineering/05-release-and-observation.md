@@ -164,9 +164,12 @@ La autorización para implementar no implica autorización para publicar.
 
 El workflow manual ejecuta suite, smoke Darwin, preflight de release y matriz
 de adopción antes de construir la candidata desde `origin/main`. Mantiene
-`contents: read` y no publica ni sube assets. Genera un JSON acotado con commit,
-árbol, URL del run y los cuatro resultados reales, y el log conserva tanto ese
-JSON como los SHA-256 generados por el runner remoto.
+`actions: read` y `contents: read`; no crea un tag ni una GitHub Release. Genera
+un JSON acotado con commit, árbol, URL del run y los cuatro resultados reales.
+Después entrega un artefacto efímero de GitHub Actions, con retención de un día,
+que contiene exactamente los cuatro assets verificados y falla si falta alguno.
+Ese transporte permite descargarlos y comprobarlos fuera del runner, pero no
+los convierte en una release ni concede autoridad para publicarlos.
 
 El workflow construye los assets dentro del mismo run y attempt que pasó los
 gates:
