@@ -436,7 +436,10 @@ jobs:
         self,
     ) -> None:
         agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        normalized = " ".join(agents.split())
+        section = agents.split("## Lookup nativo entre tareas", 1)[1].split(
+            "## Autoridad visual y tareas shadow", 1
+        )[0]
+        normalized = " ".join(section.split())
 
         for contract in (
             "`codex://threads/<UUID>`",
@@ -464,6 +467,77 @@ jobs:
             ROOT / ".codex" / "resource-registry.toml"
         ).read_text(encoding="utf-8")
         self.assertNotIn("cross-thread", registry)
+
+    def test_visual_authority_and_orchestrator_autonomy_stay_shadow_only(
+        self,
+    ) -> None:
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        section = agents.split("## Autoridad visual y tareas shadow", 1)[1].split(
+            "## Seguridad", 1
+        )[0]
+        normalized = " ".join(section.split())
+
+        for contract in (
+            "`PREPARADO — NO EJECUTADO`",
+            "merge, deploy o publicación",
+            "acción, proyecto/repositorio, rama, commit/target exactos",
+            "efecto, evidencias/gates, rollback, límites y la frase exacta",
+            "`sí`, `ok`, texto ambiguo o la propia tarjeta nunca autorizan",
+            "tampoco la frase exacta por sí sola",
+            "preparación, autorización verificada, ejecución y observación",
+            "no solo color",
+            "`PENDING_NATIVE_REISSUE` o `UNKNOWN`",
+            "`authorizes=false`",
+            "`TrustedAuthorization`",
+            "No reutilices ni serialices autoridad entre tareas o sesiones",
+            "ausente, fabricado, expirado, reutilizado",
+            "repo, acción, target o SHA",
+            "abrir, supervisar, relevar y cerrar",
+            "máximo dos workers y ningún writer solapado",
+            "checkpoint completo, estado terminal verificable",
+            "cero trabajo o efectos pendientes",
+            "commit, push, PR, merge, deploy, release, secretos ni pagos",
+            "el runtime no crea, despierta, escribe ni archiva tareas",
+            "planes shadow",
+            "Ponytail",
+            "deferido",
+            "DietrichGebert/ponytail@16f29800fd2681bdf24f3eb4ccffe38be3baec6b",
+            "sha256:40df33b58fc6ef889b93585733feb9566b76e9586efa7f376785c1e995197ac0",
+            "no se instala ni registra",
+            "delete/stdlib/native/yagni/shrink",
+            "net LOC",
+            "read-only, opcional y no autorizante",
+            "`TaskEnvelope` frente a changed paths",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, normalized)
+
+        runtime = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (ROOT / "control_plane").glob("*.py")
+        )
+        support = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (ROOT / "tests").glob("*support.py")
+        )
+        registry = (ROOT / ".codex" / "resource-registry.toml").read_text(
+            encoding="utf-8"
+        )
+        project_skills = tuple((ROOT / "skills").glob("**/SKILL.md"))
+
+        self.assertIsNone(
+            re.search(r"class\s+\w*AuthorizationReceipt\b", runtime)
+        )
+        self.assertNotIn("PENDING_NATIVE_REISSUE", runtime)
+        self.assertNotIn("authorization_receipt", support)
+        self.assertNotIn("ponytail", registry.lower())
+        self.assertFalse(
+            any(
+                "ponytail" in path.as_posix().lower()
+                or "ponytail" in path.read_text(encoding="utf-8").lower()
+                for path in project_skills
+            )
+        )
 
     def test_no_unresolved_placeholders(self) -> None:
         forbidden = re.compile(

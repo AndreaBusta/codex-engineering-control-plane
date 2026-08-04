@@ -4,10 +4,8 @@ Estas reglas se suman a las instrucciones globales y no las debilitan.
 
 ## Propósito
 
-Este repositorio versiona policy, gates, runbooks y plantillas para trabajar con
-Codex de forma proporcional, verificable y económica. La prosa no sustituye a
-los gates y los gates locales no sustituyen a GitHub, CI ni al proveedor de
-release.
+Este repositorio versiona policy, gates, runbooks y plantillas verificables.
+La prosa no sustituye a los gates, GitHub, CI ni al proveedor de release.
 
 ## Antes de editar
 
@@ -29,9 +27,8 @@ release.
 
 - Antes de ingeniería sustancial, normaliza la petición como `TaskEnvelope` y
   resuélvela con `scripts/control-plane route`.
-- Si la ingeniería es vaga, amplia, riesgosa, subespecificada o multifrente,
-  usa el `task-framer` canónico; normaliza su Markdown y nunca crees otra skill
-  de intake.
+- Si la ingeniería es vaga, amplia, riesgosa, subespecificada o multifrente, usa
+  el `task-framer` canónico; normaliza su Markdown y no dupliques el intake.
 - Comunica si `RouteDecision.interaction` recomienda `/plan`, `/goal` o
   `/plan` seguido de `/goal`; no cambies el modo automáticamente.
 - Lee por completo cada recurso `required`; carga `recommended` solo dentro del
@@ -108,6 +105,15 @@ Para una referencia exacta `codex://threads/<UUID>`, usa solo la lectura nativa 
 - Nunca despiertes, escribas, dirijas, archives ni modifiques la tarea consultada.
 - El lookup no satisface gates de revisión ni autorización y no concede continuación automática.
 
+## Autoridad visual y tareas shadow
+
+- Para merge, deploy o publicación, muestra `PREPARADO — NO EJECUTADO` con acción, proyecto/repositorio, rama, commit/target exactos, efecto, evidencias/gates, rollback, límites y la frase exacta; siempre `authorizes=false`.
+- `sí`, `ok`, texto ambiguo o la propia tarjeta nunca autorizan; tampoco la frase exacta por sí sola. Separa preparación, autorización verificada, ejecución y observación con texto/orden, no solo color.
+- Una transferencia queda `PENDING_NATIVE_REISSUE` o `UNKNOWN`, con `authorizes=false`. No reutilices ni serialices autoridad entre tareas o sesiones: un host futuro debe reemitir `TrustedAuthorization` ligada a la tarea destino; falla cerrado si está ausente, fabricado, expirado, reutilizado o no coincide en repo, acción, target o SHA.
+- El mandato solo permite proponer abrir, supervisar, relevar y cerrar, con máximo dos workers y ningún writer solapado. No propongas cierre/archivo sin checkpoint completo, estado terminal verificable y cero trabajo o efectos pendientes.
+- El mandato no concede commit, push, PR, merge, deploy, release, secretos ni pagos; el runtime no crea, despierta, escribe ni archiva tareas: produce solo planes shadow para un host futuro.
+- Ponytail `ponytail-review` queda deferido tras inspeccionar `DietrichGebert/ponytail@16f29800fd2681bdf24f3eb4ccffe38be3baec6b` (`sha256:40df33b58fc6ef889b93585733feb9566b76e9586efa7f376785c1e995197ac0`): no se instala ni registra. Si se usa el checklist delete/stdlib/native/yagni/shrink y net LOC, será read-only, opcional y no autorizante; la deriva real se comprueba con `TaskEnvelope` frente a changed paths.
+
 ## Seguridad
 
 - No leas, copies ni imprimas secretos.
@@ -130,5 +136,4 @@ git diff --check
 git status --short --branch
 ```
 
-Informa siempre si se tocaron dependencias, secretos o CI/CD y qué límites
-externos permanecen sin verificar.
+Informa si se tocaron dependencias, secretos o CI/CD y los límites externos no verificados.

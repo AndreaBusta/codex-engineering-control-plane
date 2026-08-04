@@ -1028,7 +1028,10 @@ class AdoptionTests(unittest.TestCase):
         managed = rendered.split(AGENTS_START, 1)[1].split(
             AGENTS_END, 1
         )[0]
-        normalized = " ".join(managed.split())
+        section = managed.split("## Lookup nativo entre tareas", 1)[1].split(
+            "## Autoridad visual y tareas shadow", 1
+        )[0]
+        normalized = " ".join(section.split())
 
         for contract in (
             "`codex://threads/<UUID>`",
@@ -1041,6 +1044,51 @@ class AdoptionTests(unittest.TestCase):
             "Continuation Pointer",
             "transcript, prompts, razonamiento, tool output o secretos",
             "gates de revisión ni autorización",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, normalized)
+
+    def test_render_agents_includes_shadow_authority_and_task_rules(
+        self,
+    ) -> None:
+        from control_plane.adoption import (
+            AGENTS_END,
+            AGENTS_START,
+            _render_agents,
+        )
+
+        rendered = _render_agents(ROOT, self.scenario.repo).decode("utf-8")
+        managed = rendered.split(AGENTS_START, 1)[1].split(
+            AGENTS_END, 1
+        )[0]
+        section = managed.split("## Autoridad visual y tareas shadow", 1)[1].split(
+            "## Seguridad", 1
+        )[0]
+        normalized = " ".join(section.split())
+
+        for contract in (
+            "`PREPARADO — NO EJECUTADO`",
+            "`sí`, `ok`, texto ambiguo o la propia tarjeta nunca autorizan",
+            "tampoco la frase exacta por sí sola",
+            "preparación, autorización verificada, ejecución y observación",
+            "`PENDING_NATIVE_REISSUE` o `UNKNOWN`",
+            "`authorizes=false`",
+            "`TrustedAuthorization`",
+            "No reutilices ni serialices autoridad entre tareas o sesiones",
+            "abrir, supervisar, relevar y cerrar",
+            "máximo dos workers y ningún writer solapado",
+            "checkpoint completo, estado terminal verificable",
+            "cero trabajo o efectos pendientes",
+            "el runtime no crea, despierta, escribe ni archiva tareas",
+            "planes shadow",
+            "Ponytail",
+            "deferido",
+            "DietrichGebert/ponytail@16f29800fd2681bdf24f3eb4ccffe38be3baec6b",
+            "sha256:40df33b58fc6ef889b93585733feb9566b76e9586efa7f376785c1e995197ac0",
+            "no se instala ni registra",
+            "delete/stdlib/native/yagni/shrink",
+            "read-only, opcional y no autorizante",
+            "`TaskEnvelope` frente a changed paths",
         ):
             with self.subTest(contract=contract):
                 self.assertIn(contract, normalized)
