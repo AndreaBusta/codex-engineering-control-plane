@@ -178,3 +178,16 @@ jobs:
             --workflow-url \
               "$WORKFLOW_URL" \
             --workflow-evidence "$WORKFLOW_EVIDENCE_PATH"
+
+      - name: Upload verified v2.1.1 assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: control-plane-v2.1.1-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/control-plane-release-${{ github.run_id }}/candidate/codex-engineering-control-plane-2.1.1.tar.gz
+            ${{ runner.temp }}/control-plane-release-${{ github.run_id }}/candidate/SHA256SUMS
+            ${{ runner.temp }}/control-plane-release-${{ github.run_id }}/candidate/codex-engineering-control-plane-2.1.1.manifest.json
+            ${{ runner.temp }}/control-plane-release-${{ github.run_id }}/candidate/codex-engineering-control-plane-2.1.1.receipt.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
