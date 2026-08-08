@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -25,7 +27,11 @@ from control_plane.adoption import (
     upgrade_apply,
     upgrade_plan,
 )
-from control_plane.contracts import contract_digest, validate_task_envelope
+from control_plane.contracts import (
+    contract_digest,
+    validate_task_envelope,
+    validate_task_id,
+)
 from control_plane.git_state import GateError, evaluate_preflight
 from control_plane.lifecycle import (
     TaskLease,
@@ -35,6 +41,7 @@ from control_plane.lifecycle import (
     task_allows_writer_lease,
 )
 from control_plane.lockfile import validate_lock
+from control_plane.materialization import inspect_tracked_materialization
 from control_plane.policy import PolicyError, load_policy, validate_policy
 from control_plane.repository import (
     RepositoryError,
@@ -72,6 +79,13 @@ from control_plane.routing import (
     compact_route_manifest,
     resolve_route,
     verify_route,
+)
+from control_plane.run_workflow import (
+    RunStore,
+    block_run,
+    build_run_summary,
+    prepare_run,
+    verify_run,
 )
 
 
@@ -539,6 +553,9 @@ def command_doctor(arguments: argparse.Namespace) -> int:
         "python_version": ".".join(str(item) for item in sys.version_info[:3]),
         "registry_valid": None,
         "lock_valid": None,
+        "tracked_files_materialized": None,
+        "dataless_tracked_files": None,
+        "materialization_status": "UNKNOWN",
     }
     errors: list[dict[str, str]] = []
     if not git_available:
@@ -569,6 +586,23 @@ def command_doctor(arguments: argparse.Namespace) -> int:
     if arguments.policy is None and git_repository:
         try:
             root = discover_repository(arguments.repo)
+            materialization = inspect_tracked_materialization(root)
+            facts["tracked_files_materialized"] = materialization.ok
+            facts["dataless_tracked_files"] = len(
+                materialization.dataless_paths
+            )
+            facts["materialization_status"] = materialization.status
+            if not materialization.ok:
+                errors.append(
+                    {
+                        "code": materialization.error_code
+                        or "E_MATERIALIZATION_UNKNOWN",
+                        "message": (
+                            "Tracked file materialization is incomplete or "
+                            "could not be proved."
+                        ),
+                    }
+                )
             registry = load_registry(_registry_path(root, None))
             registry_issues = validate_registry(registry)
             policy, _ = _load_validated_policy(_policy_path(root, None))
@@ -804,6 +838,219 @@ def command_route_verify(arguments: argparse.Namespace) -> int:
             },
             arguments.json,
         )
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _current_branch(repository: Path) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repository), "branch", "--show-current"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=git_environment(),
+        timeout=10,
+    )
+    branch = completed.stdout.strip()
+    if completed.returncode != 0 or not branch:
+        raise ValueError("E_RUN_GIT: current branch is unavailable")
+    return branch
+
+
+def _resolve_current_task_route(
+    *,
+    root: Path,
+    task: dict[str, Any],
+    policy_path: Path,
+    registry_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    task_issues = validate_task_envelope(task)
+    policy = load_policy(policy_path)
+    registry = load_registry(registry_path)
+    issues = [
+        *task_issues,
+        *validate_policy(policy),
+        *validate_registry(registry),
+        *validate_policy_references(policy, registry),
+    ]
+    if issues:
+        raise ValueError(f"E_RUN_INPUT: {issues[0].code}")
+    invocation_id = f"run-prepare-{uuid4().hex}"
+    observation = observe_inventory(
+        registry,
+        root,
+        root,
+        contract_digest(task),
+        invocation_id,
+        clock=time.monotonic,
+        ttl_seconds=30,
+    )
+    inventory = validate_inventory_observation(
+        observation,
+        expected_repo=root,
+        expected_worktree=root,
+        expected_registry_digest=registry_contract_digest(registry),
+        expected_task_digest=contract_digest(task),
+        expected_invocation_id=invocation_id,
+        clock=time.monotonic,
+    )
+    decision = resolve_route(
+        task,
+        policy,
+        registry,
+        inventory,
+        mode="enforce",
+        host_capability=HOST_ADAPTER_UNAVAILABLE,
+    )
+    return policy, decision
+
+
+def command_run(arguments: argparse.Namespace) -> int:
+    try:
+        root = discover_repository(arguments.repo)
+        state_dir = worktree_git_dir(root)
+        if arguments.run_action == "prepare":
+            task = _read_json(arguments.task)
+            policy, decision = _resolve_current_task_route(
+                root=root,
+                task=task,
+                policy_path=_policy_path(root, arguments.policy),
+                registry_path=_registry_path(root, arguments.registry),
+            )
+            result = prepare_run(
+                task=task,
+                decision=decision,
+                repository=root,
+                policy=policy,
+                session_id=arguments.session_id,
+                prepared_at=_utc_timestamp(),
+            )
+            payload = {
+                "schema_version": 1,
+                "command": "run-prepare",
+                "ok": True,
+                **result,
+            }
+        elif arguments.run_action == "verify":
+            result = verify_run(
+                repository=root,
+                task_id=arguments.task_id,
+                observed_at=_utc_timestamp(),
+            )
+            payload = {
+                "schema_version": 1,
+                "command": "run-verify",
+                "ok": result["summary"]["gate_status"] == "PASS",
+                **result,
+            }
+        else:
+            run_store = RunStore(state_dir)
+            plan = run_store.load_plan(arguments.task_id)
+            task_store = TaskStore(state_dir)
+            state = task_store.status(arguments.task_id)
+            if arguments.run_action == "block" and state["state"] != "blocked":
+                state = block_run(
+                    repository=root,
+                    task_id=arguments.task_id,
+                    reason_code=arguments.reason,
+                )
+            attempts = run_store.attempts(arguments.task_id)
+            latest = attempts[-1] if attempts else None
+            summary = build_run_summary(
+                run_plan=plan,
+                head=str(plan["head"]),
+                lifecycle_state=str(state["state"]),
+                attempt_count=len(attempts),
+                gate_statuses=(
+                    (str(latest["status"]),) if latest is not None else ()
+                ),
+                gate_receipt_digests=(
+                    tuple(str(item) for item in latest["gate_receipt_digests"])
+                    if latest is not None
+                    else ()
+                ),
+                review_result_digest=None,
+                blocked_reason_code=(
+                    str(state.get("block_reason"))
+                    if state["state"] == "blocked"
+                    and validate_task_id(state.get("block_reason"))
+                    else None
+                ),
+                observed_at=_utc_timestamp(),
+            )
+            payload = {
+                "schema_version": 1,
+                "command": f"run-{arguments.run_action}",
+                "ok": True,
+                "run_plan": plan,
+                "task": state,
+                "attempts": attempts,
+                "summary": summary,
+            }
+        return _emit(payload, arguments.json)
+    except (
+        RepositoryError,
+        PolicyError,
+        RegistryError,
+        ValueError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        return _emit(
+            {
+                "schema_version": 1,
+                "command": f"run-{arguments.run_action}",
+                "ok": False,
+                "errors": [{"code": code, "message": str(error)}],
+            },
+            arguments.json,
+        )
+
+
+def command_report(arguments: argparse.Namespace) -> int:
+    try:
+        root = discover_repository(arguments.repo)
+        state_dir = worktree_git_dir(root)
+        match = re.fullmatch(r"([1-9][0-9]*)d", arguments.since)
+        if match is None:
+            raise ValueError("E_REPORT_SINCE: expected a positive day window such as 30d")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(match.group(1)))
+        runs_root = state_dir / "codex-control-plane" / "runs"
+        rows: list[tuple[str, str, int, str]] = []
+        if runs_root.exists():
+            if runs_root.is_symlink():
+                raise ValueError("E_RUN_STATE: run directory is unsafe")
+            for path in sorted(runs_root.iterdir()):
+                if path.is_symlink() or not path.is_dir():
+                    raise ValueError("E_RUN_STATE: run entry is unsafe")
+                store = RunStore(state_dir)
+                plan = store.load_plan(path.name)
+                prepared = datetime.fromisoformat(
+                    str(plan["prepared_at"]).replace("Z", "+00:00")
+                )
+                if prepared < cutoff:
+                    continue
+                attempts = store.attempts(path.name)
+                task = TaskStore(state_dir).status(path.name)
+                gate = str(attempts[-1]["status"]) if attempts else "UNKNOWN"
+                rows.append((path.name, str(task["state"]), len(attempts), gate))
+        lines = [
+            f"# Control Plane report ({arguments.since})",
+            "",
+            f"Runs: {len(rows)}",
+            "",
+            "| Task | Lifecycle | Attempts | Gates |",
+            "|---|---:|---:|---:|",
+        ]
+        lines.extend(f"| {task} | {state} | {attempts} | {gate} |" for task, state, attempts, gate in rows)
+        print("\n".join(lines))
+        return 0
+    except (RepositoryError, ValueError, OSError) as error:
+        print(f"FAIL report\nERROR {str(error).split(':', 1)[0]}: {error}")
+        return 1
 
 
 def command_risk_status(arguments: argparse.Namespace) -> int:
@@ -1519,6 +1766,35 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--mode", choices=("audit", "enforce"), default="audit")
     _add_output_option(verify_parser)
     verify_parser.set_defaults(handler=command_route_verify)
+
+    run_parser = subparsers.add_parser(
+        "run", help="Prepare, verify, inspect, or block one bounded local run."
+    )
+    run_subparsers = run_parser.add_subparsers(dest="run_action", required=True)
+    run_prepare = run_subparsers.add_parser("prepare")
+    run_prepare.add_argument("--repo", type=Path, default=Path.cwd())
+    run_prepare.add_argument("--task", type=Path, required=True)
+    run_prepare.add_argument("--session-id", required=True)
+    run_prepare.add_argument("--policy", type=Path)
+    run_prepare.add_argument("--registry", type=Path)
+    _add_output_option(run_prepare)
+    run_prepare.set_defaults(handler=command_run)
+    for action in ("verify", "status", "block"):
+        action_parser = run_subparsers.add_parser(action)
+        action_parser.add_argument("--repo", type=Path, default=Path.cwd())
+        action_parser.add_argument("--task-id", required=True)
+        if action == "block":
+            action_parser.add_argument("--reason", required=True)
+        _add_output_option(action_parser)
+        action_parser.set_defaults(handler=command_run)
+
+    report_parser = subparsers.add_parser(
+        "report", help="Summarize bounded local run receipts."
+    )
+    report_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    report_parser.add_argument("--since", default="30d")
+    report_parser.add_argument("--format", choices=("markdown",), default="markdown")
+    report_parser.set_defaults(handler=command_report)
 
     risk_parser = subparsers.add_parser(
         "risk-status",

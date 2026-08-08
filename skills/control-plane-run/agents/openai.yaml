@@ -1,0 +1,4 @@
+interface:
+  display_name: "Control Plane Run"
+  short_description: "Ejecuta cambios locales con gates verificables"
+  default_prompt: "Usa $control-plane-run para convertir esta petición en un cambio local verificado y listo para revisar."

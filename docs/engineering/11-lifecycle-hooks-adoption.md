@@ -208,3 +208,21 @@ explícita; nunca se simula mediante un alias de `adopt apply`.
 El inventario `created_directories` es obligatorio para nuevos upgrades. Si un
 journal pre-release no lo contiene, el runtime nuevo falla antes de mutar: no
 puede inferir con seguridad qué directorios existían antes de la adopción.
+
+## Run local skill-led (candidato v2.2)
+
+`control-plane run prepare` recalcula el route desde el `TaskEnvelope`, policy,
+registry e inventory actuales; no acepta un RouteDecision serializado. Exige
+clarificación low/autonomous, `local_change`, preflight write, materialización
+completa y un lease exacto antes de llevar la task a `implementing`.
+
+`control-plane run verify` ejecuta secuencialmente el perfil cerrado de este
+repositorio: unittest discovery, policy-check, registry-check, doctor y
+`git diff --check`. Cada comando usa argv fijo, entorno saneado, salida acotada,
+timeout y snapshots antes/después. El estado guarda digests, no el output.
+
+Hay tres ejecuciones totales. Un `FAIL` distinto puede repararse; `UNKNOWN`,
+causa repetida, crecimiento de paths, deriva o agotamiento termina en
+`BLOCKED`. `run status` observa y `run block` detiene explícitamente. El éxito
+alcanza `review_ready`, no commit, push, PR ni integración. T2/T3 sigue
+bloqueado mientras el host no pueda publicar la revisión independiente tipada.

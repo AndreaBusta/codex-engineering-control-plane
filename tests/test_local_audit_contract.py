@@ -35,10 +35,12 @@ class LocalAuditSurfaceContractTests(unittest.TestCase):
                 "inventory",
                 "policy-check",
                 "preflight",
+                "report",
                 "registry-check",
                 "risk-status",
                 "route",
                 "route-verify",
+                "run",
                 "safe-read",
                 "task",
                 "upgrade",
@@ -52,6 +54,10 @@ class LocalAuditSurfaceContractTests(unittest.TestCase):
         self.assertEqual(
             set(_subcommands(commands["git-guard"])),
             {"pre-commit", "pre-push"},
+        )
+        self.assertEqual(
+            set(_subcommands(commands["run"])),
+            {"prepare", "verify", "status", "block"},
         )
 
     def test_candidate_only_surfaces_without_a_product_consumer_are_absent(self) -> None:

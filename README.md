@@ -113,6 +113,35 @@ scripts/control-plane adopt rollback --target /ruta/al/repositorio
 scripts/control-plane upgrade plan --target /ruta/al/repositorio
 ```
 
+### Recorrido local acotado (candidato v2.2)
+
+La skill `control-plane-run` encuadra una petición de Codex como
+`TaskEnvelope v1`; la CLI conserva policy, lease, intentos y recibos. Esta
+superficie aún no es una release v2.2 ni realiza efectos Git remotos.
+
+```bash
+scripts/control-plane run prepare \
+  --repo /ruta/al/repositorio \
+  --task /ruta/segura/task-envelope.json \
+  --session-id session-example-001 \
+  --json
+scripts/control-plane run verify \
+  --repo /ruta/al/repositorio \
+  --task-id TASK-EXAMPLE-001 \
+  --json
+scripts/control-plane run status \
+  --repo /ruta/al/repositorio \
+  --task-id TASK-EXAMPLE-001 \
+  --json
+scripts/control-plane report --repo /ruta/al/repositorio --since 30d --format markdown
+```
+
+El perfil implementado está cerrado para este Control Plane. Admite tres
+ejecuciones totales y bloquea `UNKNOWN`, deriva de HEAD/branch/policy, cambios
+fuera del lease, alcance creciente o una causa de fallo repetida. `review_ready`
+es una entrega local revisable; no significa PR creada ni autoridad de
+commit/push/PR.
+
 ### Diagnosticar riesgo local
 
 ```bash
@@ -172,6 +201,7 @@ El control plane no:
 - sustituye Rulesets o checks obligatorios;
 - prueba el estado de TestFlight sin consultar Apple;
 - calcula tokens exactos sin telemetría de plataforma;
+- descubre comandos genéricos de verificación fuera del perfil cerrado;
 - resuelve aclaraciones de forma durable sin interacción nativa;
 - instala workflows o modifica CI/CD durante la adopción local;
 - trata un hook o plugin como frontera completa de seguridad.

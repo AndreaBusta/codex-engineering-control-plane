@@ -117,6 +117,14 @@ class CliContractTests(unittest.TestCase):
         self.assertTrue(payload["facts"]["policy_valid"])
         self.assertTrue(payload["facts"]["git_repository"])
 
+    def test_doctor_json_reports_tracked_materialization(self) -> None:
+        result = run_cli("doctor", "--repo", str(ROOT), "--json")
+
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["facts"]["tracked_files_materialized"])
+        self.assertEqual(payload["facts"]["dataless_tracked_files"], 0)
+        self.assertEqual(payload["facts"]["materialization_status"], "PASS")
+
     def test_human_output_has_unambiguous_status(self) -> None:
         result = run_cli("policy-check", "--policy", str(FIXTURE_POLICY))
 
