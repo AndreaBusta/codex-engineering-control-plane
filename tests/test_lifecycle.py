@@ -1510,6 +1510,38 @@ class LifecycleTests(unittest.TestCase):
                 )
                 (repository / "new-untracked.txt").unlink(missing_ok=True)
 
+    def test_verification_snapshot_ignores_large_clean_tracked_content(self) -> None:
+        from control_plane.lifecycle import _verification_snapshot
+
+        repository, _, _, _ = self._two_worktree_repository("large-clean-tree")
+        large = repository / "large-clean.bin"
+        with large.open("wb") as handle:
+            handle.truncate(67_108_865)
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "large-clean.bin"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "commit",
+                "-m",
+                "test: large clean tracked file",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        (repository / "small-untracked.txt").write_text(
+            "candidate\n", encoding="utf-8"
+        )
+
+        snapshot = _verification_snapshot(repository)
+
+        self.assertRegex(snapshot, r"^sha256:[0-9a-f]{64}$")
+
     def test_verification_runner_uses_sanitized_environment_and_reports_host_isolation(
         self,
     ) -> None:

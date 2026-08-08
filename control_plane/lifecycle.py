@@ -704,7 +704,7 @@ def _verification_argv(
 
 
 def _verification_snapshot(repo: Path) -> str:
-    completed = subprocess.run(
+    status = subprocess.run(
         [
             "git",
             "-C",
@@ -713,43 +713,89 @@ def _verification_snapshot(repo: Path) -> str:
             "--porcelain=v2",
             "-z",
             "--untracked-files=all",
-            "--ignored=matching",
         ],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        timeout=10,
     )
-    if completed.returncode != 0:
+    if status.returncode != 0:
         raise ValueError("E_VERIFICATION_UNKNOWN: Git snapshot failed")
+    changed_paths: set[str] = set()
+    for arguments in (
+        ("diff", "--name-only", "-z", "HEAD", "--"),
+        ("ls-files", "--others", "--exclude-standard", "-z"),
+    ):
+        completed = subprocess.run(
+            ["git", "-C", str(repo), *arguments],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            raise ValueError("E_VERIFICATION_UNKNOWN: changed paths unavailable")
+        try:
+            values = completed.stdout.decode("utf-8").split("\0")
+        except UnicodeDecodeError as error:
+            raise ValueError(
+                "E_VERIFICATION_UNKNOWN: changed path is not UTF-8"
+            ) from error
+        for value in values:
+            if not value:
+                continue
+            relative = Path(value)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(
+                    "E_VERIFICATION_UNKNOWN: changed path is unsafe"
+                )
+            changed_paths.add(value)
     residue: list[dict[str, object]] = []
     total_bytes = 0
-    entries = 0
-    for path in sorted(repo.rglob("*")):
-        relative = path.relative_to(repo)
-        if relative.parts and relative.parts[0] == ".git":
-            continue
-        entries += 1
-        if entries > 20_000 or path.is_symlink():
-            raise ValueError(
-                "E_VERIFICATION_UNKNOWN: residue inventory is unsafe or too large"
-            )
-        stat = path.lstat()
-        item: dict[str, object] = {
-            "path": relative.as_posix(),
-            "mode": stat.st_mode,
-            "size": stat.st_size,
-            "kind": "directory" if path.is_dir() else "file",
-        }
-        if path.is_file():
-            total_bytes += stat.st_size
+    if len(changed_paths) > 20_000:
+        raise ValueError(
+            "E_VERIFICATION_UNKNOWN: residue inventory is too large"
+        )
+    for relative_value in sorted(changed_paths):
+        path = repo / relative_value
+        if path.is_symlink():
+            target = os.readlink(path)
+            target_bytes = os.fsencode(target)
+            total_bytes += len(target_bytes)
             if total_bytes > 67_108_864:
                 raise ValueError(
                     "E_VERIFICATION_UNKNOWN: residue bytes exceed cap"
                 )
-            from hashlib import sha256
-
-            item["digest"] = f"sha256:{sha256(path.read_bytes()).hexdigest()}"
-        residue.append(item)
+            residue.append(
+                {
+                    "path": relative_value,
+                    "kind": "symlink",
+                    "target_digest": f"sha256:{sha256(target_bytes).hexdigest()}",
+                }
+            )
+            continue
+        if not path.exists():
+            residue.append({"path": relative_value, "kind": "missing"})
+            continue
+        if not path.is_file():
+            raise ValueError(
+                "E_VERIFICATION_UNKNOWN: changed path is not a regular file"
+            )
+        stat = path.lstat()
+        total_bytes += stat.st_size
+        if total_bytes > 67_108_864:
+            raise ValueError(
+                "E_VERIFICATION_UNKNOWN: residue bytes exceed cap"
+            )
+        residue.append(
+            {
+                "path": relative_value,
+                "mode": stat.st_mode,
+                "size": stat.st_size,
+                "kind": "file",
+                "digest": f"sha256:{sha256(path.read_bytes()).hexdigest()}",
+            }
+        )
     index = subprocess.run(
         ["git", "-C", str(repo), "write-tree"],
         check=False,
@@ -763,7 +809,7 @@ def _verification_snapshot(repo: Path) -> str:
         {
             "head": _git_head(repo),
             "index_tree": index.stdout.strip(),
-            "status_hex": completed.stdout.hex(),
+            "status_hex": status.stdout.hex(),
             "residue": residue,
         }
     )

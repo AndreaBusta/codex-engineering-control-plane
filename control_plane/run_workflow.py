@@ -46,6 +46,12 @@ _TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$",
     re.ASCII,
 )
+_UNITTEST_DISCOVERY_PROGRAM = (
+    "import sys, unittest\n"
+    "suite = unittest.defaultTestLoader.discover('tests')\n"
+    "result = unittest.TextTestRunner(verbosity=1).run(suite)\n"
+    "sys.exit(0 if result.wasSuccessful() and result.testsRun > 0 else 1)\n"
+)
 _RUN_PLAN_KEYS = frozenset(
     {
         "schema_version",
@@ -946,18 +952,160 @@ def _changed_paths(repository: Path) -> tuple[str, ...]:
     return ordered
 
 
-def _local_gate_commands(repository: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
+def _relevant_tests_command_plan(
+    repository: Path,
+    *,
+    profiles: tuple[str, ...],
+    changed_paths: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[tuple[tuple[str, ...], tuple[int, ...]], ...]]:
+    python_tests = (
+        tuple(
+            sorted(
+                path
+                for path in (repository / "tests").rglob("test*.py")
+                if path.is_file() and not path.is_symlink()
+            )
+        )
+        if (repository / "tests").is_dir()
+        else ()
+    )
+    manifest = repository / "package.json"
+    node_runner = repository / "scripts" / "run-unit-tests.mjs"
+    node_test_root = repository / "tests" / "unit"
+    node_tests = (
+        tuple(
+            sorted(
+                path
+                for path in node_test_root.rglob("*")
+                if path.is_file()
+                and not path.is_symlink()
+                and path.name.endswith((".spec.js", ".node-test.mjs"))
+            )
+        )
+        if node_test_root.is_dir()
+        else ()
+    )
+    prefers_node = bool(
+        set(profiles).intersection(
+            {"android", "ios", "web_pwa", "saas_backend"}
+        )
+    )
+    node_argv: tuple[str, ...] | None = None
+    if manifest.is_file() and node_runner.is_file() and node_tests:
+        try:
+            package = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                "E_RUN_RELEVANT_TESTS_UNAVAILABLE: package manifest is unreadable"
+            ) from error
+        scripts = (
+            package.get("scripts", {}) if isinstance(package, Mapping) else {}
+        )
+        if not isinstance(scripts, Mapping) or scripts.get("test:unit") != (
+            "node ./scripts/run-unit-tests.mjs"
+        ):
+            raise ValueError(
+                "E_RUN_RELEVANT_TESTS_UNAVAILABLE: unit runner is not bound"
+            )
+        node = shutil.which("node")
+        if node is None:
+            raise ValueError(
+                "E_RUN_RELEVANT_TESTS_UNAVAILABLE: node is unavailable"
+            )
+        node_path = Path(node).resolve()
+        try:
+            node_path.relative_to(repository.resolve())
+        except ValueError:
+            pass
+        else:
+            raise ValueError(
+                "E_RUN_RELEVANT_TESTS_UNAVAILABLE: node is repository-controlled"
+            )
+        node_argv = (str(node_path), str(node_runner.resolve()))
+    python_argv = (
+        (sys.executable, "-c", _UNITTEST_DISCOVERY_PROGRAM)
+        if python_tests
+        else None
+    )
+    python_changed = any(
+        path.endswith(".py")
+        or Path(path).name in {"pyproject.toml", "setup.cfg", "setup.py", "tox.ini"}
+        or Path(path).name.startswith("requirements")
+        for path in changed_paths
+    )
+    node_changed = any(
+        path.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"))
+        or Path(path).name
+        in {
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+        }
+        for path in changed_paths
+    )
+    selected: list[tuple[str, ...]] = []
+    if python_changed:
+        if python_argv is None:
+            raise ValueError(
+                "E_RUN_RELEVANT_TESTS_UNAVAILABLE: Python changes lack a bounded test runner"
+            )
+        selected.append(python_argv)
+    if node_changed:
+        if node_argv is None:
+            raise ValueError(
+                "E_RUN_RELEVANT_TESTS_UNAVAILABLE: Node changes lack a bounded test runner"
+            )
+        selected.append(node_argv)
+    if not selected:
+        if prefers_node and node_argv is not None:
+            selected.append(node_argv)
+        elif python_argv is not None and node_argv is not None:
+            selected.extend((python_argv, node_argv))
+        elif python_argv is not None:
+            selected.append(python_argv)
+        elif node_argv is not None:
+            selected.append(node_argv)
+        else:
+            raise ValueError(
+                "E_RUN_RELEVANT_TESTS_UNAVAILABLE: no bounded project test runner was found"
+            )
+    primary = selected[0]
+    command_plan = tuple((argv, (0,)) for argv in selected)
+    return primary, command_plan
+
+
+def _local_gate_commands(
+    repository: Path,
+    *,
+    profiles: tuple[str, ...],
+    changed_paths: tuple[str, ...],
+) -> tuple[
+    tuple[
+        str,
+        tuple[str, ...],
+        tuple[tuple[tuple[str, ...], tuple[int, ...]], ...] | None,
+    ],
+    ...,
+]:
     launcher = str((repository / "scripts" / "control-plane").resolve())
     policy = str((repository / ".codex" / "project-policy.toml").resolve())
     registry = str((repository / ".codex" / "resource-registry.toml").resolve())
+    relevant_argv, relevant_plan = _relevant_tests_command_plan(
+        repository,
+        profiles=profiles,
+        changed_paths=changed_paths,
+    )
     return (
         (
             "gate.relevant-tests",
-            (sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"),
+            relevant_argv,
+            relevant_plan,
         ),
         (
             "gate.policy-check",
             (launcher, "policy-check", "--policy", policy, "--json"),
+            None,
         ),
         (
             "gate.registry-check",
@@ -970,10 +1118,53 @@ def _local_gate_commands(repository: Path) -> tuple[tuple[str, tuple[str, ...]],
                 policy,
                 "--json",
             ),
+            None,
         ),
-        ("gate.doctor", (launcher, "doctor", "--repo", str(repository), "--json")),
-        ("gate.diff-review", ("git", "-C", str(repository), "diff", "--check")),
+        (
+            "gate.doctor",
+            (launcher, "doctor", "--repo", str(repository), "--json"),
+            None,
+        ),
+        (
+            "gate.diff-review",
+            ("git", "-C", str(repository), "diff", "--check"),
+            None,
+        ),
     )
+
+
+def _untracked_paths(repository: Path) -> tuple[str, ...]:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_environment(),
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        raise ValueError("E_RUN_GIT: untracked paths are unavailable")
+    try:
+        paths = tuple(
+            sorted(
+                path
+                for path in completed.stdout.decode("utf-8").split("\0")
+                if path
+            )
+        )
+    except UnicodeDecodeError as error:
+        raise ValueError("E_RUN_GIT: untracked path is not UTF-8") from error
+    if not all(safe_scope_path(path) for path in paths):
+        raise ValueError("E_RUN_SCOPE: untracked path is unsafe")
+    return paths
 
 
 def _snapshot(repository: Path) -> tuple[str, bool]:
@@ -1018,6 +1209,7 @@ def _execute_closed_gate(
     gate_id: str,
     argv: tuple[str, ...],
     observed_at: str,
+    command_plan: tuple[tuple[tuple[str, ...], tuple[int, ...]], ...] | None = None,
 ) -> dict[str, Any]:
     if gate_id not in _LOCAL_GATE_IDS:
         raise ValueError("E_RUN_GATE: gate is outside the closed local profile")
@@ -1028,56 +1220,94 @@ def _execute_closed_gate(
     output = bytearray()
     output_truncated = False
     timed_out = False
-    returncode = -1
     execution_ok = True
-    try:
-        process = subprocess.Popen(
-            argv,
-            cwd=repository,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=_closed_gate_environment(temp_root),
-            shell=False,
-            start_new_session=True,
-        )
-        if process.stdout is None:
-            raise OSError("child output unavailable")
-        os.set_blocking(process.stdout.fileno(), False)
-        selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
-        deadline = time.monotonic() + _GATE_TIMEOUT_SECONDS
-        stream_open = True
+    failed = False
+    outcomes: list[dict[str, object]] = []
+    commands = command_plan or ((argv, (0,)),)
+    environment = _closed_gate_environment(temp_root)
+    repository_root = repository.resolve()
+    command_directories: set[str] = set()
+    for command_argv, _ in commands:
+        executable = Path(command_argv[0])
+        if not executable.is_absolute():
+            continue
+        resolved = executable.resolve()
         try:
-            while stream_open or process.poll() is None:
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                    if process.poll() is None:
+            resolved.relative_to(repository_root)
+        except ValueError:
+            command_directories.add(str(resolved.parent))
+    environment["PATH"] = os.pathsep.join(
+        sorted(
+            {
+                *environment["PATH"].split(os.pathsep),
+                *command_directories,
+            }
+        )
+    )
+    deadline = time.monotonic() + _GATE_TIMEOUT_SECONDS
+    for command_argv, accepted_returncodes in commands:
+        returncode = -1
+        try:
+            process = subprocess.Popen(
+                command_argv,
+                cwd=repository,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                shell=False,
+                start_new_session=True,
+            )
+            if process.stdout is None:
+                raise OSError("child output unavailable")
+            os.set_blocking(process.stdout.fileno(), False)
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            stream_open = True
+            try:
+                while stream_open or process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        if process.poll() is None:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        break
+                    for key, _ in selector.select(
+                        0.05 if process.poll() is None else 0
+                    ):
                         try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    break
-                for key, _ in selector.select(0.05 if process.poll() is None else 0):
-                    try:
-                        chunk = os.read(key.fd, 65_536)
-                    except BlockingIOError:
-                        continue
-                    if not chunk:
-                        selector.unregister(process.stdout)
-                        stream_open = False
-                        continue
-                    available = max(0, 1_048_576 - len(output))
-                    output.extend(chunk[:available])
-                    output_truncated = output_truncated or len(chunk) > available
-                if timed_out and process.poll() is not None and not stream_open:
-                    break
-            returncode = process.wait(timeout=1)
-        finally:
-            selector.close()
-            process.stdout.close()
-    except (OSError, subprocess.SubprocessError):
-        execution_ok = False
+                            chunk = os.read(key.fd, 65_536)
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            selector.unregister(process.stdout)
+                            stream_open = False
+                            continue
+                        available = max(0, 1_048_576 - len(output))
+                        output.extend(chunk[:available])
+                        output_truncated = (
+                            output_truncated or len(chunk) > available
+                        )
+                returncode = process.wait(timeout=1)
+            finally:
+                selector.close()
+                process.stdout.close()
+        except (OSError, subprocess.SubprocessError):
+            execution_ok = False
+        outcomes.append(
+            {
+                "argv": list(command_argv),
+                "accepted_returncodes": list(accepted_returncodes),
+                "returncode": returncode,
+            }
+        )
+        if not execution_ok or timed_out or output_truncated:
+            break
+        if returncode not in accepted_returncodes:
+            failed = True
+            break
     after, after_ok = _snapshot(repository)
     immutable = before_ok and after_ok and before == after
     current_head = ""
@@ -1089,7 +1319,7 @@ def _execute_closed_gate(
     if not execution_ok or timed_out or output_truncated or not immutable or current_head != run_plan["head"]:
         status = "UNKNOWN"
         error_code = f"E_RUN_GATE_{gate_code}_UNKNOWN"
-    elif returncode != 0:
+    elif failed:
         status = "FAIL"
         error_code = f"E_RUN_GATE_{gate_code}_FAILED"
     else:
@@ -1100,19 +1330,73 @@ def _execute_closed_gate(
         attempt=attempt,
         gate_id=gate_id,
         status=status,
-        command_digest=contract_digest({"argv": list(argv)}),
+        command_digest=contract_digest(
+            {
+                "commands": [
+                    {
+                        "argv": list(command_argv),
+                        "accepted_returncodes": list(accepted_returncodes),
+                    }
+                    for command_argv, accepted_returncodes in commands
+                ]
+            }
+        ),
         output_digest=contract_digest(
             {
                 "bytes_hex": bytes(output).hex(),
                 "truncated": output_truncated,
                 "timed_out": timed_out,
-                "returncode": returncode,
+                "outcomes": outcomes,
             }
         ),
         before_snapshot_digest=before,
         after_snapshot_digest=after,
         error_code=error_code,
         observed_at=observed_at,
+    )
+
+
+def _execute_diff_review_gate(
+    *,
+    repository: Path,
+    state_dir: Path,
+    run_plan: Mapping[str, Any],
+    attempt: int,
+    observed_at: str,
+) -> dict[str, Any]:
+    tracked = ("git", "-C", str(repository), "diff", "HEAD", "--check")
+    command_plan: list[tuple[tuple[str, ...], tuple[int, ...]]] = [
+        (tracked, (0,))
+    ]
+    for relative in _untracked_paths(repository):
+        candidate = repository / relative
+        if candidate.is_symlink():
+            continue
+        if not candidate.is_file():
+            raise ValueError("E_RUN_GIT: untracked path is not a regular file")
+        command_plan.append(
+            (
+                (
+                    "git",
+                    "diff",
+                    "--no-index",
+                    "--check",
+                    "--",
+                    os.devnull,
+                    str(candidate),
+                ),
+                (0, 1),
+            )
+        )
+    return _execute_closed_gate(
+        repository=repository,
+        state_dir=state_dir,
+        run_plan=run_plan,
+        attempt=attempt,
+        gate_id="gate.diff-review",
+        argv=tracked,
+        observed_at=observed_at,
+        command_plan=tuple(command_plan),
     )
 
 
@@ -1177,19 +1461,92 @@ def verify_run(
             )
         )
     else:
-        for gate_id, argv in _local_gate_commands(root):
-            receipt = _execute_closed_gate(
-                repository=root,
-                state_dir=state_dir,
-                run_plan=plan,
-                attempt=attempt_number,
-                gate_id=gate_id,
-                argv=argv,
-                observed_at=observed_at,
+        try:
+            local_commands = _local_gate_commands(
+                root,
+                profiles=tuple(str(item) for item in plan["profiles"]),
+                changed_paths=changed_paths,
             )
-            receipts.append(receipt)
-            if receipt["status"] != "PASS":
-                break
+        except ValueError as error:
+            if not str(error).startswith("E_RUN_RELEVANT_TESTS_UNAVAILABLE:"):
+                raise
+            snapshot, snapshot_ok = _snapshot(root)
+            receipts.append(
+                build_gate_receipt(
+                    run_plan=plan,
+                    attempt=attempt_number,
+                    gate_id="gate.relevant-tests",
+                    status="FAIL" if snapshot_ok else "UNKNOWN",
+                    command_digest=contract_digest(
+                        {"selection": "bounded-project-test-runner"}
+                    ),
+                    output_digest=contract_digest(
+                        {"error_code": "E_RUN_RELEVANT_TESTS_UNAVAILABLE"}
+                    ),
+                    before_snapshot_digest=snapshot,
+                    after_snapshot_digest=snapshot,
+                    error_code="E_RUN_RELEVANT_TESTS_UNAVAILABLE",
+                    observed_at=observed_at,
+                )
+            )
+        else:
+            for gate_id, argv, command_plan in local_commands:
+                if gate_id == "gate.diff-review":
+                    receipt = _execute_diff_review_gate(
+                        repository=root,
+                        state_dir=state_dir,
+                        run_plan=plan,
+                        attempt=attempt_number,
+                        observed_at=observed_at,
+                    )
+                else:
+                    receipt = _execute_closed_gate(
+                        repository=root,
+                        state_dir=state_dir,
+                        run_plan=plan,
+                        attempt=attempt_number,
+                        gate_id=gate_id,
+                        argv=argv,
+                        observed_at=observed_at,
+                        command_plan=command_plan,
+                    )
+                receipts.append(receipt)
+                if receipt["status"] != "PASS":
+                    break
+    if receipts and all(item["status"] == "PASS" for item in receipts):
+        proven_gate_ids = {
+            str(item["gate_id"])
+            for item in receipts
+            if item["status"] == "PASS"
+        }
+        missing_required = tuple(
+            gate_id
+            for gate_id in plan["required_gates"]
+            if gate_id not in proven_gate_ids
+        )
+        for gate_id in missing_required:
+            snapshot, _ = _snapshot(root)
+            receipts.append(
+                build_gate_receipt(
+                    run_plan=plan,
+                    attempt=attempt_number,
+                    gate_id=str(gate_id),
+                    status="UNKNOWN",
+                    command_digest=contract_digest(
+                        {"check": "required-gate-bound-receipt"}
+                    ),
+                    output_digest=contract_digest(
+                        {
+                            "required_gate": gate_id,
+                            "proven_gate_ids": sorted(proven_gate_ids),
+                        }
+                    ),
+                    before_snapshot_digest=snapshot,
+                    after_snapshot_digest=snapshot,
+                    error_code="E_RUN_REQUIRED_GATE_UNPROVEN",
+                    observed_at=observed_at,
+                )
+            )
     failure_reason = next(
         (str(item["error_code"]) for item in receipts if item["status"] != "PASS"),
         None,
@@ -1210,7 +1567,10 @@ def verify_run(
             evidence={
                 "gates_ok": True,
                 "documentation_decision": contract_digest(
-                    {"run_plan": plan["plan_digest"], "gates": list(_LOCAL_GATE_IDS)}
+                    {
+                        "run_plan": plan["plan_digest"],
+                        "gates": [str(item["gate_id"]) for item in receipts],
+                    }
                 ),
             },
             current_branch=branch,

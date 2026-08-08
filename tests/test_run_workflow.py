@@ -469,7 +469,12 @@ class RunVerificationTests(unittest.TestCase):
         RunStoreTests.setUp(self)
 
     def _prepared_scenario(
-        self, *, gate_exit: int = 0, create_change: bool = True
+        self,
+        *,
+        gate_exit: int = 0,
+        create_change: bool = True,
+        include_python_test: bool = True,
+        empty_python_test: bool = False,
     ) -> GitScenario:
         from control_plane.policy import load_policy
         from control_plane.run_workflow import prepare_run
@@ -489,6 +494,16 @@ class RunVerificationTests(unittest.TestCase):
         (scenario.repo / "tests" / "__init__.py").write_text(
             "", encoding="utf-8"
         )
+        if include_python_test:
+            source = "VALUE = 1\n" if empty_python_test else (
+                "import unittest\n\n"
+                "class FixtureTests(unittest.TestCase):\n"
+                "    def test_fixture(self):\n"
+                "        self.assertTrue(True)\n"
+            )
+            (scenario.repo / "tests" / "test_fixture.py").write_text(
+                source, encoding="utf-8"
+            )
         git(scenario.repo, "add", ".codex", "scripts", "tests")
         git(scenario.repo, "commit", "-m", "test: closed verification fixture")
         prepare_run(
@@ -565,6 +580,279 @@ class RunVerificationTests(unittest.TestCase):
         self.assertEqual(second["summary"]["gate_status"], "PASS")
         self.assertEqual(second["summary"]["attempt_count"], 2)
         self.assertEqual(state["state"], "review_ready")
+
+    def test_relevant_tests_selects_bounded_node_unit_runner(self) -> None:
+        from control_plane.run_workflow import _local_gate_commands
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            (repository / "scripts").mkdir()
+            (repository / "tests" / "unit").mkdir(parents=True)
+            (repository / "package.json").write_text(
+                '{"scripts":{"test:unit":"node ./scripts/run-unit-tests.mjs"}}\n',
+                encoding="utf-8",
+            )
+            runner = repository / "scripts" / "run-unit-tests.mjs"
+            runner.write_text("process.exit(0);\n", encoding="utf-8")
+            (repository / "tests" / "unit" / "sample.spec.js").write_text(
+                "export {};\n", encoding="utf-8"
+            )
+
+            commands = _local_gate_commands(
+                repository,
+                profiles=("web_pwa",),
+                changed_paths=("docs/strategy.md",),
+            )
+
+        self.assertEqual(len(commands[0]), 3)
+        gate_id, argv, command_plan = commands[0]
+        self.assertEqual(gate_id, "gate.relevant-tests")
+        self.assertEqual(Path(argv[0]).name, "node")
+        self.assertEqual(argv[1], str(runner.resolve()))
+        self.assertEqual(command_plan, ((argv, (0,)),))
+
+    def test_relevant_tests_selects_python_for_python_diff_in_web_repo(self) -> None:
+        from control_plane.run_workflow import _local_gate_commands
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            self._write_hybrid_test_surfaces(repository)
+
+            commands = _local_gate_commands(
+                repository,
+                profiles=("web_pwa",),
+                changed_paths=("control_plane/runtime.py",),
+            )
+
+        _, argv, command_plan = commands[0]
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(command_plan, ((argv, (0,)),))
+
+    def test_relevant_tests_selects_node_for_node_diff_in_generic_repo(self) -> None:
+        from control_plane.run_workflow import _local_gate_commands
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            runner = self._write_hybrid_test_surfaces(repository)
+
+            commands = _local_gate_commands(
+                repository,
+                profiles=("generic",),
+                changed_paths=("src/application.js",),
+            )
+
+        _, argv, command_plan = commands[0]
+        self.assertEqual(Path(argv[0]).name, "node")
+        self.assertEqual(argv[1], str(runner.resolve()))
+        self.assertEqual(command_plan, ((argv, (0,)),))
+
+    def test_relevant_tests_runs_both_runners_for_mixed_diff(self) -> None:
+        from control_plane.run_workflow import _local_gate_commands
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            runner = self._write_hybrid_test_surfaces(repository)
+
+            commands = _local_gate_commands(
+                repository,
+                profiles=("web_pwa",),
+                changed_paths=("control_plane/runtime.py", "src/application.js"),
+            )
+
+        _, argv, command_plan = commands[0]
+        self.assertEqual(argv[:2], (sys.executable, "-c"))
+        self.assertEqual(len(command_plan), 2)
+        self.assertEqual(command_plan[0][0], argv)
+        self.assertEqual(Path(command_plan[1][0][0]).name, "node")
+        self.assertEqual(command_plan[1][0][1], str(runner.resolve()))
+        self.assertEqual(command_plan[0][1], (0,))
+        self.assertEqual(command_plan[1][1], (0,))
+
+    def _write_hybrid_test_surfaces(self, repository: Path) -> Path:
+        (repository / "scripts").mkdir()
+        (repository / "tests" / "unit").mkdir(parents=True)
+        (repository / "package.json").write_text(
+            '{"scripts":{"test:unit":"node ./scripts/run-unit-tests.mjs"}}\n',
+            encoding="utf-8",
+        )
+        runner = repository / "scripts" / "run-unit-tests.mjs"
+        runner.write_text("process.exit(0);\n", encoding="utf-8")
+        (repository / "tests" / "unit" / "sample.spec.js").write_text(
+            "export {};\n", encoding="utf-8"
+        )
+        (repository / "tests" / "test_runtime.py").write_text(
+            "import unittest\n\n"
+            "class RuntimeTests(unittest.TestCase):\n"
+            "    def test_runtime(self):\n"
+            "        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        return runner
+
+    def test_relevant_tests_fails_closed_when_discovery_finds_zero_tests(self) -> None:
+        from control_plane.run_workflow import verify_run
+
+        scenario = self._prepared_scenario(include_python_test=False)
+
+        result = verify_run(
+            repository=scenario.repo,
+            task_id=self.task["task_id"],
+            observed_at="2026-08-08T10:01:00Z",
+        )
+
+        self.assertEqual(result["task"]["state"], "verifying")
+        self.assertEqual(result["summary"]["gate_status"], "FAIL")
+        self.assertEqual(
+            result["receipts"][0]["error_code"],
+            "E_RUN_RELEVANT_TESTS_UNAVAILABLE",
+        )
+
+    def test_relevant_tests_fails_when_python_runner_executes_zero_tests(self) -> None:
+        from control_plane.run_workflow import verify_run
+
+        scenario = self._prepared_scenario(empty_python_test=True)
+
+        result = verify_run(
+            repository=scenario.repo,
+            task_id=self.task["task_id"],
+            observed_at="2026-08-08T10:01:00Z",
+        )
+
+        self.assertEqual(result["task"]["state"], "verifying")
+        self.assertEqual(result["summary"]["gate_status"], "FAIL")
+        self.assertEqual(
+            result["receipts"][0]["error_code"],
+            "E_RUN_GATE_RELEVANT_TESTS_FAILED",
+        )
+
+    def test_closed_node_gate_can_relaunch_the_selected_node_binary(self) -> None:
+        from control_plane.repository import worktree_git_dir
+        from control_plane.run_workflow import _execute_closed_gate, RunStore
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is unavailable")
+        scenario = self._prepared_scenario()
+        runner = scenario.repo / "node-relaunch.mjs"
+        runner.write_text(
+            "import { spawnSync } from 'node:child_process';\n"
+            "const child = spawnSync('node', ['-e', 'process.exit(0)']);\n"
+            "process.exit(child.error ? 90 : child.status);\n",
+            encoding="utf-8",
+        )
+        state_dir = worktree_git_dir(scenario.repo)
+        plan = RunStore(state_dir).load_plan(self.task["task_id"])
+
+        receipt = _execute_closed_gate(
+            repository=scenario.repo,
+            state_dir=state_dir,
+            run_plan=plan,
+            attempt=1,
+            gate_id="gate.relevant-tests",
+            argv=(str(Path(node).resolve()), str(runner)),
+            observed_at="2026-08-08T10:01:00Z",
+        )
+
+        self.assertEqual(receipt["status"], "PASS")
+
+    def test_closed_gate_path_excludes_repository_executable_directories(self) -> None:
+        from control_plane.repository import worktree_git_dir
+        from control_plane.run_workflow import _execute_closed_gate, RunStore
+
+        scenario = self._prepared_scenario()
+        launcher = scenario.repo / "scripts" / "control-plane"
+        launcher.write_text(
+            "#!/bin/sh\n"
+            "case \"${PATH}:\" in\n"
+            "  *\"$(pwd)/scripts:\"*) exit 91 ;;\n"
+            "  *) exit 0 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o755)
+        state_dir = worktree_git_dir(scenario.repo)
+        plan = RunStore(state_dir).load_plan(self.task["task_id"])
+
+        receipt = _execute_closed_gate(
+            repository=scenario.repo,
+            state_dir=state_dir,
+            run_plan=plan,
+            attempt=1,
+            gate_id="gate.policy-check",
+            argv=(str(launcher.resolve()),),
+            observed_at="2026-08-08T10:01:00Z",
+        )
+
+        self.assertEqual(receipt["status"], "PASS")
+
+    def test_diff_review_rejects_trailing_whitespace_in_untracked_file(self) -> None:
+        from control_plane.run_workflow import verify_run
+
+        scenario = self._prepared_scenario()
+        (scenario.repo / "change.txt").write_text(
+            "trailing whitespace  \n", encoding="utf-8"
+        )
+
+        result = verify_run(
+            repository=scenario.repo,
+            task_id=self.task["task_id"],
+            observed_at="2026-08-08T10:01:00Z",
+        )
+
+        self.assertEqual(result["task"]["state"], "verifying")
+        self.assertEqual(result["receipts"][-1]["gate_id"], "gate.diff-review")
+        self.assertEqual(result["receipts"][-1]["status"], "FAIL")
+
+    def test_diff_review_rejects_trailing_whitespace_already_staged(self) -> None:
+        from control_plane.run_workflow import verify_run
+
+        scenario = self._prepared_scenario()
+        (scenario.repo / "change.txt").write_text(
+            "trailing whitespace  \n", encoding="utf-8"
+        )
+        git(scenario.repo, "add", "change.txt")
+
+        result = verify_run(
+            repository=scenario.repo,
+            task_id=self.task["task_id"],
+            observed_at="2026-08-08T10:01:00Z",
+        )
+
+        self.assertEqual(result["task"]["state"], "verifying")
+        self.assertEqual(result["receipts"][-1]["gate_id"], "gate.diff-review")
+        self.assertEqual(result["receipts"][-1]["status"], "FAIL")
+
+    def test_required_gate_without_bound_receipt_blocks_promotion(self) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.run_workflow import verify_run
+
+        self.decision["required_gates"] = [
+            "gate.independent-review",
+            "gate.relevant-tests",
+        ]
+        semantic = {
+            key: value
+            for key, value in self.decision.items()
+            if key != "decision_digest"
+        }
+        self.decision["decision_digest"] = contract_digest(semantic)
+        scenario = self._prepared_scenario()
+
+        result = verify_run(
+            repository=scenario.repo,
+            task_id=self.task["task_id"],
+            observed_at="2026-08-08T10:01:00Z",
+        )
+
+        self.assertEqual(result["task"]["state"], "blocked")
+        self.assertEqual(result["summary"]["gate_status"], "UNKNOWN")
+        self.assertEqual(
+            result["receipts"][-1]["gate_id"], "gate.independent-review"
+        )
+        self.assertEqual(
+            result["receipts"][-1]["error_code"],
+            "E_RUN_REQUIRED_GATE_UNPROVEN",
+        )
 
     def test_verify_run_blocks_a_local_change_without_a_diff(self) -> None:
         from control_plane.repository import worktree_git_dir
