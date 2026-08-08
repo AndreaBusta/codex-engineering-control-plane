@@ -81,6 +81,38 @@ class InstallControlPlaneSkillTests(unittest.TestCase):
         ):
             self.assertIn(stop_condition, text)
 
+    def test_skill_has_a_bounded_low_context_fast_path(self) -> None:
+        text = SKILL.read_text(encoding="utf-8")
+        collapsed = " ".join(text.split())
+
+        for contract in (
+            "BLOCKED_DIRTY_TARGET",
+            "before loading project documentation",
+            "local-candidate",
+            "explicit user authority",
+            "source path, HEAD, and manifest digest",
+            "no network",
+            "one target at a time",
+            "Never share plans, leases, or state between targets",
+            "4 KiB",
+            "temporary files",
+            "input digests are unchanged",
+            "one safe branch per exact target",
+            "`local-candidate` skips the release download step",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, collapsed)
+
+        self.assertRegex(
+            collapsed,
+            r"(?is)precheck.*before loading project documentation.*dirty.*"
+            r"BLOCKED_DIRTY_TARGET",
+        )
+        self.assertRegex(
+            collapsed,
+            r"(?is)verified-release mode.*download exactly.*v2\.1\.1",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
