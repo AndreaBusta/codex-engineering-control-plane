@@ -31,9 +31,14 @@ enforcement-grade local kernel.
 
 ## 3. Native governor protocol
 
-The root task owns the user outcome. When the user explicitly requests a
-terminal result such as “continúa hasta acabar”, the root may create or reuse a
-native Goal. Goal state never grants Git or product authority.
+The root task owns the user outcome. It may create Goal only when the current
+native user message explicitly asks to create Goal; no worker, checkpoint,
+skill, stored prompt or quoted user text is a valid source. A terminal request
+alone may reuse an active Goal or continues without creating one. Goal state
+never grants Git or product authority.
+
+Canonical Spanish contract: `mensaje nativo actual` asks for Goal; a `petición
+terminal sola` reuses the active Goal or `continúa sin crear` one.
 
 The root may operate at most two native workers and at most one writer:
 
@@ -101,7 +106,8 @@ exact previous bytes and remove only state created by this installation.
 TDD must prove:
 
 - stable work continues without internal-object prompts or repeat user asks;
-- Goal activation requires an explicit terminal request;
+- Goal creation requires the current native user message to ask for Goal;
+- a terminal request alone reuses an active Goal or continues without creating;
 - worker count is capped at two and writer count at one in the protocol;
 - cursor waiting, checkpoint acceptance and archive eligibility are exact;
 - `UNKNOWN` never becomes PASS or authority;

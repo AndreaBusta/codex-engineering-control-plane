@@ -4,9 +4,12 @@
 
 **Goal:** Add the smallest native task governor to `control-plane-run` and package the exact proven skill as a thin, versioned local plugin candidate.
 
-**Architecture:** The Codex-facing skill owns only native orchestration guidance: Goal use after an explicit terminal request, at most two workers, one writer, cursor-based waits, bounded checkpoints and safe archive eligibility. Existing Python lifecycle, leases and receipts remain the enforcement kernel. The plugin contains no runtime, scheduler, hook, MCP server or app.
+**Architecture:** The Codex-facing skill owns only native orchestration guidance: Goal creation only when the current native user message asks for Goal, terminal requests alone reuse or continue without creating, at most two workers, one writer, cursor-based waits, bounded checkpoints and safe archive eligibility. Existing Python lifecycle, leases and receipts remain the enforcement kernel. The plugin contains no runtime, scheduler, hook, MCP server or app.
 
 **Tech Stack:** Markdown skills, JSON plugin manifest, Python 3.11 stdlib contract tests, Codex plugin validator, Git.
+
+Canonical contract: only `mensaje nativo actual` may ask to create Goal; a
+`petición terminal sola` reuses the active Goal or `continúa sin crear` one.
 
 ---
 
@@ -23,7 +26,7 @@ Add tests that require the normalized skill text to contain all of:
 
 ```python
 required = (
-    "petición terminal explícita",
+    "mensaje nativo actual del usuario pide crear goal explícitamente",
     "goal",
     "máximo dos workers",
     "un solo writer",
@@ -49,12 +52,13 @@ mutable CLI command.
 
 Add three deterministic scenarios to `tests/skill-pressure-scenarios.md`:
 
-1. a long request explicitly says to continue until done;
+1. a long request explicitly says to continue until done but does not ask to create Goal;
 2. two workers are active and a third possible subtask appears;
 3. a worker finishes while another effect or handoff remains pending.
 
-The expected behavior is Goal reuse, no third worker, cursor wait without user
-status prompts, and no archive until the terminal checkpoint is complete.
+The expected behavior is Goal reuse or continuing without creating one, no
+third worker, cursor wait without user status prompts, and no archive until the
+terminal checkpoint is complete.
 
 - [ ] **Step 3: Run RED**
 
@@ -73,7 +77,8 @@ Compress existing wording where necessary and add one `Gobernador nativo`
 section. It must state:
 
 ```text
-explicit terminal request -> create or reuse Goal
+current native user message asks for Goal -> create Goal
+terminal request alone -> reuse active Goal or continue without creating
 root owns outcome
 workers <= 2
 writers <= 1
@@ -125,7 +130,7 @@ manifest == {
         "developerName": "Codex Engineering Control Plane",
         "category": "Productivity",
         "capabilities": [],
-        "defaultPrompt": "Use $control-plane-run to finish this engineering task safely.",
+        "defaultPrompt": "Use $control-plane:control-plane-run to finish this engineering task safely.",
     },
 }
 ```

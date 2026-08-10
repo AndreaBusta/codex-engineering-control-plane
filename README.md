@@ -199,6 +199,7 @@ scripts/control-plane git-guard pre-push
 - [ADR 0005: autoridad outcome host-bound](docs/adr/0005-host-bound-outcome-authorization.md)
 - [Threat model del outcome bridge v2.3](docs/security/2026-08-08-v2-3-outcome-bridge-threat-model.md)
 - [Rollback del outcome bridge](docs/engineering/16-outcome-bridge-rollback.md)
+- [Gobernador nativo y plugin fino v2.4](docs/engineering/18-native-governor-plugin.md)
 - [Threat model](SECURITY.md)
 
 ## Límites

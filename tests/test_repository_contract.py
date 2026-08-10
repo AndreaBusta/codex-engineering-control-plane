@@ -1278,6 +1278,83 @@ jobs:
                 self.assertIn(contract, normalized)
         self.assertNotIn("Crea ancestros privados `0700`", spec)
 
+    def test_v24_native_governor_plugin_has_a_reversible_operating_contract(self) -> None:
+        design = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-10-control-plane-v2-4-native-governor-design.md"
+        )
+        plan = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-08-10-control-plane-v2-4-native-governor.md"
+        )
+        runbook = ROOT / "docs" / "engineering" / "18-native-governor-plugin.md"
+        manifest = ROOT / "plugins" / "control-plane" / ".codex-plugin" / "plugin.json"
+
+        missing = [path for path in (design, plan, runbook, manifest) if not path.is_file()]
+        self.assertEqual(missing, [])
+
+        normalized = " ".join(runbook.read_text(encoding="utf-8").lower().split())
+        for required in (
+            "skill-only",
+            "advisory",
+            "no scheduler",
+            "máximo dos workers",
+            "un solo writer",
+            "cursor",
+            "checkpoint terminal",
+            "facts_only",
+            "10/3",
+            "global skill",
+            "fail-closed",
+            "instalación transaccional",
+            "rollback",
+            "plugin candidate",
+            "no es una release",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized)
+
+        for required in (
+            "scaffold oficial solo en la instalación inicial",
+            "conservar la entrada y source existentes",
+            "cachebuster",
+            "codex plugin add",
+            "duplicado activo",
+            "$control-plane:control-plane-run",
+            "afecta solo esa operación",
+            "continúa todo trabajo local seguro",
+            "result, evidence, remaining_work, pending_effects, authorizes=false",
+            "tareas dogfood completadas",
+            "todo lo demás es false",
+            "counts unknown no disparan v2.5",
+        ):
+            with self.subTest(update_contract=required):
+                self.assertIn(required, normalized)
+        self.assertNotIn("se crea o actualiza la entrada mediante el scaffold", normalized)
+
+        design_text = " ".join(design.read_text(encoding="utf-8").lower().split())
+        plan_text = " ".join(plan.read_text(encoding="utf-8").lower().split())
+        for text in (design_text, plan_text):
+            self.assertIn("mensaje nativo actual", text)
+            self.assertIn("petición terminal sola", text)
+            self.assertIn("continúa sin crear", text)
+        self.assertNotIn("petición terminal explícita", plan_text)
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("docs/engineering/18-native-governor-plugin.md", readme)
+
+        plugin = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(plugin["name"], "control-plane")
+        self.assertEqual(plugin["version"], "3.0.0")
+        for forbidden in ("hooks", "mcpServers", "apps"):
+            self.assertNotIn(forbidden, plugin)
+
     def test_no_unresolved_placeholders(self) -> None:
         forbidden = re.compile(
             r"\bT[B]D\b|\bT[O]DO\b|"
