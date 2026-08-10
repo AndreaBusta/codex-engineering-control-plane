@@ -226,3 +226,32 @@ causa repetida, crecimiento de paths, deriva o agotamiento termina en
 `BLOCKED`. `run status` observa y `run block` detiene explícitamente. El éxito
 alcanza `review_ready`, no commit, push, PR ni integración. T2/T3 sigue
 bloqueado mientras el host no pueda publicar la revisión independiente tipada.
+
+## Outcome bridge v2.3
+
+El outcome pedido al inicio permanece inmutable. `pull_request` termina en
+`pr_ready`; por eso `PR LISTA` es la salida predeterminada. `integration`
+continúa por `merged → base_verified` solo con una petición nativa actual,
+fresca y exacta hasta squash merge y con observación posterior de la base.
+
+La cadena conserva `review_head → committed_head → pushed_head → PR →
+merge_sha`. Cada plan y receipt durable es cerrado, ligado y
+`authorizes=false`: evidencia y autoridad son fronteras distintas.
+
+Frontera real: el bridge Python ejecuta Git local allowlisted (`git add`/`git
+commit`). En prepare/arm/revalidate, el kernel hace observación remota con `git
+ls-remote` read-only. Las mutaciones push/PR/squash merge son host-native:
+Python no recibe autoridad. Sin adaptador nativo quedan `BLOCKED`; los fixtures
+de tests no hacen disponible esa ruta.
+
+Ante escritura remota incierta, el marker durable ya está en observe-only. Se
+observa el target exacto antes de cualquier retry; `UNKNOWN` queda `BLOCKED` y
+no habilita segunda escritura ni reparación. Un receipt exacto puede
+reutilizarse solo si su sujeto e inputs no cambiaron.
+
+La ruta de mutación remota requiere un native host adapter real. Si falta,
+nunca se pide al usuario habilitar plumbing interno. La skill conserva solo los
+comandos locales `run prepare`, `run verify`, `run status` y `run block`.
+Véanse [ADR 0005](../adr/0005-host-bound-outcome-authorization.md), el
+[threat model](../security/2026-08-08-v2-3-outcome-bridge-threat-model.md) y el
+[rollback](16-outcome-bridge-rollback.md).

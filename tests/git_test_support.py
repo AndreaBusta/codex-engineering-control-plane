@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -21,6 +22,36 @@ def git(repo: Path, *arguments: str) -> str:
         text=True,
     )
     return completed.stdout.strip()
+
+
+def install_external_diff_driver(
+    repository: Path,
+    fixture_root: Path,
+    *,
+    tracked_path: str,
+    driver_name: str,
+) -> Path:
+    """Install a real external diff driver and leave one tracked modification."""
+
+    marker = fixture_root / f"{driver_name}-executed"
+    driver = fixture_root / f"{driver_name}.sh"
+    driver.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(marker))}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    driver.chmod(0o700)
+    (repository / ".gitattributes").write_text(
+        f"{tracked_path} diff={driver_name}\n", encoding="utf-8"
+    )
+    git(repository, "add", ".gitattributes")
+    git(repository, "commit", "-m", f"test: {driver_name} attributes")
+    git(repository, "config", f"diff.{driver_name}.command", str(driver))
+    (repository / tracked_path).write_text(
+        "changed through builtin diff\n", encoding="utf-8"
+    )
+    return marker
 
 
 class GitScenario:

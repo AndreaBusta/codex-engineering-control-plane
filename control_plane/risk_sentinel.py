@@ -32,9 +32,11 @@ from control_plane.policy import (
 from control_plane.project_profiles import detect_project_profile
 from control_plane.repository import (
     RepositoryError,
+    assert_no_external_git_filters,
     discover_repository,
     git_common_dir,
-    git_environment,
+    trusted_git_argv,
+    trusted_git_environment,
     worktree_git_dir,
 )
 
@@ -267,30 +269,36 @@ def _unanchored_local_dimension(
         )
     try:
         head = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD"],
-            cwd=root,
+            trusted_git_argv(root, ("rev-parse", "--verify", "HEAD")),
             check=False,
             capture_output=True,
             text=True,
-            env=git_environment(),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            timeout=10,
         )
         branch = subprocess.run(
-            ["git", "symbolic-ref", "--short", "-q", "HEAD"],
-            cwd=root,
+            trusted_git_argv(
+                root, ("symbolic-ref", "--short", "-q", "HEAD")
+            ),
             check=False,
             capture_output=True,
             text=True,
-            env=git_environment(),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            timeout=10,
         )
+        assert_no_external_git_filters(root)
         status = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z"],
-            cwd=root,
+            trusted_git_argv(root, ("status", "--porcelain=v1", "-z")),
             check=False,
             capture_output=True,
             text=True,
-            env=git_environment(),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            timeout=10,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError, ValueError):
         head = branch = status = None
     repository_observed = head is not None and head.returncode == 0
     replacements["RS_LOCAL_REPOSITORY"] = _check(
@@ -387,14 +395,17 @@ def _unanchored_local_dimension(
 def _git_config_values(repo: Path, key: str) -> tuple[int, tuple[str, ...]]:
     try:
         completed = subprocess.run(
-            ["git", "config", "--get-all", key],
-            cwd=repo,
+            trusted_git_argv(
+                repo, ("config", "--local", "--get-all", key)
+            ),
             check=False,
             capture_output=True,
             text=True,
-            env=git_environment(),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            timeout=10,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError, ValueError):
         return 128, ()
     values = tuple(
         line.strip() for line in completed.stdout.splitlines() if line.strip()
@@ -613,28 +624,44 @@ def _task_check(
 
 def _git_changed_paths(repo: Path) -> tuple[str, ...] | None:
     try:
+        assert_no_external_git_filters(repo)
+        environment = trusted_git_environment()
         changed = subprocess.run(
-            [
-                "git",
-                "diff",
-                "--no-renames",
-                "--name-only",
-                "-z",
-                "HEAD",
-            ],
-            cwd=repo,
+            trusted_git_argv(
+                repo,
+                (
+                    "diff",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    "HEAD",
+                ),
+            ),
             check=False,
             capture_output=True,
-            env=git_environment(),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
         )
+        if changed.returncode != 0:
+            return None
         untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-            cwd=repo,
+            trusted_git_argv(
+                repo,
+                (
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ),
+            ),
             check=False,
             capture_output=True,
-            env=git_environment(),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            timeout=10,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
     if changed.returncode != 0 or untracked.returncode != 0:
         return None

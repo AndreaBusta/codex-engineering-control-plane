@@ -7,8 +7,10 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 import control_plane.host_bridge as bridge
 from control_plane.contracts import contract_digest
@@ -314,6 +316,79 @@ class GitGuardTests(unittest.TestCase):
         )
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["errors"][0]["code"], "GG_NON_FAST_FORWARD")
+
+    def test_pre_push_missing_promisor_ancestor_is_unobservable_without_transport(self) -> None:
+        """A missing object must not turn an ancestry check into network I/O."""
+
+        head = git(self.scenario.repo, "rev-parse", "HEAD")
+        observed_environments: list[dict[str, str]] = []
+        real_run = subprocess.run
+
+        def missing_promisor_object(*args, **kwargs):
+            command = args[0]
+            if command[1:3] == ["merge-base", "--is-ancestor"]:
+                observed_environments.append(dict(kwargs["env"]))
+                return subprocess.CompletedProcess(command, 128, b"", b"missing promisor object")
+            return real_run(*args, **kwargs)
+
+        with patch("control_plane.git_guards.subprocess.run", side_effect=missing_promisor_object):
+            payload = guard_pre_push(
+                self.scenario.repo,
+                self.scenario.load(),
+                remote_name="origin",
+                remote_url=REMOTE_URL,
+                updates=[
+                    ("refs/heads/feature/test", head, "refs/heads/feature/test", "e" * 40)
+                ],
+            )
+
+        self.assertEqual(
+            [error["code"] for error in payload["errors"]],
+            ["GG_GIT_STATE_UNOBSERVABLE"],
+        )
+        self.assertEqual(len(observed_environments), 1)
+        self.assertEqual(observed_environments[0]["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(observed_environments[0]["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_pre_push_shallow_rc1_is_unobservable_not_non_fast_forward(self) -> None:
+        """Both endpoint commits can exist while the shallow boundary hides their path."""
+        base = git(self.scenario.repo, "rev-parse", "HEAD")
+        for name in ("intermediate", "head"):
+            (self.scenario.repo / f"{name}.txt").write_text(name, encoding="utf-8")
+            git(self.scenario.repo, "add", f"{name}.txt")
+            git(self.scenario.repo, "commit", "-m", f"test: {name}")
+        head = git(self.scenario.repo, "rev-parse", "HEAD")
+        with tempfile.TemporaryDirectory() as temporary:
+            shallow = Path(temporary) / "shallow"
+            subprocess.run(
+                ["git", "clone", "--depth=1", f"file://{self.scenario.repo}", str(shallow)],
+                check=True, capture_output=True, text=True,
+            )
+            git(shallow, "fetch", "--depth=1", "origin", f"{base}:refs/heads/base")
+            self.assertEqual(git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+            self.assertEqual(git(shallow, "cat-file", "-e", f"{base}^{{commit}}"), "")
+            self.assertEqual(git(shallow, "cat-file", "-e", f"{head}^{{commit}}"), "")
+            self.assertNotEqual(
+                subprocess.run(["git", "-C", str(shallow), "cat-file", "-e", "HEAD~1^{commit}"], check=False, capture_output=True).returncode,
+                0,
+            )
+            git(shallow, "remote", "set-url", "origin", REMOTE_URL)
+            isolated = object.__new__(InstalledGuardScenario)
+            isolated.repo = shallow
+            common = Path(git(shallow, "rev-parse", "--git-common-dir"))
+            isolated.common_dir = (common if common.is_absolute() else shallow / common).resolve()
+            isolated.install_invocation_id = "shallow-guard"
+            isolated.manifest_digest = isolated._install_snapshot()
+
+            payload = guard_pre_push(
+                shallow, isolated.load(), remote_name="origin", remote_url=REMOTE_URL,
+                updates=[("refs/heads/feature/test", head, "refs/heads/feature/test", base)],
+            )
+
+        self.assertEqual(
+            [error["code"] for error in payload["errors"]],
+            ["GG_GIT_STATE_UNOBSERVABLE"],
+        )
 
     def test_replace_refs_cannot_disguise_non_fast_forward(self) -> None:
         self.scenario.git.checkout_feature()

@@ -36,6 +36,13 @@ Un cambio local o un PR abierto no se describe como integrado hasta demostrar
 el squash en `origin/main`. La protección de rama, CI y los proveedores de
 release siguen siendo fronteras externas y requieren sus propias evidencias.
 
+La rama candidata v2.3 añade contratos cerrados para review, delivery y
+verificación de base. Frontera real: el bridge Python ejecuta Git local
+allowlisted (`git add`/`git commit`). En prepare/arm/revalidate, el kernel hace
+observación remota con `git ls-remote` read-only. Las mutaciones push/PR/squash
+merge son host-native: Python no recibe autoridad. Sin adaptador nativo quedan
+`BLOCKED`; los adapters de tests solo validan el contrato.
+
 ## Inicio rápido
 
 ```bash
@@ -189,6 +196,9 @@ scripts/control-plane git-guard pre-push
 - [Multidominio y recomendación de `/plan` o `/goal`](docs/engineering/12-multidominio-y-modos.md)
 - [Aclaración y riesgo local-audit v2.1](docs/engineering/13-clarification-and-risk-local-audit.md)
 - [ADR 0003: núcleo local-audit](docs/adr/0003-local-audit-kernel-v2-1.md)
+- [ADR 0005: autoridad outcome host-bound](docs/adr/0005-host-bound-outcome-authorization.md)
+- [Threat model del outcome bridge v2.3](docs/security/2026-08-08-v2-3-outcome-bridge-threat-model.md)
+- [Rollback del outcome bridge](docs/engineering/16-outcome-bridge-rollback.md)
 - [Threat model](SECURITY.md)
 
 ## Límites

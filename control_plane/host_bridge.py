@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import copy
 from hashlib import sha256
 import json
@@ -30,6 +31,7 @@ from control_plane.contracts import (
     SHA256_DIGEST,
     TASK_EFFECTS,
     contract_digest,
+    safe_scope_path,
     validate_task_id,
     validate_task_envelope,
 )
@@ -37,6 +39,11 @@ from control_plane.resource_registry import (
     build_inventory,
     registry_contract_digest,
     validate_inventory,
+)
+from control_plane.repository import (
+    assert_no_external_git_filters as _assert_no_external_git_filters,
+    trusted_git_argv,
+    trusted_git_environment,
 )
 from control_plane.scopes import normalize_scope
 
@@ -64,6 +71,3065 @@ _FEATURE_PUSH_CLAIM_LOCK = threading.Lock()
 _FEATURE_PUSH_OPERATIONS: dict[int, object] = {}
 _PR_MUTATION_CLAIM_LOCK = threading.Lock()
 _CAPABILITY_CONSUMPTION_LOCK = threading.Lock()
+_INTEGRATION_TICKET_LOCK = threading.Lock()
+_INTEGRATION_TICKETS: dict[
+    str, tuple[str, object, datetime, datetime, datetime]
+] = {}
+_THREAD_LOCK_TYPE = type(threading.Lock())
+
+
+_OUTCOME_REMOTE_NAME = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", re.ASCII
+)
+_OUTCOME_BRANCH = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$", re.ASCII
+)
+_OUTCOME_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?Z$",
+    re.ASCII,
+)
+_INTEGRATION_EFFECT_PLAN_MAX_TTL_SECONDS = 300.0
+_INTEGRATION_READY_MAX_AGE_SECONDS = 30.0
+_OUTCOME_EFFECT_PLAN_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "requested_outcome",
+        "repository",
+        "remote",
+        "remote_url",
+        "remote_url_digest",
+        "remote_identity_digest",
+        "base",
+        "branch",
+        "head_sha",
+        "scope_paths",
+        "subject_digest",
+        "policy_digest",
+        "effect",
+        "title",
+        "title_digest",
+        "body",
+        "body_digest",
+        "draft",
+        "operation",
+        "operation_digest",
+        "required_checks",
+        "argv",
+        "argv_digest",
+        "observation_argv",
+        "observation_argv_digest",
+        "observe_before_retry",
+        "authorizes",
+        "plan_digest",
+    }
+)
+_INTEGRATION_EFFECT_PLAN_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "requested_outcome",
+        "repository",
+        "remote",
+        "remote_url",
+        "remote_url_digest",
+        "remote_identity",
+        "remote_identity_digest",
+        "base",
+        "branch",
+        "head_sha",
+        "scope_paths",
+        "subject_digest",
+        "policy_digest",
+        "effect",
+        "integration_strategy",
+        "pull_request_number",
+        "pull_request_url",
+        "pull_request_digest",
+        "checks_digest",
+        "prepared_at",
+        "expires_at",
+        "argv",
+        "argv_digest",
+        "observation_argv",
+        "observation_argv_digest",
+        "observe_before_retry",
+        "authorizes",
+        "plan_digest",
+    }
+)
+_INTEGRATION_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "requested_outcome",
+        "repository",
+        "remote",
+        "remote_url_digest",
+        "remote_identity",
+        "base",
+        "branch",
+        "head_sha",
+        "subject_digest",
+        "policy_digest",
+        "effect",
+        "integration_strategy",
+        "pull_request_number",
+        "pull_request_url",
+        "pull_request_digest",
+        "checks_digest",
+        "effect_plan_digest",
+        "status",
+        "observed_repository",
+        "observed_base",
+        "observed_branch",
+        "observed_head_sha",
+        "observed_pr_number",
+        "observed_pr_url",
+        "observed_pr_state",
+        "observed_pr_draft",
+        "observed_strategy",
+        "observed_checks_digest",
+        "observed_merge_sha",
+        "observed_at",
+        "authorizes",
+        "receipt_digest",
+    }
+)
+_BASE_REFRESH_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "repository",
+        "remote",
+        "remote_url",
+        "remote_url_digest",
+        "remote_identity",
+        "remote_identity_digest",
+        "base",
+        "base_ref",
+        "policy_digest",
+        "effect_plan_digest",
+        "integration_receipt_digest",
+        "merge_sha",
+        "refresh_argv",
+        "refresh_argv_digest",
+        "status",
+        "observed_ref",
+        "observed_sha",
+        "observed_at",
+        "authorizes",
+        "receipt_digest",
+    }
+)
+_BASE_VERIFICATION_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "repository",
+        "remote",
+        "base",
+        "base_ref",
+        "policy_digest",
+        "effect_plan_digest",
+        "integration_receipt_digest",
+        "refresh_receipt_digest",
+        "merge_sha",
+        "status",
+        "reason_code",
+        "observed_base_sha",
+        "contained",
+        "observed_at",
+        "authorizes",
+        "receipt_digest",
+    }
+)
+_REMOTE_OUTCOME_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "requested_outcome",
+        "repository",
+        "remote",
+        "remote_url",
+        "remote_url_digest",
+        "remote_identity_digest",
+        "base",
+        "branch",
+        "head_sha",
+        "scope_paths",
+        "subject_digest",
+        "policy_digest",
+        "effect",
+        "title_digest",
+        "body_digest",
+        "draft",
+        "effect_plan_digest",
+        "status",
+        "observed_repository",
+        "observed_remote",
+        "observed_base",
+        "observed_branch",
+        "observed_head_sha",
+        "observed_pr_number",
+        "observed_pr_url",
+        "observed_pr_draft",
+        "disposition",
+        "observation_kind",
+        "required_check_digests",
+        "check_results",
+        "feedback",
+        "observed_at",
+        "authorizes",
+        "receipt_digest",
+    }
+)
+_OUTCOME_CONTRACT_MAX_BYTES = 16_384
+_OUTCOME_SCOPE_MAX_ITEMS = 64
+
+
+def _outcome_digest(value: object) -> bool:
+    return isinstance(value, str) and SHA256_DIGEST.fullmatch(value) is not None
+
+
+def _outcome_scope(value: object) -> bool:
+    return (
+        isinstance(value, tuple)
+        and 1 <= len(value) <= _OUTCOME_SCOPE_MAX_ITEMS
+        and tuple(sorted(set(value))) == value
+        and all(
+            isinstance(path, str)
+            and len(path.encode("utf-8")) <= 512
+            and safe_scope_path(path)
+            for path in value
+        )
+    )
+
+
+def _outcome_contract_size(value: Mapping[str, object]) -> int:
+    try:
+        return len(
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        return _OUTCOME_CONTRACT_MAX_BYTES + 1
+
+
+def _outcome_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or _OUTCOME_TIMESTAMP.fullmatch(value) is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo == timezone.utc else None
+
+
+_PR_SECRET_LIKE = re.compile(
+    r"(?i)(?:ghp_[A-Za-z0-9]{8,}|github_pat_[A-Za-z0-9_]{8,}|"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
+    r"(?:bearer|token|password|secret)\s*[:=]\s*\S{8,})",
+    re.ASCII,
+)
+
+
+def _outcome_pr_content(title: object, body: object) -> bool:
+    if (
+        not isinstance(title, str)
+        or title != title.strip()
+        or not 1 <= len(title) <= 180
+        or len(title.encode("utf-8")) > 512
+        or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in title)
+        or not isinstance(body, str)
+        or not 1 <= len(body.encode("utf-8")) <= 32_768
+        or any(
+            (ord(character) < 32 and character not in {"\n", "\t"})
+            or 127 <= ord(character) <= 159
+            for character in body
+        )
+        or _PR_SECRET_LIKE.search(title) is not None
+        or _PR_SECRET_LIKE.search(body) is not None
+    ):
+        return False
+    return True
+
+
+def _outcome_required_checks(value: object, *, required: bool) -> bool:
+    if not isinstance(value, tuple) or len(value) > 64 or (required and not value):
+        return False
+    if not all(
+        isinstance(item, tuple)
+        and len(item) == 4
+        and isinstance(item[0], str)
+        and item[0] == item[0].strip()
+        and bool(item[0])
+        and isinstance(item[1], str)
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", item[1]) is not None
+        and isinstance(item[2], tuple)
+        and item[2] == tuple(sorted(set(item[2])))
+        and bool(item[2])
+        and all(conclusion in {"SUCCESS", "NEUTRAL", "SKIPPED"} for conclusion in item[2])
+        and _outcome_digest(item[3])
+        and item[3] == contract_digest(
+            {"name": item[0], "app": item[1], "conclusions": item[2]}
+        )
+        for item in value
+    ):
+        return False
+    return tuple(item[3] for item in value) == tuple(sorted(item[3] for item in value)) and len({item[3] for item in value}) == len(value)
+
+
+def _outcome_identity_for_url(remote_url: str) -> str:
+    if not isinstance(remote_url, str) or not remote_url:
+        raise ValueError("E_OUTCOME_EFFECT_PLAN: remote URL is invalid")
+    local_remote = Path(remote_url)
+    if local_remote.is_absolute():
+        return f"local:{local_remote.resolve()}"
+    match = _GITHUB_HTTPS_REMOTE.fullmatch(remote_url)
+    if match is None or "@" in remote_url:
+        raise ValueError(
+            "E_OUTCOME_EFFECT_PLAN: remote URL is not credential-free"
+        )
+    return (
+        f"github:{match.group('owner').lower()}/"
+        f"{match.group('repository').lower()}"
+    )
+
+
+@dataclass(frozen=True)
+class IntegrationEffectPlanV1:
+    """Closed, non-authorizing proposal for one explicit squash merge."""
+
+    schema_version: int
+    kind: str
+    task_id: str
+    task_digest: str
+    run_plan_digest: str
+    requested_outcome: str
+    repository: str
+    remote: str
+    remote_url: str
+    remote_url_digest: str
+    remote_identity: str
+    remote_identity_digest: str
+    base: str
+    branch: str
+    head_sha: str
+    scope_paths: tuple[str, ...]
+    subject_digest: str
+    policy_digest: str
+    effect: str
+    integration_strategy: str
+    pull_request_number: int
+    pull_request_url: str
+    pull_request_digest: str
+    checks_digest: str
+    prepared_at: str
+    expires_at: str
+    argv: tuple[str, ...]
+    argv_digest: str
+    observation_argv: tuple[str, ...]
+    observation_argv_digest: str
+    observe_before_retry: bool
+    authorizes: bool
+    plan_digest: str
+
+    def __post_init__(self) -> None:
+        expected_argv = (
+            "gh",
+            "pr",
+            "merge",
+            str(self.pull_request_number),
+            "--repo",
+            self.remote_identity,
+            "--match-head-commit",
+            self.head_sha,
+            "--squash",
+        )
+        expected_observation = (
+            "gh",
+            "pr",
+            "view",
+            str(self.pull_request_number),
+            "--repo",
+            self.remote_identity,
+            "--json",
+            "number,url,state,isDraft,baseRefName,headRefName,headRefOid,mergeCommit,mergedAt",
+        )
+        prepared = _outcome_time(self.prepared_at)
+        expires = _outcome_time(self.expires_at)
+        core = {
+            key: value
+            for key, value in self.to_dict().items()
+            if key != "plan_digest"
+        }
+        try:
+            pr_repository, pr_number = _github_pull_request_url_identity(
+                self.pull_request_url,
+                code="E_INTEGRATION_EFFECT_PLAN",
+            )
+        except ValueError:
+            pr_repository, pr_number = None, None
+        if (
+            self.schema_version != 1
+            or self.kind != "IntegrationEffectPlanV1"
+            or not validate_task_id(self.task_id)
+            or not all(
+                _outcome_digest(value)
+                for value in (
+                    self.task_digest,
+                    self.run_plan_digest,
+                    self.remote_url_digest,
+                    self.remote_identity_digest,
+                    self.subject_digest,
+                    self.policy_digest,
+                    self.pull_request_digest,
+                    self.checks_digest,
+                    self.argv_digest,
+                    self.observation_argv_digest,
+                    self.plan_digest,
+                )
+            )
+            or self.requested_outcome != "integration"
+            or not isinstance(self.repository, str)
+            or not Path(self.repository).is_absolute()
+            or str(Path(self.repository).resolve()) != self.repository
+            or _OUTCOME_REMOTE_NAME.fullmatch(self.remote) is None
+            or self.remote_url_digest != contract_digest(self.remote_url)
+            or self.remote_identity
+            != _canonical_github_repository_from_url(
+                self.remote_url, code="E_INTEGRATION_EFFECT_PLAN"
+            )
+            or self.remote_identity_digest != contract_digest(self.remote_identity)
+            or pr_repository != self.remote_identity
+            or pr_number != self.pull_request_number
+            or _OUTCOME_BRANCH.fullmatch(self.base) is None
+            or _OUTCOME_BRANCH.fullmatch(self.branch) is None
+            or self.base == self.branch
+            or _GIT_OBJECT_ID.fullmatch(self.head_sha) is None
+            or not _outcome_scope(self.scope_paths)
+            or self.effect != "integration"
+            or self.integration_strategy != "squash"
+            or not isinstance(self.pull_request_number, int)
+            or isinstance(self.pull_request_number, bool)
+            or self.pull_request_number <= 0
+            or prepared is None
+            or expires is None
+            or prepared >= expires
+            or (expires - prepared).total_seconds()
+            > _INTEGRATION_EFFECT_PLAN_MAX_TTL_SECONDS
+            or self.argv != expected_argv
+            or self.observation_argv != expected_observation
+            or self.argv_digest != contract_digest(list(self.argv))
+            or self.observation_argv_digest
+            != contract_digest(list(self.observation_argv))
+            or self.observe_before_retry is not True
+            or self.authorizes is not False
+            or self.plan_digest != contract_digest(core)
+            or _outcome_contract_size(self.to_dict()) > _OUTCOME_CONTRACT_MAX_BYTES
+        ):
+            raise ValueError(
+                "E_INTEGRATION_EFFECT_PLAN: closed squash plan is invalid"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "task_id": self.task_id,
+            "task_digest": self.task_digest,
+            "run_plan_digest": self.run_plan_digest,
+            "requested_outcome": self.requested_outcome,
+            "repository": self.repository,
+            "remote": self.remote,
+            "remote_url": self.remote_url,
+            "remote_url_digest": self.remote_url_digest,
+            "remote_identity": self.remote_identity,
+            "remote_identity_digest": self.remote_identity_digest,
+            "base": self.base,
+            "branch": self.branch,
+            "head_sha": self.head_sha,
+            "scope_paths": list(self.scope_paths),
+            "subject_digest": self.subject_digest,
+            "policy_digest": self.policy_digest,
+            "effect": self.effect,
+            "integration_strategy": self.integration_strategy,
+            "pull_request_number": self.pull_request_number,
+            "pull_request_url": self.pull_request_url,
+            "pull_request_digest": self.pull_request_digest,
+            "checks_digest": self.checks_digest,
+            "prepared_at": self.prepared_at,
+            "expires_at": self.expires_at,
+            "argv": list(self.argv),
+            "argv_digest": self.argv_digest,
+            "observation_argv": list(self.observation_argv),
+            "observation_argv_digest": self.observation_argv_digest,
+            "observe_before_retry": self.observe_before_retry,
+            "authorizes": self.authorizes,
+            "plan_digest": self.plan_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "IntegrationEffectPlanV1":
+        if not isinstance(value, Mapping) or set(value) != _INTEGRATION_EFFECT_PLAN_KEYS:
+            raise ValueError("E_INTEGRATION_EFFECT_PLAN: schema is not closed")
+        try:
+            payload = dict(value)
+            payload["scope_paths"] = tuple(payload["scope_paths"])
+            payload["argv"] = tuple(payload["argv"])
+            payload["observation_argv"] = tuple(payload["observation_argv"])
+            return cls(**payload)
+        except (TypeError, ValueError, KeyError) as error:
+            if isinstance(error, ValueError) and str(error).startswith(
+                "E_INTEGRATION_EFFECT_PLAN"
+            ):
+                raise
+            raise ValueError(
+                "E_INTEGRATION_EFFECT_PLAN: payload is invalid"
+            ) from error
+
+
+class IntegrationExecutionTicket:
+    """Process-local executor-edge proof; never durable or authorizing."""
+
+    __slots__ = (
+        "_ticket_id",
+        "_plan_digest",
+        "_clock",
+        "_issued_at",
+        "_ready_deadline",
+        "_plan_expires",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "IntegrationExecutionTicket":
+        raise TypeError("IntegrationExecutionTicket is internal")
+
+
+def _issue_integration_execution_ticket(
+    effect_plan: IntegrationEffectPlanV1,
+    *,
+    clock: object,
+    issued_at: datetime,
+    ready_deadline: datetime,
+    plan_expires: datetime,
+) -> IntegrationExecutionTicket:
+    if (
+        type(effect_plan) is not IntegrationEffectPlanV1
+        or not callable(clock)
+        or not isinstance(issued_at, datetime)
+        or issued_at.tzinfo != timezone.utc
+        or not isinstance(ready_deadline, datetime)
+        or ready_deadline.tzinfo != timezone.utc
+        or not isinstance(plan_expires, datetime)
+        or plan_expires.tzinfo != timezone.utc
+        or issued_at > ready_deadline
+        or issued_at >= plan_expires
+    ):
+        raise ValueError("E_INTEGRATION_EXECUTION: exact live plan is required")
+    ticket_id = uuid4().hex
+    ticket = object.__new__(IntegrationExecutionTicket)
+    ticket._ticket_id = ticket_id
+    ticket._plan_digest = effect_plan.plan_digest
+    ticket._clock = clock
+    ticket._issued_at = issued_at
+    ticket._ready_deadline = ready_deadline
+    ticket._plan_expires = plan_expires
+    with _INTEGRATION_TICKET_LOCK:
+        _INTEGRATION_TICKETS[ticket_id] = (
+            effect_plan.plan_digest,
+            clock,
+            issued_at,
+            ready_deadline,
+            plan_expires,
+        )
+    return ticket
+
+
+def consume_integration_execution_ticket(
+    ticket: IntegrationExecutionTicket,
+    *,
+    effect_plan: IntegrationEffectPlanV1,
+) -> IntegrationEffectPlanV1:
+    """Consume one executor-edge ticket without invoking a provider."""
+
+    if (
+        type(ticket) is not IntegrationExecutionTicket
+        or type(effect_plan) is not IntegrationEffectPlanV1
+    ):
+        raise ValueError("E_INTEGRATION_EXECUTION: one-shot ticket is invalid")
+    with _INTEGRATION_TICKET_LOCK:
+        registered = _INTEGRATION_TICKETS.pop(ticket._ticket_id, None)
+    if (
+        registered is None
+        or registered[0] != effect_plan.plan_digest
+        or registered[1] is not ticket._clock
+        or registered[2] != ticket._issued_at
+        or registered[3] != ticket._ready_deadline
+        or registered[4] != ticket._plan_expires
+        or ticket._plan_digest != effect_plan.plan_digest
+    ):
+        raise ValueError("E_INTEGRATION_EXECUTION: one-shot ticket is unavailable")
+    try:
+        observed = ticket._clock()
+    except Exception as error:
+        raise ValueError(
+            "E_INTEGRATION_EXECUTION: ticket time is UNKNOWN"
+        ) from error
+    current = (
+        observed
+        if isinstance(observed, datetime) and observed.tzinfo == timezone.utc
+        else _outcome_time(observed)
+    )
+    if current is None:
+        raise ValueError("E_INTEGRATION_EXECUTION: ticket time is UNKNOWN")
+    if current < ticket._issued_at:
+        raise ValueError("E_INTEGRATION_EXECUTION: ticket clock rolled back")
+    if (
+        current > ticket._ready_deadline
+        or current >= ticket._plan_expires
+    ):
+        raise ValueError("E_INTEGRATION_EXECUTION: one-shot ticket expired")
+    return IntegrationEffectPlanV1.from_dict(effect_plan.to_dict())
+
+
+@dataclass(frozen=True)
+class IntegrationReceiptV1:
+    """Exact merge observation bound to one non-authorizing squash plan."""
+
+    schema_version: int
+    kind: str
+    task_id: str
+    task_digest: str
+    run_plan_digest: str
+    requested_outcome: str
+    repository: str
+    remote: str
+    remote_url_digest: str
+    remote_identity: str
+    base: str
+    branch: str
+    head_sha: str
+    subject_digest: str
+    policy_digest: str
+    effect: str
+    integration_strategy: str
+    pull_request_number: int
+    pull_request_url: str
+    pull_request_digest: str
+    checks_digest: str
+    effect_plan_digest: str
+    status: str
+    observed_repository: str | None
+    observed_base: str | None
+    observed_branch: str | None
+    observed_head_sha: str | None
+    observed_pr_number: int | None
+    observed_pr_url: str | None
+    observed_pr_state: str | None
+    observed_pr_draft: bool | None
+    observed_strategy: str | None
+    observed_checks_digest: str | None
+    observed_merge_sha: str | None
+    observed_at: str
+    authorizes: bool
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        core = {
+            key: value
+            for key, value in self.to_dict().items()
+            if key != "receipt_digest"
+        }
+        try:
+            canonical_identity = _canonical_github_repository_identity(
+                self.remote_identity, code="E_INTEGRATION_RECEIPT"
+            )
+            pull_request_identity, pull_request_number = (
+                _github_pull_request_url_identity(
+                    self.pull_request_url, code="E_INTEGRATION_RECEIPT"
+                )
+            )
+        except ValueError:
+            canonical_identity = None
+            pull_request_identity, pull_request_number = None, None
+        observed = (
+            self.observed_repository,
+            self.observed_base,
+            self.observed_branch,
+            self.observed_head_sha,
+            self.observed_pr_number,
+            self.observed_pr_url,
+            self.observed_pr_state,
+            self.observed_pr_draft,
+            self.observed_strategy,
+            self.observed_checks_digest,
+            self.observed_merge_sha,
+        )
+        pass_exact = self.status != "PASS" or observed == (
+            self.remote_identity,
+            self.base,
+            self.branch,
+            self.head_sha,
+            self.pull_request_number,
+            self.pull_request_url,
+            "MERGED",
+            False,
+            "squash",
+            self.checks_digest,
+            self.observed_merge_sha,
+        )
+        ready_exact = self.status != "READY" or observed == (
+            self.remote_identity,
+            self.base,
+            self.branch,
+            self.head_sha,
+            self.pull_request_number,
+            self.pull_request_url,
+            "OPEN",
+            False,
+            None,
+            self.checks_digest,
+            None,
+        )
+        inconclusive_empty = self.status in {"PASS", "READY"} or all(
+            value is None for value in observed
+        )
+        if (
+            self.schema_version != 1
+            or self.kind != "IntegrationReceiptV1"
+            or not validate_task_id(self.task_id)
+            or not all(
+                _outcome_digest(value)
+                for value in (
+                    self.task_digest,
+                    self.run_plan_digest,
+                    self.remote_url_digest,
+                    self.subject_digest,
+                    self.policy_digest,
+                    self.pull_request_digest,
+                    self.checks_digest,
+                    self.effect_plan_digest,
+                    self.receipt_digest,
+                )
+            )
+            or self.requested_outcome != "integration"
+            or not isinstance(self.repository, str)
+            or not Path(self.repository).is_absolute()
+            or str(Path(self.repository).resolve()) != self.repository
+            or _OUTCOME_REMOTE_NAME.fullmatch(self.remote) is None
+            or _GITHUB_REPOSITORY_IDENTITY.fullmatch(self.remote_identity) is None
+            or canonical_identity != self.remote_identity
+            or pull_request_identity != self.remote_identity
+            or pull_request_number != self.pull_request_number
+            or _OUTCOME_BRANCH.fullmatch(self.base) is None
+            or _OUTCOME_BRANCH.fullmatch(self.branch) is None
+            or self.base == self.branch
+            or _GIT_OBJECT_ID.fullmatch(self.head_sha) is None
+            or self.effect != "integration"
+            or self.integration_strategy != "squash"
+            or not isinstance(self.pull_request_number, int)
+            or isinstance(self.pull_request_number, bool)
+            or self.pull_request_number <= 0
+            or self.status not in {"READY", "PASS", "FAIL", "UNKNOWN"}
+            or not pass_exact
+            or not ready_exact
+            or not inconclusive_empty
+            or (
+                self.status == "PASS"
+                and _GIT_OBJECT_ID.fullmatch(str(self.observed_merge_sha)) is None
+            )
+            or _outcome_time(self.observed_at) is None
+            or self.authorizes is not False
+            or self.receipt_digest != contract_digest(core)
+            or _outcome_contract_size(self.to_dict()) > _OUTCOME_CONTRACT_MAX_BYTES
+        ):
+            raise ValueError(
+                "E_INTEGRATION_RECEIPT: closed squash receipt is invalid"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return dict(self.__dict__)
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "IntegrationReceiptV1":
+        if not isinstance(value, Mapping) or set(value) != _INTEGRATION_RECEIPT_KEYS:
+            raise ValueError("E_INTEGRATION_RECEIPT: schema is not closed")
+        try:
+            return cls(**dict(value))
+        except (TypeError, ValueError, KeyError) as error:
+            if isinstance(error, ValueError) and str(error).startswith(
+                "E_INTEGRATION_RECEIPT"
+            ):
+                raise
+            raise ValueError("E_INTEGRATION_RECEIPT: payload is invalid") from error
+
+
+@dataclass(frozen=True)
+class BaseRefreshReceiptV1:
+    """Non-authorizing host receipt for one exact closed base fetch."""
+
+    schema_version: int
+    kind: str
+    task_id: str
+    task_digest: str
+    run_plan_digest: str
+    repository: str
+    remote: str
+    remote_url: str
+    remote_url_digest: str
+    remote_identity: str
+    remote_identity_digest: str
+    base: str
+    base_ref: str
+    policy_digest: str
+    effect_plan_digest: str
+    integration_receipt_digest: str
+    merge_sha: str
+    refresh_argv: tuple[str, ...]
+    refresh_argv_digest: str
+    status: str
+    observed_ref: str | None
+    observed_sha: str | None
+    observed_at: str
+    authorizes: bool
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        expected_ref = f"refs/remotes/{self.remote}/{self.base}"
+        expected_argv = (
+            "git",
+            "-C",
+            self.repository,
+            "fetch",
+            "--no-tags",
+            "--no-prune",
+            self.remote_url,
+            f"+refs/heads/{self.base}:{expected_ref}",
+        )
+        core = {
+            key: value
+            for key, value in self.to_dict().items()
+            if key != "receipt_digest"
+        }
+        pass_exact = self.status != "PASS" or (
+            self.observed_ref == expected_ref
+            and _GIT_OBJECT_ID.fullmatch(str(self.observed_sha)) is not None
+        )
+        inconclusive_empty = self.status == "PASS" or (
+            self.observed_ref is None and self.observed_sha is None
+        )
+        if (
+            self.schema_version != 1
+            or self.kind != "BaseRefreshReceiptV1"
+            or not validate_task_id(self.task_id)
+            or not all(
+                _outcome_digest(value)
+                for value in (
+                    self.task_digest,
+                    self.run_plan_digest,
+                    self.remote_url_digest,
+                    self.remote_identity_digest,
+                    self.policy_digest,
+                    self.effect_plan_digest,
+                    self.integration_receipt_digest,
+                    self.refresh_argv_digest,
+                    self.receipt_digest,
+                )
+            )
+            or not isinstance(self.repository, str)
+            or not Path(self.repository).is_absolute()
+            or str(Path(self.repository).resolve()) != self.repository
+            or _OUTCOME_REMOTE_NAME.fullmatch(self.remote) is None
+            or self.remote_url_digest != contract_digest(self.remote_url)
+            or self.remote_identity
+            != _canonical_github_repository_from_url(
+                self.remote_url, code="E_BASE_REFRESH_RECEIPT"
+            )
+            or self.remote_identity_digest != contract_digest(self.remote_identity)
+            or _OUTCOME_BRANCH.fullmatch(self.base) is None
+            or self.base_ref != expected_ref
+            or _GIT_OBJECT_ID.fullmatch(self.merge_sha) is None
+            or self.refresh_argv != expected_argv
+            or self.refresh_argv_digest != contract_digest(list(self.refresh_argv))
+            or self.status not in {"PASS", "FAIL", "UNKNOWN"}
+            or not pass_exact
+            or not inconclusive_empty
+            or _outcome_time(self.observed_at) is None
+            or self.authorizes is not False
+            or self.receipt_digest != contract_digest(core)
+        ):
+            raise ValueError("E_BASE_REFRESH_RECEIPT: receipt is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return {**self.__dict__, "refresh_argv": list(self.refresh_argv)}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "BaseRefreshReceiptV1":
+        if not isinstance(value, Mapping) or set(value) != _BASE_REFRESH_RECEIPT_KEYS:
+            raise ValueError("E_BASE_REFRESH_RECEIPT: schema is not closed")
+        try:
+            payload = dict(value)
+            payload["refresh_argv"] = tuple(payload["refresh_argv"])
+            return cls(**payload)
+        except (TypeError, ValueError, KeyError) as error:
+            if isinstance(error, ValueError) and str(error).startswith(
+                "E_BASE_REFRESH_RECEIPT"
+            ):
+                raise
+            raise ValueError("E_BASE_REFRESH_RECEIPT: payload is invalid") from error
+
+
+@dataclass(frozen=True)
+class BaseVerificationReceiptV1:
+    """Read-only containment result for the exact refreshed remote base."""
+
+    schema_version: int
+    kind: str
+    task_id: str
+    task_digest: str
+    run_plan_digest: str
+    repository: str
+    remote: str
+    base: str
+    base_ref: str
+    policy_digest: str
+    effect_plan_digest: str
+    integration_receipt_digest: str
+    refresh_receipt_digest: str
+    merge_sha: str
+    status: str
+    reason_code: str
+    observed_base_sha: str | None
+    contained: bool | None
+    observed_at: str
+    authorizes: bool
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        expected_ref = f"refs/remotes/{self.remote}/{self.base}"
+        core = {
+            key: value
+            for key, value in self.to_dict().items()
+            if key != "receipt_digest"
+        }
+        pass_exact = (
+            self.status != "PASS"
+            or (
+                self.reason_code == "BASE_CONTAINED"
+                and self.contained is True
+                and _GIT_OBJECT_ID.fullmatch(str(self.observed_base_sha))
+                is not None
+            )
+        )
+        blocked_exact = (
+            self.status != "BLOCKED"
+            or (
+                self.reason_code
+                in {
+                    "BASE_REFRESH_UNKNOWN",
+                    "BASE_REF_MISSING",
+                    "BASE_REF_MISMATCH",
+                    "BASE_MERGE_NOT_CONTAINED",
+                    "BASE_CONTAINMENT_UNKNOWN",
+                }
+                and self.contained in {False, None}
+                and (
+                    self.observed_base_sha is None
+                    or _GIT_OBJECT_ID.fullmatch(self.observed_base_sha) is not None
+                )
+            )
+        )
+        if (
+            self.schema_version != 1
+            or self.kind != "BaseVerificationReceiptV1"
+            or not validate_task_id(self.task_id)
+            or not all(
+                _outcome_digest(value)
+                for value in (
+                    self.task_digest,
+                    self.run_plan_digest,
+                    self.policy_digest,
+                    self.effect_plan_digest,
+                    self.integration_receipt_digest,
+                    self.refresh_receipt_digest,
+                    self.receipt_digest,
+                )
+            )
+            or not isinstance(self.repository, str)
+            or not Path(self.repository).is_absolute()
+            or str(Path(self.repository).resolve()) != self.repository
+            or _OUTCOME_REMOTE_NAME.fullmatch(self.remote) is None
+            or _OUTCOME_BRANCH.fullmatch(self.base) is None
+            or self.base_ref != expected_ref
+            or _GIT_OBJECT_ID.fullmatch(self.merge_sha) is None
+            or self.status not in {"PASS", "BLOCKED"}
+            or not pass_exact
+            or not blocked_exact
+            or _outcome_time(self.observed_at) is None
+            or self.authorizes is not False
+            or self.receipt_digest != contract_digest(core)
+        ):
+            raise ValueError("E_BASE_VERIFICATION_RECEIPT: receipt is invalid")
+
+    def to_dict(self) -> dict[str, object]:
+        return dict(self.__dict__)
+
+    @classmethod
+    def from_dict(
+        cls, value: Mapping[str, object]
+    ) -> "BaseVerificationReceiptV1":
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != _BASE_VERIFICATION_RECEIPT_KEYS
+        ):
+            raise ValueError("E_BASE_VERIFICATION_RECEIPT: schema is not closed")
+        try:
+            return cls(**dict(value))
+        except (TypeError, ValueError, KeyError) as error:
+            if isinstance(error, ValueError) and str(error).startswith(
+                "E_BASE_VERIFICATION_RECEIPT"
+            ):
+                raise
+            raise ValueError(
+                "E_BASE_VERIFICATION_RECEIPT: payload is invalid"
+            ) from error
+
+
+@dataclass(frozen=True)
+class OutcomeEffectPlanV1:
+    """Closed kernel proposal for one bounded remote outcome effect.
+
+    This value describes an effect.  It carries no host authority and cannot
+    execute itself.
+    """
+
+    schema_version: int
+    kind: str
+    task_id: str
+    task_digest: str
+    run_plan_digest: str
+    requested_outcome: str
+    repository: str
+    remote: str
+    remote_url: str
+    remote_url_digest: str
+    remote_identity_digest: str
+    base: str
+    branch: str
+    head_sha: str
+    scope_paths: tuple[str, ...]
+    subject_digest: str
+    policy_digest: str
+    effect: str
+    title: str | None
+    title_digest: str | None
+    body: str | None
+    body_digest: str | None
+    draft: bool | None
+    operation: str | None
+    operation_digest: str | None
+    required_checks: tuple[tuple[str, str, tuple[str, ...], str], ...]
+    argv: tuple[str, ...]
+    argv_digest: str
+    observation_argv: tuple[str, ...]
+    observation_argv_digest: str
+    observe_before_retry: bool
+    authorizes: bool
+    plan_digest: str
+
+    def __post_init__(self) -> None:
+        expected_push = (
+            "git",
+            "push",
+            self.remote_url,
+            f"{self.head_sha}:refs/heads/{self.branch}",
+        )
+        expected_observation = (
+            "git",
+            "ls-remote",
+            "--heads",
+            self.remote_url,
+            f"refs/heads/{self.branch}",
+        )
+        expected_pr_argv = (
+            "pull_request.create_draft",
+            self.remote_identity_digest,
+            self.base,
+            self.branch,
+            self.head_sha,
+            str(self.title_digest),
+            str(self.body_digest),
+        )
+        expected_pr_observation = (
+            "pull_request.observe",
+            self.remote_identity_digest,
+            self.base,
+            self.branch,
+            self.head_sha,
+        )
+        ready_number = self.argv[2] if len(self.argv) == 8 else None
+        ready_url_digest = self.argv[3] if len(self.argv) == 8 else None
+        ready_checks_digest = self.argv[7] if len(self.argv) == 8 else None
+        expected_ready_argv = (
+            "pull_request.mark_ready",
+            self.remote_identity_digest,
+            ready_number,
+            ready_url_digest,
+            self.base,
+            self.branch,
+            self.head_sha,
+            ready_checks_digest,
+        )
+        expected_ready_observation = (
+            "pull_request.observe",
+            self.remote_identity_digest,
+            ready_number,
+            ready_url_digest,
+            self.base,
+            self.branch,
+            self.head_sha,
+        )
+        remote_write_variant = (
+            self.effect == "remote_write"
+            and all(
+                value is None
+                for value in (
+                    self.title,
+                    self.title_digest,
+                    self.body,
+                    self.body_digest,
+                    self.draft,
+                    self.operation,
+                    self.operation_digest,
+                )
+            )
+            and not self.required_checks
+            and self.argv == expected_push
+            and self.observation_argv == expected_observation
+        )
+        pull_request_variant = (
+            self.effect == "pull_request"
+            and _outcome_pr_content(self.title, self.body)
+            and self.title_digest == contract_digest(self.title)
+            and self.body_digest == contract_digest(self.body)
+            and self.draft is True
+            and self.operation == "create_draft_pull_request"
+            and self.operation_digest
+            == contract_digest(
+                {
+                    "operation": self.operation,
+                    "argv": list(expected_pr_argv),
+                    "observation_argv": list(expected_pr_observation),
+                }
+            )
+            and self.argv == expected_pr_argv
+            and self.observation_argv == expected_pr_observation
+            and _outcome_required_checks(self.required_checks, required=True)
+        )
+        pull_request_ready_variant = (
+            self.effect == "pull_request"
+            and all(
+                value is None
+                for value in (
+                    self.title,
+                    self.title_digest,
+                    self.body,
+                    self.body_digest,
+                )
+            )
+            and self.draft is False
+            and self.operation == "mark_pull_request_ready"
+            and isinstance(ready_number, str)
+            and re.fullmatch(r"[1-9][0-9]*", ready_number) is not None
+            and _outcome_digest(ready_url_digest)
+            and _outcome_digest(ready_checks_digest)
+            and self.operation_digest
+            == contract_digest(
+                {
+                    "operation": self.operation,
+                    "argv": list(expected_ready_argv),
+                    "observation_argv": list(expected_ready_observation),
+                }
+            )
+            and self.argv == expected_ready_argv
+            and self.observation_argv == expected_ready_observation
+            and _outcome_required_checks(self.required_checks, required=True)
+        )
+        core = {
+            key: value
+            for key, value in self.to_dict().items()
+            if key != "plan_digest"
+        }
+        if (
+            self.schema_version != 1
+            or self.kind != "OutcomeEffectPlanV1"
+            or not validate_task_id(self.task_id)
+            or not all(
+                _outcome_digest(value)
+                for value in (
+                    self.task_digest,
+                    self.run_plan_digest,
+                    self.subject_digest,
+                    self.policy_digest,
+                    self.remote_url_digest,
+                    self.remote_identity_digest,
+                    self.argv_digest,
+                    self.observation_argv_digest,
+                    self.plan_digest,
+                )
+            )
+            or self.requested_outcome not in {"pull_request", "integration"}
+            or not isinstance(self.repository, str)
+            or not Path(self.repository).is_absolute()
+            or str(Path(self.repository).resolve()) != self.repository
+            or _OUTCOME_REMOTE_NAME.fullmatch(self.remote) is None
+            or self.remote_url_digest != contract_digest(self.remote_url)
+            or self.remote_identity_digest
+            != contract_digest(_outcome_identity_for_url(self.remote_url))
+            or _OUTCOME_BRANCH.fullmatch(self.base) is None
+            or _OUTCOME_BRANCH.fullmatch(self.branch) is None
+            or self.base == self.branch
+            or _GIT_OBJECT_ID.fullmatch(self.head_sha) is None
+            or not _outcome_scope(self.scope_paths)
+            or not (
+                remote_write_variant
+                or pull_request_variant
+                or pull_request_ready_variant
+            )
+            or self.argv_digest != contract_digest(list(self.argv))
+            or self.observation_argv_digest
+            != contract_digest(list(self.observation_argv))
+            or self.observe_before_retry is not True
+            or self.authorizes is not False
+            or self.plan_digest != contract_digest(core)
+            or _outcome_contract_size(self.to_dict())
+            > _OUTCOME_CONTRACT_MAX_BYTES
+        ):
+            raise ValueError(
+                "E_OUTCOME_EFFECT_PLAN: closed outcome effect plan is invalid"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "task_id": self.task_id,
+            "task_digest": self.task_digest,
+            "run_plan_digest": self.run_plan_digest,
+            "requested_outcome": self.requested_outcome,
+            "repository": self.repository,
+            "remote": self.remote,
+            "remote_url": self.remote_url,
+            "remote_url_digest": self.remote_url_digest,
+            "remote_identity_digest": self.remote_identity_digest,
+            "base": self.base,
+            "branch": self.branch,
+            "head_sha": self.head_sha,
+            "scope_paths": list(self.scope_paths),
+            "subject_digest": self.subject_digest,
+            "policy_digest": self.policy_digest,
+            "effect": self.effect,
+            "title": self.title,
+            "title_digest": self.title_digest,
+            "body": self.body,
+            "body_digest": self.body_digest,
+            "draft": self.draft,
+            "operation": self.operation,
+            "operation_digest": self.operation_digest,
+            "required_checks": [
+                {"name": item[0], "app": item[1], "conclusions": list(item[2]), "selector_digest": item[3]}
+                for item in self.required_checks
+            ],
+            "argv": list(self.argv),
+            "argv_digest": self.argv_digest,
+            "observation_argv": list(self.observation_argv),
+            "observation_argv_digest": self.observation_argv_digest,
+            "observe_before_retry": self.observe_before_retry,
+            "authorizes": self.authorizes,
+            "plan_digest": self.plan_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "OutcomeEffectPlanV1":
+        if not isinstance(value, Mapping) or set(value) != _OUTCOME_EFFECT_PLAN_KEYS:
+            raise ValueError("E_OUTCOME_EFFECT_PLAN: schema is not closed")
+        try:
+            payload = dict(value)
+            raw_checks = payload["required_checks"]
+            if (
+                not isinstance(raw_checks, list)
+                or any(
+                    not isinstance(item, Mapping)
+                    or set(item) != {"name", "app", "conclusions", "selector_digest"}
+                    or not isinstance(item["conclusions"], list)
+                    for item in raw_checks
+                )
+            ):
+                raise ValueError("E_OUTCOME_EFFECT_PLAN: nested schema is not closed")
+            payload["scope_paths"] = tuple(payload["scope_paths"])
+            payload["argv"] = tuple(payload["argv"])
+            payload["observation_argv"] = tuple(payload["observation_argv"])
+            payload["required_checks"] = tuple(
+                (
+                    item["name"], item["app"], tuple(item["conclusions"]),
+                    item["selector_digest"],
+                )
+                for item in payload["required_checks"]
+            )
+            return cls(**payload)
+        except (TypeError, ValueError, KeyError) as error:
+            if isinstance(error, ValueError) and str(error).startswith(
+                "E_OUTCOME_EFFECT_PLAN"
+            ):
+                raise
+            raise ValueError("E_OUTCOME_EFFECT_PLAN: payload is invalid") from error
+
+
+@dataclass(frozen=True)
+class RemoteOutcomeReceiptV1:
+    """Durable result of a host observation; never proof of authority."""
+
+    schema_version: int
+    kind: str
+    task_id: str
+    task_digest: str
+    run_plan_digest: str
+    requested_outcome: str
+    repository: str
+    remote: str
+    remote_url: str
+    remote_url_digest: str
+    remote_identity_digest: str
+    base: str
+    branch: str
+    head_sha: str
+    scope_paths: tuple[str, ...]
+    subject_digest: str
+    policy_digest: str
+    effect: str
+    title_digest: str | None
+    body_digest: str | None
+    draft: bool | None
+    effect_plan_digest: str
+    status: str
+    observed_repository: str | None
+    observed_remote: str | None
+    observed_base: str | None
+    observed_branch: str | None
+    observed_head_sha: str | None
+    observed_pr_number: int | None
+    observed_pr_url: str | None
+    observed_pr_draft: bool | None
+    disposition: str | None
+    observation_kind: str | None
+    required_check_digests: tuple[str, ...]
+    check_results: tuple[tuple[str, str], ...]
+    feedback: tuple[tuple[int, str, str, str], ...]
+    observed_at: str
+    authorizes: bool
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        core = {
+            key: value
+            for key, value in self.to_dict().items()
+            if key != "receipt_digest"
+        }
+        observed = (
+            self.observed_repository,
+            self.observed_remote,
+            self.observed_base,
+            self.observed_branch,
+            self.observed_head_sha,
+        )
+        observed_repository_valid = self.observed_repository is None or (
+            isinstance(self.observed_repository, str)
+            and Path(self.observed_repository).is_absolute()
+            and not any(
+                ord(character) < 32 for character in self.observed_repository
+            )
+            and (
+                str(Path(self.observed_repository).resolve())
+                == self.observed_repository
+                or (self.effect == "pull_request" and self.status == "FAIL")
+            )
+        )
+        observed_fields_valid = observed_repository_valid and (
+            self.observed_remote is None
+            or _OUTCOME_REMOTE_NAME.fullmatch(self.observed_remote) is not None
+        ) and (
+            self.observed_base is None
+            or _OUTCOME_BRANCH.fullmatch(self.observed_base) is not None
+        ) and (
+            self.observed_branch is None
+            or _OUTCOME_BRANCH.fullmatch(self.observed_branch) is not None
+        ) and (
+            self.observed_head_sha is None
+            or _GIT_OBJECT_ID.fullmatch(self.observed_head_sha) is not None
+        )
+        pass_exact = self.status != "PASS" or observed == (
+            self.repository,
+            self.remote,
+            self.base,
+            self.branch,
+            self.head_sha,
+        )
+        unknown_empty = self.status != "UNKNOWN" or all(
+            value is None for value in observed
+        )
+        pr_observed = (
+            self.observed_pr_number,
+            self.observed_pr_url,
+            self.observed_pr_draft,
+            self.disposition,
+        )
+        valid_pr_url = self.observed_pr_url is None
+        if self.observed_pr_url is not None:
+            try:
+                expected_repository = _canonical_github_repository_from_url(
+                    self.remote_url, code="E_REMOTE_OUTCOME_RECEIPT"
+                )
+                observed_repository, observed_number = (
+                    _github_pull_request_url_identity(
+                        self.observed_pr_url,
+                        code="E_REMOTE_OUTCOME_RECEIPT",
+                    )
+                )
+            except ValueError:
+                valid_pr_url = False
+            else:
+                valid_pr_url = (
+                    observed_repository == expected_repository
+                    and observed_number == self.observed_pr_number
+                )
+        remote_write_variant = (
+            self.effect == "remote_write"
+            and self.status in {"PASS", "FAIL", "UNKNOWN"}
+            and self.title_digest is None
+            and self.body_digest is None
+            and self.draft is None
+            and all(value is None for value in pr_observed)
+            and pass_exact
+            and unknown_empty
+        )
+        pr_empty = all(value is None for value in (*observed, *pr_observed))
+        pr_pass = (
+            self.status == "PASS"
+            and observed
+            == (
+                self.repository,
+                self.remote,
+                self.base,
+                self.branch,
+                self.head_sha,
+            )
+            and isinstance(self.observed_pr_number, int)
+            and not isinstance(self.observed_pr_number, bool)
+            and self.observed_pr_number > 0
+            and valid_pr_url
+            and self.observed_pr_draft is True
+            and self.disposition in {"observed_existing", "created"}
+        )
+        pr_fail = (
+            self.status == "FAIL"
+            and not pr_empty
+            and isinstance(self.observed_pr_number, int)
+            and not isinstance(self.observed_pr_number, bool)
+            and self.observed_pr_number > 0
+            and valid_pr_url
+            and isinstance(self.observed_pr_draft, bool)
+            and self.disposition == "observed_existing"
+        )
+        pull_request_variant = (
+            self.effect == "pull_request"
+            and _outcome_digest(self.title_digest)
+            and _outcome_digest(self.body_digest)
+            and self.draft is True
+            and self.status in {"PASS", "FAIL", "UNKNOWN", "ABSENT"}
+            and (pr_pass or pr_fail or (self.status in {"UNKNOWN", "ABSENT"} and pr_empty))
+        )
+        readiness_pr = (
+            self.effect == "pull_request"
+            and self.status in {"PASS", "UNKNOWN"}
+            and self.observed_repository == self.repository
+            and self.observed_remote == self.remote
+            and self.observed_base == self.base
+            and self.observed_branch == self.branch
+            and self.observed_head_sha == self.head_sha
+            and isinstance(self.observed_pr_number, int)
+            and not isinstance(self.observed_pr_number, bool)
+            and self.observed_pr_number > 0
+            and valid_pr_url
+            and self.observed_pr_draft is True
+            and self.disposition == "observed_existing"
+        )
+        check_digests_valid = (
+            isinstance(self.required_check_digests, tuple)
+            and len(self.required_check_digests) <= 64
+            and tuple(sorted(set(self.required_check_digests)))[::] == self.required_check_digests
+            and all(_outcome_digest(value) for value in self.required_check_digests)
+        )
+        check_results_valid = (
+            isinstance(self.check_results, tuple)
+            and len(self.check_results) <= 64
+            and all(
+                isinstance(item, tuple)
+                and len(item) == 2
+                and _outcome_digest(item[0])
+                and item[1] in {"PASS", "FAIL", "UNKNOWN"}
+                for item in self.check_results
+            )
+            and tuple(item[0] for item in self.check_results)
+            == self.required_check_digests
+        )
+        feedback_valid = (
+            isinstance(self.feedback, tuple)
+            and len(self.feedback) <= 64
+            and len({item[0] for item in self.feedback if isinstance(item, tuple) and len(item) == 4})
+            == len(self.feedback)
+            and all(
+                isinstance(item, tuple)
+                and len(item) == 4
+                and isinstance(item[0], int)
+                and not isinstance(item[0], bool)
+                and item[0] > 0
+                and _outcome_digest(item[1])
+                and item[2] in {"Critical", "Important", "Minor"}
+                and item[3] in {"resolved", "unresolved"}
+                for item in self.feedback
+            )
+        )
+        readiness_variant = (
+            readiness_pr
+            and self.observation_kind in {"checks", "review_threads", "comments"}
+            and (
+                (
+                    self.observation_kind == "checks"
+                    and self.status == "PASS"
+                    and check_digests_valid
+                    and check_results_valid
+                    and not self.feedback
+                )
+                or (
+                    self.observation_kind in {"review_threads", "comments"}
+                    and not self.required_check_digests
+                    and not self.check_results
+                    and feedback_valid
+                    and (self.status == "PASS" or not self.feedback)
+                )
+            )
+        )
+        ready_pass = (
+            self.status == "PASS"
+            and observed
+            == (
+                self.repository,
+                self.remote,
+                self.base,
+                self.branch,
+                self.head_sha,
+            )
+            and isinstance(self.observed_pr_number, int)
+            and not isinstance(self.observed_pr_number, bool)
+            and self.observed_pr_number > 0
+            and valid_pr_url
+            and self.observed_pr_draft is False
+            and self.disposition in {"marked_ready", "observed_existing"}
+        )
+        ready_unknown = self.status == "UNKNOWN" and (
+            pr_empty
+            or (
+                observed
+                == (
+                    self.repository,
+                    self.remote,
+                    self.base,
+                    self.branch,
+                    self.head_sha,
+                )
+                and isinstance(self.observed_pr_number, int)
+                and not isinstance(self.observed_pr_number, bool)
+                and self.observed_pr_number > 0
+                and valid_pr_url
+                and self.observed_pr_draft is True
+                and self.disposition == "observed_existing"
+            )
+        )
+        pull_request_ready_variant = (
+            self.effect == "pull_request"
+            and self.title_digest is None
+            and self.body_digest is None
+            and self.draft is False
+            and self.observation_kind == "ready_state"
+            and not self.required_check_digests
+            and not self.check_results
+            and not self.feedback
+            and (ready_pass or ready_unknown)
+        )
+        legacy_variant = (
+            self.observation_kind is None
+            and not self.required_check_digests
+            and not self.check_results
+            and not self.feedback
+            and (remote_write_variant or pull_request_variant)
+        )
+        if (
+            self.schema_version != 1
+            or self.kind != "RemoteOutcomeReceiptV1"
+            or not validate_task_id(self.task_id)
+            or not all(
+                _outcome_digest(value)
+                for value in (
+                    self.task_digest,
+                    self.run_plan_digest,
+                    self.subject_digest,
+                    self.policy_digest,
+                    self.remote_url_digest,
+                    self.remote_identity_digest,
+                    self.effect_plan_digest,
+                    self.receipt_digest,
+                )
+            )
+            or self.requested_outcome not in {"pull_request", "integration"}
+            or not isinstance(self.repository, str)
+            or not Path(self.repository).is_absolute()
+            or str(Path(self.repository).resolve()) != self.repository
+            or _OUTCOME_REMOTE_NAME.fullmatch(self.remote) is None
+            or self.remote_url_digest != contract_digest(self.remote_url)
+            or self.remote_identity_digest
+            != contract_digest(_outcome_identity_for_url(self.remote_url))
+            or _OUTCOME_BRANCH.fullmatch(self.base) is None
+            or _OUTCOME_BRANCH.fullmatch(self.branch) is None
+            or self.base == self.branch
+            or _GIT_OBJECT_ID.fullmatch(self.head_sha) is None
+            or not _outcome_scope(self.scope_paths)
+            or not (
+                legacy_variant
+                or readiness_variant
+                or pull_request_ready_variant
+            )
+            or not observed_fields_valid
+            or _OUTCOME_TIMESTAMP.fullmatch(self.observed_at) is None
+            or self.authorizes is not False
+            or self.receipt_digest != contract_digest(core)
+            or _outcome_contract_size(self.to_dict())
+            > _OUTCOME_CONTRACT_MAX_BYTES
+        ):
+            raise ValueError(
+                "E_REMOTE_OUTCOME_RECEIPT: closed observation receipt is invalid"
+            )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "task_id": self.task_id,
+            "task_digest": self.task_digest,
+            "run_plan_digest": self.run_plan_digest,
+            "requested_outcome": self.requested_outcome,
+            "repository": self.repository,
+            "remote": self.remote,
+            "remote_url": self.remote_url,
+            "remote_url_digest": self.remote_url_digest,
+            "remote_identity_digest": self.remote_identity_digest,
+            "base": self.base,
+            "branch": self.branch,
+            "head_sha": self.head_sha,
+            "scope_paths": list(self.scope_paths),
+            "subject_digest": self.subject_digest,
+            "policy_digest": self.policy_digest,
+            "effect": self.effect,
+            "title_digest": self.title_digest,
+            "body_digest": self.body_digest,
+            "draft": self.draft,
+            "effect_plan_digest": self.effect_plan_digest,
+            "status": self.status,
+            "observed_repository": self.observed_repository,
+            "observed_remote": self.observed_remote,
+            "observed_base": self.observed_base,
+            "observed_branch": self.observed_branch,
+            "observed_head_sha": self.observed_head_sha,
+            "observed_pr_number": self.observed_pr_number,
+            "observed_pr_url": self.observed_pr_url,
+            "observed_pr_draft": self.observed_pr_draft,
+            "disposition": self.disposition,
+            "observation_kind": self.observation_kind,
+            "required_check_digests": list(self.required_check_digests),
+            "check_results": [list(item) for item in self.check_results],
+            "feedback": [
+                {"id": item[0], "digest": item[1], "severity": item[2], "status": item[3]}
+                for item in self.feedback
+            ],
+            "observed_at": self.observed_at,
+            "authorizes": self.authorizes,
+            "receipt_digest": self.receipt_digest,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, object]) -> "RemoteOutcomeReceiptV1":
+        if not isinstance(value, Mapping) or set(value) != _REMOTE_OUTCOME_RECEIPT_KEYS:
+            raise ValueError("E_REMOTE_OUTCOME_RECEIPT: schema is not closed")
+        try:
+            payload = dict(value)
+            raw_required = payload["required_check_digests"]
+            raw_results = payload["check_results"]
+            raw_feedback = payload["feedback"]
+            if (
+                not isinstance(raw_required, list)
+                or not isinstance(raw_results, list)
+                or not isinstance(raw_feedback, list)
+                or any(
+                    not isinstance(item, list) or len(item) != 2
+                    for item in raw_results
+                )
+                or any(
+                    not isinstance(item, Mapping)
+                    or set(item) != {"id", "digest", "severity", "status"}
+                    for item in raw_feedback
+                )
+            ):
+                raise ValueError("E_REMOTE_OUTCOME_RECEIPT: nested schema is not closed")
+            payload["scope_paths"] = tuple(payload["scope_paths"])
+            payload["required_check_digests"] = tuple(payload["required_check_digests"])
+            payload["check_results"] = tuple(
+                tuple(item) for item in payload["check_results"]
+            )
+            payload["feedback"] = tuple(
+                (item["id"], item["digest"], item["severity"], item["status"])
+                for item in payload["feedback"]
+            )
+            return cls(**payload)
+        except (TypeError, ValueError, KeyError) as error:
+            if isinstance(error, ValueError) and str(error).startswith(
+                "E_REMOTE_OUTCOME_RECEIPT"
+            ):
+                raise
+            raise ValueError("E_REMOTE_OUTCOME_RECEIPT: payload is invalid") from error
+
+
+def _outcome_remote_url_and_identity(
+    repository: Path, remote: str
+) -> tuple[str, str, str]:
+    completed = subprocess.run(
+        trusted_git_argv(
+            repository, ("remote", "get-url", "--push", remote)
+        ),
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=10,
+        env=trusted_git_environment(),
+    )
+    if completed.returncode != 0:
+        raise ValueError("E_OUTCOME_EFFECT_PLAN: remote identity is unavailable")
+    remote_url = completed.stdout.rstrip("\n")
+    identity = _outcome_identity_for_url(remote_url)
+    return remote_url, contract_digest(remote_url), contract_digest(identity)
+
+
+def build_remote_write_effect_plan(
+    *,
+    outcome_binding: Mapping[str, object],
+    task_digest: str,
+    remote: str,
+    base: str,
+    scope_paths: tuple[str, ...],
+    policy_digest: str,
+) -> OutcomeEffectPlanV1:
+    """Build the only supported push plan: feature -> same feature ref."""
+
+    from control_plane.run_workflow import validate_outcome_binding
+
+    if (
+        validate_outcome_binding(outcome_binding)
+        or not _outcome_digest(task_digest)
+        or not _outcome_digest(policy_digest)
+        or tuple(sorted(set(scope_paths))) != scope_paths
+        or contract_digest(list(scope_paths))
+        != outcome_binding.get("scope_paths_digest")
+        or outcome_binding.get("requested_outcome")
+        not in {"pull_request", "integration"}
+        or outcome_binding.get("consumed_effect_ids")
+        not in (
+            ["local_write", "commit"],
+            ("local_write", "commit"),
+        )
+        or outcome_binding.get("committed_head") is None
+    ):
+        raise ValueError(
+            "E_OUTCOME_EFFECT_PLAN: committed OutcomeBinding is required"
+        )
+    branch = str(outcome_binding["branch"])
+    repository = Path(str(outcome_binding["repository"])).resolve()
+    remote_url, remote_url_digest, remote_identity_digest = (
+        _outcome_remote_url_and_identity(repository, remote)
+    )
+    head_sha = str(outcome_binding["committed_head"])
+    argv = (
+        "git",
+        "push",
+        remote_url,
+        f"{head_sha}:refs/heads/{branch}",
+    )
+    observation_argv = (
+        "git",
+        "ls-remote",
+        "--heads",
+        remote_url,
+        f"refs/heads/{branch}",
+    )
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "OutcomeEffectPlanV1",
+        "task_id": outcome_binding["task_id"],
+        "task_digest": task_digest,
+        "run_plan_digest": outcome_binding["run_plan_digest"],
+        "requested_outcome": outcome_binding["requested_outcome"],
+        "repository": str(repository),
+        "remote": remote,
+        "remote_url": remote_url,
+        "remote_url_digest": remote_url_digest,
+        "remote_identity_digest": remote_identity_digest,
+        "base": base,
+        "branch": branch,
+        "head_sha": head_sha,
+        "scope_paths": list(scope_paths),
+        "subject_digest": outcome_binding["binding_digest"],
+        "policy_digest": policy_digest,
+        "effect": "remote_write",
+        "title": None,
+        "title_digest": None,
+        "body": None,
+        "body_digest": None,
+        "draft": None,
+        "operation": None,
+        "operation_digest": None,
+        "required_checks": [],
+        "argv": list(argv),
+        "argv_digest": contract_digest(list(argv)),
+        "observation_argv": list(observation_argv),
+        "observation_argv_digest": contract_digest(list(observation_argv)),
+        "observe_before_retry": True,
+        "authorizes": False,
+    }
+    return OutcomeEffectPlanV1.from_dict(
+        {**core, "plan_digest": contract_digest(core)}
+    )
+
+
+def build_squash_merge_effect_plan(
+    *,
+    outcome_binding: Mapping[str, object],
+    task_digest: str,
+    policy: Mapping[str, object],
+    scope_paths: tuple[str, ...],
+    pull_request_number: int,
+    pull_request_url: str,
+    prepared_at: str,
+    expires_at: str,
+    now: str,
+) -> IntegrationEffectPlanV1:
+    """Build the only supported integration plan from an exact PR predecessor."""
+
+    from control_plane.policy import validate_policy
+    from control_plane.run_workflow import validate_outcome_binding
+
+    policy_git = policy.get("git", {}) if isinstance(policy, Mapping) else {}
+    if policy_git.get("integration_strategy") != "squash":
+        raise ValueError(
+            "BLOCKED_UNSUPPORTED_INTEGRATION_STRATEGY: squash is required"
+        )
+    prepared = _outcome_time(prepared_at)
+    expires = _outcome_time(expires_at)
+    current = _outcome_time(now)
+    if (
+        validate_policy(policy)
+        or validate_outcome_binding(outcome_binding)
+        or outcome_binding.get("requested_outcome") != "integration"
+        or outcome_binding.get("consumed_effect_ids")
+        not in (
+            ["local_write", "commit", "remote_write", "pull_request"],
+            ("local_write", "commit", "remote_write", "pull_request"),
+        )
+        or outcome_binding.get("pushed_head")
+        != outcome_binding.get("committed_head")
+        or not _outcome_digest(outcome_binding.get("pull_request_digest"))
+        or not _outcome_digest(outcome_binding.get("checks_digest"))
+        or not _outcome_digest(task_digest)
+        or tuple(sorted(set(scope_paths))) != scope_paths
+        or contract_digest(list(scope_paths))
+        != outcome_binding.get("scope_paths_digest")
+        or policy_git.get("require_pull_request") is not True
+        or policy_git.get("allow_direct_base_push") is not False
+        or not isinstance(pull_request_number, int)
+        or isinstance(pull_request_number, bool)
+        or pull_request_number <= 0
+        or prepared is None
+        or expires is None
+        or current is None
+        or not prepared <= current < expires
+        or (expires - prepared).total_seconds()
+        > _INTEGRATION_EFFECT_PLAN_MAX_TTL_SECONDS
+    ):
+        raise ValueError(
+            "E_INTEGRATION_EFFECT_PLAN: exact unexpired PR binding is required"
+        )
+    repository = Path(str(outcome_binding["repository"])).resolve()
+    remote = str(policy_git["remote"])
+    base = str(policy_git["base_branch"])
+    branch = str(outcome_binding["branch"])
+    if branch == base:
+        raise ValueError(
+            "E_INTEGRATION_EFFECT_PLAN: direct base integration is forbidden"
+        )
+    remote_url, remote_url_digest, _ = _outcome_remote_url_and_identity(
+        repository, remote
+    )
+    remote_identity = _canonical_github_repository_from_url(
+        remote_url, code="E_INTEGRATION_EFFECT_PLAN"
+    )
+    try:
+        observed_repository, observed_number = _github_pull_request_url_identity(
+            pull_request_url, code="E_INTEGRATION_EFFECT_PLAN"
+        )
+    except ValueError as error:
+        raise ValueError(
+            "E_INTEGRATION_EFFECT_PLAN: pull request identity is invalid"
+        ) from error
+    head_sha = str(outcome_binding["committed_head"])
+    expected_pr_digest = contract_digest(
+        {
+            "number": pull_request_number,
+            "url": pull_request_url,
+            "head": head_sha,
+            "draft": True,
+        }
+    )
+    if (
+        observed_repository != remote_identity
+        or observed_number != pull_request_number
+        or expected_pr_digest != outcome_binding.get("pull_request_digest")
+    ):
+        raise ValueError(
+            "E_INTEGRATION_EFFECT_PLAN: pull request binding drifted"
+        )
+    argv = (
+        "gh",
+        "pr",
+        "merge",
+        str(pull_request_number),
+        "--repo",
+        remote_identity,
+        "--match-head-commit",
+        head_sha,
+        "--squash",
+    )
+    observation_argv = (
+        "gh",
+        "pr",
+        "view",
+        str(pull_request_number),
+        "--repo",
+        remote_identity,
+        "--json",
+        "number,url,state,isDraft,baseRefName,headRefName,headRefOid,mergeCommit,mergedAt",
+    )
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "IntegrationEffectPlanV1",
+        "task_id": outcome_binding["task_id"],
+        "task_digest": task_digest,
+        "run_plan_digest": outcome_binding["run_plan_digest"],
+        "requested_outcome": "integration",
+        "repository": str(repository),
+        "remote": remote,
+        "remote_url": remote_url,
+        "remote_url_digest": remote_url_digest,
+        "remote_identity": remote_identity,
+        "remote_identity_digest": contract_digest(remote_identity),
+        "base": base,
+        "branch": branch,
+        "head_sha": head_sha,
+        "scope_paths": list(scope_paths),
+        "subject_digest": outcome_binding["binding_digest"],
+        "policy_digest": contract_digest(policy),
+        "effect": "integration",
+        "integration_strategy": "squash",
+        "pull_request_number": pull_request_number,
+        "pull_request_url": pull_request_url,
+        "pull_request_digest": outcome_binding["pull_request_digest"],
+        "checks_digest": outcome_binding["checks_digest"],
+        "prepared_at": prepared_at,
+        "expires_at": expires_at,
+        "argv": list(argv),
+        "argv_digest": contract_digest(list(argv)),
+        "observation_argv": list(observation_argv),
+        "observation_argv_digest": contract_digest(list(observation_argv)),
+        "observe_before_retry": True,
+        "authorizes": False,
+    }
+    return IntegrationEffectPlanV1.from_dict(
+        {**core, "plan_digest": contract_digest(core)}
+    )
+
+
+def build_integration_receipt(
+    *,
+    effect_plan: IntegrationEffectPlanV1,
+    status: str,
+    observed_at: str,
+    observed_repository: str | None = None,
+    observed_base: str | None = None,
+    observed_branch: str | None = None,
+    observed_head_sha: str | None = None,
+    observed_pr_number: int | None = None,
+    observed_pr_url: str | None = None,
+    observed_pr_state: str | None = None,
+    observed_pr_draft: bool | None = None,
+    observed_strategy: str | None = None,
+    observed_checks_digest: str | None = None,
+    observed_merge_sha: str | None = None,
+) -> IntegrationReceiptV1:
+    """Build a durable merge observation that never carries authority."""
+
+    if type(effect_plan) is not IntegrationEffectPlanV1:
+        raise ValueError("E_INTEGRATION_RECEIPT: exact effect plan is required")
+    effect_plan = IntegrationEffectPlanV1.from_dict(effect_plan.to_dict())
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "IntegrationReceiptV1",
+        "task_id": effect_plan.task_id,
+        "task_digest": effect_plan.task_digest,
+        "run_plan_digest": effect_plan.run_plan_digest,
+        "requested_outcome": effect_plan.requested_outcome,
+        "repository": effect_plan.repository,
+        "remote": effect_plan.remote,
+        "remote_url_digest": effect_plan.remote_url_digest,
+        "remote_identity": effect_plan.remote_identity,
+        "base": effect_plan.base,
+        "branch": effect_plan.branch,
+        "head_sha": effect_plan.head_sha,
+        "subject_digest": effect_plan.subject_digest,
+        "policy_digest": effect_plan.policy_digest,
+        "effect": effect_plan.effect,
+        "integration_strategy": effect_plan.integration_strategy,
+        "pull_request_number": effect_plan.pull_request_number,
+        "pull_request_url": effect_plan.pull_request_url,
+        "pull_request_digest": effect_plan.pull_request_digest,
+        "checks_digest": effect_plan.checks_digest,
+        "effect_plan_digest": effect_plan.plan_digest,
+        "status": status,
+        "observed_repository": observed_repository,
+        "observed_base": observed_base,
+        "observed_branch": observed_branch,
+        "observed_head_sha": observed_head_sha,
+        "observed_pr_number": observed_pr_number,
+        "observed_pr_url": observed_pr_url,
+        "observed_pr_state": observed_pr_state,
+        "observed_pr_draft": observed_pr_draft,
+        "observed_strategy": observed_strategy,
+        "observed_checks_digest": observed_checks_digest,
+        "observed_merge_sha": observed_merge_sha,
+        "observed_at": observed_at,
+        "authorizes": False,
+    }
+    return IntegrationReceiptV1.from_dict(
+        {**core, "receipt_digest": contract_digest(core)}
+    )
+
+
+def apply_integration_receipt(
+    *,
+    outcome_binding: Mapping[str, object],
+    effect_plan: IntegrationEffectPlanV1,
+    receipt: IntegrationReceiptV1,
+) -> dict[str, object]:
+    """Advance pull_request -> merged only from one exact PASS receipt."""
+
+    from control_plane.run_workflow import (
+        advance_outcome_binding,
+        validate_outcome_binding,
+    )
+
+    if validate_outcome_binding(outcome_binding):
+        raise ValueError("E_INTEGRATION_BINDING: OutcomeBinding is invalid")
+    if "integration" in outcome_binding.get("consumed_effect_ids", ()):
+        raise ValueError("E_INTEGRATION_REPLAY: integration was already consumed")
+    if type(effect_plan) is not IntegrationEffectPlanV1:
+        raise ValueError("E_INTEGRATION_EFFECT_PLAN: exact plan is required")
+    if type(receipt) is not IntegrationReceiptV1:
+        raise ValueError("E_INTEGRATION_RECEIPT: exact receipt is required")
+    effect_plan = IntegrationEffectPlanV1.from_dict(effect_plan.to_dict())
+    receipt = IntegrationReceiptV1.from_dict(receipt.to_dict())
+    binding_fields = (
+        ("task_id", "task_id"),
+        ("run_plan_digest", "run_plan_digest"),
+        ("requested_outcome", "requested_outcome"),
+        ("repository", "repository"),
+        ("branch", "branch"),
+        ("head_sha", "committed_head"),
+        ("pull_request_digest", "pull_request_digest"),
+        ("checks_digest", "checks_digest"),
+    )
+    receipt_fields = (
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "requested_outcome",
+        "repository",
+        "remote",
+        "remote_url_digest",
+        "remote_identity",
+        "base",
+        "branch",
+        "head_sha",
+        "subject_digest",
+        "policy_digest",
+        "effect",
+        "integration_strategy",
+        "pull_request_number",
+        "pull_request_url",
+        "pull_request_digest",
+        "checks_digest",
+    )
+    if (
+        outcome_binding.get("consumed_effect_ids")
+        not in (
+            ["local_write", "commit", "remote_write", "pull_request"],
+            ("local_write", "commit", "remote_write", "pull_request"),
+        )
+        or effect_plan.subject_digest != outcome_binding.get("binding_digest")
+        or any(
+            getattr(effect_plan, plan_name) != outcome_binding.get(binding_name)
+            for plan_name, binding_name in binding_fields
+        )
+        or receipt.effect_plan_digest != effect_plan.plan_digest
+        or any(
+            getattr(receipt, field) != getattr(effect_plan, field)
+            for field in receipt_fields
+        )
+    ):
+        raise ValueError("E_INTEGRATION_BINDING: plan or receipt drifted")
+    if receipt.status == "UNKNOWN":
+        raise ValueError(
+            "E_INTEGRATION_UNKNOWN: BLOCKED; observe the same PR before retry"
+        )
+    if receipt.status == "FAIL":
+        raise ValueError(
+            "E_INTEGRATION_FAIL: BLOCKED; observe the same PR before retry"
+        )
+    return advance_outcome_binding(
+        outcome_binding,
+        effect_id="integration",
+        observation={
+            "merge_sha": receipt.observed_merge_sha,
+            "checks_digest": receipt.observed_checks_digest,
+        },
+    )
+
+
+def _integration_receipt_matches_plan(
+    effect_plan: IntegrationEffectPlanV1,
+    receipt: IntegrationReceiptV1,
+) -> bool:
+    fields = (
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "requested_outcome",
+        "repository",
+        "remote",
+        "remote_url_digest",
+        "remote_identity",
+        "base",
+        "branch",
+        "head_sha",
+        "subject_digest",
+        "policy_digest",
+        "effect",
+        "integration_strategy",
+        "pull_request_number",
+        "pull_request_url",
+        "pull_request_digest",
+        "checks_digest",
+    )
+    return (
+        receipt.effect_plan_digest == effect_plan.plan_digest
+        and all(
+            getattr(receipt, field) == getattr(effect_plan, field)
+            for field in fields
+        )
+    )
+
+
+def build_base_refresh_receipt(
+    *,
+    effect_plan: IntegrationEffectPlanV1,
+    integration_receipt: IntegrationReceiptV1,
+    status: str,
+    observed_at: str,
+    observed_ref: str | None = None,
+    observed_sha: str | None = None,
+) -> BaseRefreshReceiptV1:
+    """Record the host's exact fetch result without performing the fetch."""
+
+    if (
+        type(effect_plan) is not IntegrationEffectPlanV1
+        or type(integration_receipt) is not IntegrationReceiptV1
+    ):
+        raise ValueError("E_BASE_REFRESH_RECEIPT: exact contracts are required")
+    effect_plan = IntegrationEffectPlanV1.from_dict(effect_plan.to_dict())
+    integration_receipt = IntegrationReceiptV1.from_dict(
+        integration_receipt.to_dict()
+    )
+    if (
+        integration_receipt.status != "PASS"
+        or not _integration_receipt_matches_plan(
+            effect_plan, integration_receipt
+        )
+    ):
+        raise ValueError(
+            "E_BASE_REFRESH_RECEIPT: exact PASS integration is required"
+        )
+    base_ref = f"refs/remotes/{effect_plan.remote}/{effect_plan.base}"
+    refresh_argv = (
+        "git",
+        "-C",
+        effect_plan.repository,
+        "fetch",
+        "--no-tags",
+        "--no-prune",
+        effect_plan.remote_url,
+        f"+refs/heads/{effect_plan.base}:{base_ref}",
+    )
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "BaseRefreshReceiptV1",
+        "task_id": effect_plan.task_id,
+        "task_digest": effect_plan.task_digest,
+        "run_plan_digest": effect_plan.run_plan_digest,
+        "repository": effect_plan.repository,
+        "remote": effect_plan.remote,
+        "remote_url": effect_plan.remote_url,
+        "remote_url_digest": effect_plan.remote_url_digest,
+        "remote_identity": effect_plan.remote_identity,
+        "remote_identity_digest": effect_plan.remote_identity_digest,
+        "base": effect_plan.base,
+        "base_ref": base_ref,
+        "policy_digest": effect_plan.policy_digest,
+        "effect_plan_digest": effect_plan.plan_digest,
+        "integration_receipt_digest": integration_receipt.receipt_digest,
+        "merge_sha": integration_receipt.observed_merge_sha,
+        "refresh_argv": list(refresh_argv),
+        "refresh_argv_digest": contract_digest(list(refresh_argv)),
+        "status": status,
+        "observed_ref": observed_ref,
+        "observed_sha": observed_sha,
+        "observed_at": observed_at,
+        "authorizes": False,
+    }
+    return BaseRefreshReceiptV1.from_dict(
+        {**core, "receipt_digest": contract_digest(core)}
+    )
+
+
+def build_base_verification_receipt(
+    *,
+    effect_plan: IntegrationEffectPlanV1,
+    integration_receipt: IntegrationReceiptV1,
+    refresh_receipt: BaseRefreshReceiptV1,
+    status: str,
+    reason_code: str,
+    observed_base_sha: str | None,
+    contained: bool | None,
+) -> BaseVerificationReceiptV1:
+    """Build the closed read-only result after inspecting the refreshed ref."""
+
+    if (
+        type(effect_plan) is not IntegrationEffectPlanV1
+        or type(integration_receipt) is not IntegrationReceiptV1
+        or type(refresh_receipt) is not BaseRefreshReceiptV1
+    ):
+        raise ValueError(
+            "E_BASE_VERIFICATION_RECEIPT: exact contracts are required"
+        )
+    try:
+        effect_plan = IntegrationEffectPlanV1.from_dict(effect_plan.to_dict())
+        integration_receipt = IntegrationReceiptV1.from_dict(
+            integration_receipt.to_dict()
+        )
+        refresh_receipt = BaseRefreshReceiptV1.from_dict(
+            refresh_receipt.to_dict()
+        )
+    except ValueError as error:
+        raise ValueError(
+            "E_BASE_VERIFICATION_RECEIPT: exact contracts are required"
+        ) from error
+    expected_base_ref = f"refs/remotes/{effect_plan.remote}/{effect_plan.base}"
+    if (
+        integration_receipt.status != "PASS"
+        or not _integration_receipt_matches_plan(
+            effect_plan, integration_receipt
+        )
+        or refresh_receipt.task_id != effect_plan.task_id
+        or refresh_receipt.task_digest != effect_plan.task_digest
+        or refresh_receipt.run_plan_digest != effect_plan.run_plan_digest
+        or refresh_receipt.repository != effect_plan.repository
+        or refresh_receipt.remote != effect_plan.remote
+        or refresh_receipt.remote_url != effect_plan.remote_url
+        or refresh_receipt.remote_url_digest != effect_plan.remote_url_digest
+        or refresh_receipt.remote_identity != effect_plan.remote_identity
+        or refresh_receipt.remote_identity_digest
+        != effect_plan.remote_identity_digest
+        or refresh_receipt.base != effect_plan.base
+        or refresh_receipt.base_ref != expected_base_ref
+        or refresh_receipt.policy_digest != effect_plan.policy_digest
+        or refresh_receipt.effect_plan_digest != effect_plan.plan_digest
+        or refresh_receipt.integration_receipt_digest
+        != integration_receipt.receipt_digest
+        or refresh_receipt.merge_sha != integration_receipt.observed_merge_sha
+    ):
+        raise ValueError(
+            "E_BASE_VERIFICATION_RECEIPT: receipt binding drifted"
+        )
+    if status == "PASS" and refresh_receipt.status != "PASS":
+        raise ValueError(
+            "E_BASE_VERIFICATION_RECEIPT: exact PASS refresh is required"
+        )
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "BaseVerificationReceiptV1",
+        "task_id": effect_plan.task_id,
+        "task_digest": effect_plan.task_digest,
+        "run_plan_digest": effect_plan.run_plan_digest,
+        "repository": effect_plan.repository,
+        "remote": effect_plan.remote,
+        "base": effect_plan.base,
+        "base_ref": refresh_receipt.base_ref,
+        "policy_digest": effect_plan.policy_digest,
+        "effect_plan_digest": effect_plan.plan_digest,
+        "integration_receipt_digest": integration_receipt.receipt_digest,
+        "refresh_receipt_digest": refresh_receipt.receipt_digest,
+        "merge_sha": integration_receipt.observed_merge_sha,
+        "status": status,
+        "reason_code": reason_code,
+        "observed_base_sha": observed_base_sha,
+        "contained": contained,
+        "observed_at": refresh_receipt.observed_at,
+        "authorizes": False,
+    }
+    return BaseVerificationReceiptV1.from_dict(
+        {**core, "receipt_digest": contract_digest(core)}
+    )
+
+
+def build_pull_request_effect_plan(
+    *,
+    outcome_binding: Mapping[str, object],
+    task_digest: str,
+    remote: str,
+    base: str,
+    scope_paths: tuple[str, ...],
+    policy_digest: str,
+    title: str,
+    body: str,
+    required_checks: tuple[object, ...],
+) -> OutcomeEffectPlanV1:
+    """Build a non-authorizing proposal for one draft pull request."""
+
+    from control_plane.policy import RequiredCheckCandidate
+    from control_plane.run_workflow import validate_outcome_binding
+
+    selector_rows = tuple(sorted(
+        [
+            (item.name, item.app, item.conclusions, item.selector_digest)
+            for item in required_checks
+            if isinstance(item, RequiredCheckCandidate)
+        ],
+        key=lambda item: item[3],
+    ))
+
+    if (
+        validate_outcome_binding(outcome_binding)
+        or not _outcome_digest(task_digest)
+        or not _outcome_digest(policy_digest)
+        or tuple(sorted(set(scope_paths))) != scope_paths
+        or contract_digest(list(scope_paths))
+        != outcome_binding.get("scope_paths_digest")
+        or outcome_binding.get("requested_outcome")
+        not in {"pull_request", "integration"}
+        or outcome_binding.get("consumed_effect_ids")
+        not in (
+            ["local_write", "commit", "remote_write"],
+            ("local_write", "commit", "remote_write"),
+        )
+        or outcome_binding.get("pushed_head")
+        != outcome_binding.get("committed_head")
+        or not _outcome_pr_content(title, body)
+        or len(selector_rows) != len(required_checks)
+        or not _outcome_required_checks(selector_rows, required=True)
+    ):
+        raise ValueError(
+            "E_OUTCOME_EFFECT_PLAN: pushed OutcomeBinding and safe PR content are required"
+        )
+    branch = str(outcome_binding["branch"])
+    repository = Path(str(outcome_binding["repository"])).resolve()
+    remote_url, remote_url_digest, remote_identity_digest = (
+        _outcome_remote_url_and_identity(repository, remote)
+    )
+    head_sha = str(outcome_binding["pushed_head"])
+    title_digest = contract_digest(title)
+    body_digest = contract_digest(body)
+    argv = (
+        "pull_request.create_draft",
+        remote_identity_digest,
+        base,
+        branch,
+        head_sha,
+        title_digest,
+        body_digest,
+    )
+    observation_argv = (
+        "pull_request.observe",
+        remote_identity_digest,
+        base,
+        branch,
+        head_sha,
+    )
+    operation = "create_draft_pull_request"
+    operation_digest = contract_digest(
+        {
+            "operation": operation,
+            "argv": list(argv),
+            "observation_argv": list(observation_argv),
+        }
+    )
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "OutcomeEffectPlanV1",
+        "task_id": outcome_binding["task_id"],
+        "task_digest": task_digest,
+        "run_plan_digest": outcome_binding["run_plan_digest"],
+        "requested_outcome": outcome_binding["requested_outcome"],
+        "repository": str(repository),
+        "remote": remote,
+        "remote_url": remote_url,
+        "remote_url_digest": remote_url_digest,
+        "remote_identity_digest": remote_identity_digest,
+        "base": base,
+        "branch": branch,
+        "head_sha": head_sha,
+        "scope_paths": list(scope_paths),
+        "subject_digest": outcome_binding["binding_digest"],
+        "policy_digest": policy_digest,
+        "effect": "pull_request",
+        "title": title,
+        "title_digest": title_digest,
+        "body": body,
+        "body_digest": body_digest,
+        "draft": True,
+        "operation": operation,
+        "operation_digest": operation_digest,
+        "required_checks": [
+            {"name": item[0], "app": item[1], "conclusions": list(item[2]), "selector_digest": item[3]}
+            for item in selector_rows
+        ],
+        "argv": list(argv),
+        "argv_digest": contract_digest(list(argv)),
+        "observation_argv": list(observation_argv),
+        "observation_argv_digest": contract_digest(list(observation_argv)),
+        "observe_before_retry": True,
+        "authorizes": False,
+    }
+    return OutcomeEffectPlanV1.from_dict(
+        {**core, "plan_digest": contract_digest(core)}
+    )
+
+
+def build_pull_request_ready_effect_plan(
+    *,
+    draft_effect_plan: OutcomeEffectPlanV1,
+    outcome_binding: Mapping[str, object],
+    pull_request_number: int,
+    pull_request_url: str,
+    readiness_receipts: tuple[RemoteOutcomeReceiptV1, ...],
+) -> OutcomeEffectPlanV1:
+    """Build the exact non-authorizing proposal for draft -> ready."""
+
+    from control_plane.run_workflow import validate_outcome_binding
+
+    if type(draft_effect_plan) is not OutcomeEffectPlanV1:
+        raise ValueError(
+            "E_PR_READY_EFFECT_PLAN: exact draft effect plan is required"
+        )
+    draft_effect_plan = OutcomeEffectPlanV1.from_dict(
+        draft_effect_plan.to_dict()
+    )
+    if (
+        validate_outcome_binding(outcome_binding)
+        or draft_effect_plan.effect != "pull_request"
+        or draft_effect_plan.draft is not True
+        or draft_effect_plan.operation != "create_draft_pull_request"
+        or outcome_binding.get("binding_digest")
+        != draft_effect_plan.subject_digest
+        or outcome_binding.get("consumed_effect_ids")
+        not in (
+            ["local_write", "commit", "remote_write"],
+            ("local_write", "commit", "remote_write"),
+        )
+        or outcome_binding.get("pushed_head") != draft_effect_plan.head_sha
+        or not isinstance(pull_request_number, int)
+        or isinstance(pull_request_number, bool)
+        or pull_request_number <= 0
+        or not isinstance(readiness_receipts, tuple)
+        or len(readiness_receipts) != 3
+        or any(
+            type(receipt) is not RemoteOutcomeReceiptV1
+            for receipt in readiness_receipts
+        )
+    ):
+        raise ValueError(
+            "E_PR_READY_EFFECT_PLAN: exact passed readiness proof is required"
+        )
+    parsed = tuple(
+        RemoteOutcomeReceiptV1.from_dict(receipt.to_dict())
+        for receipt in readiness_receipts
+    )
+    by_kind = {receipt.observation_kind: receipt for receipt in parsed}
+    if (
+        set(by_kind) != {"checks", "review_threads", "comments"}
+        or len(by_kind) != 3
+    ):
+        raise ValueError(
+            "E_PR_READY_EFFECT_PLAN: exact passed readiness proof is required"
+        )
+    ordered = (
+        by_kind["checks"],
+        by_kind["review_threads"],
+        by_kind["comments"],
+    )
+    plan_fields = (
+        "task_id",
+        "task_digest",
+        "run_plan_digest",
+        "requested_outcome",
+        "repository",
+        "remote",
+        "remote_url",
+        "remote_url_digest",
+        "remote_identity_digest",
+        "base",
+        "branch",
+        "head_sha",
+        "scope_paths",
+        "subject_digest",
+        "policy_digest",
+        "effect",
+        "title_digest",
+        "body_digest",
+    )
+    if (
+        any(receipt.status != "PASS" for receipt in ordered)
+        or any(
+            getattr(receipt, field) != getattr(draft_effect_plan, field)
+            for receipt in ordered
+            for field in plan_fields
+        )
+        or any(receipt.draft is not True for receipt in ordered)
+        or any(
+            (
+                receipt.observed_pr_number,
+                receipt.observed_pr_url,
+                receipt.observed_pr_draft,
+                receipt.observed_head_sha,
+            )
+            != (
+                pull_request_number,
+                pull_request_url,
+                True,
+                draft_effect_plan.head_sha,
+            )
+            for receipt in ordered
+        )
+        or any(
+            row[3] == "unresolved"
+            for receipt in ordered[1:]
+            for row in receipt.feedback
+        )
+        or any(status != "PASS" for _, status in ordered[0].check_results)
+    ):
+        raise ValueError(
+            "E_PR_READY_EFFECT_PLAN: exact passed readiness proof is required"
+        )
+    try:
+        observed_repository, observed_number = _github_pull_request_url_identity(
+            pull_request_url, code="E_PR_READY_EFFECT_PLAN"
+        )
+        expected_repository = _canonical_github_repository_from_url(
+            draft_effect_plan.remote_url, code="E_PR_READY_EFFECT_PLAN"
+        )
+    except ValueError as error:
+        raise ValueError(
+            "E_PR_READY_EFFECT_PLAN: pull request identity is invalid"
+        ) from error
+    if (
+        observed_repository != expected_repository
+        or observed_number != pull_request_number
+    ):
+        raise ValueError(
+            "E_PR_READY_EFFECT_PLAN: pull request identity drifted"
+        )
+    receipt_digests = tuple(receipt.receipt_digest for receipt in ordered)
+    checks_digest = contract_digest(list(receipt_digests))
+    url_digest = contract_digest(pull_request_url)
+    argv = (
+        "pull_request.mark_ready",
+        draft_effect_plan.remote_identity_digest,
+        str(pull_request_number),
+        url_digest,
+        draft_effect_plan.base,
+        draft_effect_plan.branch,
+        draft_effect_plan.head_sha,
+        checks_digest,
+    )
+    observation_argv = (
+        "pull_request.observe",
+        draft_effect_plan.remote_identity_digest,
+        str(pull_request_number),
+        url_digest,
+        draft_effect_plan.base,
+        draft_effect_plan.branch,
+        draft_effect_plan.head_sha,
+    )
+    operation = "mark_pull_request_ready"
+    operation_digest = contract_digest(
+        {
+            "operation": operation,
+            "argv": list(argv),
+            "observation_argv": list(observation_argv),
+        }
+    )
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "OutcomeEffectPlanV1",
+        "task_id": draft_effect_plan.task_id,
+        "task_digest": draft_effect_plan.task_digest,
+        "run_plan_digest": draft_effect_plan.run_plan_digest,
+        "requested_outcome": draft_effect_plan.requested_outcome,
+        "repository": draft_effect_plan.repository,
+        "remote": draft_effect_plan.remote,
+        "remote_url": draft_effect_plan.remote_url,
+        "remote_url_digest": draft_effect_plan.remote_url_digest,
+        "remote_identity_digest": draft_effect_plan.remote_identity_digest,
+        "base": draft_effect_plan.base,
+        "branch": draft_effect_plan.branch,
+        "head_sha": draft_effect_plan.head_sha,
+        "scope_paths": list(draft_effect_plan.scope_paths),
+        "subject_digest": draft_effect_plan.subject_digest,
+        "policy_digest": draft_effect_plan.policy_digest,
+        "effect": "pull_request",
+        "title": None,
+        "title_digest": None,
+        "body": None,
+        "body_digest": None,
+        "draft": False,
+        "operation": operation,
+        "operation_digest": operation_digest,
+        "required_checks": [
+            {
+                "name": item[0],
+                "app": item[1],
+                "conclusions": list(item[2]),
+                "selector_digest": item[3],
+            }
+            for item in draft_effect_plan.required_checks
+        ],
+        "argv": list(argv),
+        "argv_digest": contract_digest(list(argv)),
+        "observation_argv": list(observation_argv),
+        "observation_argv_digest": contract_digest(list(observation_argv)),
+        "observe_before_retry": True,
+        "authorizes": False,
+    }
+    return OutcomeEffectPlanV1.from_dict(
+        {**core, "plan_digest": contract_digest(core)}
+    )
+
+
+def build_remote_outcome_receipt(
+    *,
+    effect_plan: OutcomeEffectPlanV1,
+    status: str,
+    observed_at: str,
+    observed_repository: str | None = None,
+    observed_remote: str | None = None,
+    observed_base: str | None = None,
+    observed_branch: str | None = None,
+    observed_head_sha: str | None = None,
+) -> RemoteOutcomeReceiptV1:
+    """Publish only a durable observation; this does not assert provenance."""
+
+    if type(effect_plan) is not OutcomeEffectPlanV1:
+        raise ValueError("E_REMOTE_OUTCOME_RECEIPT: exact effect plan is required")
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "RemoteOutcomeReceiptV1",
+        "task_id": effect_plan.task_id,
+        "task_digest": effect_plan.task_digest,
+        "run_plan_digest": effect_plan.run_plan_digest,
+        "requested_outcome": effect_plan.requested_outcome,
+        "repository": effect_plan.repository,
+        "remote": effect_plan.remote,
+        "remote_url": effect_plan.remote_url,
+        "remote_url_digest": effect_plan.remote_url_digest,
+        "remote_identity_digest": effect_plan.remote_identity_digest,
+        "base": effect_plan.base,
+        "branch": effect_plan.branch,
+        "head_sha": effect_plan.head_sha,
+        "scope_paths": list(effect_plan.scope_paths),
+        "subject_digest": effect_plan.subject_digest,
+        "policy_digest": effect_plan.policy_digest,
+        "effect": effect_plan.effect,
+        "title_digest": effect_plan.title_digest,
+        "body_digest": effect_plan.body_digest,
+        "draft": effect_plan.draft,
+        "effect_plan_digest": effect_plan.plan_digest,
+        "status": status,
+        "observed_repository": observed_repository,
+        "observed_remote": observed_remote,
+        "observed_base": observed_base,
+        "observed_branch": observed_branch,
+        "observed_head_sha": observed_head_sha,
+        "observed_pr_number": None,
+        "observed_pr_url": None,
+        "observed_pr_draft": None,
+        "disposition": None,
+        "observation_kind": None,
+        "required_check_digests": [],
+        "check_results": [],
+        "feedback": [],
+        "observed_at": observed_at,
+        "authorizes": False,
+    }
+    return RemoteOutcomeReceiptV1.from_dict(
+        {**core, "receipt_digest": contract_digest(core)}
+    )
+
+
+def build_pull_request_outcome_receipt(
+    *,
+    effect_plan: OutcomeEffectPlanV1,
+    status: str,
+    observed_at: str,
+    observed_repository: str | None = None,
+    observed_remote: str | None = None,
+    observed_base: str | None = None,
+    observed_branch: str | None = None,
+    observed_head_sha: str | None = None,
+    observed_pr_number: int | None = None,
+    observed_pr_url: str | None = None,
+    observed_pr_draft: bool | None = None,
+    disposition: str | None = None,
+) -> RemoteOutcomeReceiptV1:
+    """Record one bounded PR observation without provider authority."""
+
+    if (
+        type(effect_plan) is not OutcomeEffectPlanV1
+        or effect_plan.effect != "pull_request"
+    ):
+        raise ValueError("E_REMOTE_OUTCOME_RECEIPT: exact PR plan is required")
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "RemoteOutcomeReceiptV1",
+        "task_id": effect_plan.task_id,
+        "task_digest": effect_plan.task_digest,
+        "run_plan_digest": effect_plan.run_plan_digest,
+        "requested_outcome": effect_plan.requested_outcome,
+        "repository": effect_plan.repository,
+        "remote": effect_plan.remote,
+        "remote_url": effect_plan.remote_url,
+        "remote_url_digest": effect_plan.remote_url_digest,
+        "remote_identity_digest": effect_plan.remote_identity_digest,
+        "base": effect_plan.base,
+        "branch": effect_plan.branch,
+        "head_sha": effect_plan.head_sha,
+        "scope_paths": list(effect_plan.scope_paths),
+        "subject_digest": effect_plan.subject_digest,
+        "policy_digest": effect_plan.policy_digest,
+        "effect": effect_plan.effect,
+        "title_digest": effect_plan.title_digest,
+        "body_digest": effect_plan.body_digest,
+        "draft": effect_plan.draft,
+        "effect_plan_digest": effect_plan.plan_digest,
+        "status": status,
+        "observed_repository": observed_repository,
+        "observed_remote": observed_remote,
+        "observed_base": observed_base,
+        "observed_branch": observed_branch,
+        "observed_head_sha": observed_head_sha,
+        "observed_pr_number": observed_pr_number,
+        "observed_pr_url": observed_pr_url,
+        "observed_pr_draft": observed_pr_draft,
+        "disposition": disposition,
+        "observation_kind": None,
+        "required_check_digests": [],
+        "check_results": [],
+        "feedback": [],
+        "observed_at": observed_at,
+        "authorizes": False,
+    }
+    return RemoteOutcomeReceiptV1.from_dict(
+        {**core, "receipt_digest": contract_digest(core)}
+    )
+
+
+def build_pull_request_readiness_receipt(
+    *,
+    effect_plan: OutcomeEffectPlanV1,
+    observation_kind: str,
+    status: str,
+    observed_at: str,
+    observed_repository: str | None,
+    observed_remote: str | None,
+    observed_base: str | None,
+    observed_branch: str | None,
+    observed_head_sha: str | None,
+    observed_pr_number: int | None,
+    observed_pr_url: str | None,
+    observed_pr_draft: bool | None,
+    required_check_digests: tuple[str, ...] = (),
+    check_results: tuple[tuple[str, str], ...] = (),
+    feedback: tuple[tuple[int, str, str, str], ...] = (),
+) -> RemoteOutcomeReceiptV1:
+    """Record bounded checks or feedback; never serialize provider text."""
+
+    if type(effect_plan) is not OutcomeEffectPlanV1 or effect_plan.effect != "pull_request":
+        raise ValueError("E_REMOTE_OUTCOME_RECEIPT: exact PR plan is required")
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "RemoteOutcomeReceiptV1",
+        "task_id": effect_plan.task_id,
+        "task_digest": effect_plan.task_digest,
+        "run_plan_digest": effect_plan.run_plan_digest,
+        "requested_outcome": effect_plan.requested_outcome,
+        "repository": effect_plan.repository,
+        "remote": effect_plan.remote,
+        "remote_url": effect_plan.remote_url,
+        "remote_url_digest": effect_plan.remote_url_digest,
+        "remote_identity_digest": effect_plan.remote_identity_digest,
+        "base": effect_plan.base,
+        "branch": effect_plan.branch,
+        "head_sha": effect_plan.head_sha,
+        "scope_paths": list(effect_plan.scope_paths),
+        "subject_digest": effect_plan.subject_digest,
+        "policy_digest": effect_plan.policy_digest,
+        "effect": effect_plan.effect,
+        "title_digest": effect_plan.title_digest,
+        "body_digest": effect_plan.body_digest,
+        "draft": effect_plan.draft,
+        "effect_plan_digest": effect_plan.plan_digest,
+        "status": status,
+        "observed_repository": observed_repository,
+        "observed_remote": observed_remote,
+        "observed_base": observed_base,
+        "observed_branch": observed_branch,
+        "observed_head_sha": observed_head_sha,
+        "observed_pr_number": observed_pr_number,
+        "observed_pr_url": observed_pr_url,
+        "observed_pr_draft": observed_pr_draft,
+        "disposition": "observed_existing",
+        "observation_kind": observation_kind,
+        "required_check_digests": list(required_check_digests),
+        "check_results": [list(item) for item in check_results],
+        "feedback": [
+            {"id": item[0], "digest": item[1], "severity": item[2], "status": item[3]}
+            for item in feedback
+        ],
+        "observed_at": observed_at,
+        "authorizes": False,
+    }
+    return RemoteOutcomeReceiptV1.from_dict(
+        {**core, "receipt_digest": contract_digest(core)}
+    )
+
+
+def build_pull_request_ready_outcome_receipt(
+    *,
+    effect_plan: OutcomeEffectPlanV1,
+    status: str,
+    observed_at: str,
+    observed_repository: str | None = None,
+    observed_remote: str | None = None,
+    observed_base: str | None = None,
+    observed_branch: str | None = None,
+    observed_head_sha: str | None = None,
+    observed_pr_number: int | None = None,
+    observed_pr_url: str | None = None,
+    observed_pr_draft: bool | None = None,
+    disposition: str | None = None,
+) -> RemoteOutcomeReceiptV1:
+    """Record only the observed result of one draft -> ready effect."""
+
+    if (
+        type(effect_plan) is not OutcomeEffectPlanV1
+        or effect_plan.effect != "pull_request"
+        or effect_plan.operation != "mark_pull_request_ready"
+        or effect_plan.draft is not False
+    ):
+        raise ValueError(
+            "E_PR_READY_OUTCOME_RECEIPT: exact ready effect plan is required"
+        )
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "RemoteOutcomeReceiptV1",
+        "task_id": effect_plan.task_id,
+        "task_digest": effect_plan.task_digest,
+        "run_plan_digest": effect_plan.run_plan_digest,
+        "requested_outcome": effect_plan.requested_outcome,
+        "repository": effect_plan.repository,
+        "remote": effect_plan.remote,
+        "remote_url": effect_plan.remote_url,
+        "remote_url_digest": effect_plan.remote_url_digest,
+        "remote_identity_digest": effect_plan.remote_identity_digest,
+        "base": effect_plan.base,
+        "branch": effect_plan.branch,
+        "head_sha": effect_plan.head_sha,
+        "scope_paths": list(effect_plan.scope_paths),
+        "subject_digest": effect_plan.subject_digest,
+        "policy_digest": effect_plan.policy_digest,
+        "effect": effect_plan.effect,
+        "title_digest": None,
+        "body_digest": None,
+        "draft": False,
+        "effect_plan_digest": effect_plan.plan_digest,
+        "status": status,
+        "observed_repository": observed_repository,
+        "observed_remote": observed_remote,
+        "observed_base": observed_base,
+        "observed_branch": observed_branch,
+        "observed_head_sha": observed_head_sha,
+        "observed_pr_number": observed_pr_number,
+        "observed_pr_url": observed_pr_url,
+        "observed_pr_draft": observed_pr_draft,
+        "disposition": disposition,
+        "observation_kind": "ready_state",
+        "required_check_digests": [],
+        "check_results": [],
+        "feedback": [],
+        "observed_at": observed_at,
+        "authorizes": False,
+    }
+    try:
+        return RemoteOutcomeReceiptV1.from_dict(
+            {**core, "receipt_digest": contract_digest(core)}
+        )
+    except ValueError as error:
+        raise ValueError(
+            "E_PR_READY_OUTCOME_RECEIPT: observation is invalid"
+        ) from error
+
+
+def apply_remote_write_receipt(
+    *,
+    outcome_binding: Mapping[str, object],
+    effect_plan: OutcomeEffectPlanV1,
+    receipt: RemoteOutcomeReceiptV1,
+) -> dict[str, object]:
+    """Advance CAS only after one exact PASS observation of the remote ref."""
+
+    from control_plane.run_workflow import (
+        advance_outcome_binding,
+        validate_outcome_binding,
+    )
+
+    if validate_outcome_binding(outcome_binding):
+        raise ValueError("E_OUTCOME_BINDING: binding is invalid")
+    if type(effect_plan) is not OutcomeEffectPlanV1:
+        raise ValueError("E_OUTCOME_EFFECT_PLAN: exact plan is required")
+    if type(receipt) is not RemoteOutcomeReceiptV1:
+        raise ValueError("E_REMOTE_OUTCOME_RECEIPT: exact receipt is required")
+    effect_plan = OutcomeEffectPlanV1.from_dict(effect_plan.to_dict())
+    receipt = RemoteOutcomeReceiptV1.from_dict(receipt.to_dict())
+    if "remote_write" in outcome_binding.get("consumed_effect_ids", ()):
+        raise ValueError("E_OUTCOME_REPLAY: effect has already been consumed")
+    common = (
+        ("task_id", "task_id"),
+        ("run_plan_digest", "run_plan_digest"),
+        ("requested_outcome", "requested_outcome"),
+        ("repository", "repository"),
+        ("branch", "branch"),
+    )
+    if (
+        effect_plan.subject_digest != outcome_binding.get("binding_digest")
+        or effect_plan.head_sha != outcome_binding.get("committed_head")
+        or effect_plan.effect != "remote_write"
+        or any(
+            getattr(effect_plan, plan_name) != outcome_binding.get(binding_name)
+            for plan_name, binding_name in common
+        )
+        or receipt.effect_plan_digest != effect_plan.plan_digest
+        or any(
+            getattr(receipt, name) != getattr(effect_plan, name)
+            for name in (
+                "task_id",
+                "task_digest",
+                "run_plan_digest",
+                "requested_outcome",
+                "repository",
+                "remote",
+                "remote_url",
+                "remote_url_digest",
+                "remote_identity_digest",
+                "base",
+                "branch",
+                "head_sha",
+                "scope_paths",
+                "subject_digest",
+                "policy_digest",
+                "effect",
+            )
+        )
+    ):
+        raise ValueError("E_REMOTE_OUTCOME_BINDING: plan or receipt drifted")
+    if receipt.status == "UNKNOWN":
+        raise ValueError(
+            "E_REMOTE_OUTCOME_UNKNOWN: BLOCKED; observe the same ref, do not retry"
+        )
+    if receipt.status == "FAIL":
+        raise ValueError(
+            "E_REMOTE_OUTCOME_FAIL: BLOCKED; bounded repair is required"
+        )
+    return advance_outcome_binding(
+        outcome_binding,
+        effect_id="remote_write",
+        observation={"pushed_head": receipt.observed_head_sha},
+    )
 
 
 def _native_host_adapter_unavailable(_: object, __: str) -> bool:
@@ -245,6 +3311,45 @@ def _runtime_host_object_registry():
             "session_id",
             "invocation_id",
             "freshness_deadline",
+        ),
+        "independent_review_observation": (
+            "_consumed",
+            "task_id",
+            "task_digest",
+            "review_packet_digest",
+            "review_kind",
+            "criteria_digest",
+            "findings_digest",
+            "critical",
+            "important",
+            "status",
+            "reviewer_identity",
+            "reviewer_identity_digest",
+            "session_id",
+            "invocation_id",
+            "observed_at",
+            "observed_at_monotonic",
+            "freshness_deadline",
+            "observation_digest",
+        ),
+        "validated_independent_review_observation": (
+            "_consumed",
+            "_clock",
+            "task_id",
+            "task_digest",
+            "review_packet_digest",
+            "review_kind",
+            "criteria_digest",
+            "findings_digest",
+            "critical",
+            "important",
+            "status",
+            "reviewer_identity_digest",
+            "session_id",
+            "invocation_id",
+            "observed_at",
+            "freshness_deadline",
+            "observation_digest",
         ),
         "remote_effect_context": remote_context_bindings,
         "validated_remote_effect_context": remote_context_bindings,
@@ -675,6 +3780,7 @@ class ValidatedWorktreeInventoryObservation:
     __slots__ = (
         "_consumed",
         "_clock",
+        "_claim_lock",
         "observation_id",
         "invocation_id",
         "common_git_dir",
@@ -1099,6 +4205,523 @@ def consume_lease_recovery_authorization(
     return authorization
 
 
+class RollbackPlanObservation:
+    """One host-issued structured rollback plan; never serialized as authority."""
+
+    __slots__ = (
+        "_consumed", "task_id", "task_digest", "run_plan_digest",
+        "run_revision_digest", "attempt", "repository", "branch", "head",
+        "scope_paths_digest", "trigger_conditions", "rollback_steps",
+        "post_rollback_checks", "irreversible_boundaries", "status",
+        "session_id", "invocation_id", "observed_at",
+        "observed_at_monotonic", "freshness_deadline", "observation_digest",
+    )
+
+    def __new__(cls, *_: object, **__: object) -> "RollbackPlanObservation":
+        raise TypeError("RollbackPlanObservation is host-bound")
+
+
+class ValidatedRollbackPlanObservation:
+    """Process-local one-shot proof for an exact structured rollback plan."""
+
+    __slots__ = (
+        "_consumed", "_clock", "task_id", "task_digest", "run_plan_digest",
+        "run_revision_digest", "attempt", "repository", "branch", "head",
+        "scope_paths_digest", "trigger_conditions", "rollback_steps",
+        "post_rollback_checks", "irreversible_boundaries", "status",
+        "session_id", "invocation_id", "observed_at", "freshness_deadline",
+        "observation_digest",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedRollbackPlanObservation":
+        raise TypeError("ValidatedRollbackPlanObservation is host-bound")
+
+
+_ROLLBACK_PLAN_OBSERVATION_DIGEST_FIELDS = (
+    "task_id", "task_digest", "run_plan_digest", "run_revision_digest",
+    "attempt", "repository", "branch", "head", "scope_paths_digest",
+    "trigger_conditions", "rollback_steps", "post_rollback_checks",
+    "irreversible_boundaries", "status", "session_id", "invocation_id",
+    "observed_at", "observed_at_monotonic", "freshness_deadline",
+)
+
+
+def _rollback_plan_content_is_valid(observation: object) -> bool:
+    def bounded(value: object) -> bool:
+        return bool(
+            isinstance(value, str)
+            and 1 <= len(value.encode("utf-8")) <= 512
+            and "\x00" not in value
+        )
+
+    triggers = getattr(observation, "trigger_conditions", None)
+    steps = getattr(observation, "rollback_steps", None)
+    checks = getattr(observation, "post_rollback_checks", None)
+    boundaries = getattr(observation, "irreversible_boundaries", None)
+    status = getattr(observation, "status", None)
+    if (
+        type(triggers) is not tuple
+        or type(steps) is not tuple
+        or type(checks) is not tuple
+        or type(boundaries) is not tuple
+        or status not in {"PASS", "UNKNOWN"}
+        or any(type(row) is not tuple for row in (*triggers, *steps, *checks, *boundaries))
+        or any(len(row) != 2 or not all(bounded(item) for item in row) for row in triggers)
+        or any(
+            len(row) != 4
+            or not isinstance(row[0], int)
+            or isinstance(row[0], bool)
+            or not all(bounded(item) for item in row[1:])
+            for row in steps
+        )
+        or any(len(row) != 2 or not all(bounded(item) for item in row) for row in checks)
+        or any(len(row) != 2 or not all(bounded(item) for item in row) for row in boundaries)
+    ):
+        return False
+    if status == "UNKNOWN":
+        return not triggers and not steps and not checks and not boundaries
+    return bool(
+        1 <= len(triggers) <= 16
+        and 1 <= len(steps) <= 32
+        and 1 <= len(checks) <= 16
+        and 1 <= len(boundaries) <= 16
+        and tuple(row[0] for row in steps) == tuple(range(1, len(steps) + 1))
+        and len({row[0] for row in checks}) == len(checks)
+    )
+
+
+def _rollback_plan_observation_digest(
+    observation: RollbackPlanObservation,
+) -> str:
+    return contract_digest({
+        name: getattr(observation, name)
+        for name in _ROLLBACK_PLAN_OBSERVATION_DIGEST_FIELDS
+    })
+
+
+def validate_rollback_plan_observation(
+    observation: object,
+    *,
+    run_plan: Mapping[str, object],
+    run_revision: Mapping[str, object],
+    expected_attempt: int,
+    expected_session_id: str,
+    expected_invocation_id: str,
+    clock: Callable[[], float],
+) -> ValidatedRollbackPlanObservation:
+    """Validate and frame one exact fresh host rollback-plan observation."""
+
+    now = float(clock())
+    expected_scope_digest = contract_digest({
+        "scope_paths": run_plan.get("scope_paths")
+    })
+    if (
+        type(observation) is not RollbackPlanObservation
+        or observation._consumed
+        or not _runtime_host_object_is_live(
+            observation, "rollback_plan_observation"
+        )
+        or not validate_task_id(observation.task_id)
+        or observation.task_id != run_plan.get("task_id")
+        or observation.task_digest != run_plan.get("task_digest")
+        or observation.run_plan_digest != run_plan.get("plan_digest")
+        or observation.run_revision_digest != run_revision.get("revision_digest")
+        or observation.attempt != expected_attempt
+        or not isinstance(expected_attempt, int)
+        or isinstance(expected_attempt, bool)
+        or not 1 <= expected_attempt <= 3
+        or observation.repository != run_plan.get("repository")
+        or observation.branch != run_plan.get("branch")
+        or observation.head != run_revision.get("head")
+        or observation.scope_paths_digest != expected_scope_digest
+        or not _rollback_plan_content_is_valid(observation)
+        or observation.session_id != expected_session_id
+        or observation.invocation_id != expected_invocation_id
+        or not validate_task_id(expected_session_id)
+        or not isinstance(expected_invocation_id, str)
+        or not expected_invocation_id
+        or _OUTCOME_TIMESTAMP.fullmatch(observation.observed_at) is None
+        or not isinstance(observation.observed_at_monotonic, (int, float))
+        or isinstance(observation.observed_at_monotonic, bool)
+        or not isinstance(observation.freshness_deadline, (int, float))
+        or isinstance(observation.freshness_deadline, bool)
+        or not observation.observed_at_monotonic <= now <= observation.freshness_deadline
+        or observation.freshness_deadline - observation.observed_at_monotonic > 300
+        or observation.observation_digest
+        != _rollback_plan_observation_digest(observation)
+    ):
+        raise ValueError(
+            "E_ROLLBACK_PLAN_OBSERVATION: binding is invalid or stale"
+        )
+    if not _consume_runtime_host_object(
+        observation, "rollback_plan_observation"
+    ):
+        raise ValueError(
+            "E_ROLLBACK_PLAN_OBSERVATION: observation is not host-issued"
+        )
+    observation._consumed = True
+    validated = object.__new__(ValidatedRollbackPlanObservation)
+    validated._consumed = False
+    validated._clock = clock
+    for name in (
+        "task_id", "task_digest", "run_plan_digest", "run_revision_digest",
+        "attempt", "repository", "branch", "head", "scope_paths_digest",
+        "trigger_conditions", "rollback_steps", "post_rollback_checks",
+        "irreversible_boundaries", "status", "session_id", "invocation_id",
+        "observed_at", "freshness_deadline", "observation_digest",
+    ):
+        setattr(validated, name, getattr(observation, name))
+    _register_runtime_host_object(
+        validated, "validated_rollback_plan_observation"
+    )
+    return validated
+
+
+def inspect_rollback_plan_observation(
+    observation: object,
+    *,
+    run_plan: Mapping[str, object],
+    run_revision: Mapping[str, object],
+    attempt: int,
+) -> dict[str, object]:
+    """Expose only closed durable rollback fields from a live exact proof."""
+
+    if (
+        type(observation) is not ValidatedRollbackPlanObservation
+        or observation._consumed
+        or not _runtime_host_object_is_live(
+            observation, "validated_rollback_plan_observation"
+        )
+        or float(observation._clock()) > observation.freshness_deadline
+        or observation.task_id != run_plan.get("task_id")
+        or observation.task_digest != run_plan.get("task_digest")
+        or observation.run_plan_digest != run_plan.get("plan_digest")
+        or observation.run_revision_digest != run_revision.get("revision_digest")
+        or observation.attempt != attempt
+        or observation.repository != run_plan.get("repository")
+        or observation.branch != run_plan.get("branch")
+        or observation.head != run_revision.get("head")
+    ):
+        raise ValueError(
+            "E_ROLLBACK_PLAN_OBSERVATION: proof is invalid or stale"
+        )
+    return {
+        "trigger_conditions": observation.trigger_conditions,
+        "rollback_steps": observation.rollback_steps,
+        "post_rollback_checks": observation.post_rollback_checks,
+        "irreversible_boundaries": observation.irreversible_boundaries,
+        "status": observation.status,
+        "observed_at": observation.observed_at,
+        "observation_digest": observation.observation_digest,
+    }
+
+
+def consume_rollback_plan_observation(
+    observation: object,
+    *,
+    run_plan: Mapping[str, object],
+    run_revision: Mapping[str, object],
+    rollback_plan: Mapping[str, object],
+) -> None:
+    """Consume the exact host proof immediately before durable publication."""
+
+    inspected = inspect_rollback_plan_observation(
+        observation,
+        run_plan=run_plan,
+        run_revision=run_revision,
+        attempt=int(rollback_plan.get("attempt", 0)),
+    )
+    expected = {
+        "trigger_conditions": tuple(
+            (row["condition"], row["signal"])
+            for row in rollback_plan.get("trigger_conditions", ())
+        ),
+        "rollback_steps": tuple(
+            (row["order"], row["action"], row["target"], row["success_condition"])
+            for row in rollback_plan.get("rollback_steps", ())
+        ),
+        "post_rollback_checks": tuple(
+            (row["check_id"], row["expected"])
+            for row in rollback_plan.get("post_rollback_checks", ())
+        ),
+        "irreversible_boundaries": tuple(
+            (row["boundary"], row["mitigation"])
+            for row in rollback_plan.get("irreversible_boundaries", ())
+        ),
+        "status": rollback_plan.get("status"),
+        "observed_at": rollback_plan.get("observed_at"),
+        "observation_digest": rollback_plan.get("observation_digest"),
+    }
+    if inspected != expected:
+        raise ValueError("E_ROLLBACK_PLAN_OBSERVATION: plan binding drifted")
+    assert isinstance(observation, ValidatedRollbackPlanObservation)
+    if not _consume_runtime_host_object(
+        observation, "validated_rollback_plan_observation"
+    ):
+        raise ValueError(
+            "E_ROLLBACK_PLAN_OBSERVATION: proof is not host-issued"
+        )
+    observation._consumed = True
+
+
+class IndependentReviewObservation:
+    """One host-issued reviewer conclusion; never serialized as authority."""
+
+    __slots__ = (
+        "_consumed",
+        "task_id",
+        "task_digest",
+        "review_packet_digest",
+        "review_kind",
+        "criteria_digest",
+        "findings_digest",
+        "critical",
+        "important",
+        "status",
+        "reviewer_identity",
+        "reviewer_identity_digest",
+        "session_id",
+        "invocation_id",
+        "observed_at",
+        "observed_at_monotonic",
+        "freshness_deadline",
+        "observation_digest",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "IndependentReviewObservation":
+        raise TypeError("IndependentReviewObservation is host-bound")
+
+
+class ValidatedIndependentReviewObservation:
+    """Process-local proof that an exact host observation was validated."""
+
+    __slots__ = (
+        "_consumed",
+        "_clock",
+        "task_id",
+        "task_digest",
+        "review_packet_digest",
+        "review_kind",
+        "criteria_digest",
+        "findings_digest",
+        "critical",
+        "important",
+        "status",
+        "reviewer_identity_digest",
+        "session_id",
+        "invocation_id",
+        "observed_at",
+        "freshness_deadline",
+        "observation_digest",
+    )
+
+    def __new__(
+        cls, *_: object, **__: object
+    ) -> "ValidatedIndependentReviewObservation":
+        raise TypeError(
+            "ValidatedIndependentReviewObservation is host-bound"
+        )
+
+
+_INDEPENDENT_REVIEW_OBSERVATION_DIGEST_FIELDS = (
+    "task_id",
+    "task_digest",
+    "review_packet_digest",
+    "review_kind",
+    "criteria_digest",
+    "findings_digest",
+    "critical",
+    "important",
+    "status",
+    "reviewer_identity_digest",
+    "session_id",
+    "invocation_id",
+    "observed_at",
+    "observed_at_monotonic",
+    "freshness_deadline",
+)
+
+
+def _independent_review_observation_digest(
+    observation: IndependentReviewObservation,
+) -> str:
+    return contract_digest(
+        {
+            name: getattr(observation, name)
+            for name in _INDEPENDENT_REVIEW_OBSERVATION_DIGEST_FIELDS
+        }
+    )
+
+
+def validate_independent_review_observation(
+    observation: object,
+    *,
+    review_packet: Mapping[str, object],
+    expected_session_id: str,
+    expected_invocation_id: str,
+    clock: Callable[[], float],
+) -> ValidatedIndependentReviewObservation:
+    """Validate and frame one exact, fresh, independently issued review."""
+
+    now = float(clock())
+    if type(observation) is not IndependentReviewObservation:
+        raise ValueError(
+            "E_INDEPENDENT_REVIEW_OBSERVATION: host observation required"
+        )
+    expected_identity_digest = contract_digest(
+        {"reviewer_identity": observation.reviewer_identity}
+    )
+    if (
+        observation._consumed
+        or not _runtime_host_object_is_live(
+            observation, "independent_review_observation"
+        )
+        or not validate_task_id(observation.task_id)
+        or observation.task_id != review_packet.get("task_id")
+        or SHA256_DIGEST.fullmatch(observation.task_digest) is None
+        or observation.task_digest != review_packet.get("task_digest")
+        or observation.review_packet_digest != review_packet.get("packet_digest")
+        or observation.review_kind != review_packet.get("review_kind")
+        or observation.criteria_digest != review_packet.get("criteria_digest")
+        or SHA256_DIGEST.fullmatch(observation.findings_digest) is None
+        or observation.status not in {"PASS", "FAIL", "UNKNOWN"}
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (observation.critical, observation.important)
+        )
+        or (
+            observation.status == "PASS"
+            and (observation.critical != 0 or observation.important != 0)
+        )
+        or (
+            observation.status == "FAIL"
+            and observation.critical + observation.important == 0
+        )
+        or (
+            observation.status == "UNKNOWN"
+            and (observation.critical != 0 or observation.important != 0)
+        )
+        or not isinstance(observation.reviewer_identity, str)
+        or not 1 <= len(observation.reviewer_identity) <= 256
+        or observation.reviewer_identity_digest != expected_identity_digest
+        or observation.session_id != expected_session_id
+        or observation.invocation_id != expected_invocation_id
+        or not validate_task_id(expected_session_id)
+        or not isinstance(expected_invocation_id, str)
+        or not expected_invocation_id
+        or _OUTCOME_TIMESTAMP.fullmatch(observation.observed_at) is None
+        or not isinstance(observation.observed_at_monotonic, (int, float))
+        or isinstance(observation.observed_at_monotonic, bool)
+        or not isinstance(observation.freshness_deadline, (int, float))
+        or isinstance(observation.freshness_deadline, bool)
+        or not observation.observed_at_monotonic <= now <= observation.freshness_deadline
+        or observation.freshness_deadline - observation.observed_at_monotonic > 300
+        or observation.observation_digest
+        != _independent_review_observation_digest(observation)
+    ):
+        raise ValueError(
+            "E_INDEPENDENT_REVIEW_OBSERVATION: binding is invalid or stale"
+        )
+    if not _consume_runtime_host_object(
+        observation, "independent_review_observation"
+    ):
+        raise ValueError(
+            "E_INDEPENDENT_REVIEW_OBSERVATION: observation is not host-issued"
+        )
+    observation._consumed = True
+    validated = object.__new__(ValidatedIndependentReviewObservation)
+    validated._consumed = False
+    validated._clock = clock
+    for name in (
+        "task_id",
+        "task_digest",
+        "review_packet_digest",
+        "review_kind",
+        "criteria_digest",
+        "findings_digest",
+        "critical",
+        "important",
+        "status",
+        "reviewer_identity_digest",
+        "session_id",
+        "invocation_id",
+        "observed_at",
+        "freshness_deadline",
+        "observation_digest",
+    ):
+        setattr(validated, name, getattr(observation, name))
+    _register_runtime_host_object(
+        validated, "validated_independent_review_observation"
+    )
+    return validated
+
+
+def inspect_independent_review_observation(
+    observation: object,
+    *,
+    review_packet: Mapping[str, object],
+) -> tuple[str, str]:
+    """Return only the durable digests of a still-live exact proof."""
+
+    if (
+        type(observation) is not ValidatedIndependentReviewObservation
+        or observation._consumed
+        or not _runtime_host_object_is_live(
+            observation, "validated_independent_review_observation"
+        )
+        or float(observation._clock()) > observation.freshness_deadline
+        or observation.task_id != review_packet.get("task_id")
+        or observation.task_digest != review_packet.get("task_digest")
+        or observation.review_packet_digest != review_packet.get("packet_digest")
+        or observation.review_kind != review_packet.get("review_kind")
+        or observation.criteria_digest != review_packet.get("criteria_digest")
+    ):
+        raise ValueError(
+            "E_INDEPENDENT_REVIEW_OBSERVATION: proof is invalid or stale"
+        )
+    return (
+        str(observation.reviewer_identity_digest),
+        str(observation.observation_digest),
+    )
+
+
+def consume_independent_review_observation(
+    observation: object,
+    *,
+    review_packet: Mapping[str, object],
+    receipt: Mapping[str, object],
+) -> None:
+    """Consume the one-shot proof immediately before durable publication."""
+
+    reviewer_digest, observation_digest = inspect_independent_review_observation(
+        observation, review_packet=review_packet
+    )
+    assert isinstance(observation, ValidatedIndependentReviewObservation)
+    if (
+        receipt.get("findings_digest") != observation.findings_digest
+        or receipt.get("critical") != observation.critical
+        or receipt.get("important") != observation.important
+        or receipt.get("status") != observation.status
+        or receipt.get("observed_at") != observation.observed_at
+        or receipt.get("reviewer_identity_digest") != reviewer_digest
+        or receipt.get("observation_digest") != observation_digest
+    ):
+        raise ValueError(
+            "E_INDEPENDENT_REVIEW_OBSERVATION: receipt binding drifted"
+        )
+    if not _consume_runtime_host_object(
+        observation, "validated_independent_review_observation"
+    ):
+        raise ValueError(
+            "E_INDEPENDENT_REVIEW_OBSERVATION: proof is not host-issued"
+        )
+    observation._consumed = True
+
+
 class LocalGitObservation:
     __slots__ = (
         "observation_id",
@@ -1369,14 +4992,28 @@ def validate_local_git_observation(
 
 
 def _git_text(worktree: Path, arguments: list[str]) -> str:
-    completed = subprocess.run(
-        _closed_git_argv(worktree, arguments),
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        env=_sanitized_git_environment(),
-    )
+    if arguments[:1] == ["status"] or (
+        arguments[:1] == ["diff"]
+        and "--cached" not in arguments
+        and "--staged" not in arguments
+        and "--no-index" not in arguments
+    ):
+        _assert_no_external_git_filters(worktree)
+    try:
+        completed = subprocess.run(
+            trusted_git_argv(worktree, arguments),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=trusted_git_environment(),
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ValueError(
+            "E_LIFECYCLE_OBSERVATION: local Git observation failed"
+        ) from error
     if completed.returncode != 0:
         raise ValueError(
             "E_LIFECYCLE_OBSERVATION: local Git observation failed"
@@ -1484,20 +5121,23 @@ def observe_local_git_state(
     observed_root = Path(_git_text(worktree, ["rev-parse", "--show-toplevel"])).resolve()
     branch = _git_text(worktree, ["branch", "--show-current"])
     head = _git_text(worktree, ["rev-parse", "HEAD"])
+    _assert_no_external_git_filters(worktree)
     status = subprocess.run(
-        _closed_git_argv(
+        trusted_git_argv(
             worktree,
-            [
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            ],
+            (
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ),
         ),
         check=False,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        env=_sanitized_git_environment(),
+        env=trusted_git_environment(),
+        timeout=10,
     )
     if (
         observed_root != worktree
@@ -2051,11 +5691,12 @@ def _governing_git_bytes(
     max_output_bytes: int,
 ) -> bytes:
     completed = subprocess.run(
-        _closed_git_argv(worktree, arguments),
+        trusted_git_argv(worktree, arguments),
         check=False,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        env=_sanitized_git_environment(),
+        env=trusted_git_environment(),
         timeout=10,
     )
     payload = completed.stdout
@@ -2358,6 +5999,7 @@ def validate_worktree_inventory_observation(
     validated = object.__new__(ValidatedWorktreeInventoryObservation)
     validated._consumed = False
     validated._clock = clock
+    validated._claim_lock = threading.Lock()
     validated.observation_id = observation.observation_id
     validated.invocation_id = observation.invocation_id
     validated.common_git_dir = observation.common_git_dir
@@ -2395,18 +6037,27 @@ def _inventory_is_current(
 def _consume_worktree_inventory(
     inventory: object, *, expected_common_git_dir: Path
 ) -> tuple[WorktreeInventoryRecord, ...]:
+    claim_lock = getattr(inventory, "_claim_lock", None)
     if (
         type(inventory) is not ValidatedWorktreeInventoryObservation
-        or inventory._consumed
-        or float(inventory._clock()) > inventory.freshness_deadline
-        or inventory.common_git_dir != str(expected_common_git_dir.resolve())
-        or not _inventory_is_current(inventory)
+        or type(claim_lock) is not _THREAD_LOCK_TYPE
     ):
         raise ValueError(
             "E_LEASE_OBSERVATION_STALE: worktree inventory changed before use"
         )
-    inventory._consumed = True
-    return inventory.records
+    with claim_lock:
+        if (
+            inventory._consumed
+            or float(inventory._clock()) > inventory.freshness_deadline
+            or inventory.common_git_dir
+            != str(expected_common_git_dir.resolve())
+            or not _inventory_is_current(inventory)
+        ):
+            raise ValueError(
+                "E_LEASE_OBSERVATION_STALE: worktree inventory changed before use"
+            )
+        inventory._consumed = True
+        return inventory.records
 
 
 class _ValidatedVerificationTarget:
@@ -2493,20 +6144,23 @@ def _attest_verification_target(
     ).resolve()
     branch = _git_text(target, ["branch", "--show-current"]) or None
     head = _git_text(target, ["rev-parse", "HEAD"])
+    _assert_no_external_git_filters(target)
     status = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(target),
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--untracked-files=all",
-        ],
+        trusted_git_argv(
+            target,
+            (
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+            ),
+        ),
         check=False,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        env=_sanitized_git_environment(),
+        env=trusted_git_environment(),
+        timeout=10,
     )
     policy_digest: str | None = None
     if expected_policy_digest is not None:
@@ -3351,38 +7005,6 @@ class LocalGitIndexObservation:
         raise TypeError("LocalGitIndexObservation is host-bound")
 
 
-def _assert_no_external_git_filters(
-    worktree: Path, paths: tuple[str, ...]
-) -> None:
-    completed = subprocess.run(
-        _closed_git_argv(
-            worktree, ["check-attr", "-z", "filter", "--", *paths]
-        ),
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_sanitized_git_environment(),
-    )
-    fields = completed.stdout.split(b"\0")
-    if fields and fields[-1] == b"":
-        fields.pop()
-    if (
-        completed.returncode != 0
-        or len(fields) != len(paths) * 3
-        or any(fields[index + 1] != b"filter" for index in range(0, len(fields), 3))
-    ):
-        raise ValueError(
-            "E_GIT_FILTER: clean-filter inventory is incomplete"
-        )
-    if any(
-        fields[index + 2] not in {b"unspecified", b"unset"}
-        for index in range(0, len(fields), 3)
-    ):
-        raise ValueError(
-            "E_GIT_FILTER: external clean filters are not permitted"
-        )
-
-
 def _assert_exact_stage_paths(
     worktree: Path,
     requested: tuple[str, ...],
@@ -3420,14 +7042,16 @@ def _assert_exact_stage_paths(
             )
         if not target.exists():
             tracked = subprocess.run(
-                _closed_git_argv(
+                trusted_git_argv(
                     worktree,
-                    ["ls-files", "--error-unmatch", "--", relative],
+                    ("ls-files", "--error-unmatch", "--", relative),
                 ),
                 check=False,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=_sanitized_git_environment(),
+                env=trusted_git_environment(),
+                timeout=10,
             )
             if tracked.returncode != 0:
                 raise ValueError(
@@ -3440,14 +7064,16 @@ def _assert_no_unsafe_transport_config(worktree: Path) -> None:
     scopes = ["--local"]
     for scope in scopes:
         completed = subprocess.run(
-            _closed_git_argv(
+            trusted_git_argv(
                 worktree,
-                ["config", scope, "--name-only", "--null", "--list"],
+                ("config", scope, "--name-only", "--null", "--list"),
             ),
             check=False,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            env=_sanitized_git_environment(),
+            env=trusted_git_environment(),
+            timeout=10,
         )
         payload = completed.stdout
         if (
@@ -3522,19 +7148,36 @@ def _validate_governing_git_effect(
     session_id: str,
     invocation_id: str,
     clock: Callable[[], float],
-) -> tuple[Path, Mapping[str, object]]:
+    expected_marker_phase: str,
+    expected_inventory_consumed: bool = False,
+    expected_authorization_consumed: bool = False,
+) -> tuple[Path, Mapping[str, object], Mapping[str, object]]:
+    now = float(clock())
     if (
         type(governing_runtime) is not GoverningRuntimeObservation
         or not _governing_runtime_observation_is_live(governing_runtime)
         or governing_runtime._consumed
-        or float(clock()) > governing_runtime.freshness_deadline
+        or now > governing_runtime.freshness_deadline
         or not isinstance(task_context, Mapping)
         or not isinstance(
             inventory, ValidatedWorktreeInventoryObservation
         )
-        or inventory._consumed
+        or inventory._consumed is not expected_inventory_consumed
+        or (
+            expected_inventory_consumed
+            and now > inventory.freshness_deadline
+        )
+        or not _inventory_is_current(inventory)
         or not isinstance(lease, Mapping)
         or not isinstance(authorization, TrustedAuthorization)
+        or (
+            authorization._consumed
+            is not expected_authorization_consumed
+        )
+        or (
+            expected_authorization_consumed
+            and now > authorization.freshness_deadline
+        )
         or governing_runtime.session_id != session_id
         or governing_runtime.invocation_id != invocation_id
         or lease.get("session_id") != session_id
@@ -3574,7 +7217,7 @@ def _validate_governing_git_effect(
     lease_path = (
         Path(owner.git_dir)
         / "codex-control-plane"
-        / "leases"
+        / "delivery-leases"
         / f"{task_id}.json"
     )
     try:
@@ -3595,6 +7238,27 @@ def _validate_governing_git_effect(
         if live_policy_digest == governing_runtime.policy_digest
         else _governing_policy_contract_digest(governing_runtime)
     )
+    marker = live_task.get("finalizing_delivery_commit") if isinstance(live_task, Mapping) else None
+    review_binding = (
+        live_task.get("delivery_review_binding")
+        if isinstance(live_task, Mapping)
+        else None
+    )
+    marker_required = {
+        "schema_version",
+        "task_id",
+        "generation",
+        "lease_digest",
+        "snapshot_digest",
+        "allowlist",
+        "expected_index_tree",
+        "parent_head",
+        "base_head",
+        "expected_tree",
+        "message_digest",
+        "phase",
+        "marker_digest",
+    }
     if (
         task_path.is_symlink()
         or lease_path.is_symlink()
@@ -3604,7 +7268,48 @@ def _validate_governing_git_effect(
         or live_task.get("task_digest") != task_context.get("task_digest")
         or live_task.get("branch") != lease.get("branch")
         or live_task.get("state") != "review_ready"
-        or live_task.get("resume_forbidden") is True
+        or not isinstance(marker, Mapping)
+        or set(marker) != marker_required
+        or marker.get("schema_version") != 1
+        or marker.get("task_id") != task_id
+        or marker.get("generation") != live_task.get("generation")
+        or marker.get("generation") != live_lease.get("generation")
+        or marker.get("lease_digest") != lease.get("lease_digest")
+        or marker.get("phase") != expected_marker_phase
+        or marker.get("parent_head") != expected_head
+        or marker.get("parent_head") != live_lease.get("review_head")
+        or marker.get("base_head") != live_lease.get("base_head")
+        or marker.get("expected_index_tree") != marker.get("expected_tree")
+        or _GIT_OBJECT_ID.fullmatch(
+            str(marker.get("expected_index_tree", ""))
+        ) is None
+        or not isinstance(marker.get("message_digest"), str)
+        or SHA256_DIGEST.fullmatch(str(marker.get("message_digest"))) is None
+        or not isinstance(marker.get("allowlist"), list)
+        or tuple(marker.get("allowlist", ()))
+        != tuple(live_lease.get("paths", ()))
+        or not isinstance(review_binding, Mapping)
+        or review_binding.get("authorizes") is not False
+        or review_binding.get("binding_digest")
+        != contract_digest(
+            {
+                key: value
+                for key, value in review_binding.items()
+                if key != "binding_digest"
+            }
+        )
+        or marker.get("snapshot_digest")
+        != review_binding.get("binding_digest")
+        or marker.get("parent_head") != review_binding.get("reviewed_head")
+        or marker.get("allowlist") != review_binding.get("scope_paths")
+        or marker.get("marker_digest")
+        != contract_digest(
+            {
+                key: value
+                for key, value in marker.items()
+                if key != "marker_digest"
+            }
+        )
         or dict(live_lease) != dict(lease)
         or live_lease.get("lease_digest") != contract_digest(lease_semantic)
         or live_lease.get("lease_digest")
@@ -3614,7 +7319,29 @@ def _validate_governing_git_effect(
         raise ValueError(
             "E_GIT_EFFECT: live task or writer lease binding drifted"
         )
-    return worktree, lease
+    return worktree, lease, marker
+
+
+def _governing_git_effect_lock_binding(
+    *,
+    worktree: Path,
+    task_context: Mapping[str, object],
+    inventory: ValidatedWorktreeInventoryObservation,
+    lease: Mapping[str, object],
+) -> tuple[Path, Path, str]:
+    task_id = str(task_context.get("task_id", ""))
+    owner = next(
+        (
+            item
+            for item in inventory.records
+            if item.worktree == str(worktree)
+            and item.branch == lease.get("branch")
+        ),
+        None,
+    )
+    if owner is None or not validate_task_id(task_id):
+        raise ValueError("E_GIT_EFFECT: worktree lock binding is invalid")
+    return Path(inventory.common_git_dir), Path(owner.git_dir), task_id
 
 
 def stage_allowlisted_paths(
@@ -3631,7 +7358,7 @@ def stage_allowlisted_paths(
     tool_use_id: str,
     clock: Callable[[], float],
 ) -> LocalGitIndexObservation:
-    worktree, lease_mapping = _validate_governing_git_effect(
+    worktree, lease_mapping, _marker = _validate_governing_git_effect(
         governing_runtime=governing_runtime,
         task_context=task_context,
         inventory=inventory,
@@ -3641,6 +7368,7 @@ def stage_allowlisted_paths(
         session_id=session_id,
         invocation_id=invocation_id,
         clock=clock,
+        expected_marker_phase="prepared",
     )
     normalized = tuple(normalize_scope(item) for item in paths)
     owned = tuple(str(item) for item in lease_mapping.get("paths", ()))
@@ -3683,40 +7411,88 @@ def stage_allowlisted_paths(
         inventory,
         expected_common_git_dir=Path(inventory.common_git_dir),
     )
-    _assert_exact_stage_paths(worktree, paths, exact_paths)
-    _assert_no_external_git_filters(worktree, exact_paths)
-    completed = subprocess.run(
-        _closed_git_argv(
-            worktree, ["add", "--", *normalized]
-        ),
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_sanitized_git_environment(),
+    common_dir, task_state_dir, task_id = (
+        _governing_git_effect_lock_binding(
+            worktree=worktree,
+            task_context=task_context,
+            inventory=inventory,
+            lease=lease_mapping,
+        )
     )
-    staged = subprocess.run(
-        _closed_git_argv(
-            worktree,
-            [
-            "diff",
-            "--cached",
-            "--name-only",
-            "-z",
-            ],
-        ),
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_sanitized_git_environment(),
-    )
-    observed_paths = tuple(
-        item.decode("utf-8") for item in staged.stdout.split(b"\0") if item
-    )
-    if completed.returncode != 0 or staged.returncode != 0 or set(
-        observed_paths
-    ) != set(normalized):
-        raise ValueError("E_GIT_EFFECT: staged index is not the allowlist")
-    index_tree = _git_text(worktree, ["write-tree"])
+    from control_plane.lifecycle import _common_lease_lock, _task_guard
+
+    with _common_lease_lock(common_dir):
+        with _task_guard(task_state_dir, task_id):
+            worktree, lease_mapping, _marker = (
+                _validate_governing_git_effect(
+                    governing_runtime=governing_runtime,
+                    task_context=task_context,
+                    inventory=inventory,
+                    lease=lease,
+                    authorization=authorization,
+                    expected_head=expected_head,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    clock=clock,
+                    expected_marker_phase="prepared",
+                    expected_inventory_consumed=True,
+                    expected_authorization_consumed=True,
+                )
+            )
+            _assert_exact_stage_paths(worktree, paths, exact_paths)
+            _assert_no_external_git_filters(worktree, exact_paths)
+            worktree, lease_mapping, _marker = (
+                _validate_governing_git_effect(
+                    governing_runtime=governing_runtime,
+                    task_context=task_context,
+                    inventory=inventory,
+                    lease=lease,
+                    authorization=authorization,
+                    expected_head=expected_head,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    clock=clock,
+                    expected_marker_phase="prepared",
+                    expected_inventory_consumed=True,
+                    expected_authorization_consumed=True,
+                )
+            )
+            completed = subprocess.run(
+                _closed_git_argv(
+                    worktree, ["add", "--", *normalized]
+                ),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_sanitized_git_environment(),
+            )
+            staged = subprocess.run(
+                _closed_git_argv(
+                    worktree,
+                    [
+                        "diff",
+                        "--cached",
+                        "--name-only",
+                        "-z",
+                    ],
+                ),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_sanitized_git_environment(),
+            )
+            observed_paths = tuple(
+                item.decode("utf-8")
+                for item in staged.stdout.split(b"\0")
+                if item
+            )
+            if completed.returncode != 0 or staged.returncode != 0 or set(
+                observed_paths
+            ) != set(normalized):
+                raise ValueError(
+                    "E_GIT_EFFECT: staged index is not the allowlist"
+                )
+            index_tree = _git_text(worktree, ["write-tree"])
     observation = object.__new__(LocalGitIndexObservation)
     observation._consumed = False
     observation.task_digest = str(task_context["task_digest"])
@@ -3745,6 +7521,68 @@ def stage_allowlisted_paths(
     return observation
 
 
+def _validate_staged_commit_binding(
+    *,
+    worktree: Path,
+    task_context: Mapping[str, object],
+    lease: Mapping[str, object],
+    marker: Mapping[str, object],
+    index_observation: object,
+    message: object,
+    expected_prior_head: str,
+    session_id: str,
+    invocation_id: str,
+) -> None:
+    if (
+        type(index_observation) is not LocalGitIndexObservation
+        or index_observation._consumed
+        or index_observation.task_digest
+        != task_context.get("task_digest")
+        or index_observation.worktree_identity != str(worktree)
+        or index_observation.branch != lease.get("branch")
+        or index_observation.head != expected_prior_head
+        or index_observation.session_id != session_id
+        or index_observation.invocation_id != invocation_id
+        or tuple(index_observation.paths)
+        != tuple(lease.get("paths", ()))
+        or index_observation.observation_digest
+        != contract_digest(
+            {
+                name: getattr(index_observation, name)
+                for name in (
+                    "task_digest",
+                    "worktree_identity",
+                    "branch",
+                    "head",
+                    "index_tree",
+                    "paths",
+                    "session_id",
+                    "invocation_id",
+                )
+            }
+        )
+        or not isinstance(message, str)
+        or not 1 <= len(message) <= 200
+        or any(ord(character) < 32 for character in message)
+        or marker.get("parent_head") != expected_prior_head
+        or marker.get("message_digest")
+        != f"sha256:{sha256(message.encode('utf-8')).hexdigest()}"
+        or _git_text(worktree, ["branch", "--show-current"])
+        != lease.get("branch")
+        or _git_text(worktree, ["rev-parse", "HEAD"])
+        != expected_prior_head
+        or _git_text(worktree, ["write-tree"])
+        != index_observation.index_tree
+        or marker.get("expected_index_tree")
+        != index_observation.index_tree
+        or marker.get("expected_tree")
+        != index_observation.index_tree
+    ):
+        raise ValueError(
+            "E_GIT_EFFECT: staged commit binding is invalid"
+        )
+
+
 def commit_staged_change(
     *,
     governing_runtime: object,
@@ -3760,7 +7598,7 @@ def commit_staged_change(
     tool_use_id: str,
     clock: Callable[[], float],
 ) -> LocalGitObservation:
-    worktree, lease_mapping = _validate_governing_git_effect(
+    worktree, lease_mapping, marker = _validate_governing_git_effect(
         governing_runtime=governing_runtime,
         task_context=task_context,
         inventory=inventory,
@@ -3770,20 +7608,19 @@ def commit_staged_change(
         session_id=session_id,
         invocation_id=invocation_id,
         clock=clock,
+        expected_marker_phase="index_observed",
     )
-    if (
-        type(index_observation) is not LocalGitIndexObservation
-        or index_observation._consumed
-        or index_observation.task_digest != task_context.get("task_digest")
-        or index_observation.worktree_identity != str(worktree)
-        or index_observation.head != expected_prior_head
-        or not isinstance(message, str)
-        or not 1 <= len(message) <= 200
-        or any(ord(character) < 32 for character in message)
-        or _git_text(worktree, ["write-tree"])
-        != index_observation.index_tree
-    ):
-        raise ValueError("E_GIT_EFFECT: staged commit binding is invalid")
+    _validate_staged_commit_binding(
+        worktree=worktree,
+        task_context=task_context,
+        lease=lease_mapping,
+        marker=marker,
+        index_observation=index_observation,
+        message=message,
+        expected_prior_head=expected_prior_head,
+        session_id=session_id,
+        invocation_id=invocation_id,
+    )
     subject_digest = contract_digest(
         {
             "index": index_observation.observation_digest,
@@ -3809,24 +7646,94 @@ def commit_staged_change(
         inventory,
         expected_common_git_dir=Path(inventory.common_git_dir),
     )
-    completed = subprocess.run(
-        _closed_git_argv(
-            worktree, ["commit", "-m", message]
-        ),
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=_sanitized_git_environment(),
+    common_dir, task_state_dir, task_id = (
+        _governing_git_effect_lock_binding(
+            worktree=worktree,
+            task_context=task_context,
+            inventory=inventory,
+            lease=lease_mapping,
+        )
     )
-    head = _git_text(worktree, ["rev-parse", "HEAD"])
-    if (
-        completed.returncode != 0
-        or head == expected_prior_head
-        or _GIT_OBJECT_ID.fullmatch(head) is None
-        or _git_text(worktree, ["diff", "--cached", "--name-only"])
-    ):
-        raise ValueError("E_GIT_EFFECT: commit was not observed exactly")
-    index_observation._consumed = True
+    from control_plane.lifecycle import _common_lease_lock, _task_guard
+
+    with _common_lease_lock(common_dir):
+        with _task_guard(task_state_dir, task_id):
+            worktree, lease_mapping, marker = (
+                _validate_governing_git_effect(
+                    governing_runtime=governing_runtime,
+                    task_context=task_context,
+                    inventory=inventory,
+                    lease=lease,
+                    authorization=authorization,
+                    expected_head=expected_prior_head,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    clock=clock,
+                    expected_marker_phase="index_observed",
+                    expected_inventory_consumed=True,
+                    expected_authorization_consumed=True,
+                )
+            )
+            _validate_staged_commit_binding(
+                worktree=worktree,
+                task_context=task_context,
+                lease=lease_mapping,
+                marker=marker,
+                index_observation=index_observation,
+                message=message,
+                expected_prior_head=expected_prior_head,
+                session_id=session_id,
+                invocation_id=invocation_id,
+            )
+            worktree, lease_mapping, marker = (
+                _validate_governing_git_effect(
+                    governing_runtime=governing_runtime,
+                    task_context=task_context,
+                    inventory=inventory,
+                    lease=lease,
+                    authorization=authorization,
+                    expected_head=expected_prior_head,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    clock=clock,
+                    expected_marker_phase="index_observed",
+                    expected_inventory_consumed=True,
+                    expected_authorization_consumed=True,
+                )
+            )
+            _validate_staged_commit_binding(
+                worktree=worktree,
+                task_context=task_context,
+                lease=lease_mapping,
+                marker=marker,
+                index_observation=index_observation,
+                message=message,
+                expected_prior_head=expected_prior_head,
+                session_id=session_id,
+                invocation_id=invocation_id,
+            )
+            completed = subprocess.run(
+                _closed_git_argv(
+                    worktree, ["commit", "-m", message]
+                ),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_sanitized_git_environment(),
+            )
+            head = _git_text(worktree, ["rev-parse", "HEAD"])
+            if (
+                completed.returncode != 0
+                or head == expected_prior_head
+                or _GIT_OBJECT_ID.fullmatch(head) is None
+                or _git_text(
+                    worktree, ["diff", "--cached", "--name-only"]
+                )
+            ):
+                raise ValueError(
+                    "E_GIT_EFFECT: commit was not observed exactly"
+                )
+            index_observation._consumed = True
     now = float(clock())
     observation = object.__new__(LocalGitObservation)
     observation.observation_id = f"local-git-{uuid4().hex}"
@@ -5102,7 +9009,7 @@ def execute_pull_request_mutation(
         )
         if bindings.draft:
             arguments = (*arguments, "--draft")
-    else:
+    elif bindings.draft:
         arguments = (
             "gh",
             "pr",
@@ -5114,6 +9021,15 @@ def execute_pull_request_mutation(
             bindings.title,
             "--body",
             bindings.body,
+        )
+    else:
+        arguments = (
+            "gh",
+            "pr",
+            "ready",
+            str(bindings.expected_pr_number),
+            "--repo",
+            repository,
         )
     request._execution_state = "effect_started"
     try:
@@ -5404,24 +9320,19 @@ def _closed_artifact_digests(
 
 
 def _smoke_git_head(repository: Path) -> str:
-    git = _trusted_git_executable()
-    if git is None:
+    try:
+        completed = subprocess.run(
+            trusted_git_argv(repository, ("rev-parse", "HEAD")),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=trusted_git_environment(),
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
         return ""
-    completed = subprocess.run(
-        [git, "-C", str(repository), "rev-parse", "HEAD"],
-        check=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "LC_ALL": "C",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_TERMINAL_PROMPT": "0",
-        },
-    )
     return completed.stdout.strip() if completed.returncode == 0 else ""
 
 

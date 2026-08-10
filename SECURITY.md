@@ -41,7 +41,7 @@ un gate ni modifica la precedencia.
 
 | Amenaza | Control preventivo | Evidencia | Riesgo residual |
 |---|---|---|---|
-| Prompt injection concede push/release | `AuthorizationGrant` separado y ligado a task digest/scope | `RouteDecision.authorization` | host emisor comprometido |
+| Prompt injection concede push/release | autoridad host-bound, opaca y one-shot por efecto; ningún payload serializable autoriza | plan/receipt `authorizes=false` y revalidación executor-edge | host emisor comprometido |
 | Recurso duplicado o suplantado | ID ASCII, canonicalidad, digest y bloqueo ambiguo | `E_RESOURCE_AMBIGUOUS` | inventario externo degradado |
 | Traversal o symlink escape | locators sin ejecución y resolución confinada | `R_LOCATOR`, `R_SYMLINK_ESCAPE` | filesystem alterado tras snapshot |
 | Exfiltración por MCP/plugin | egress y data classes; autorización separada | inventory + receipt | proveedor comprometido |
@@ -89,10 +89,16 @@ gobernado.
 
 Implementar no autoriza commit. Commit no autoriza push. Push no autoriza PR.
 PR no autoriza merge. Merge no autoriza release. `TaskEnvelope` solo solicita
-efectos: ni siquiera `source=user_explicit` puede concederlos. Los efectos
-externos requieren un `AuthorizationGrant` emitido por un canal host confiable,
-ligado al digest exacto de tarea, sesión, scope y efectos. El CLI no acepta un
-archivo arbitrario de grant como sustituto de ese canal.
+efectos: ni siquiera `source=user_explicit` puede concederlos. La autoridad
+del outcome bridge v2.3 permanece opaca y host-bound, se consume una vez por
+efecto y nunca se serializa en sus planes, receipts, CLI o recovery. La
+evidencia no es autoridad.
+
+Una cadena estable puede continuar sin nuevas preguntas hasta su outcome
+actual. `PR LISTA` es el default; integración exige una petición nativa fresca y
+exacta hasta squash merge. Deriva o un efecto nuevo exige una sola decisión de
+producto. Si falta el adaptador nativo, se bloquea: no se pide al usuario
+configurar plumbing interno.
 
 GitHub, Xcode Cloud y TestFlight permanecen
 `pending_external_evidence` hasta consultar el proveedor. La protección de
@@ -101,6 +107,10 @@ GitHub, Xcode Cloud y TestFlight permanecen
 La distribución v2.1 local-audit no instala `.github/workflows/**`, no añade un
 provider GitHub y no acepta policy candidata como sustituto de evidencia
 externa. Por ello la dimensión remota de `risk-status` es `UNKNOWN` por diseño.
+
+El modelo específico de replay, drift, stale review y uncertain write está en
+[v2.3 outcome bridge threat model](docs/security/2026-08-08-v2-3-outcome-bridge-threat-model.md).
+Los hooks y guards locales no son GitHub branch protection.
 
 ## Reportar una vulnerabilidad
 

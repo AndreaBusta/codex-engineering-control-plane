@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Any, Mapping
 import subprocess
 
-from control_plane.repository import git_environment
+from control_plane.repository import (
+    assert_no_external_git_filters,
+    trusted_git_argv,
+    trusted_git_environment,
+)
 
 
 @dataclass(frozen=True)
@@ -53,20 +57,35 @@ class GateResult:
 def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
-            ["git", *arguments],
-            cwd=repo,
+            trusted_git_argv(repo, arguments),
             check=False,
             capture_output=True,
             text=True,
-            env=git_environment(),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            timeout=5.0,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
         return subprocess.CompletedProcess(
-            args=["git", *arguments],
+            args=["/usr/bin/git", *arguments],
             returncode=128,
             stdout="",
             stderr="",
         )
+
+
+def _is_shallow_repository(repo: Path) -> bool | None:
+    """Return shallow state, or None when the Git fact is unavailable."""
+
+    result = _git(repo, "rev-parse", "--is-shallow-repository")
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return None
 
 
 def _check(
@@ -163,7 +182,17 @@ def evaluate_preflight(
         "HEAD is detached.",
     )
 
-    status_result = _git(root, "status", "--porcelain=v1", "-z")
+    try:
+        assert_no_external_git_filters(root)
+    except ValueError:
+        status_result = subprocess.CompletedProcess(
+            args=["/usr/bin/git", "status"],
+            returncode=128,
+            stdout="",
+            stderr="",
+        )
+    else:
+        status_result = _git(root, "status", "--porcelain=v1", "-z")
     status_observed = status_result.returncode == 0
     dirty = bool(status_result.stdout) if status_observed else None
     facts["dirty"] = dirty
@@ -303,3 +332,193 @@ def evaluate_preflight(
             )
 
     return GateResult(not errors, mode, facts, checks, errors)
+
+
+def verify_refreshed_base_containment(
+    *,
+    effect_plan: object,
+    integration_receipt: object,
+    refresh_receipt: object,
+) -> object:
+    """Read only the exact refreshed remote ref and prove merge containment."""
+
+    from control_plane.host_bridge import (
+        BaseRefreshReceiptV1,
+        IntegrationEffectPlanV1,
+        IntegrationReceiptV1,
+        build_base_verification_receipt,
+    )
+
+    if (
+        type(effect_plan) is not IntegrationEffectPlanV1
+        or type(integration_receipt) is not IntegrationReceiptV1
+        or type(refresh_receipt) is not BaseRefreshReceiptV1
+    ):
+        raise ValueError("E_BASE_VERIFICATION: exact contracts are required")
+    effect_plan = IntegrationEffectPlanV1.from_dict(effect_plan.to_dict())
+    integration_receipt = IntegrationReceiptV1.from_dict(
+        integration_receipt.to_dict()
+    )
+    refresh_receipt = BaseRefreshReceiptV1.from_dict(
+        refresh_receipt.to_dict()
+    )
+
+    def blocked(
+        reason_code: str,
+        *,
+        observed_base_sha: str | None = None,
+        contained: bool | None = None,
+    ) -> object:
+        return build_base_verification_receipt(
+            effect_plan=effect_plan,
+            integration_receipt=integration_receipt,
+            refresh_receipt=refresh_receipt,
+            status="BLOCKED",
+            reason_code=reason_code,
+            observed_base_sha=observed_base_sha,
+            contained=contained,
+        )
+
+    expected_base_ref = (
+        f"refs/remotes/{effect_plan.remote}/{effect_plan.base}"
+    )
+    if (
+        refresh_receipt.task_id != effect_plan.task_id
+        or refresh_receipt.task_digest != effect_plan.task_digest
+        or refresh_receipt.run_plan_digest != effect_plan.run_plan_digest
+        or refresh_receipt.repository != effect_plan.repository
+        or refresh_receipt.remote != effect_plan.remote
+        or refresh_receipt.remote_url != effect_plan.remote_url
+        or refresh_receipt.remote_url_digest != effect_plan.remote_url_digest
+        or refresh_receipt.remote_identity != effect_plan.remote_identity
+        or refresh_receipt.remote_identity_digest
+        != effect_plan.remote_identity_digest
+        or refresh_receipt.base != effect_plan.base
+        or refresh_receipt.base_ref != expected_base_ref
+        or refresh_receipt.policy_digest != effect_plan.policy_digest
+        or refresh_receipt.effect_plan_digest != effect_plan.plan_digest
+        or refresh_receipt.integration_receipt_digest
+        != integration_receipt.receipt_digest
+        or refresh_receipt.merge_sha != integration_receipt.observed_merge_sha
+    ):
+        raise ValueError("E_BASE_VERIFICATION: receipt binding drifted")
+    if refresh_receipt.status != "PASS":
+        return blocked("BASE_REFRESH_UNKNOWN")
+    repository = Path(effect_plan.repository)
+    ref = _git(repository, "rev-parse", "--verify", f"{refresh_receipt.base_ref}^{{commit}}")
+    if ref.returncode != 0:
+        return blocked("BASE_REF_MISSING")
+    observed_base_sha = ref.stdout.strip()
+    if observed_base_sha != refresh_receipt.observed_sha:
+        return blocked(
+            "BASE_REF_MISMATCH", observed_base_sha=observed_base_sha
+        )
+    merge = _git(
+        repository,
+        "cat-file",
+        "-e",
+        f"{integration_receipt.observed_merge_sha}^{{commit}}",
+    )
+    if merge.returncode != 0:
+        return blocked(
+            "BASE_CONTAINMENT_UNKNOWN", observed_base_sha=observed_base_sha
+        )
+    containment = _git(
+        repository,
+        "merge-base",
+        "--is-ancestor",
+        str(integration_receipt.observed_merge_sha),
+        refresh_receipt.base_ref,
+    )
+    if containment.returncode == 1:
+        if _is_shallow_repository(repository) is not False:
+            return blocked(
+                "BASE_CONTAINMENT_UNKNOWN",
+                observed_base_sha=observed_base_sha,
+            )
+        return blocked(
+            "BASE_MERGE_NOT_CONTAINED",
+            observed_base_sha=observed_base_sha,
+            contained=False,
+        )
+    if containment.returncode != 0:
+        return blocked(
+            "BASE_CONTAINMENT_UNKNOWN", observed_base_sha=observed_base_sha
+        )
+    return build_base_verification_receipt(
+        effect_plan=effect_plan,
+        integration_receipt=integration_receipt,
+        refresh_receipt=refresh_receipt,
+        status="PASS",
+        reason_code="BASE_CONTAINED",
+        observed_base_sha=observed_base_sha,
+        contained=True,
+    )
+
+
+def revalidate_base_verification_receipt(
+    receipt: object,
+    *,
+    refresh_receipt: object,
+) -> bool:
+    """Re-read one exact PASS refresh and its proof; never mutate or fetch."""
+
+    from control_plane.host_bridge import (
+        BaseRefreshReceiptV1,
+        BaseVerificationReceiptV1,
+    )
+
+    if (
+        type(receipt) is not BaseVerificationReceiptV1
+        or type(refresh_receipt) is not BaseRefreshReceiptV1
+    ):
+        return False
+    try:
+        receipt = BaseVerificationReceiptV1.from_dict(receipt.to_dict())
+        refresh_receipt = BaseRefreshReceiptV1.from_dict(
+            refresh_receipt.to_dict()
+        )
+    except ValueError:
+        return False
+    if (
+        receipt.status != "PASS"
+        or receipt.contained is not True
+        or refresh_receipt.status != "PASS"
+        or receipt.refresh_receipt_digest != refresh_receipt.receipt_digest
+        or receipt.task_id != refresh_receipt.task_id
+        or receipt.task_digest != refresh_receipt.task_digest
+        or receipt.run_plan_digest != refresh_receipt.run_plan_digest
+        or receipt.repository != refresh_receipt.repository
+        or receipt.remote != refresh_receipt.remote
+        or receipt.base != refresh_receipt.base
+        or receipt.base_ref != refresh_receipt.base_ref
+        or receipt.policy_digest != refresh_receipt.policy_digest
+        or receipt.effect_plan_digest != refresh_receipt.effect_plan_digest
+        or receipt.integration_receipt_digest
+        != refresh_receipt.integration_receipt_digest
+        or receipt.merge_sha != refresh_receipt.merge_sha
+        or receipt.observed_at != refresh_receipt.observed_at
+        or refresh_receipt.observed_ref != receipt.base_ref
+        or refresh_receipt.observed_sha != receipt.observed_base_sha
+    ):
+        return False
+    repository = Path(receipt.repository)
+    ref = _git(
+        repository,
+        "rev-parse",
+        "--verify",
+        f"{receipt.base_ref}^{{commit}}",
+    )
+    if ref.returncode != 0 or ref.stdout.strip() != receipt.observed_base_sha:
+        return False
+    merge = _git(repository, "cat-file", "-e", f"{receipt.merge_sha}^{{commit}}")
+    if merge.returncode != 0:
+        return False
+    containment = _git(
+        repository,
+        "merge-base",
+        "--is-ancestor",
+        receipt.merge_sha,
+        receipt.base_ref,
+    )
+    return containment.returncode == 0

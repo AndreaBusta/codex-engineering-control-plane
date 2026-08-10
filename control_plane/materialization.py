@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 
-from control_plane.repository import git_environment
+from control_plane.repository import trusted_git_argv, trusted_git_environment
 
 
 DATALESS_FLAG = 0x40000000
@@ -42,14 +42,15 @@ def inspect_tracked_materialization(
     root = repository.resolve()
     try:
         completed = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "-z"],
+            trusted_git_argv(root, ("ls-files", "-z")),
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            env=git_environment(),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
             timeout=10,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.SubprocessError):
         return MaterializationResult(
             False, "UNKNOWN", 0, (), "E_MATERIALIZATION_INVENTORY"
         )
@@ -82,11 +83,14 @@ def inspect_tracked_materialization(
                 dataless_items.append(relative)
         if missing:
             deleted = subprocess.run(
-                ["git", "-C", str(root), "ls-files", "--deleted", "-z"],
+                trusted_git_argv(
+                    root, ("ls-files", "--deleted", "-z")
+                ),
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env=git_environment(),
+                env=trusted_git_environment(),
+                stdin=subprocess.DEVNULL,
                 timeout=10,
             )
             deleted_paths = {
@@ -96,7 +100,7 @@ def inspect_tracked_materialization(
             }
             if deleted.returncode != 0 or not set(missing).issubset(deleted_paths):
                 raise OSError("tracked path disappeared during inspection")
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.SubprocessError):
         return MaterializationResult(
             False,
             "UNKNOWN",

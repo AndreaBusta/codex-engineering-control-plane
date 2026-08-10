@@ -93,6 +93,16 @@ Comparar:
 Con squash merge, el hash de feature puede no aparecer en base. Consultar el PR
 y verificar su merge commit.
 
+Si push, creación de PR o merge devuelve timeout, crash o `UNKNOWN`, no repetir
+la mutación ni intentar repararla. Conservar el marker observe-only y observar
+primero el target exacto. La ausencia de respuesta no prueba ausencia del
+efecto. Receipt serializable, evidencia local y guards no conceden autoridad
+para una segunda escritura.
+
+Para el flujo detallado antes de commit, después de commit, después de push/PR,
+escritura incierta y verificación post-merge, usar
+[Outcome bridge rollback](16-outcome-bridge-rollback.md).
+
 ## Recuperación de release
 
 Separar código y artefacto:

@@ -693,6 +693,25 @@ class RoutingTests(unittest.TestCase):
         self.assertFalse(decision["authorization"]["remote_write"])
         self.assertIn("remote_write", decision["approval_boundaries"])
 
+    def test_remote_outcome_has_closed_deferred_effect_sequence(self) -> None:
+        from control_plane.routing import deferred_effects_for_outcome
+
+        self.assertEqual(deferred_effects_for_outcome("local_change"), [])
+        self.assertEqual(deferred_effects_for_outcome("commit"), ["commit"])
+        self.assertEqual(
+            deferred_effects_for_outcome("pull_request"),
+            ["commit", "remote_write", "pull_request"],
+        )
+        self.assertEqual(
+            deferred_effects_for_outcome("integration"),
+            ["commit", "remote_write", "pull_request", "integration"],
+        )
+        for rejected in ("answer", "release"):
+            with self.subTest(rejected=rejected), self.assertRaisesRegex(
+                ValueError, "E_RUN_OUTCOME"
+            ):
+                deferred_effects_for_outcome(rejected)
+
     def test_low_uncertainty_is_autonomous_without_new_authority(self) -> None:
         task = task_envelope(
             risk={

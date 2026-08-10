@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -81,6 +82,50 @@ class MaterializationTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "PASS")
+
+    def test_inventory_ignores_ambient_path_and_index_redirect(self) -> None:
+        from control_plane.materialization import inspect_tracked_materialization
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = self._repository(root)
+            empty_index = root / "empty.index"
+            index_environment = dict(os.environ)
+            index_environment["GIT_INDEX_FILE"] = str(empty_index)
+            subprocess.run(
+                ["git", "-C", str(repo), "read-tree", "--empty"],
+                check=True,
+                env=index_environment,
+            )
+            marker = root / "ambient-git-executed"
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/usr/bin/python3\n"
+                "import os, sys\n"
+                f"open({str(marker)!r}, 'wb').close()\n"
+                "os.execv('/usr/bin/git', ['/usr/bin/git', *sys.argv[1:]])\n",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o700)
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": str(fake_bin),
+                    "GIT_INDEX_FILE": str(empty_index),
+                },
+                clear=False,
+            ), patch(
+                "control_plane.materialization._file_flags", return_value=0
+            ):
+                result = inspect_tracked_materialization(repo)
+
+            ambient_git_executed = marker.exists()
+
+        self.assertFalse(ambient_git_executed)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.tracked_files, 2)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,11 @@ import shutil
 import subprocess
 import sys
 from unittest.mock import patch
-from tests.host_adapter_test_support import lifecycle_observation
+from tests.host_adapter_test_support import (
+    independent_review_receipt,
+    lifecycle_observation,
+)
+from tests.git_test_support import install_external_diff_driver
 
 
 class LifecycleTests(unittest.TestCase):
@@ -67,6 +71,767 @@ class LifecycleTests(unittest.TestCase):
         common_dir = repository / ".git"
         other_git_dir = common_dir / "worktrees" / other.name
         return repository, other, common_dir, other_git_dir
+
+    def test_verification_git_never_executes_external_diff_driver(self) -> None:
+        from control_plane.lifecycle import _verification_git
+
+        repository, _, _, _ = self._two_worktree_repository("diff-driver")
+        marker = install_external_diff_driver(
+            repository,
+            self.state_dir,
+            tracked_path="tracked.txt",
+            driver_name="verification-subject-driver",
+        )
+
+        completed = _verification_git(
+            repository, ("diff", "HEAD", "--", "tracked.txt")
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertFalse(marker.exists())
+        self.assertIn(b"changed through builtin diff", completed.stdout)
+
+
+class HostBridgeLifecycleCompositionTests(LifecycleTests):
+    """Exercise the local delivery handoff without a remote mutation."""
+
+    def setUp(self) -> None:
+        from control_plane.contracts import contract_digest
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.state_dir = Path(self.temp.name)
+        self.digest = contract_digest({"test": "delivery-composition"})
+
+    def _repository(self) -> tuple[Path, Path]:
+        repository = self.state_dir / "delivery-repository"
+        repository.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main", str(repository)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for key, value in (
+            ("user.name", "Control Plane Tests"),
+            ("user.email", "tests@example.invalid"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(repository), "config", key, value],
+                check=True,
+            )
+        (repository / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "tracked.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-m", "baseline"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return repository, repository / ".git"
+
+    def _expected_index_tree(self, repository: Path, paths: tuple[str, ...] = ("tracked.txt",)) -> str:
+        temporary_index = self.state_dir / "expected.index"
+        environment = dict(__import__("os").environ)
+        environment["GIT_INDEX_FILE"] = str(temporary_index)
+        for arguments in (
+            ("read-tree", "HEAD"),
+            ("add", "--", *paths),
+        ):
+            subprocess.run(
+                ["git", "-C", str(repository), *arguments],
+                check=True,
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return subprocess.run(
+            ["git", "-C", str(repository), "write-tree"],
+            check=True,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+    def _delivery_policy_digest(self, repository: Path) -> str:
+        from control_plane.contracts import contract_digest
+        from control_plane.policy import load_policy
+
+        return contract_digest(load_policy(repository / ".codex" / "project-policy.toml"))
+
+    def _published_delivery_review(self, task_id: str, *, outcome: str = "commit", include_untracked: bool = False):
+        """Create delivery proof through the public run/review/promotion path."""
+
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import TaskStore
+        from control_plane.policy import load_policy
+        from control_plane.repository import worktree_git_dir
+        from control_plane.run_workflow import (
+            RunStore, build_independent_review_receipt, prepare_review_packet,
+            prepare_run, publish_review_ready, verify_run,
+        )
+        from tests.git_test_support import FIXTURE_POLICY, GitScenario, git
+        from tests.router_test_support import task_envelope
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature(f"codex/{task_id.lower()}")
+        (scenario.repo / ".codex").mkdir()
+        shutil.copy2(FIXTURE_POLICY, scenario.repo / ".codex" / "project-policy.toml")
+        (scenario.repo / "scripts").mkdir()
+        launcher = scenario.repo / "scripts" / "control-plane"
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launcher.chmod(0o755)
+        (scenario.repo / "tests").mkdir()
+        (scenario.repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (scenario.repo / "tests" / "test_fixture.py").write_text(
+            "import unittest\n\nclass FixtureTests(unittest.TestCase):\n    def test_fixture(self): self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        (scenario.repo / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+        git(scenario.repo, "add", ".codex", "scripts", "tests", "tracked.txt")
+        git(scenario.repo, "commit", "-m", "test: delivery review fixture")
+        scope_paths = ["tracked.txt", "untracked.txt"] if include_untracked else ["tracked.txt"]
+        task = task_envelope(
+            task_id=task_id, requested_outcome=outcome, scope_paths=scope_paths,
+            effects=[{"name": "local_write", "source": "user_explicit"},
+                     {"name": "commit", "source": "user_explicit"}],
+        )
+        boundaries = [] if outcome == "commit" else ["commit", "remote_write", "pull_request"]
+        effects = task["effects"]
+        if outcome != "commit":
+            effects.extend([
+                {"name": "remote_write", "source": "user_explicit"},
+                {"name": "pull_request", "source": "user_explicit"},
+            ])
+        decision_core = {
+            "schema_version": 1, "task_id": task_id, "mode": "audit", "ok": True,
+            "decision_ready": False,
+            "summary": {"tier": "T2", "project_profile": {"profiles": ["generic"]}},
+            "documentation": {},
+            "interaction": {"clarification_gate": {"level": "low", "status": "autonomous", "decision_ready": True}},
+            "approval_boundaries": boundaries,
+            "authorization": {"local_write": True},
+            "required_gates": ["gate.relevant-tests", "gate.independent-review"],
+            "selected_resource_digests": {}, "matched_routes": ["quality-profile-generic"],
+            "facts": {"task_digest": contract_digest(task)}, "errors": [],
+        }
+        decision = {**decision_core, "decision_digest": contract_digest(decision_core)}
+        prepare_run(task=task, decision=decision, repository=scenario.repo,
+                    policy=load_policy(FIXTURE_POLICY), session_id=f"session-{task_id.lower()}",
+                    prepared_at="2026-08-09T10:00:00Z")
+        parent = git(scenario.repo, "rev-parse", "HEAD")
+        (scenario.repo / "tracked.txt").write_text("delivery reviewed\n", encoding="utf-8")
+        if include_untracked:
+            (scenario.repo / "untracked.txt").write_text("delivery untracked\n", encoding="utf-8")
+        verified = verify_run(repository=scenario.repo, task_id=task_id,
+                              observed_at="2026-08-09T10:01:00Z")
+        state_dir = worktree_git_dir(scenario.repo)
+        runs = RunStore(state_dir)
+        packet = prepare_review_packet(scenario.repo, task_id, 1, "independent", "sha256:" + "4" * 64)
+        receipt, review_observation = independent_review_receipt(
+            run_store=runs, review_packet=packet,
+            findings_digest="sha256:" + "5" * 64,
+            critical=0, important=0, status="PASS", observed_at="2026-08-09T10:02:00Z",
+        )
+        runs.persist_review_receipt(
+            task_id, packet["packet_digest"], receipt,
+            observation=review_observation,
+        )
+        state = TaskStore(state_dir).status(task_id)
+        ready = publish_review_ready(repository=scenario.repo, task_id=task_id,
+                                     expected_generation=state["generation"],
+                                     receipt_digests=(receipt["receipt_digest"],))
+        self.assertEqual(verified["attempt"]["status"], "PASS")
+        self.assertEqual(ready["state"], "review_ready")
+        return scenario.repo, state_dir, TaskStore(state_dir), parent
+
+    def _delivery_fixture(self, task_id: str):
+        repository, state_dir, store, parent = self._published_delivery_review(task_id)
+        expected_tree = self._expected_index_tree(repository)
+        lease = store.acquire_delivery_lease(
+            task_id, worktree=str(repository), branch="codex/" + task_id.lower(), session_id=f"session-{task_id.lower()}",
+            paths=["tracked.txt"], policy_digest=self._delivery_policy_digest(repository), expected_head=parent,
+            diff_digest=store.status(task_id)["delivery_review_binding"]["diff_digest"], expected_generation=store.status(task_id)["generation"],
+        )
+        store.prepare_delivery_commit(
+            task_id, lease=lease, snapshot_digest=store.status(task_id)["delivery_review_binding"]["binding_digest"], allowlist=("tracked.txt",),
+            expected_index_tree=expected_tree, parent_head=parent, expected_tree=expected_tree,
+            message="test: delivery fault",
+        )
+        return repository, state_dir, store, parent, expected_tree, lease
+
+    def _commit_delivery(self, repository, store, task_id, parent, lease):
+        from control_plane.host_bridge import observe_local_git_state, validate_local_git_observation
+
+        subprocess.run(["git", "-C", str(repository), "add", "--", "tracked.txt"], check=True)
+        store.observe_delivery_index(task_id, lease=lease, expected_index_tree=self._expected_index_tree(repository))
+        subprocess.run(["git", "-C", str(repository), "commit", "-m", "test: delivery fault"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        raw = observe_local_git_state(
+            task_state=store.status(task_id), expected_repo=repository, expected_worktree=repository,
+            expected_branch=store.status(task_id)["branch"], expected_prior_head=parent, target_state="committed",
+            session_id=lease["session_id"], invocation_id=f"commit-{task_id}", clock=lambda: 100.0, ttl_seconds=30,
+        )
+        return validate_local_git_observation(
+            raw, expected_task_digest=store.status(task_id)["task_digest"], expected_repo=repository, expected_worktree=repository,
+            expected_branch=store.status(task_id)["branch"], expected_prior_head=parent, expected_target_state="committed",
+            expected_session_id=lease["session_id"], expected_invocation_id=f"commit-{task_id}", clock=lambda: 100.0,
+        )
+
+    def test_delivery_staged_diff_matches_real_review_artifact_for_tracked_and_untracked(self) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import _delivery_review_diff, _delivery_review_diff_matches
+
+        task_id = "TASK-DELIVERY-DIFF-PARITY"
+        repository, _state_dir, store, parent = self._published_delivery_review(
+            task_id, include_untracked=True,
+        )
+        binding = store.status(task_id)["delivery_review_binding"]
+        paths = ("tracked.txt", "untracked.txt")
+        lease = store.acquire_delivery_lease(
+            task_id, worktree=str(repository), branch=store.status(task_id)["branch"],
+            session_id=f"session-{task_id.lower()}", paths=list(paths),
+            policy_digest=self._delivery_policy_digest(repository), expected_head=parent,
+            diff_digest=binding["diff_digest"],
+            expected_generation=store.status(task_id)["generation"],
+        )
+        expected_tree = self._expected_index_tree(repository, paths)
+        store.prepare_delivery_commit(
+            task_id, lease=lease, snapshot_digest=store.status(task_id)["delivery_review_binding"]["binding_digest"], allowlist=paths,
+            expected_index_tree=expected_tree, parent_head=parent,
+            expected_tree=expected_tree, message="test: diff parity",
+        )
+        subprocess.run(["git", "-C", str(repository), "add", "--", *paths], check=True)
+        rendered = _delivery_review_diff(repository, parent, paths)
+        self.assertEqual(contract_digest({"diff": rendered.hex()}), binding["diff_digest"])
+        self.assertTrue(_delivery_review_diff_matches(repository, binding, paths))
+        store.observe_delivery_index(task_id, lease=lease, expected_index_tree=expected_tree)
+
+    def test_delivery_review_revalidation_ignores_replace_ref_hiding_staged_diff(self) -> None:
+        from control_plane.lifecycle import _delivery_review_diff_matches
+
+        task_id = "TASK-DELIVERY-REPLACE-REF"
+        repository, _state_dir, store, parent = self._published_delivery_review(
+            task_id
+        )
+        binding = store.status(task_id)["delivery_review_binding"]
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "--", "tracked.txt"],
+            check=True,
+        )
+        tree = subprocess.run(
+            ["git", "-C", str(repository), "write-tree"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        replacement = subprocess.run(
+            ["git", "-C", str(repository), "commit-tree", tree],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(repository), "replace", parent, replacement],
+            check=True,
+        )
+
+        self.assertTrue(
+            _delivery_review_diff_matches(
+                repository, binding, ("tracked.txt",)
+            )
+        )
+
+    def test_delivery_index_uses_only_an_explicit_index_parameter(self) -> None:
+        from control_plane.lifecycle import _delivery_index_tree
+
+        repository, _git_dir = self._repository()
+        tracked = repository / "tracked.txt"
+        tracked.write_text("actual index\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "tracked.txt"],
+            check=True,
+        )
+        actual_tree = _delivery_index_tree(repository)
+
+        explicit_index = self.state_dir / "explicit-delivery.index"
+        environment = dict(__import__("os").environ)
+        environment["GIT_INDEX_FILE"] = str(explicit_index)
+        tracked.write_text("explicit index\n", encoding="utf-8")
+        for arguments in (("read-tree", "HEAD"), ("add", "tracked.txt")):
+            subprocess.run(
+                ["git", "-C", str(repository), *arguments],
+                check=True,
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        explicit_tree = subprocess.run(
+            ["git", "-C", str(repository), "write-tree"],
+            check=True,
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        self.assertNotEqual(actual_tree, explicit_tree)
+
+        with patch.dict(
+            "os.environ",
+            {"GIT_INDEX_FILE": str(explicit_index)},
+            clear=False,
+        ):
+            self.assertEqual(_delivery_index_tree(repository), actual_tree)
+            self.assertEqual(
+                _delivery_index_tree(
+                    repository, index_file=explicit_index
+                ),
+                explicit_tree,
+            )
+
+    def test_delivery_marker_requires_the_durable_review_binding_digest(self) -> None:
+        task_id = "TASK-DELIVERY-SNAPSHOT-BINDING"
+        repository, _state_dir, store, parent = self._published_delivery_review(task_id)
+        binding = store.status(task_id)["delivery_review_binding"]
+        expected_tree = self._expected_index_tree(repository)
+        lease = store.acquire_delivery_lease(
+            task_id, worktree=str(repository), branch=store.status(task_id)["branch"],
+            session_id=f"session-{task_id.lower()}", paths=["tracked.txt"],
+            policy_digest=self._delivery_policy_digest(repository), expected_head=parent,
+            diff_digest=binding["diff_digest"], expected_generation=store.status(task_id)["generation"],
+        )
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_MARKER"):
+            store.prepare_delivery_commit(
+                task_id, lease=lease, snapshot_digest=self.digest,
+                allowlist=("tracked.txt",), expected_index_tree=expected_tree,
+                parent_head=parent, expected_tree=expected_tree, message="test: forged snapshot",
+            )
+
+    def test_delivery_review_diff_caps_a_large_staged_untracked_blob(self) -> None:
+        from control_plane.lifecycle import _delivery_review_diff
+
+        repository, _state_dir, store, parent = self._published_delivery_review(
+            "TASK-DELIVERY-DIFF-CAP", include_untracked=True,
+        )
+        (repository / "untracked.txt").write_bytes(b"x" * (1_048_577))
+        subprocess.run(["git", "-C", str(repository), "add", "--", "tracked.txt", "untracked.txt"], check=True)
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_INDEX"):
+            _delivery_review_diff(repository, parent, ("tracked.txt", "untracked.txt"))
+
+    def test_delivery_acquire_rejects_untracked_mode_drift_after_review(self) -> None:
+        task_id = "TASK-DELIVERY-UNTRACKED-MODE-DRIFT"
+        repository, _state_dir, store, parent = self._published_delivery_review(task_id, include_untracked=True)
+        (repository / "untracked.txt").chmod(0o755)
+        binding = store.status(task_id)["delivery_review_binding"]
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_REVIEW"):
+            store.acquire_delivery_lease(
+                task_id, worktree=str(repository), branch=store.status(task_id)["branch"],
+                session_id=f"session-{task_id.lower()}", paths=["tracked.txt", "untracked.txt"],
+                policy_digest=self._delivery_policy_digest(repository), expected_head=parent,
+                diff_digest=binding["diff_digest"], expected_generation=store.status(task_id)["generation"],
+            )
+
+    def test_delivery_acquire_rejects_review_drift_unrelated_untracked_and_pre_staged_index(self) -> None:
+        def acquire_after(task_id: str, mutate) -> None:
+            repository, _state_dir, store, parent = self._published_delivery_review(task_id)
+            mutate(repository)
+            binding = store.status(task_id)["delivery_review_binding"]
+            with self.assertRaisesRegex(ValueError, "E_DELIVERY_REVIEW"):
+                store.acquire_delivery_lease(
+                    task_id, worktree=str(repository), branch=store.status(task_id)["branch"],
+                    session_id=f"session-{task_id.lower()}", paths=["tracked.txt"],
+                    policy_digest=self._delivery_policy_digest(repository), expected_head=parent,
+                    diff_digest=binding["diff_digest"], expected_generation=store.status(task_id)["generation"],
+                )
+
+        acquire_after("TASK-DELIVERY-WORKING-DRIFT", lambda repo: (repo / "tracked.txt").write_text("changed after review\n", encoding="utf-8"))
+        acquire_after("TASK-DELIVERY-UNTRACKED-OUTSIDE", lambda repo: (repo / "outside.txt").write_text("outside\n", encoding="utf-8"))
+        acquire_after("TASK-DELIVERY-PRE-STAGED", lambda repo: subprocess.run(["git", "-C", str(repo), "add", "--", "tracked.txt"], check=True))
+
+    def test_delivery_acquire_rejects_review_ready_without_durable_proof(self) -> None:
+        from control_plane.lifecycle import TaskStore
+
+        repository, state_dir = self._repository()
+        task_id = "TASK-DELIVERY-MISSING-PROOF"
+        store = TaskStore(state_dir)
+        store.start(task_id, outcome="commit", branch="main", task_digest=self.digest, decision_digest=self.digest)
+        for target, evidence in (("planned", None), ("ready", {"preflight_ok": True}), ("implementing", None), ("verifying", {"implementation_complete": True}), ("review_ready", {"gates_ok": True, "documentation_decision": self.digest})):
+            store.transition(task_id, target, evidence=evidence, current_branch="main")
+        head = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_REVIEW"):
+            store.acquire_delivery_lease(task_id, worktree=str(repository), branch="main", session_id="session-missing-proof", paths=["tracked.txt"], policy_digest=self.digest, expected_head=head, diff_digest=self.digest, expected_generation=store.status(task_id)["generation"])
+
+    def test_delivery_acquire_rejects_missing_required_gate_receipt(self) -> None:
+        from control_plane.run_workflow import RunStore
+
+        task_id = "TASK-DELIVERY-MISSING-GATE"
+        repository, state_dir, store, parent = self._published_delivery_review(task_id)
+        runs = RunStore(state_dir)
+        latest = runs.attempts(task_id)[-1]
+        gate_digest = latest["gate_receipt_digests"][0].removeprefix("sha256:")
+        (runs._directory(task_id) / "receipts" / f"{gate_digest}.json").unlink()
+        binding = store.status(task_id)["delivery_review_binding"]
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_REVIEW"):
+            store.acquire_delivery_lease(
+                task_id, worktree=str(repository), branch=store.status(task_id)["branch"],
+                session_id="session-missing-gate", paths=["tracked.txt"],
+                policy_digest=self._delivery_policy_digest(repository), expected_head=parent,
+                diff_digest=binding["diff_digest"], expected_generation=store.status(task_id)["generation"],
+            )
+
+    def test_delivery_does_not_promote_remote_state_without_a_remote_observation(self) -> None:
+        task_id = "TASK-DELIVERY-REMOTE-UNKNOWN"
+        _repository, _state_dir, store, _parent = self._published_delivery_review(task_id, outcome="pull_request")
+        self.assertFalse(hasattr(store, "publish_delivery_push"))
+        with self.assertRaisesRegex(ValueError, "E_TRANSITION"):
+            store.transition(
+                task_id, "pushed", current_branch=store.status(task_id)["branch"],
+            )
+
+    def test_delivery_acquire_rejects_live_branch_and_cached_base_drift(self) -> None:
+        def assert_rejected(task_id: str, mutate) -> None:
+            repository, _state_dir, store, parent = self._published_delivery_review(task_id)
+            mutate(repository, parent)
+            binding = store.status(task_id)["delivery_review_binding"]
+            with self.assertRaisesRegex(ValueError, "E_DELIVERY_REVIEW"):
+                store.acquire_delivery_lease(
+                    task_id, worktree=str(repository), branch=store.status(task_id)["branch"],
+                    session_id=f"session-{task_id.lower()}", paths=["tracked.txt"],
+                    policy_digest=self._delivery_policy_digest(repository), expected_head=parent,
+                    diff_digest=binding["diff_digest"], expected_generation=store.status(task_id)["generation"],
+                )
+
+        assert_rejected("TASK-DELIVERY-BRANCH-DRIFT", lambda repo, _head: subprocess.run(["git", "-C", str(repo), "switch", "-c", "codex/delivery-drift"], check=True, stdout=subprocess.DEVNULL))
+        assert_rejected("TASK-DELIVERY-BASE-DRIFT", lambda repo, head: subprocess.run(["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", head], check=True))
+
+    def test_delivery_prepare_rejects_cached_base_drift_after_acquire(self) -> None:
+        task_id = "TASK-DELIVERY-BASE-DRIFT-AFTER-LEASE"
+        repository, _state_dir, store, parent = self._published_delivery_review(task_id)
+        binding = store.status(task_id)["delivery_review_binding"]
+        lease = store.acquire_delivery_lease(
+            task_id, worktree=str(repository), branch=store.status(task_id)["branch"],
+            session_id=f"session-{task_id.lower()}", paths=["tracked.txt"],
+            policy_digest=self._delivery_policy_digest(repository), expected_head=parent,
+            diff_digest=binding["diff_digest"], expected_generation=store.status(task_id)["generation"],
+        )
+        subprocess.run(["git", "-C", str(repository), "update-ref", "refs/remotes/origin/main", parent], check=True)
+        expected_tree = self._expected_index_tree(repository)
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_MARKER"):
+            store.prepare_delivery_commit(
+                task_id, lease=lease, snapshot_digest=binding["binding_digest"],
+                allowlist=("tracked.txt",), expected_index_tree=expected_tree,
+                parent_head=parent, expected_tree=expected_tree, message="test: base drift",
+            )
+
+    def test_review_ready_can_reach_remote_context_after_local_commit(self) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.host_bridge import (
+            observe_local_git_state,
+            validate_local_git_observation,
+        )
+        from control_plane.run_workflow import validate_outcome_binding
+
+        task_id = "TASK-DELIVERY-COMPOSITION"
+        session_id = "session-delivery-composition"
+        repository, state_dir, store, parent = self._published_delivery_review(
+            task_id, outcome="pull_request",
+        )
+        branch = store.status(task_id)["branch"]
+        expected_tree = self._expected_index_tree(repository)
+        lease = store.acquire_delivery_lease(
+            task_id,
+            worktree=str(repository),
+            branch=branch,
+            session_id=session_id,
+            paths=["tracked.txt"],
+            policy_digest=self._delivery_policy_digest(repository),
+            expected_head=parent,
+            diff_digest=store.status(task_id)["delivery_review_binding"]["diff_digest"],
+            expected_generation=store.status(task_id)["generation"],
+        )
+        self.assertEqual(store.status(task_id)["state"], "review_ready")
+        store.prepare_delivery_commit(
+            task_id,
+            lease=lease,
+            snapshot_digest=store.status(task_id)["delivery_review_binding"]["binding_digest"],
+            allowlist=("tracked.txt",),
+            expected_index_tree=expected_tree,
+            parent_head=parent,
+            expected_tree=expected_tree,
+            message="test: delivery",
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "--", "tracked.txt"],
+            check=True,
+        )
+        store.observe_delivery_index(
+            task_id, lease=lease, expected_index_tree=expected_tree
+        )
+        self.assertEqual(store.status(task_id)["state"], "review_ready")
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-m", "test: delivery"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        observed = observe_local_git_state(
+            task_state=store.status(task_id),
+            expected_repo=repository,
+            expected_worktree=repository,
+            expected_branch=branch,
+            expected_prior_head=parent,
+            target_state="committed",
+            session_id=session_id,
+            invocation_id="delivery-commit-observation",
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        validated = validate_local_git_observation(
+            observed,
+            expected_task_digest=store.status(task_id)["task_digest"],
+            expected_repo=repository,
+            expected_worktree=repository,
+            expected_branch=branch,
+            expected_prior_head=parent,
+            expected_target_state="committed",
+            expected_session_id=session_id,
+            expected_invocation_id="delivery-commit-observation",
+            clock=lambda: 100.0,
+        )
+        committed = store.publish_delivery_commit(
+            task_id, lease=lease, observation=validated, current_branch=branch
+        )
+        binding = committed["outcome_binding"]
+
+        self.assertEqual(committed["state"], "committed")
+        self.assertEqual(validate_outcome_binding(binding), [])
+        self.assertEqual(binding["consumed_effect_ids"], ["local_write", "commit"])
+        self.assertEqual(binding["review_head"], parent)
+        self.assertEqual(
+            binding["reviewed_tree_digest"],
+            contract_digest({"git_tree_oid": expected_tree}),
+        )
+        self.assertEqual(
+            binding["reviewed_diff_digest"],
+            committed["delivery_review_binding"]["diff_digest"],
+        )
+        self.assertEqual(binding["committed_head"], committed["evidence"]["committed"]["commit"])
+        self.assertFalse((state_dir / "codex-control-plane" / "delivery-leases" / f"{task_id}.json").exists())
+
+    def test_review_ready_rejects_implementation_lease(self) -> None:
+        from control_plane.lifecycle import TaskLease, TaskStore
+
+        repository, state_dir = self._repository()
+        task_id = "TASK-DELIVERY-LEASE-ONLY"
+        store = TaskStore(state_dir)
+        store.start(
+            task_id,
+            outcome="commit",
+            branch="main",
+            task_digest=self.digest,
+            decision_digest=self.digest,
+        )
+        for target, evidence in (
+            ("planned", None),
+            ("ready", {"preflight_ok": True}),
+            ("implementing", None),
+            ("verifying", {"implementation_complete": True}),
+            ("review_ready", {"gates_ok": True, "documentation_decision": self.digest}),
+        ):
+            store.transition(task_id, target, evidence=evidence, current_branch="main")
+
+        with self.assertRaisesRegex(ValueError, "E_LEASE_DELIVERY_REQUIRED"):
+            TaskLease.acquire(
+                state_dir,
+                task_id=task_id,
+                worktree=str(repository),
+                branch="main",
+                session_id="session-writer-rejected",
+                paths=["tracked.txt"],
+                policy_digest=self.digest,
+            )
+
+    def test_delivery_recovery_after_marker_before_stage_blocks_without_write(self) -> None:
+        task_id = "TASK-DELIVERY-RECOVERY-PREPARED"
+        repository, state_dir, store, _parent, _expected_tree, _lease = self._delivery_fixture(task_id)
+
+        recovered = store.recover_writer_finalization(task_id)
+
+        self.assertEqual(recovered["state"], "blocked")
+        self.assertTrue((state_dir / "codex-control-plane" / "delivery-leases" / f"{task_id}.json").exists())
+        cached = subprocess.run(
+            ["git", "-C", str(repository), "diff", "--cached", "--name-only"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        self.assertEqual(cached, "")
+
+    def test_delivery_recovery_after_stage_blocks_without_repeating_stage(self) -> None:
+        repository, state_dir, store, _parent, expected_tree, lease = self._delivery_fixture("TASK-FAULT-POST-STAGE")
+        subprocess.run(["git", "-C", str(repository), "add", "--", "tracked.txt"], check=True)
+        store.observe_delivery_index("TASK-FAULT-POST-STAGE", lease=lease, expected_index_tree=expected_tree)
+
+        recovered = store.recover_writer_finalization("TASK-FAULT-POST-STAGE")
+
+        self.assertEqual(recovered["state"], "blocked")
+        self.assertEqual(recovered["finalizing_delivery_commit"]["phase"], "index_observed")
+        self.assertEqual(
+            subprocess.run(["git", "-C", str(repository), "diff", "--cached", "--name-only"], check=True, text=True, stdout=subprocess.PIPE).stdout,
+            "tracked.txt\n",
+        )
+        self.assertTrue((state_dir / "codex-control-plane" / "delivery-leases" / "TASK-FAULT-POST-STAGE.json").exists())
+
+    def test_delivery_recovery_after_native_commit_publishes_once_and_releases(self) -> None:
+        repository, state_dir, store, parent, _expected_tree, lease = self._delivery_fixture("TASK-FAULT-POST-COMMIT")
+        self._commit_delivery(repository, store, "TASK-FAULT-POST-COMMIT", parent, lease)
+
+        recovered = store.recover_writer_finalization("TASK-FAULT-POST-COMMIT")
+        repeated = store.recover_writer_finalization("TASK-FAULT-POST-COMMIT")
+
+        self.assertEqual(recovered["state"], "committed")
+        self.assertEqual(repeated["state"], "committed")
+        self.assertEqual(recovered["finalizing_delivery_commit"]["phase"], "lease_released")
+        self.assertFalse((state_dir / "codex-control-plane" / "delivery-leases" / "TASK-FAULT-POST-COMMIT.json").exists())
+
+    def test_delivery_recovery_blocks_unstaged_drift_after_native_commit(self) -> None:
+        repository, state_dir, store, parent, _expected_tree, lease = self._delivery_fixture("TASK-FAULT-RECOVERY-UNSTAGED")
+        self._commit_delivery(repository, store, "TASK-FAULT-RECOVERY-UNSTAGED", parent, lease)
+        (repository / "foreign-after-commit.txt").write_text("foreign\n", encoding="utf-8")
+        recovered = store.recover_writer_finalization("TASK-FAULT-RECOVERY-UNSTAGED")
+        self.assertEqual(recovered["state"], "blocked")
+        self.assertTrue((state_dir / "codex-control-plane" / "delivery-leases" / "TASK-FAULT-RECOVERY-UNSTAGED.json").exists())
+
+    def test_delivery_recovery_after_state_publish_releases_idempotently(self) -> None:
+        from control_plane.lifecycle import DeliveryLease
+
+        repository, state_dir, store, parent, _expected_tree, lease = self._delivery_fixture("TASK-FAULT-POST-STATE")
+        observation = self._commit_delivery(repository, store, "TASK-FAULT-POST-STATE", parent, lease)
+        with patch.object(DeliveryLease, "release", side_effect=RuntimeError("fault-before-release")):
+            with self.assertRaisesRegex(RuntimeError, "fault-before-release"):
+                store.publish_delivery_commit("TASK-FAULT-POST-STATE", lease=lease, observation=observation, current_branch=store.status("TASK-FAULT-POST-STATE")["branch"])
+
+        marker = store.status("TASK-FAULT-POST-STATE")
+        self.assertEqual(marker["state"], "committed")
+        self.assertEqual(marker["finalizing_delivery_commit"]["phase"], "state_committed")
+        recovered = store.recover_writer_finalization("TASK-FAULT-POST-STATE")
+
+        self.assertEqual(recovered["finalizing_delivery_commit"]["phase"], "lease_released")
+        self.assertFalse((state_dir / "codex-control-plane" / "delivery-leases" / "TASK-FAULT-POST-STATE.json").exists())
+
+    def test_delivery_recovery_after_release_tombstone_is_idempotent(self) -> None:
+        import control_plane.lifecycle as lifecycle
+
+        repository, _state_dir, store, parent, _expected_tree, lease = self._delivery_fixture("TASK-FAULT-DURING-RELEASE")
+        observation = self._commit_delivery(repository, store, "TASK-FAULT-DURING-RELEASE", parent, lease)
+        with patch.object(lifecycle, "_fsync_directory", side_effect=RuntimeError("fault-during-release")):
+            with self.assertRaisesRegex(RuntimeError, "fault-during-release"):
+                store.publish_delivery_commit("TASK-FAULT-DURING-RELEASE", lease=lease, observation=observation, current_branch=store.status("TASK-FAULT-DURING-RELEASE")["branch"])
+
+        recovered = store.recover_writer_finalization("TASK-FAULT-DURING-RELEASE")
+
+        self.assertEqual(recovered["state"], "committed")
+        self.assertEqual(recovered["finalizing_delivery_commit"]["phase"], "lease_released")
+
+    def test_delivery_lease_release_is_owner_bound_and_idempotent(self) -> None:
+        from control_plane.lifecycle import DeliveryLease
+
+        _repository, _state_dir, _store, _parent, _tree, lease = self._delivery_fixture("TASK-DELIVERY-DOUBLE-RELEASE")
+        first = DeliveryLease.release(_state_dir, task_id="TASK-DELIVERY-DOUBLE-RELEASE", lease=lease)
+        second = DeliveryLease.release(_state_dir, task_id="TASK-DELIVERY-DOUBLE-RELEASE", lease=lease)
+        other = {**lease, "session_id": "other-owner"}
+
+        self.assertFalse(first["idempotent"])
+        self.assertTrue(second["idempotent"])
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_LEASE_MISMATCH"):
+            DeliveryLease.release(_state_dir, task_id="TASK-DELIVERY-DOUBLE-RELEASE", lease=other)
+
+    def test_delivery_publish_reobserves_head_before_committing_state(self) -> None:
+        repository, _state_dir, store, parent, _tree, lease = self._delivery_fixture("TASK-DELIVERY-PUBLISH-HEAD-DRIFT")
+        observation = self._commit_delivery(repository, store, "TASK-DELIVERY-PUBLISH-HEAD-DRIFT", parent, lease)
+        branch = store.status("TASK-DELIVERY-PUBLISH-HEAD-DRIFT")["branch"]
+        subprocess.run(["git", "-C", str(repository), "update-ref", f"refs/heads/{branch}", parent], check=True)
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_COMMIT"):
+            store.publish_delivery_commit(
+                "TASK-DELIVERY-PUBLISH-HEAD-DRIFT", lease=lease,
+                observation=observation, current_branch=branch,
+            )
+        self.assertEqual(store.status("TASK-DELIVERY-PUBLISH-HEAD-DRIFT")["state"], "review_ready")
+
+    def test_active_run_revision_binding_is_closed_and_compare_and_swap(self) -> None:
+        from control_plane.lifecycle import TaskStore
+
+        store = TaskStore(self.state_dir, runtime_digest=self.digest)
+        task_id = "TASK-RUN-REVISION-BIND"
+        branch = "codex/revision-bind"
+        store.start(
+            task_id, outcome="local_change", branch=branch,
+            task_digest=self.digest, decision_digest=self.digest,
+        )
+        revision = "sha256:" + "a" * 64
+        bound = store.bind_active_run_revision(
+            task_id, run_plan_digest=self.digest,
+            revision_digest=revision, current_branch=branch,
+        )
+        self.assertEqual(bound["active_run_revision_digest"], revision)
+        self.assertEqual(
+            store.bind_active_run_revision(
+                task_id, run_plan_digest=self.digest,
+                revision_digest=revision, current_branch=branch,
+            )["active_run_revision_digest"],
+            revision,
+        )
+        with self.assertRaisesRegex(ValueError, "E_STATE_CAS"):
+            store.bind_active_run_revision(
+                task_id, run_plan_digest=self.digest,
+                revision_digest="sha256:" + "b" * 64,
+                current_branch=branch,
+            )
+
+    def test_review_handoff_recovery_rejects_a_marker_without_live_subject_proof(self) -> None:
+        import control_plane.lifecycle as lifecycle
+        from control_plane.lifecycle import TaskLease, TaskStore
+
+        task_id, branch, session = "TASK-REVIEW-HANDOFF", "codex/review-handoff", "session-review-handoff"
+        store = TaskStore(self.state_dir, runtime_digest=self.digest)
+        store.start(task_id, outcome="local_change", branch=branch, task_digest=self.digest, decision_digest=self.digest)
+        for target, evidence in (("planned", None), ("ready", {"preflight_ok": True}), ("implementing", None), ("verifying", {"implementation_complete": True})):
+            state = store.transition(task_id, target, evidence=evidence, current_branch=branch)
+        lease = TaskLease.acquire(self.state_dir, task_id=task_id, worktree="/repo/review-handoff", branch=branch, session_id=session, paths=["."], policy_digest=self.digest)
+        state.update({"state": "finalizing_review_handoff", "resume_forbidden": True,
+            "review_handoff_finalization": {"prior_generation": state["generation"], "evidence": {"revision_digest": "sha256:" + "a" * 64, "attempt_digest": "sha256:" + "b" * 64, "artifact_digest": "sha256:" + "c" * 64}, "task_id": task_id, "worktree": "/repo/review-handoff", "branch": branch, "session_id": session, "policy_digest": self.digest, "lease_digest": lease["lease_digest"]}})
+        lifecycle._atomic_json(store._path(task_id), state)
+        with self.assertRaisesRegex(ValueError, "E_REVIEW_HANDOFF_RECOVERY_UNKNOWN"):
+            store.recover_writer_finalization(task_id)
+        self.assertTrue((self.state_dir / "codex-control-plane" / "leases" / f"{task_id}.json").exists())
+        self.assertEqual(store.status(task_id)["state"], "finalizing_review_handoff")
+
+    def test_review_handoff_recovery_rejects_a_third_lease_without_mutation(self) -> None:
+        import control_plane.lifecycle as lifecycle
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import TaskLease, TaskStore
+
+        task_id, branch, session = "TASK-REVIEW-HANDOFF-THIRD", "codex/review-handoff-third", "session-review-handoff"
+        store = TaskStore(self.state_dir, runtime_digest=self.digest)
+        store.start(task_id, outcome="local_change", branch=branch, task_digest=self.digest, decision_digest=self.digest)
+        for target, evidence in (("planned", None), ("ready", {"preflight_ok": True}), ("implementing", None), ("verifying", {"implementation_complete": True})):
+            state = store.transition(task_id, target, evidence=evidence, current_branch=branch)
+        lease = TaskLease.acquire(self.state_dir, task_id=task_id, worktree="/repo/review-handoff-third", branch=branch, session_id=session, paths=["."], policy_digest=self.digest)
+        state.update({"state": "finalizing_review_handoff", "resume_forbidden": True,
+            "review_handoff_finalization": {"prior_generation": state["generation"], "evidence": {"revision_digest": "sha256:" + "a" * 64, "attempt_digest": "sha256:" + "b" * 64, "artifact_digest": "sha256:" + "c" * 64}, "task_id": task_id, "worktree": "/repo/review-handoff-third", "branch": branch, "session_id": session, "policy_digest": self.digest, "lease_digest": lease["lease_digest"]}})
+        lifecycle._atomic_json(store._path(task_id), state)
+        third = dict(lease)
+        third["session_id"] = "session-third-owner"
+        third["lease_digest"] = contract_digest({key: value for key, value in third.items() if key != "lease_digest"})
+        lifecycle._atomic_json(self.state_dir / "codex-control-plane" / "leases" / f"{task_id}.json", third)
+
+        with self.assertRaisesRegex(ValueError, "E_REVIEW_HANDOFF_RECOVERY_UNKNOWN"):
+            store.recover_writer_finalization(task_id)
+
+        self.assertEqual(store.status(task_id)["state"], "finalizing_review_handoff")
+        self.assertEqual(store._read_owner_lease(task_id), third)
 
     def _verification_context_for_repo(
         self,
@@ -166,7 +931,7 @@ class LifecycleTests(unittest.TestCase):
         store = TaskStore(common_dir, runtime_digest=self.digest)
         store.start(
             task_id,
-            outcome="local_change",
+            outcome="commit",
             branch="main",
             task_digest=self.digest,
             decision_digest=self.digest,
@@ -349,7 +1114,7 @@ class LifecycleTests(unittest.TestCase):
         store = TaskStore(common_dir)
         store.start(
             task_id,
-            outcome="local_change",
+            outcome="commit",
             branch="main",
             task_digest=self.digest,
             decision_digest=self.digest,
@@ -575,6 +1340,7 @@ class LifecycleTests(unittest.TestCase):
         expected_pr_number: int | None,
         expected_base_sha: str,
         expected_checks_digest: str | None,
+        draft: bool = True,
     ):
         import control_plane.host_bridge as bridge
         from control_plane.contracts import contract_digest
@@ -679,7 +1445,7 @@ class LifecycleTests(unittest.TestCase):
                 "context": context.context_digest,
                 "title": title.digest,
                 "body": body.digest,
-                "draft": True,
+                "draft": draft,
                 "expected_pr_number": expected_pr_number,
             }
         )
@@ -725,7 +1491,7 @@ class LifecycleTests(unittest.TestCase):
             authorization=authorization,
             title=title,
             body=body,
-            draft=True,
+            draft=draft,
             expected_pr_number=expected_pr_number,
             session_id=fixture["session_id"],
             invocation_id=fixture["invocation_id"],
@@ -741,6 +1507,80 @@ class LifecycleTests(unittest.TestCase):
             }
         )
         return fixture
+
+    def test_pr_ready_uses_fresh_one_shot_grant_and_native_ready_effect(
+        self,
+    ) -> None:
+        import json
+        import control_plane.host_bridge as bridge
+
+        fixture = self._pr_mutation_fixture(
+            task_id="TASK-PR-MARK-READY",
+            expected_pr_number=7,
+            expected_base_sha="a" * 40,
+            expected_checks_digest=None,
+            draft=False,
+        )
+        mutation_argv: list[tuple[str, ...]] = []
+
+        def provider(operation, arguments, max_output_bytes):
+            del max_output_bytes
+            if operation == "github_pull_request_precondition_pr":
+                return 0, json.dumps({
+                    "number": 7,
+                    "baseRefName": "main",
+                    "headRefName": fixture["branch"],
+                    "headRefOid": fixture["head"],
+                }).encode("utf-8")
+            if operation == "github_pull_request_precondition_base":
+                return 0, json.dumps({
+                    "object": {"sha": "a" * 40}
+                }).encode("utf-8")
+            if operation == "github_pull_request_precondition_checks":
+                return 0, b'{"total_count":0,"check_runs":[]}'
+            if operation == "github_pull_request_mutation":
+                mutation_argv.append(tuple(arguments))
+                return 0, b""
+            if operation == "github_pull_request_observe":
+                return 0, json.dumps({
+                    "number": 7,
+                    "url": "https://github.com/example/control-plane/pull/7",
+                    "isDraft": False,
+                    "baseRefName": "main",
+                    "headRefName": fixture["branch"],
+                    "headRefOid": fixture["head"],
+                }).encode("utf-8")
+            raise AssertionError(f"unexpected provider operation: {operation}")
+
+        with patch.object(
+            bridge,
+            "_native_host_remote_executor",
+            side_effect=provider,
+        ):
+            observed = bridge.execute_pull_request_mutation(
+                fixture["request"], clock=lambda: 100.0
+            )
+        self.assertEqual(
+            mutation_argv,
+            [("gh", "pr", "ready", "7", "--repo", "example/control-plane")],
+        )
+        validated = bridge.validate_pull_request_mutation(
+            observed,
+            expected_repository="example/control-plane",
+            expected_base="main",
+            expected_head_branch=fixture["branch"],
+            expected_head_sha=fixture["head"],
+            expected_pr_number=7,
+            expected_draft=False,
+            expected_session_id=fixture["session_id"],
+            expected_invocation_id=fixture["invocation_id"],
+            clock=lambda: 100.0,
+        )
+        self.assertFalse(validated.draft)
+        with self.assertRaisesRegex(ValueError, "E_PR_MUTATION"):
+            bridge.execute_pull_request_mutation(
+                fixture["request"], clock=lambda: 100.0
+            )
 
     def _fresh_feature_push_bindings(
         self,
@@ -1542,6 +2382,132 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertRegex(snapshot, r"^sha256:[0-9a-f]{64}$")
 
+    def test_verification_snapshot_ignores_replace_path_config_and_ambient_index(self) -> None:
+        from control_plane.lifecycle import _verification_snapshot
+
+        repository, _, _, _ = self._two_worktree_repository(
+            "snapshot-git-environment"
+        )
+        baseline = _verification_snapshot(repository)
+        head = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        tracked = repository / "tracked.txt"
+        tracked.write_text("replacement tree\n", encoding="utf-8")
+        replacement_index = self.state_dir / "snapshot-replacement.index"
+        index_environment = dict(__import__("os").environ)
+        index_environment["GIT_INDEX_FILE"] = str(replacement_index)
+        for arguments in (("read-tree", "HEAD"), ("add", "tracked.txt")):
+            subprocess.run(
+                ["git", "-C", str(repository), *arguments],
+                check=True,
+                env=index_environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        replacement_tree = subprocess.run(
+            ["git", "-C", str(repository), "write-tree"],
+            check=True,
+            env=index_environment,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        tracked.write_text("baseline\n", encoding="utf-8")
+        replacement = subprocess.run(
+            ["git", "-C", str(repository), "commit-tree", replacement_tree],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(repository), "replace", head, replacement],
+            check=True,
+        )
+
+        fake_bin = self.state_dir / "snapshot-fake-bin"
+        fake_bin.mkdir()
+        marker = self.state_dir / "snapshot-ambient-git-executed"
+        fake_git = fake_bin / "git"
+        fake_git.write_text(
+            f"#!/bin/sh\n: > {str(marker)!r}\nexit 99\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o700)
+        external_config = self.state_dir / "snapshot-external.gitconfig"
+        external_config.write_text(
+            "[core]\n\tfsmonitor = /usr/bin/false\n", encoding="utf-8"
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "PATH": str(fake_bin),
+                "GIT_CONFIG_GLOBAL": str(external_config),
+                "GIT_INDEX_FILE": str(replacement_index),
+            },
+            clear=False,
+        ):
+            observed = _verification_snapshot(repository)
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(observed, baseline)
+
+    def test_verification_snapshot_blocks_clean_filter_before_execution(self) -> None:
+        from control_plane.lifecycle import _verification_snapshot
+
+        repository, _, _, _ = self._two_worktree_repository(
+            "snapshot-clean-filter"
+        )
+        attributes = repository / ".gitattributes"
+        attributes.write_text(
+            "tracked.txt filter=snapshot-clean\n", encoding="utf-8"
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "add", ".gitattributes"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "commit",
+                "-m",
+                "test: snapshot filter baseline",
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        marker = repository / "snapshot-clean-filter-executed"
+        filter_script = repository / "snapshot-clean-filter.sh"
+        filter_script.write_text(
+            f"#!/bin/sh\n: > {str(marker)!r}\ncat\n",
+            encoding="utf-8",
+        )
+        filter_script.chmod(0o700)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "config",
+                "filter.snapshot-clean.clean",
+                str(filter_script),
+            ],
+            check=True,
+        )
+        (repository / "tracked.txt").write_text(
+            "after filter\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(ValueError, "E_GIT_FILTER"):
+            _verification_snapshot(repository)
+
+        self.assertFalse(marker.exists())
+
     def test_verification_runner_uses_sanitized_environment_and_reports_host_isolation(
         self,
     ) -> None:
@@ -1838,74 +2804,33 @@ class LifecycleTests(unittest.TestCase):
     def test_governing_stage_and_commit_effects_are_closed_and_one_shot(
         self,
     ) -> None:
+        import json
         import control_plane.host_bridge as bridge
         from control_plane.contracts import contract_digest
-        from control_plane.lifecycle import TaskLease, TaskStore
+        from control_plane.lifecycle import (
+            TaskLease,
+            TaskStore,
+            _atomic_json,
+            _common_lease_lock,
+            _task_guard,
+        )
         from tests.host_adapter_test_support import (
             governing_runtime_observation,
             native_session_event,
             native_user_interaction_event,
         )
 
-        repository, _, common_dir, _ = self._two_worktree_repository()
         task_id = "TASK-GOVERNING-GIT"
         session_id = "session-governing-git"
         invocation_id = "invocation-governing-git"
-        head = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        store = TaskStore(common_dir)
-        store.start(
-            task_id,
-            outcome="commit",
-            branch="main",
-            task_digest=self.digest,
-            decision_digest=self.digest,
-        )
-        store.transition(task_id, "planned", current_branch="main")
-        store.transition(
-            task_id,
-            "ready",
-            evidence={"preflight_ok": True},
-            current_branch="main",
-        )
-        store.transition(task_id, "implementing", current_branch="main")
-        store.transition(
-            task_id,
-            "verifying",
-            evidence={"implementation_complete": True},
-            current_branch="main",
-        )
-        store.transition(
-            task_id,
-            "review_ready",
-            evidence={
-                "gates_ok": True,
-                "documentation_decision": self.digest,
-            },
-            current_branch="main",
-        )
-        lease = TaskLease.acquire(
-            common_dir,
-            task_id=task_id,
-            worktree=str(repository),
-            branch="main",
-            session_id=session_id,
-            paths=["tracked.txt"],
-            policy_digest=self.digest,
-        )
-        task_context = {
-            "task_id": task_id,
-            "task_digest": self.digest,
-            "lease_digest": lease["lease_digest"],
-        }
+        repository, common_dir, store, head = self._published_delivery_review(task_id)
+        branch = store.status(task_id)["branch"]
+        delivery_task_digest = store.status(task_id)["task_digest"]
+        delivery_policy_digest = self._delivery_policy_digest(repository)
         runtime = governing_runtime_observation(
             runtime_digest=self.digest,
             lock_digest=self.digest,
-            policy_digest=self.digest,
+            policy_digest=delivery_policy_digest,
             attestor_worktree=str(repository.resolve()),
             target_worktree=str(repository.resolve()),
             governing_base_commit=head,
@@ -1930,16 +2855,40 @@ class LifecycleTests(unittest.TestCase):
             ],
             check=True,
         )
-        (repository / "tracked.txt").write_text(
-            "governing stage\n", encoding="utf-8"
+        expected_tree = self._expected_index_tree(repository)
+        lease = store.acquire_delivery_lease(
+            task_id,
+            worktree=str(repository),
+            branch=branch,
+            session_id=session_id,
+            paths=["tracked.txt"],
+            policy_digest=self._delivery_policy_digest(repository),
+            expected_head=head,
+            diff_digest=store.status(task_id)["delivery_review_binding"]["diff_digest"],
+            expected_generation=store.status(task_id)["generation"],
         )
+        store.prepare_delivery_commit(
+            task_id,
+            lease=lease,
+            snapshot_digest=store.status(task_id)["delivery_review_binding"]["binding_digest"],
+            allowlist=("tracked.txt",),
+            expected_index_tree=expected_tree,
+            parent_head=head,
+            expected_tree=expected_tree,
+            message="Commit governed change",
+        )
+        task_context = {
+            "task_id": task_id,
+            "task_digest": store.status(task_id)["task_digest"],
+            "lease_digest": lease["lease_digest"],
+        }
 
-        def inventory(invocation: str):
+        def inventory(invocation: str, *, ttl_seconds: float = 30.0):
             raw = bridge.observe_worktree_inventory(
                 canonical_common_git_dir=common_dir,
                 invocation_id=invocation,
                 clock=lambda: 100.0,
-                ttl_seconds=30,
+                ttl_seconds=ttl_seconds,
                 max_output_bytes=1_000_000,
             )
             return bridge.validate_worktree_inventory_observation(
@@ -1967,16 +2916,16 @@ class LifecycleTests(unittest.TestCase):
                 event_id="authorize-stage-governing",
                 session_id=session_id,
                 invocation_id=invocation_id,
-                task_digest=self.digest,
+                task_digest=delivery_task_digest,
                 subject_digest=stage_subject,
                 observed_at_monotonic=100.0,
             ),
             host_capability=stage_capability,
-            task_digest=self.digest,
+            task_digest=delivery_task_digest,
             session_id=session_id,
             repository_identity=repository,
             worktree_identity=repository,
-            branch="main",
+            branch=branch,
             expected_head=head,
             subject_digest=stage_subject,
             scope_paths=("tracked.txt",),
@@ -2046,6 +2995,557 @@ class LifecycleTests(unittest.TestCase):
             ],
             check=True,
         )
+
+        def fresh_stage_authorization(
+            suffix: str, *, ttl_seconds: float = 30.0
+        ):
+            capability = bridge.attest_host_adapter_capability(
+                native_session_event(
+                    event_id=f"session-stage-post-consume-{suffix}",
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    observed_at_monotonic=100.0,
+                ),
+                expected_session_id=session_id,
+                expected_invocation_id=invocation_id,
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+            return bridge.frame_effect_authorization(
+                native_user_interaction_event(
+                    event_id=f"authorize-stage-post-consume-{suffix}",
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    task_digest=delivery_task_digest,
+                    subject_digest=stage_subject,
+                    observed_at_monotonic=100.0,
+                ),
+                host_capability=capability,
+                task_digest=delivery_task_digest,
+                session_id=session_id,
+                repository_identity=repository,
+                worktree_identity=repository,
+                branch=branch,
+                expected_head=head,
+                subject_digest=stage_subject,
+                scope_paths=("tracked.txt",),
+                effect="local_write",
+                operation_nonce=f"tool-stage-post-consume-{suffix}",
+                invocation_id=invocation_id,
+                clock=lambda: 100.0,
+                ttl_seconds=ttl_seconds,
+            )
+
+        original_task_state = store.status(task_id)
+        lease_path = (
+            common_dir
+            / "codex-control-plane"
+            / "delivery-leases"
+            / f"{task_id}.json"
+        )
+        original_lease_state = json.loads(
+            lease_path.read_text(encoding="utf-8")
+        )
+        real_run = subprocess.run
+        original_inventory_consume = bridge._consume_worktree_inventory
+        expected_pristine_index = real_run(
+            ["git", "-C", str(repository), "write-tree"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+
+        def advance_clock_after_grants_are_consumed(
+            consumed: threading.Event,
+            locked: threading.Event,
+            now: list[float],
+            errors: list[Exception],
+        ) -> None:
+            try:
+                with _common_lease_lock(common_dir):
+                    with _task_guard(common_dir, task_id):
+                        locked.set()
+                        if not consumed.wait(timeout=1.0):
+                            raise AssertionError(
+                                "effect grants were not consumed before timeout"
+                            )
+                        now[0] = 106.0
+            except Exception as error:
+                errors.append(error)
+
+        for expired_grant in ("authorization", "inventory"):
+            with self.subTest(stage_post_consume_expiry=expired_grant):
+                expiry_now = [100.0]
+                expiry_clock_calls: list[float] = []
+                expiry_authorization = fresh_stage_authorization(
+                    f"expired-{expired_grant}",
+                    ttl_seconds=(
+                        5.0 if expired_grant == "authorization" else 30.0
+                    ),
+                )
+                expiry_inventory = inventory(
+                    f"inventory-stage-expired-{expired_grant}",
+                    ttl_seconds=(
+                        5.0 if expired_grant == "inventory" else 30.0
+                    ),
+                )
+                grants_consumed = threading.Event()
+                expiry_lock_held = threading.Event()
+                expiry_errors: list[Exception] = []
+                expiry_add_argv: list[tuple[str, ...]] = []
+                expiry_thread = threading.Thread(
+                    target=advance_clock_after_grants_are_consumed,
+                    args=(
+                        grants_consumed,
+                        expiry_lock_held,
+                        expiry_now,
+                        expiry_errors,
+                    ),
+                    name=f"stage-{expired_grant}-expiry",
+                    daemon=True,
+                )
+                expiry_thread.start()
+                self.assertTrue(expiry_lock_held.wait(timeout=1.0))
+
+                def consume_then_signal(*args, **kwargs):
+                    result = original_inventory_consume(*args, **kwargs)
+                    grants_consumed.set()
+                    return result
+
+                def record_expired_stage_add(argv, *args, **kwargs):
+                    if "add" in argv:
+                        expiry_add_argv.append(
+                            tuple(str(item) for item in argv)
+                        )
+                        return subprocess.CompletedProcess(
+                            argv, 1, b"", b""
+                        )
+                    return real_run(argv, *args, **kwargs)
+
+                def expiry_clock() -> float:
+                    expiry_clock_calls.append(expiry_now[0])
+                    return expiry_now[0]
+
+                try:
+                    with (
+                        patch.object(
+                            bridge,
+                            "_consume_worktree_inventory",
+                            side_effect=consume_then_signal,
+                        ),
+                        patch.object(
+                            bridge.subprocess,
+                            "run",
+                            side_effect=record_expired_stage_add,
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError, "E_GIT_EFFECT"
+                        ),
+                    ):
+                        bridge.stage_allowlisted_paths(
+                            governing_runtime=runtime,
+                            task_context=task_context,
+                            inventory=expiry_inventory,
+                            lease=lease,
+                            authorization=expiry_authorization,
+                            paths=("tracked.txt",),
+                            expected_head=head,
+                            session_id=session_id,
+                            invocation_id=invocation_id,
+                            tool_use_id=(
+                                f"tool-stage-post-consume-expired-"
+                                f"{expired_grant}"
+                            ),
+                            clock=expiry_clock,
+                        )
+                finally:
+                    grants_consumed.set()
+                    expiry_thread.join(timeout=2.0)
+
+                self.assertFalse(
+                    expiry_thread.is_alive(), "stage expiry deadlocked"
+                )
+                self.assertEqual(expiry_errors, [])
+                self.assertEqual(expiry_now[0], 106.0)
+                self.assertLess(
+                    expiry_now[0], runtime.freshness_deadline
+                )
+                self.assertEqual(
+                    expiry_clock_calls, [100.0, 100.0, 106.0]
+                )
+                self.assertEqual(expiry_add_argv, [])
+                self.assertTrue(expiry_authorization._consumed)
+                self.assertTrue(expiry_inventory._consumed)
+                self.assertEqual(
+                    real_run(
+                        ["git", "-C", str(repository), "write-tree"],
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip(),
+                    expected_pristine_index,
+                )
+                self.assertEqual(
+                    real_run(
+                        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip(),
+                    head,
+                )
+
+        for drift_kind in ("state", "marker", "lease"):
+            with self.subTest(stage_post_consume_drift=drift_kind):
+                drift_authorization = fresh_stage_authorization(drift_kind)
+                drift_inventory = inventory(
+                    f"inventory-stage-post-consume-{drift_kind}"
+                )
+                stage_add_argv: list[tuple[str, ...]] = []
+
+                def consume_then_drift(*args, **kwargs):
+                    result = original_inventory_consume(*args, **kwargs)
+                    if drift_kind == "lease":
+                        drifted_lease = dict(original_lease_state)
+                        drifted_lease["generation"] = (
+                            int(drifted_lease["generation"]) + 1
+                        )
+                        drifted_lease["lease_digest"] = contract_digest(
+                            {
+                                key: value
+                                for key, value in drifted_lease.items()
+                                if key != "lease_digest"
+                            }
+                        )
+                        _atomic_json(lease_path, drifted_lease)
+                    else:
+                        drifted_task = store.status(task_id)
+                        if drift_kind == "state":
+                            drifted_task["state"] = "committed"
+                        else:
+                            drifted_marker = dict(
+                                drifted_task["finalizing_delivery_commit"]
+                            )
+                            drifted_marker["phase"] = "index_observed"
+                            drifted_marker["marker_digest"] = contract_digest(
+                                {
+                                    key: value
+                                    for key, value in drifted_marker.items()
+                                    if key != "marker_digest"
+                                }
+                            )
+                            drifted_task["finalizing_delivery_commit"] = (
+                                drifted_marker
+                            )
+                        _atomic_json(store._path(task_id), drifted_task)
+                    return result
+
+                def record_stage_add(argv, *args, **kwargs):
+                    if "add" in argv:
+                        stage_add_argv.append(
+                            tuple(str(item) for item in argv)
+                        )
+                        return subprocess.CompletedProcess(
+                            argv, 1, b"", b""
+                        )
+                    return real_run(argv, *args, **kwargs)
+
+                try:
+                    with (
+                        patch.object(
+                            bridge,
+                            "_consume_worktree_inventory",
+                            side_effect=consume_then_drift,
+                        ),
+                        patch.object(
+                            bridge.subprocess,
+                            "run",
+                            side_effect=record_stage_add,
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError, "E_GIT_EFFECT"
+                        ),
+                    ):
+                        bridge.stage_allowlisted_paths(
+                            governing_runtime=runtime,
+                            task_context=task_context,
+                            inventory=drift_inventory,
+                            lease=lease,
+                            authorization=drift_authorization,
+                            paths=("tracked.txt",),
+                            expected_head=head,
+                            session_id=session_id,
+                            invocation_id=invocation_id,
+                            tool_use_id=(
+                                f"tool-stage-post-consume-{drift_kind}"
+                            ),
+                            clock=lambda: 100.0,
+                        )
+                finally:
+                    _atomic_json(store._path(task_id), original_task_state)
+                    _atomic_json(lease_path, original_lease_state)
+
+                self.assertEqual(stage_add_argv, [])
+                self.assertTrue(drift_authorization._consumed)
+                self.assertTrue(drift_inventory._consumed)
+                self.assertEqual(
+                    real_run(
+                        ["git", "-C", str(repository), "write-tree"],
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip(),
+                    expected_pristine_index,
+                )
+                self.assertEqual(
+                    real_run(
+                        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip(),
+                    head,
+                )
+
+        race_authorization = fresh_stage_authorization("locked-race")
+        race_inventory = inventory("inventory-stage-locked-race")
+        race_locked = threading.Event()
+        second_filter_reached = threading.Event()
+        durable_drift_written = threading.Event()
+        race_errors: list[BaseException] = []
+        race_add_argv: list[tuple[str, ...]] = []
+
+        def mutate_state_under_canonical_locks() -> None:
+            try:
+                with _common_lease_lock(common_dir):
+                    with _task_guard(common_dir, task_id):
+                        race_locked.set()
+                        second_filter_reached.wait(timeout=0.25)
+                        drifted_task = json.loads(
+                            store._path(task_id).read_text(encoding="utf-8")
+                        )
+                        drifted_task["state"] = "committed"
+                        _atomic_json(store._path(task_id), drifted_task)
+                        durable_drift_written.set()
+            except BaseException as error:
+                race_errors.append(error)
+
+        race_thread = threading.Thread(
+            target=mutate_state_under_canonical_locks,
+            name="stage-governing-state-race",
+            daemon=True,
+        )
+        race_thread.start()
+        self.assertTrue(race_locked.wait(timeout=1.0))
+        real_filter_guard = bridge._assert_no_external_git_filters
+        filter_guard_calls = 0
+
+        def signal_from_second_filter(*args, **kwargs):
+            nonlocal filter_guard_calls
+            filter_guard_calls += 1
+            if filter_guard_calls == 2:
+                second_filter_reached.set()
+                if not durable_drift_written.wait(timeout=1.0):
+                    raise AssertionError(
+                        "durable drift did not complete after the second guard"
+                    )
+            return real_filter_guard(*args, **kwargs)
+
+        def record_racing_stage_add(argv, *args, **kwargs):
+            if "add" in argv:
+                race_add_argv.append(tuple(str(item) for item in argv))
+                return subprocess.CompletedProcess(argv, 1, b"", b"")
+            return real_run(argv, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(
+                    bridge,
+                    "_assert_no_external_git_filters",
+                    side_effect=signal_from_second_filter,
+                ),
+                patch.object(
+                    bridge.subprocess,
+                    "run",
+                    side_effect=record_racing_stage_add,
+                ),
+                self.assertRaisesRegex(ValueError, "E_GIT_EFFECT"),
+            ):
+                bridge.stage_allowlisted_paths(
+                    governing_runtime=runtime,
+                    task_context=task_context,
+                    inventory=race_inventory,
+                    lease=lease,
+                    authorization=race_authorization,
+                    paths=("tracked.txt",),
+                    expected_head=head,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    tool_use_id="tool-stage-post-consume-locked-race",
+                    clock=lambda: 100.0,
+                )
+        finally:
+            second_filter_reached.set()
+            race_thread.join(timeout=2.0)
+            _atomic_json(store._path(task_id), original_task_state)
+
+        self.assertFalse(race_thread.is_alive(), "stage race deadlocked")
+        self.assertEqual(race_errors, [])
+        self.assertTrue(durable_drift_written.is_set())
+        self.assertEqual(race_add_argv, [])
+        self.assertTrue(race_authorization._consumed)
+        self.assertTrue(race_inventory._consumed)
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "write-tree"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            expected_pristine_index,
+        )
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            head,
+        )
+
+        shared_inventory = inventory("inventory-stage-shared-claim")
+        shared_authorizations = {
+            suffix: fresh_stage_authorization(f"inventory-claim-{suffix}")
+            for suffix in ("a", "b")
+        }
+        self.assertNotEqual(
+            shared_authorizations["a"].authorization_id,
+            shared_authorizations["b"].authorization_id,
+        )
+        start_stage_claim = threading.Barrier(2)
+        concurrent_current_check = threading.Barrier(2)
+        inventory_check_counts = threading.local()
+        race_results_lock = threading.Lock()
+        shared_claim_results: list[object] = []
+        shared_claim_errors: list[Exception] = []
+        shared_claim_add_argv: list[tuple[str, ...]] = []
+        real_inventory_is_current = bridge._inventory_is_current
+
+        def synchronize_inventory_claim(candidate) -> bool:
+            count = getattr(inventory_check_counts, "count", 0) + 1
+            inventory_check_counts.count = count
+            if candidate is shared_inventory and count == 2:
+                try:
+                    concurrent_current_check.wait(timeout=0.25)
+                except threading.BrokenBarrierError:
+                    pass
+            return real_inventory_is_current(candidate)
+
+        def record_shared_claim_add(argv, *args, **kwargs):
+            if "add" in argv:
+                with race_results_lock:
+                    shared_claim_add_argv.append(
+                        tuple(str(item) for item in argv)
+                    )
+            return real_run(argv, *args, **kwargs)
+
+        def stage_with_shared_inventory(suffix: str) -> None:
+            try:
+                start_stage_claim.wait(timeout=1.0)
+                result = bridge.stage_allowlisted_paths(
+                    governing_runtime=runtime,
+                    task_context=task_context,
+                    inventory=shared_inventory,
+                    lease=lease,
+                    authorization=shared_authorizations[suffix],
+                    paths=("tracked.txt",),
+                    expected_head=head,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    tool_use_id=(
+                        f"tool-stage-post-consume-inventory-claim-{suffix}"
+                    ),
+                    clock=lambda: 100.0,
+                )
+                with race_results_lock:
+                    shared_claim_results.append(result)
+            except Exception as error:
+                with race_results_lock:
+                    shared_claim_errors.append(error)
+
+        shared_claim_threads = tuple(
+            threading.Thread(
+                target=stage_with_shared_inventory,
+                args=(suffix,),
+                name=f"stage-shared-inventory-{suffix}",
+                daemon=True,
+            )
+            for suffix in ("a", "b")
+        )
+        with (
+            patch.object(
+                bridge,
+                "_inventory_is_current",
+                side_effect=synchronize_inventory_claim,
+            ),
+            patch.object(
+                bridge.subprocess,
+                "run",
+                side_effect=record_shared_claim_add,
+            ),
+        ):
+            for thread in shared_claim_threads:
+                thread.start()
+            for thread in shared_claim_threads:
+                thread.join(timeout=2.0)
+
+        self.assertTrue(
+            all(not thread.is_alive() for thread in shared_claim_threads),
+            "shared inventory claim deadlocked",
+        )
+        self.assertEqual(len(shared_claim_results), 1)
+        self.assertEqual(len(shared_claim_errors), 1)
+        self.assertIsInstance(shared_claim_errors[0], ValueError)
+        self.assertRegex(
+            str(shared_claim_errors[0]), "E_LEASE_OBSERVATION_STALE"
+        )
+        self.assertEqual(len(shared_claim_add_argv), 1)
+        self.assertTrue(shared_inventory._consumed)
+        self.assertTrue(
+            all(
+                authorization._consumed
+                for authorization in shared_authorizations.values()
+            )
+        )
+        self.assertEqual(
+            shared_claim_results[0].index_tree, expected_tree
+        )
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "write-tree"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            expected_tree,
+        )
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            head,
+        )
+
+        stage_boundary_clock_calls: list[float] = []
+
+        def stage_boundary_clock() -> float:
+            stage_boundary_clock_calls.append(130.0)
+            return 130.0
+
         index = bridge.stage_allowlisted_paths(
             governing_runtime=runtime,
             task_context=task_context,
@@ -2057,23 +3557,24 @@ class LifecycleTests(unittest.TestCase):
             session_id=session_id,
             invocation_id=invocation_id,
             tool_use_id="tool-stage-governing",
-            clock=lambda: 100.0,
+            clock=stage_boundary_clock,
         )
+        self.assertEqual(stage_boundary_clock_calls, [130.0] * 4)
         with self.assertRaisesRegex(ValueError, "E_AUTH_REPLAY"):
             bridge.consume_authorization(
                 stage_authorization,
-                expected_task_digest=self.digest,
+                expected_task_digest=store.status(task_id)["task_digest"],
                 expected_session_id=session_id,
                 expected_repository_identity=repository,
                 expected_worktree_identity=repository,
-                expected_branch="main",
+                expected_branch=branch,
                 expected_head=head,
                 expected_subject_digest=stage_subject,
                 expected_scope_paths=("tracked.txt",),
                 expected_effect="local_write",
                 expected_operation_nonce="tool-stage-governing",
                 expected_invocation_id=invocation_id,
-                clock=lambda: 100.0,
+                clock=lambda: 131.0,
             )
 
         message = "Commit governed change"
@@ -2097,16 +3598,16 @@ class LifecycleTests(unittest.TestCase):
                 event_id="authorize-commit-governing",
                 session_id=session_id,
                 invocation_id=invocation_id,
-                task_digest=self.digest,
+                task_digest=delivery_task_digest,
                 subject_digest=commit_subject,
                 observed_at_monotonic=100.0,
             ),
             host_capability=commit_capability,
-            task_digest=self.digest,
+            task_digest=delivery_task_digest,
             session_id=session_id,
             repository_identity=repository,
             worktree_identity=repository,
-            branch="main",
+            branch=branch,
             expected_head=head,
             subject_digest=commit_subject,
             scope_paths=("tracked.txt",),
@@ -2116,6 +3617,579 @@ class LifecycleTests(unittest.TestCase):
             clock=lambda: 100.0,
             ttl_seconds=30,
         )
+
+        def fresh_commit_authorization(
+            suffix: str, *, ttl_seconds: float = 30.0
+        ):
+            capability = bridge.attest_host_adapter_capability(
+                native_session_event(
+                    event_id=f"session-commit-{suffix}",
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    observed_at_monotonic=100.0,
+                ),
+                expected_session_id=session_id,
+                expected_invocation_id=invocation_id,
+                clock=lambda: 100.0,
+                ttl_seconds=30,
+            )
+            return bridge.frame_effect_authorization(
+                native_user_interaction_event(
+                    event_id=f"authorize-commit-{suffix}",
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    task_digest=delivery_task_digest,
+                    subject_digest=commit_subject,
+                    observed_at_monotonic=100.0,
+                ),
+                host_capability=capability,
+                task_digest=delivery_task_digest,
+                session_id=session_id,
+                repository_identity=repository,
+                worktree_identity=repository,
+                branch=branch,
+                expected_head=head,
+                subject_digest=commit_subject,
+                scope_paths=("tracked.txt",),
+                effect="commit",
+                operation_nonce=f"tool-commit-{suffix}",
+                invocation_id=invocation_id,
+                clock=lambda: 100.0,
+                ttl_seconds=ttl_seconds,
+            )
+        with self.assertRaisesRegex(ValueError, "E_GIT_EFFECT"):
+            bridge.commit_staged_change(
+                governing_runtime=runtime,
+                task_context=task_context,
+                inventory=inventory("inventory-commit-before-index-observed"),
+                lease=lease,
+                index_observation=index,
+                authorization=commit_authorization,
+                message=message,
+                expected_prior_head=head,
+                session_id=session_id,
+                invocation_id=invocation_id,
+                tool_use_id="tool-commit-governing",
+                clock=lambda: 100.0,
+            )
+        self.assertFalse(commit_authorization._consumed)
+        self.assertEqual(
+            subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip(),
+            head,
+        )
+        store.observe_delivery_index(
+            task_id, lease=lease, expected_index_tree=index.index_tree
+        )
+        drifted_message = "Commit a different governed change"
+        drifted_subject = contract_digest(
+            {"index": index.observation_digest, "message": drifted_message}
+        )
+        drifted_capability = bridge.attest_host_adapter_capability(
+            native_session_event(
+                event_id="session-commit-message-drift",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=session_id,
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        drifted_authorization = bridge.frame_effect_authorization(
+            native_user_interaction_event(
+                event_id="authorize-commit-message-drift",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                task_digest=delivery_task_digest,
+                subject_digest=drifted_subject,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=drifted_capability,
+            task_digest=delivery_task_digest,
+            session_id=session_id,
+            repository_identity=repository,
+            worktree_identity=repository,
+            branch=branch,
+            expected_head=head,
+            subject_digest=drifted_subject,
+            scope_paths=("tracked.txt",),
+            effect="commit",
+            operation_nonce="tool-commit-message-drift",
+            invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        real_run = subprocess.run
+        commit_argv: list[tuple[str, ...]] = []
+
+        def record_commit(argv, *args, **kwargs):
+            if "commit" in argv:
+                commit_argv.append(tuple(str(item) for item in argv))
+                return subprocess.CompletedProcess(argv, 1, b"", b"")
+            return real_run(argv, *args, **kwargs)
+
+        with patch.object(
+            bridge.subprocess, "run", side_effect=record_commit
+        ), self.assertRaisesRegex(ValueError, "E_GIT_EFFECT"):
+            bridge.commit_staged_change(
+                governing_runtime=runtime,
+                task_context=task_context,
+                inventory=inventory("inventory-commit-message-drift"),
+                lease=lease,
+                index_observation=index,
+                authorization=drifted_authorization,
+                message=drifted_message,
+                expected_prior_head=head,
+                session_id=session_id,
+                invocation_id=invocation_id,
+                tool_use_id="tool-commit-message-drift",
+                clock=lambda: 100.0,
+            )
+        self.assertEqual(commit_argv, [])
+        self.assertEqual(
+            subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            head,
+        )
+        self.assertFalse(index._consumed)
+        original_state = store.status(task_id)
+        original_marker = dict(
+            original_state["finalizing_delivery_commit"]
+        )
+        for field, value in (
+            ("parent_head", "e" * 40),
+            ("expected_tree", "f" * 40),
+        ):
+            with self.subTest(marker_drift=field):
+                drifted_state = store.status(task_id)
+                drifted_marker = dict(
+                    drifted_state["finalizing_delivery_commit"]
+                )
+                drifted_marker[field] = value
+                drifted_marker["marker_digest"] = contract_digest(
+                    {
+                        key: item
+                        for key, item in drifted_marker.items()
+                        if key != "marker_digest"
+                    }
+                )
+                drifted_state["finalizing_delivery_commit"] = drifted_marker
+                _atomic_json(store._path(task_id), drifted_state)
+                marker_commit_argv: list[tuple[str, ...]] = []
+
+                def record_marker_commit(argv, *args, **kwargs):
+                    if "commit" in argv:
+                        marker_commit_argv.append(
+                            tuple(str(item) for item in argv)
+                        )
+                        return subprocess.CompletedProcess(
+                            argv, 1, b"", b""
+                        )
+                    return real_run(argv, *args, **kwargs)
+
+                with patch.object(
+                    bridge.subprocess,
+                    "run",
+                    side_effect=record_marker_commit,
+                ), self.assertRaisesRegex(ValueError, "E_GIT_EFFECT"):
+                    bridge.commit_staged_change(
+                        governing_runtime=runtime,
+                        task_context=task_context,
+                        inventory=inventory(
+                            f"inventory-commit-marker-{field}"
+                        ),
+                        lease=lease,
+                        index_observation=index,
+                        authorization=commit_authorization,
+                        message=message,
+                        expected_prior_head=head,
+                        session_id=session_id,
+                        invocation_id=invocation_id,
+                        tool_use_id="tool-commit-governing",
+                        clock=lambda: 100.0,
+                    )
+                self.assertEqual(marker_commit_argv, [])
+                self.assertFalse(commit_authorization._consumed)
+                self.assertFalse(index._consumed)
+                restored = store.status(task_id)
+                restored["finalizing_delivery_commit"] = dict(
+                    original_marker
+                )
+                _atomic_json(store._path(task_id), restored)
+        post_consume_capability = bridge.attest_host_adapter_capability(
+            native_session_event(
+                event_id="session-commit-post-consume-drift",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                observed_at_monotonic=100.0,
+            ),
+            expected_session_id=session_id,
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        post_consume_authorization = bridge.frame_effect_authorization(
+            native_user_interaction_event(
+                event_id="authorize-commit-post-consume-drift",
+                session_id=session_id,
+                invocation_id=invocation_id,
+                task_digest=delivery_task_digest,
+                subject_digest=commit_subject,
+                observed_at_monotonic=100.0,
+            ),
+            host_capability=post_consume_capability,
+            task_digest=delivery_task_digest,
+            session_id=session_id,
+            repository_identity=repository,
+            worktree_identity=repository,
+            branch=branch,
+            expected_head=head,
+            subject_digest=commit_subject,
+            scope_paths=("tracked.txt",),
+            effect="commit",
+            operation_nonce="tool-commit-post-consume-drift",
+            invocation_id=invocation_id,
+            clock=lambda: 100.0,
+            ttl_seconds=30,
+        )
+        expected_index_bytes = real_run(
+            ["git", "-C", str(repository), "show", ":tracked.txt"],
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        original_consume = bridge.consume_authorization
+        post_consume_commit_argv: list[tuple[str, ...]] = []
+
+        def consume_then_mutate_index(*args, **kwargs):
+            result = original_consume(*args, **kwargs)
+            (repository / "tracked.txt").write_text(
+                "post-consume index drift\n", encoding="utf-8"
+            )
+            real_run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "add",
+                    "--",
+                    "tracked.txt",
+                ],
+                check=True,
+            )
+            return result
+
+        def record_post_consume_commit(argv, *args, **kwargs):
+            if "commit" in argv:
+                post_consume_commit_argv.append(
+                    tuple(str(item) for item in argv)
+                )
+                return subprocess.CompletedProcess(argv, 1, b"", b"")
+            return real_run(argv, *args, **kwargs)
+
+        with (
+            patch.object(
+                bridge,
+                "consume_authorization",
+                side_effect=consume_then_mutate_index,
+            ),
+            patch.object(
+                bridge.subprocess,
+                "run",
+                side_effect=record_post_consume_commit,
+            ),
+            self.assertRaisesRegex(ValueError, "E_GIT_EFFECT"),
+        ):
+            bridge.commit_staged_change(
+                governing_runtime=runtime,
+                task_context=task_context,
+                inventory=inventory("inventory-commit-post-consume-drift"),
+                lease=lease,
+                index_observation=index,
+                authorization=post_consume_authorization,
+                message=message,
+                expected_prior_head=head,
+                session_id=session_id,
+                invocation_id=invocation_id,
+                tool_use_id="tool-commit-post-consume-drift",
+                clock=lambda: 100.0,
+            )
+        self.assertEqual(post_consume_commit_argv, [])
+        self.assertTrue(post_consume_authorization._consumed)
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            head,
+        )
+        (repository / "tracked.txt").write_bytes(expected_index_bytes)
+        real_run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "add",
+                "--",
+                "tracked.txt",
+            ],
+            check=True,
+        )
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "write-tree"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            index.index_tree,
+        )
+        for expired_grant in ("authorization", "inventory"):
+            with self.subTest(commit_post_consume_expiry=expired_grant):
+                expiry_now = [100.0]
+                expiry_clock_calls: list[float] = []
+                expiry_authorization = fresh_commit_authorization(
+                    f"expired-{expired_grant}",
+                    ttl_seconds=(
+                        5.0 if expired_grant == "authorization" else 30.0
+                    ),
+                )
+                expiry_inventory = inventory(
+                    f"inventory-commit-expired-{expired_grant}",
+                    ttl_seconds=(
+                        5.0 if expired_grant == "inventory" else 30.0
+                    ),
+                )
+                grants_consumed = threading.Event()
+                expiry_lock_held = threading.Event()
+                expiry_errors: list[Exception] = []
+                expiry_commit_argv: list[tuple[str, ...]] = []
+                expiry_thread = threading.Thread(
+                    target=advance_clock_after_grants_are_consumed,
+                    args=(
+                        grants_consumed,
+                        expiry_lock_held,
+                        expiry_now,
+                        expiry_errors,
+                    ),
+                    name=f"commit-{expired_grant}-expiry",
+                    daemon=True,
+                )
+                expiry_thread.start()
+                self.assertTrue(expiry_lock_held.wait(timeout=1.0))
+
+                def consume_then_signal(*args, **kwargs):
+                    result = original_inventory_consume(*args, **kwargs)
+                    grants_consumed.set()
+                    return result
+
+                def record_expired_commit(argv, *args, **kwargs):
+                    if "commit" in argv:
+                        expiry_commit_argv.append(
+                            tuple(str(item) for item in argv)
+                        )
+                        return subprocess.CompletedProcess(
+                            argv, 1, b"", b""
+                        )
+                    return real_run(argv, *args, **kwargs)
+
+                def expiry_clock() -> float:
+                    expiry_clock_calls.append(expiry_now[0])
+                    return expiry_now[0]
+
+                try:
+                    with (
+                        patch.object(
+                            bridge,
+                            "_consume_worktree_inventory",
+                            side_effect=consume_then_signal,
+                        ),
+                        patch.object(
+                            bridge.subprocess,
+                            "run",
+                            side_effect=record_expired_commit,
+                        ),
+                        self.assertRaisesRegex(
+                            ValueError, "E_GIT_EFFECT"
+                        ),
+                    ):
+                        bridge.commit_staged_change(
+                            governing_runtime=runtime,
+                            task_context=task_context,
+                            inventory=expiry_inventory,
+                            lease=lease,
+                            index_observation=index,
+                            authorization=expiry_authorization,
+                            message=message,
+                            expected_prior_head=head,
+                            session_id=session_id,
+                            invocation_id=invocation_id,
+                            tool_use_id=(
+                                f"tool-commit-expired-{expired_grant}"
+                            ),
+                            clock=expiry_clock,
+                        )
+                finally:
+                    grants_consumed.set()
+                    expiry_thread.join(timeout=2.0)
+
+                self.assertFalse(
+                    expiry_thread.is_alive(), "commit expiry deadlocked"
+                )
+                self.assertEqual(expiry_errors, [])
+                self.assertEqual(expiry_now[0], 106.0)
+                self.assertLess(
+                    expiry_now[0], runtime.freshness_deadline
+                )
+                self.assertEqual(
+                    expiry_clock_calls, [100.0, 100.0, 106.0]
+                )
+                self.assertEqual(expiry_commit_argv, [])
+                self.assertTrue(expiry_authorization._consumed)
+                self.assertTrue(expiry_inventory._consumed)
+                self.assertFalse(index._consumed)
+                self.assertEqual(
+                    real_run(
+                        ["git", "-C", str(repository), "write-tree"],
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip(),
+                    index.index_tree,
+                )
+                self.assertEqual(
+                    real_run(
+                        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip(),
+                    head,
+                )
+        commit_race_authorization = fresh_commit_authorization("locked-race")
+        commit_race_inventory = inventory("inventory-commit-locked-race")
+        commit_race_locked = threading.Event()
+        second_binding_reached = threading.Event()
+        commit_drift_written = threading.Event()
+        commit_race_errors: list[BaseException] = []
+        racing_commit_argv: list[tuple[str, ...]] = []
+        commit_original_task = store.status(task_id)
+
+        def mutate_commit_state_under_canonical_locks() -> None:
+            try:
+                with _common_lease_lock(common_dir):
+                    with _task_guard(common_dir, task_id):
+                        commit_race_locked.set()
+                        second_binding_reached.wait(timeout=0.25)
+                        drifted_task = json.loads(
+                            store._path(task_id).read_text(encoding="utf-8")
+                        )
+                        drifted_task["state"] = "committed"
+                        _atomic_json(store._path(task_id), drifted_task)
+                        commit_drift_written.set()
+            except BaseException as error:
+                commit_race_errors.append(error)
+
+        commit_race_thread = threading.Thread(
+            target=mutate_commit_state_under_canonical_locks,
+            name="commit-governing-state-race",
+            daemon=True,
+        )
+        commit_race_thread.start()
+        self.assertTrue(commit_race_locked.wait(timeout=1.0))
+        real_commit_binding = bridge._validate_staged_commit_binding
+        commit_binding_calls = 0
+
+        def signal_after_second_commit_binding(*args, **kwargs):
+            nonlocal commit_binding_calls
+            result = real_commit_binding(*args, **kwargs)
+            commit_binding_calls += 1
+            if commit_binding_calls == 2:
+                second_binding_reached.set()
+                if not commit_drift_written.wait(timeout=1.0):
+                    raise AssertionError(
+                        "durable drift did not complete after commit binding"
+                    )
+            return result
+
+        def record_racing_commit(argv, *args, **kwargs):
+            if "commit" in argv:
+                racing_commit_argv.append(tuple(str(item) for item in argv))
+                return subprocess.CompletedProcess(argv, 1, b"", b"")
+            return real_run(argv, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(
+                    bridge,
+                    "_validate_staged_commit_binding",
+                    side_effect=signal_after_second_commit_binding,
+                ),
+                patch.object(
+                    bridge.subprocess,
+                    "run",
+                    side_effect=record_racing_commit,
+                ),
+                self.assertRaisesRegex(ValueError, "E_GIT_EFFECT"),
+            ):
+                bridge.commit_staged_change(
+                    governing_runtime=runtime,
+                    task_context=task_context,
+                    inventory=commit_race_inventory,
+                    lease=lease,
+                    index_observation=index,
+                    authorization=commit_race_authorization,
+                    message=message,
+                    expected_prior_head=head,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    tool_use_id="tool-commit-locked-race",
+                    clock=lambda: 100.0,
+                )
+        finally:
+            second_binding_reached.set()
+            commit_race_thread.join(timeout=2.0)
+            _atomic_json(store._path(task_id), commit_original_task)
+
+        self.assertFalse(
+            commit_race_thread.is_alive(), "commit race deadlocked"
+        )
+        self.assertEqual(commit_race_errors, [])
+        self.assertTrue(commit_drift_written.is_set())
+        self.assertEqual(racing_commit_argv, [])
+        self.assertTrue(commit_race_authorization._consumed)
+        self.assertTrue(commit_race_inventory._consumed)
+        self.assertFalse(index._consumed)
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "write-tree"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            index.index_tree,
+        )
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            head,
+        )
+        commit_boundary_clock_calls: list[float] = []
+
+        def commit_boundary_clock() -> float:
+            commit_boundary_clock_calls.append(130.0)
+            return 130.0
+
         committed = bridge.commit_staged_change(
             governing_runtime=runtime,
             task_context=task_context,
@@ -2128,21 +4202,46 @@ class LifecycleTests(unittest.TestCase):
             session_id=session_id,
             invocation_id=invocation_id,
             tool_use_id="tool-commit-governing",
-            clock=lambda: 100.0,
+            clock=commit_boundary_clock,
         )
+        self.assertEqual(commit_boundary_clock_calls, [130.0] * 5)
         self.assertNotEqual(committed.evidence["commit"], head)
         self.assertTrue(index._consumed)
+        with self.assertRaisesRegex(ValueError, "E_AUTH_REPLAY"):
+            bridge.consume_authorization(
+                commit_authorization,
+                expected_task_digest=delivery_task_digest,
+                expected_session_id=session_id,
+                expected_repository_identity=repository,
+                expected_worktree_identity=repository,
+                expected_branch=branch,
+                expected_head=head,
+                expected_subject_digest=commit_subject,
+                expected_scope_paths=("tracked.txt",),
+                expected_effect="commit",
+                expected_operation_nonce="tool-commit-governing",
+                expected_invocation_id=invocation_id,
+                clock=lambda: 131.0,
+            )
 
         new_head = committed.evidence["commit"]
-        TaskLease.release(
-            common_dir,
-            common_dir,
+        validated_commit = bridge.validate_local_git_observation(
+            committed,
+            expected_task_digest=store.status(task_id)["task_digest"],
+            expected_repo=repository,
+            expected_worktree=repository,
+            expected_branch=branch,
+            expected_prior_head=head,
+            expected_target_state="committed",
+            expected_session_id=session_id,
+            expected_invocation_id=invocation_id,
+            clock=lambda: 130.0,
+        )
+        store.publish_delivery_commit(
             task_id=task_id,
-            worktree=str(repository),
-            branch="main",
-            session_id=session_id,
-            policy_digest=self.digest,
-            lease_digest=lease["lease_digest"],
+            lease=lease,
+            observation=validated_commit,
+            current_branch=branch,
         )
         (repository / "tracked.txt").write_text(
             "stale lease must not stage\n", encoding="utf-8"
@@ -2165,16 +4264,16 @@ class LifecycleTests(unittest.TestCase):
                 event_id="authorize-stale-lease",
                 session_id=session_id,
                 invocation_id=invocation_id,
-                task_digest=self.digest,
+                task_digest=delivery_task_digest,
                 subject_digest=stale_subject,
                 observed_at_monotonic=100.0,
             ),
             host_capability=stale_capability,
-            task_digest=self.digest,
+            task_digest=delivery_task_digest,
             session_id=session_id,
             repository_identity=repository,
             worktree_identity=repository,
-            branch="main",
+            branch=branch,
             expected_head=new_head,
             subject_digest=stale_subject,
             scope_paths=("tracked.txt",),
@@ -2211,57 +4310,26 @@ class LifecycleTests(unittest.TestCase):
             native_user_interaction_event,
         )
 
-        repository, _, common_dir, _ = self._two_worktree_repository(
-            "descendant-filter"
-        )
-        head = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
         task_id = "TASK-STAGE-DESCENDANT-FILTER"
         session_id = "session-stage-descendant-filter"
         invocation_id = "stage-descendant-filter"
-        store = TaskStore(common_dir)
-        store.start(
+        repository, common_dir, store, head = self._published_delivery_review(task_id)
+        branch = store.status(task_id)["branch"]
+        delivery_task_digest = store.status(task_id)["task_digest"]
+        lease = store.acquire_delivery_lease(
             task_id,
-            outcome="local_change",
-            branch="main",
-            task_digest=self.digest,
-            decision_digest=self.digest,
-        )
-        for state_name, evidence in (
-            ("planned", None),
-            ("ready", {"preflight_ok": True}),
-            ("implementing", None),
-            ("verifying", {"implementation_complete": True}),
-            (
-                "review_ready",
-                {
-                    "gates_ok": True,
-                    "documentation_decision": self.digest,
-                },
-            ),
-        ):
-            store.transition(
-                task_id,
-                state_name,
-                evidence=evidence,
-                current_branch="main",
-            )
-        lease = TaskLease.acquire(
-            common_dir,
-            task_id=task_id,
             worktree=str(repository),
-            branch="main",
+            branch=branch,
             session_id=session_id,
-            paths=["."],
-            policy_digest=self.digest,
+            paths=["tracked.txt"],
+            policy_digest=self._delivery_policy_digest(repository),
+            expected_head=head,
+            diff_digest=store.status(task_id)["delivery_review_binding"]["diff_digest"],
+            expected_generation=store.status(task_id)["generation"],
         )
         task_context = {
             "task_id": task_id,
-            "task_digest": self.digest,
+            "task_digest": delivery_task_digest,
             "lease_digest": lease["lease_digest"],
         }
         runtime = governing_runtime_observation(
@@ -2327,16 +4395,16 @@ class LifecycleTests(unittest.TestCase):
                 event_id="authorize-stage-descendant-filter",
                 session_id=session_id,
                 invocation_id=invocation_id,
-                task_digest=self.digest,
+                task_digest=delivery_task_digest,
                 subject_digest=subject_digest,
                 observed_at_monotonic=100.0,
             ),
             host_capability=capability,
-            task_digest=self.digest,
+            task_digest=delivery_task_digest,
             session_id=session_id,
             repository_identity=repository,
             worktree_identity=repository,
-            branch="main",
+            branch=branch,
             expected_head=head,
             subject_digest=subject_digest,
             scope_paths=("dir",),
@@ -3055,6 +5123,10 @@ class LifecycleTests(unittest.TestCase):
                     stdout=push_fixture["branch"] + "\n",
                     stderr="",
                 )
+            if arguments[-2:] == ["ls-files", "-z"]:
+                return subprocess.CompletedProcess(
+                    arguments, 0, stdout=b"", stderr=b""
+                )
             if "status" in arguments:
                 return subprocess.CompletedProcess(
                     arguments, 0, stdout="", stderr=""
@@ -3280,6 +5352,10 @@ class LifecycleTests(unittest.TestCase):
             if arguments[-2:] == ["branch", "--show-current"]:
                 return subprocess.CompletedProcess(
                     arguments, 0, stdout=pr_fixture["branch"] + "\n"
+                )
+            if arguments[-2:] == ["ls-files", "-z"]:
+                return subprocess.CompletedProcess(
+                    arguments, 0, stdout=b"", stderr=b""
                 )
             if "status" in arguments:
                 return subprocess.CompletedProcess(
@@ -4738,6 +6814,102 @@ class LifecycleTests(unittest.TestCase):
                 policy_digest=self.digest,
             )
 
+    def test_delivery_and_implementation_leases_conflict_across_worktrees(self) -> None:
+        from control_plane.lifecycle import DeliveryLease, TaskLease
+
+        repository, other, common_dir, other_git_dir = self._two_worktree_repository("delivery-conflict")
+        head = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+        TaskLease.acquire(
+            common_dir, task_id="TASK-IMPLEMENTATION-OWNER", worktree=str(repository),
+            branch="main", session_id="session-implementation-owner", paths=["src/**"],
+            policy_digest=self.digest,
+        )
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_LEASE_CONFLICT"):
+            DeliveryLease.acquire(
+                other_git_dir, task_id="TASK-DELIVERY-CANDIDATE", worktree=str(other),
+                branch="codex/other", session_id="session-delivery-candidate", paths=["src/file.py"],
+                policy_digest=self.digest, generation=1, review_head=head, base_head=head, diff_digest=self.digest,
+            )
+
+    def test_delivery_leases_conflict_across_worktrees(self) -> None:
+        from control_plane.lifecycle import DeliveryLease
+
+        repository, other, common_dir, other_git_dir = self._two_worktree_repository("delivery-delivery-conflict")
+        head = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+        DeliveryLease.acquire(
+            common_dir, task_id="TASK-DELIVERY-OWNER", worktree=str(repository),
+            branch="main", session_id="session-delivery-owner", paths=["src/**"],
+            policy_digest=self.digest, generation=1, review_head=head, base_head=head, diff_digest=self.digest,
+        )
+        with self.assertRaisesRegex(ValueError, "E_DELIVERY_LEASE_CONFLICT"):
+            DeliveryLease.acquire(
+                other_git_dir, task_id="TASK-DELIVERY-CANDIDATE", worktree=str(other),
+                branch="codex/other", session_id="session-delivery-candidate", paths=["src/file.py"],
+                policy_digest=self.digest, generation=1, review_head=head, base_head=head, diff_digest=self.digest,
+            )
+
+    def test_implementation_rejects_overlapping_delivery_lease_across_worktrees(self) -> None:
+        from control_plane.lifecycle import DeliveryLease, TaskLease
+
+        repository, other, common_dir, other_git_dir = self._two_worktree_repository("implementation-delivery-conflict")
+        head = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+        DeliveryLease.acquire(
+            common_dir, task_id="TASK-DELIVERY-OWNER", worktree=str(repository),
+            branch="main", session_id="session-delivery-owner", paths=["src/**"],
+            policy_digest=self.digest, generation=1, review_head=head, base_head=head, diff_digest=self.digest,
+        )
+        with self.assertRaisesRegex(ValueError, "E_LEASE_CONFLICT"):
+            TaskLease.acquire(
+                other_git_dir, task_id="TASK-IMPLEMENTATION-CANDIDATE", worktree=str(other),
+                branch="codex/other", session_id="session-implementation-candidate", paths=["src/file.py"],
+                policy_digest=self.digest,
+            )
+
+    def test_delivery_lease_acquisition_is_atomic_for_overlapping_worktrees(self) -> None:
+        from control_plane.lifecycle import DeliveryLease
+
+        repository, other, common_dir, other_git_dir = self._two_worktree_repository("delivery-atomic")
+        head = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+        barrier = threading.Barrier(2)
+        results: list[str] = []
+
+        def acquire(state_dir, task_id, worktree, branch) -> None:
+            barrier.wait()
+            try:
+                DeliveryLease.acquire(
+                    state_dir, task_id=task_id, worktree=str(worktree), branch=branch,
+                    session_id=f"session-{task_id.lower()}", paths=["src/**"],
+                    policy_digest=self.digest, generation=1, review_head=head, base_head=head, diff_digest=self.digest,
+                )
+                results.append("acquired")
+            except ValueError as error:
+                results.append(str(error).split(":", 1)[0])
+
+        first = threading.Thread(target=acquire, args=(common_dir, "TASK-DELIVERY-A", repository, "main"))
+        second = threading.Thread(target=acquire, args=(other_git_dir, "TASK-DELIVERY-B", other, "codex/other"))
+        first.start(); second.start(); first.join(); second.join()
+        self.assertCountEqual(results, ["acquired", "E_DELIVERY_LEASE_CONFLICT"])
+
+    def test_delivery_lease_scan_rejects_symlink_and_oversized_candidates(self) -> None:
+        from control_plane.lifecycle import DeliveryLease
+
+        for label, install in (
+            ("symlink", lambda path: path.symlink_to(path.parent / "outside.json")),
+            ("oversized", lambda path: path.write_bytes(b"x" * 65_537)),
+        ):
+            with self.subTest(label=label):
+                repository, _other, common_dir, other_git_dir = self._two_worktree_repository(f"delivery-{label}")
+                head = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+                candidate = other_git_dir / "codex-control-plane" / "delivery-leases" / "TASK-UNSAFE.json"
+                candidate.parent.mkdir(parents=True)
+                install(candidate)
+                with self.assertRaisesRegex(ValueError, "E_LEASE_OBSERVATION_UNKNOWN"):
+                    DeliveryLease.acquire(
+                        common_dir, task_id="TASK-DELIVERY-SAFE", worktree=str(repository),
+                        branch="main", session_id="session-delivery-safe", paths=["src/**"],
+                        policy_digest=self.digest, generation=1, review_head=head, base_head=head, diff_digest=self.digest,
+                    )
+
     def test_writer_lease_never_expires_or_transfers_implicitly(self) -> None:
         from control_plane.lifecycle import TaskLease
 
@@ -6073,7 +8245,7 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertEqual(pushed["evidence"]["pushed"]["remote_head"], head)
 
-    def test_pr_review_cycle_can_record_a_new_committed_and_pushed_head(
+    def test_pr_review_cycle_without_task5a_marker_is_rejected(
         self,
     ) -> None:
         import control_plane.host_bridge as bridge
@@ -6248,30 +8420,24 @@ class LifecycleTests(unittest.TestCase):
             clock=lambda: 100.0,
         )
 
-        implementing = store.start_revision(
-            task_id,
-            expected_generation=state["generation"],
-            reason="review_feedback",
-            observation=revision_observation,
-            worktree_inventory=inventory,
-            worktree=str(repository),
-            session_id="session-revision",
-            policy_digest=self.digest,
-            scope_paths=["."],
-            current_branch=branch,
-        )
+        with self.assertRaisesRegex(ValueError, "E_REVISION_MARKER"):
+            store.start_revision(
+                task_id,
+                expected_generation=state["generation"],
+                reason="review_feedback",
+                observation=revision_observation,
+                worktree_inventory=inventory,
+                worktree=str(repository),
+                session_id="session-revision",
+                policy_digest=self.digest,
+                scope_paths=["."],
+                current_branch=branch,
+            )
 
-        self.assertEqual(implementing["state"], "implementing")
-        self.assertEqual(implementing["revision"], 1)
-        self.assertEqual(implementing["pull_request"]["number"], 7)
-        self.assertNotIn("committed", implementing["evidence"])
-        self.assertNotIn("pushed", implementing["evidence"])
-        self.assertIsNotNone(implementing["lease_digest"])
-
-    def test_start_revision_acquires_new_writer_lease_before_implementing(
+    def test_start_revision_without_marker_cannot_acquire_writer_lease(
         self,
     ) -> None:
-        self.test_pr_review_cycle_can_record_a_new_committed_and_pushed_head()
+        self.test_pr_review_cycle_without_task5a_marker_is_rejected()
 
     def test_start_revision_uses_lock_token_aware_acquire_without_relocking_or_subprocess(
         self,
@@ -6285,7 +8451,7 @@ class LifecycleTests(unittest.TestCase):
                 "start_revision called the public relocking API"
             ),
         ):
-            self.test_pr_review_cycle_can_record_a_new_committed_and_pushed_head()
+            self.test_pr_review_cycle_without_task5a_marker_is_rejected()
 
     def test_bootstrap_review_round_uses_a_fresh_child_and_lease(self) -> None:
         from control_plane.lifecycle import TaskLease, TaskStore
@@ -6355,7 +8521,7 @@ class LifecycleTests(unittest.TestCase):
                 current_branch="codex/base-advanced",
             )
 
-    def test_revision_start_marker_without_lease_recovers_prior_pr_state(
+    def test_revision_start_marker_without_required_binding_is_rejected(
         self,
     ) -> None:
         import json
@@ -6399,11 +8565,8 @@ class LifecycleTests(unittest.TestCase):
         )
         path.write_text(json.dumps(marker), encoding="utf-8")
 
-        recovered = store.recover_revision_start(task_id)
-
-        self.assertEqual(recovered["state"], "pr_draft")
-        self.assertEqual(recovered["generation"], 8)
-        self.assertFalse(recovered["resume_forbidden"])
+        with self.assertRaisesRegex(ValueError, "E_REVISION_RECOVERY"):
+            store.recover_revision_start(task_id)
 
     def test_false_or_untyped_evidence_cannot_advance_lifecycle(self) -> None:
         from control_plane.lifecycle import TaskStore
@@ -6476,7 +8639,7 @@ class LifecycleTests(unittest.TestCase):
                 changed_paths=["src/file.py"],
             )
 
-    def test_release_lifecycle_links_commit_pr_checks_manifest_and_build(
+    def test_legacy_release_lifecycle_cannot_bypass_typed_pr_readiness(
         self,
     ) -> None:
         import control_plane.host_bridge as bridge
@@ -6553,6 +8716,20 @@ class LifecycleTests(unittest.TestCase):
             ),
         ]
         for target, evidence in transitions:
+            if target == "pr_ready":
+                with self.assertRaisesRegex(
+                    ValueError, "E_PR_READINESS_PROOF"
+                ):
+                    store.transition(
+                        "TASK-RELEASE",
+                        target,
+                        evidence=evidence,
+                        current_branch=branch,
+                    )
+                self.assertEqual(
+                    store.status("TASK-RELEASE")["state"], "pr_draft"
+                )
+                break
             if target in {
                 "committed",
                 "pushed",
@@ -6638,9 +8815,6 @@ class LifecycleTests(unittest.TestCase):
                 evidence=evidence,
                 current_branch=branch,
             )
-
-        closed = store.close("TASK-RELEASE", current_branch=branch)
-        self.assertEqual(closed["state"], "closed")
 
     def test_close_releases_task_lease(self) -> None:
         from control_plane.lifecycle import TaskLease, TaskStore
@@ -6942,7 +9116,6 @@ class LifecycleTests(unittest.TestCase):
         self.assertNotIn("blocked", ORDERED_STATES)
         for terminal in OUTCOME_LIMITS.values():
             self.assertIn(terminal, ORDERED_STATES)
-
 
 if __name__ == "__main__":
     unittest.main()

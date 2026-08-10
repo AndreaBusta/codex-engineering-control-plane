@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK-V23-SANDBOX-PR-READY",
+  "objective": "In a separately selected disposable private GitHub sandbox, implement one bounded fixture change, verify it, create or observe its pull request, and stop only at PR LISTA.",
+  "intent": "implement",
+  "phase": "implement",
+  "requested_outcome": "pull_request",
+  "goals": [
+    {
+      "id": "sandbox-change",
+      "summary": "Implement the bounded fixture change without touching the base branch.",
+      "domains": [
+        "project"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "sandbox-verify",
+      "summary": "Run the exact local gates and independent review for the fixture change.",
+      "domains": [
+        "project"
+      ],
+      "depends_on": [
+        "sandbox-change"
+      ]
+    },
+    {
+      "id": "sandbox-pr-ready",
+      "summary": "Observe the exact push, draft pull request, checks and feedback, then stop at PR LISTA.",
+      "domains": [
+        "project"
+      ],
+      "depends_on": [
+        "sandbox-verify"
+      ]
+    }
+  ],
+  "domains": [
+    "project"
+  ],
+  "signals": [
+    "multi_file",
+    "regression_risk",
+    "external_effect"
+  ],
+  "scope_paths": [
+    "sandbox/change.txt",
+    "sandbox/test_change.py"
+  ],
+  "risk": {
+    "uncertainty": 2,
+    "blast_radius": 2,
+    "irreversibility": 2,
+    "verification_complexity": 3
+  },
+  "risk_provenance": "model_inference",
+  "effects": [
+    {
+      "name": "local_read",
+      "source": "model_inference"
+    },
+    {
+      "name": "local_write",
+      "source": "model_inference"
+    },
+    {
+      "name": "commit",
+      "source": "model_inference"
+    },
+    {
+      "name": "remote_write",
+      "source": "model_inference"
+    },
+    {
+      "name": "pull_request",
+      "source": "model_inference"
+    }
+  ],
+  "explicit_resources": [],
+  "excluded_resources": []
+}

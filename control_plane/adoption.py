@@ -45,7 +45,9 @@ from control_plane.repository import (
     RepositoryError,
     discover_repository,
     git_common_dir,
-    git_environment,
+    trusted_git_argv,
+    trusted_git_environment,
+    trusted_git_executable,
     worktree_git_dir,
 )
 from control_plane.resource_registry import load_registry
@@ -56,6 +58,7 @@ PRODUCT_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$", re.ASCII)
 RUNTIME_MODULES = (
     "__init__.py",
     "adoption.py",
+    "candidate_receipt.py",
     "clarification.py",
     "cli.py",
     "contracts.py",
@@ -365,14 +368,20 @@ def _remove_created_directories(root: Path, values: object) -> None:
 
 
 def _git(root: Path, *arguments: str) -> str:
-    completed = subprocess.run(
-        ["git", *arguments],
-        cwd=root,
-        check=False,
-        capture_output=True,
-        text=True,
-        env=git_environment(),
-    )
+    try:
+        completed = subprocess.run(
+            trusted_git_argv(root, arguments),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ValueError(
+            "E_ADOPT_GIT: git command failed: " + " ".join(arguments)
+        ) from error
     if completed.returncode != 0:
         raise ValueError(
             "E_ADOPT_GIT: git command failed: " + " ".join(arguments)
@@ -383,20 +392,23 @@ def _git(root: Path, *arguments: str) -> str:
 def _git_config_result(
     root: Path, *arguments: str
 ) -> subprocess.CompletedProcess[str]:
-    environment = git_environment()
-    environment["LANG"] = "C"
-    environment["LC_ALL"] = "C"
     try:
         completed = subprocess.run(
-            ["/usr/bin/git", "config", *arguments],
-            cwd=root,
+            [
+                trusted_git_executable(),
+                "-C",
+                str(root),
+                "config",
+                *arguments,
+            ],
             check=False,
             capture_output=True,
             text=True,
-            env=environment,
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
             timeout=5.0,
         )
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise ValueError(
             "E_ADOPT_HOOK_PATH_CONFLICT: Git config is not observable"
         ) from error
@@ -475,6 +487,52 @@ def _record_has_direct_local_origin(
     return observed == expected
 
 
+def _explicit_global_hook_records(
+    target_root: Path,
+) -> list[dict[str, str]]:
+    configured = os.environ.get("GIT_CONFIG_GLOBAL")
+    if configured is None:
+        return []
+    candidate = Path(configured)
+    try:
+        metadata = candidate.lstat()
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(
+            "E_ADOPT_HOOK_PATH_CONFLICT: global Git config is not observable"
+        ) from error
+    if (
+        not candidate.is_absolute()
+        or stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size > 1_048_576
+    ):
+        raise ValueError(
+            "E_ADOPT_HOOK_PATH_CONFLICT: global Git config is not observable"
+        )
+    result = _git_config_result(
+        target_root,
+        "--file",
+        str(resolved),
+        "--includes",
+        "--show-origin",
+        "--get-all",
+        "core.hooksPath",
+    )
+    records: list[dict[str, str]] = []
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) != 2:
+                raise ValueError(
+                    "E_ADOPT_HOOK_PATH_CONFLICT: Git config output is ambiguous"
+                )
+            records.append(
+                {"scope": "global", "origin": parts[0], "value": parts[1]}
+            )
+    return records
+
+
 def _observe_git_hook_config(target_root: Path) -> dict[str, Any]:
     result = _git_config_result(
         target_root,
@@ -498,6 +556,7 @@ def _observe_git_hook_config(target_root: Path) -> dict[str, Any]:
                     "value": parts[2],
                 }
             )
+    records.extend(_explicit_global_hook_records(target_root))
     local_values = _config_values(target_root, "local")
     worktree_values = _config_values(target_root, "worktree")
     active_managed = _current_managed_hooks_path(target_root)
@@ -1036,20 +1095,23 @@ def _publish_install_snapshot(
 def _git_config_mutation(
     root: Path, *arguments: str, allowed: set[int]
 ) -> None:
-    environment = git_environment()
-    environment["LANG"] = "C"
-    environment["LC_ALL"] = "C"
     try:
         completed = subprocess.run(
-            ["/usr/bin/git", "config", *arguments],
-            cwd=root,
+            [
+                trusted_git_executable(),
+                "-C",
+                str(root),
+                "config",
+                *arguments,
+            ],
             check=False,
             capture_output=True,
             text=True,
-            env=environment,
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
             timeout=5.0,
         )
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise ValueError(
             "E_ADOPT_HOOK_CONFIG: Git config mutation failed"
         ) from error

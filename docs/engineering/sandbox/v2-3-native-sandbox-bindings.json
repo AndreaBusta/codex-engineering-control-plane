@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "status": "PENDING_SANDBOX_TARGET",
+  "authorizes": false,
+  "packets": [
+    {
+      "task_id": "TASK-V23-SANDBOX-PR-READY",
+      "task_envelope": "docs/engineering/sandbox/v2-3-pr-ready-task-envelope.json",
+      "repository": null,
+      "base": null,
+      "branch": "codex/v2-3-sandbox-pr-ready",
+      "review_head": null,
+      "scope_paths": [
+        "sandbox/change.txt",
+        "sandbox/test_change.py"
+      ],
+      "required_checks": null,
+      "recovery": [
+        "observe the exact remote state before any retry",
+        "permit zero second write while the result is unknown",
+        "end blocked when exact observation remains unavailable"
+      ],
+      "rollback": [
+        "preserve the pull request and evidence for inspection",
+        "remove only the task-owned clean worktree after terminal observation",
+        "never force push or rewrite the base"
+      ]
+    },
+    {
+      "task_id": "TASK-V23-SANDBOX-SQUASH-MERGE",
+      "task_envelope": "docs/engineering/sandbox/v2-3-squash-merge-task-envelope.json",
+      "repository": null,
+      "base": null,
+      "branch": "codex/v2-3-sandbox-squash-merge",
+      "review_head": null,
+      "scope_paths": [
+        "sandbox/change.txt",
+        "sandbox/test_change.py"
+      ],
+      "required_checks": null,
+      "recovery": [
+        "observe the exact pull request and base before any provider retry",
+        "permit zero second merge write while the result is unknown",
+        "require the observed merge SHA in the refreshed exact base ref"
+      ],
+      "rollback": [
+        "do not attempt automatic remote rollback after merge",
+        "preserve the merged evidence and report any containment failure",
+        "never force push, reset the base, or delete an unobserved branch"
+      ]
+    }
+  ]
+}

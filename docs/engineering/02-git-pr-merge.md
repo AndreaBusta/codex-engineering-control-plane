@@ -195,6 +195,25 @@ El merge requiere:
 Si falta algo, Codex responde qué gate falta y mantiene el PR en Draft o
 bloqueado.
 
+## Outcome bridge v2.3
+
+`PR LISTA` es el resultado predeterminado: significa `pr_ready` observado, no
+permiso para integrar. La regla es **evidence != authority**. Review packets,
+checks, RunPlan, effect plans y receipts son evidencia cerrada y no autorizante;
+ningún JSON ni comando local concede commit, push, PR o merge.
+
+Una petición de producto estable puede cubrir automáticamente su cadena normal
+hasta PR. Solo una petición nativa actual, fresca y exacta «hasta squash merge»
+incluye integración. Un efecto nuevo o deriva de repository, base, branch,
+reviewed HEAD, scope, checks, policy o digest requiere una única reautorización
+de producto. Nunca se pide al usuario operar clases, grants, nonces o bindings
+internos.
+
+Los efectos remotos son host-bound y one-shot. Sin adaptador nativo del host,
+la ruta remota es `BLOCKED`; los adapters de tests no la vuelven disponible. Si
+una escritura es incierta, se observa el destino exacto antes de reintentar y
+no se emite una segunda escritura ni una reparación automática.
+
 ## Demostrar integración
 
 Tras el merge:
@@ -207,6 +226,11 @@ Tras el merge:
 6. demostrar que el commit está contenido en `origin/<base>`;
 7. comprobar checks de la base;
 8. sincronizar la copia local con fast-forward.
+
+El fetch de verificación debe usar la URL credential-free y la identidad remota
+exactas ligadas al plan, no un alias mutable. La contención local solo puede
+probarse después de esa observación host. Véase el
+[runbook del outcome bridge](16-outcome-bridge-rollback.md).
 
 Squash merge crea un commit nuevo. No basta con buscar los hashes originales de
 feature.
