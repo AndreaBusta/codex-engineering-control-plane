@@ -4184,6 +4184,113 @@ class HostBridgeLifecycleCompositionTests(LifecycleTests):
             ).stdout.strip(),
             head,
         )
+        race_index = object.__new__(bridge.LocalGitIndexObservation)
+        for field in (
+            "task_digest",
+            "worktree_identity",
+            "branch",
+            "head",
+            "index_tree",
+            "paths",
+            "session_id",
+            "invocation_id",
+            "observation_digest",
+        ):
+            setattr(race_index, field, getattr(index, field))
+        race_index._consumed = False
+        ref_race_authorization = fresh_commit_authorization("ref-race")
+        ref_race_inventory = inventory("inventory-commit-ref-race")
+        raced = False
+
+        def race_ref_at_commit_boundary(argv, *args, **kwargs):
+            nonlocal raced
+            if not raced and ("commit" in argv or "update-ref" in argv):
+                raced = True
+                base_tree = real_run(
+                    [
+                        "git", "-C", str(repository), "show", "-s",
+                        "--format=%T", head,
+                    ],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                ).stdout.strip()
+                competitor = real_run(
+                    [
+                        "git", "-C", str(repository), "commit-tree",
+                        base_tree, "-p", head,
+                    ],
+                    check=True,
+                    input=b"competing commit\n",
+                    stdout=subprocess.PIPE,
+                ).stdout.decode("ascii").strip()
+                real_run(
+                    [
+                        "git", "-C", str(repository), "update-ref",
+                        f"refs/heads/{branch}", competitor, head,
+                    ],
+                    check=True,
+                )
+            return real_run(argv, *args, **kwargs)
+
+        try:
+            with (
+                patch.object(
+                    bridge.subprocess,
+                    "run",
+                    side_effect=race_ref_at_commit_boundary,
+                ),
+                self.assertRaisesRegex(ValueError, "E_GIT_EFFECT"),
+            ):
+                bridge.commit_staged_change(
+                    governing_runtime=runtime,
+                    task_context=task_context,
+                    inventory=ref_race_inventory,
+                    lease=lease,
+                    index_observation=race_index,
+                    authorization=ref_race_authorization,
+                    message=message,
+                    expected_prior_head=head,
+                    session_id=session_id,
+                    invocation_id=invocation_id,
+                    tool_use_id="tool-commit-ref-race",
+                    clock=lambda: 100.0,
+                )
+        finally:
+            live_head = real_run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            if live_head != head:
+                real_run(
+                    [
+                        "git", "-C", str(repository), "update-ref",
+                        f"refs/heads/{branch}", head, live_head,
+                    ],
+                    check=True,
+                )
+        self.assertTrue(raced)
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            head,
+        )
+        self.assertEqual(
+            real_run(
+                ["git", "-C", str(repository), "write-tree"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            index.index_tree,
+        )
+        self.assertFalse(index._consumed)
         commit_boundary_clock_calls: list[float] = []
 
         def commit_boundary_clock() -> float:
@@ -4225,6 +4332,30 @@ class HostBridgeLifecycleCompositionTests(LifecycleTests):
             )
 
         new_head = committed.evidence["commit"]
+        self.assertEqual(
+            real_run(
+                [
+                    "git", "-C", str(repository), "rev-list", "--parents",
+                    "-n", "1", new_head,
+                ],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.split(),
+            [new_head, head],
+        )
+        self.assertEqual(
+            real_run(
+                [
+                    "git", "-C", str(repository), "show", "-s",
+                    "--format=%T", new_head,
+                ],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip(),
+            index.index_tree,
+        )
         validated_commit = bridge.validate_local_git_observation(
             committed,
             expected_task_digest=store.status(task_id)["task_digest"],

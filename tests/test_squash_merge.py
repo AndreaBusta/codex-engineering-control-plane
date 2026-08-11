@@ -261,6 +261,92 @@ class SquashMergeContractTests(unittest.TestCase):
             observed_merge_sha=merge_sha,
         )
 
+    def _merge_observation(self, plan, receipt):
+        import control_plane.host_bridge as bridge
+        from control_plane.contracts import contract_digest
+
+        evidence = {
+            "effect_plan_digest": plan.plan_digest,
+            "integration_receipt_digest": receipt.receipt_digest,
+            "pull_request_digest": plan.pull_request_digest,
+            "checks_digest": plan.checks_digest,
+            "merge_commit": receipt.observed_merge_sha,
+            "strategy": "squash",
+        }
+        invocation_id = f"integration-{receipt.receipt_digest[-16:]}"
+        raw = lifecycle_observation(
+            bridge.GitHubObservation,
+            observation_id=invocation_id,
+            invocation_id=invocation_id,
+            task_digest=self.run_plan["task_digest"],
+            repository_identity=str(self.repository.resolve()),
+            worktree_identity=str(self.repository.resolve()),
+            branch="codex/squash-contract",
+            prior_head=plan.head_sha,
+            target_state="merged",
+            session_id="session-integration-observation",
+            provider="github",
+            subject_digest=contract_digest(evidence),
+            evidence=evidence,
+            observed_at_monotonic=100.0,
+            freshness_deadline=130.0,
+        )
+        return bridge.validate_github_observation(
+            raw,
+            expected_task_digest=self.run_plan["task_digest"],
+            expected_repo=self.repository,
+            expected_worktree=self.repository,
+            expected_branch="codex/squash-contract",
+            expected_prior_head=plan.head_sha,
+            expected_target_state="merged",
+            expected_session_id="session-integration-observation",
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+        )
+
+    def _ready_observation(self, plan, receipt):
+        import control_plane.host_bridge as bridge
+        from control_plane.contracts import contract_digest
+
+        evidence = {
+            "effect_plan_digest": plan.plan_digest,
+            "integration_receipt_digest": receipt.receipt_digest,
+            "pull_request_digest": plan.pull_request_digest,
+            "checks_digest": plan.checks_digest,
+            "pull_request_state": "OPEN",
+            "draft": False,
+        }
+        invocation_id = f"integration-ready-{receipt.receipt_digest[-16:]}"
+        raw = lifecycle_observation(
+            bridge.GitHubObservation,
+            observation_id=invocation_id,
+            invocation_id=invocation_id,
+            task_digest=self.run_plan["task_digest"],
+            repository_identity=str(self.repository.resolve()),
+            worktree_identity=str(self.repository.resolve()),
+            branch="codex/squash-contract",
+            prior_head=plan.head_sha,
+            target_state="integration_ready",
+            session_id="session-integration-ready",
+            provider="github",
+            subject_digest=contract_digest(evidence),
+            evidence=evidence,
+            observed_at_monotonic=100.0,
+            freshness_deadline=130.0,
+        )
+        return bridge.validate_github_observation(
+            raw,
+            expected_task_digest=self.run_plan["task_digest"],
+            expected_repo=self.repository,
+            expected_worktree=self.repository,
+            expected_branch="codex/squash-contract",
+            expected_prior_head=plan.head_sha,
+            expected_target_state="integration_ready",
+            expected_session_id="session-integration-ready",
+            expected_invocation_id=invocation_id,
+            clock=lambda: 100.0,
+        )
+
     def _git_commit_pair(self) -> tuple[str, str]:
         for key, value in (
             ("user.name", "Control Plane Tests"),
@@ -314,11 +400,13 @@ class SquashMergeContractTests(unittest.TestCase):
             current_branch="codex/squash-contract",
             now="2026-08-09T10:06:00Z",
         )
+        ready = self._ready_receipt(plan)
         store.arm_integration_observe_only(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._ready_receipt(plan),
+            receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             now="2026-08-09T10:06:30Z",
         )
         ticket = store.revalidate_integration_before_execution(
@@ -334,6 +422,7 @@ class SquashMergeContractTests(unittest.TestCase):
             effect_plan=plan,
             receipt=receipt,
             current_branch="codex/squash-contract",
+            observation=self._merge_observation(plan, receipt),
         )
         return store, plan, receipt
 
@@ -626,6 +715,7 @@ class SquashMergeContractTests(unittest.TestCase):
             effect_plan=plan,
             receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             now="2026-08-09T10:06:30Z",
         )
         self.assertEqual(armed["pending_integration_effect"]["phase"], "observe_only")
@@ -646,14 +736,71 @@ class SquashMergeContractTests(unittest.TestCase):
                 current_branch="codex/squash-contract",
                 now="2026-08-09T10:06:50Z",
             )
+        pass_receipt = self._pass_receipt(plan)
         merged = publish(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._pass_receipt(plan),
+            receipt=pass_receipt,
             current_branch="codex/squash-contract",
+            observation=self._merge_observation(plan, pass_receipt),
         )
         self.assertEqual(merged["state"], "merged")
         self.assertEqual(merged["outcome_binding"]["merge_sha"], "c" * 40)
+
+    def test_publish_integration_rejects_scalar_pass_without_native_provider_observation(
+        self,
+    ) -> None:
+        store = self._seed_pr_ready_store()
+        plan = self._effect_plan()
+        store.prepare_integration(
+            "TASK-SQUASH-MERGE",
+            effect_plan=plan,
+            current_branch="codex/squash-contract",
+            now="2026-08-09T10:06:00Z",
+        )
+        ready = self._ready_receipt(plan)
+        store.arm_integration_observe_only(
+            "TASK-SQUASH-MERGE",
+            effect_plan=plan,
+            receipt=ready,
+            current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
+            now="2026-08-09T10:06:30Z",
+        )
+
+        with self.assertRaisesRegex(ValueError, "E_INTEGRATION_OBSERVATION"):
+            store.publish_integration(
+                "TASK-SQUASH-MERGE",
+                effect_plan=plan,
+                receipt=self._pass_receipt(plan),
+                current_branch="codex/squash-contract",
+            )
+
+        self.assertEqual(store.status("TASK-SQUASH-MERGE")["state"], "pr_ready")
+
+    def test_arm_integration_rejects_scalar_ready_without_native_provider_observation(
+        self,
+    ) -> None:
+        store = self._seed_pr_ready_store()
+        plan = self._effect_plan()
+        store.prepare_integration(
+            "TASK-SQUASH-MERGE",
+            effect_plan=plan,
+            current_branch="codex/squash-contract",
+            now="2026-08-09T10:06:00Z",
+        )
+
+        with self.assertRaisesRegex(ValueError, "E_INTEGRATION_OBSERVATION"):
+            store.arm_integration_observe_only(
+                "TASK-SQUASH-MERGE",
+                effect_plan=plan,
+                receipt=self._ready_receipt(plan),
+                current_branch="codex/squash-contract",
+                now="2026-08-09T10:06:30Z",
+            )
+
+        marker = store.status("TASK-SQUASH-MERGE")["pending_integration_effect"]
+        self.assertEqual(marker["phase"], "prepared")
 
     def test_execution_ticket_expires_and_failed_consume_burns_claim(self) -> None:
         import control_plane.host_bridge as bridge
@@ -666,11 +813,13 @@ class SquashMergeContractTests(unittest.TestCase):
             current_branch="codex/squash-contract",
             clock=lambda: "2026-08-09T10:06:00Z",
         )
+        ready = self._ready_receipt(plan)
         store.arm_integration_observe_only(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._ready_receipt(plan),
+            receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             clock=lambda: "2026-08-09T10:06:30Z",
         )
         current = ["2026-08-09T10:06:45Z"]
@@ -699,11 +848,13 @@ class SquashMergeContractTests(unittest.TestCase):
             current_branch="codex/squash-contract",
             clock=lambda: "2026-08-09T10:06:00Z",
         )
+        ready = self._ready_receipt(plan)
         store.arm_integration_observe_only(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._ready_receipt(plan),
+            receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             clock=lambda: "2026-08-09T10:06:30Z",
         )
         current = ["2026-08-09T10:06:45Z"]
@@ -742,6 +893,7 @@ class SquashMergeContractTests(unittest.TestCase):
             effect_plan=plan,
             receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             clock=lambda: "2026-08-09T10:09:45Z",
         )
         current = ["2026-08-09T10:09:50Z"]
@@ -770,11 +922,13 @@ class SquashMergeContractTests(unittest.TestCase):
             current_branch="codex/squash-contract",
             clock=lambda: "2026-08-09T10:06:00Z",
         )
+        ready = self._ready_receipt(plan)
         store.arm_integration_observe_only(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._ready_receipt(plan),
+            receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             clock=lambda: "2026-08-09T10:06:30Z",
         )
         current = ["2026-08-09T10:06:45Z"]
@@ -810,6 +964,7 @@ class SquashMergeContractTests(unittest.TestCase):
             effect_plan=plan,
             receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             clock=lambda: "2026-08-09T10:09:45Z",
         )
         current = ["2026-08-09T10:09:50Z"]
@@ -859,6 +1014,7 @@ class SquashMergeContractTests(unittest.TestCase):
                 effect_plan=plan,
                 receipt=stale,
                 current_branch="codex/squash-contract",
+                observation=self._ready_observation(plan, stale),
                 clock=lambda: "2026-08-09T10:06:30Z",
             )
         self.assertEqual(
@@ -875,12 +1031,14 @@ class SquashMergeContractTests(unittest.TestCase):
         future["receipt_digest"] = contract_digest(
             {key: value for key, value in future.items() if key != "receipt_digest"}
         )
+        future_receipt = IntegrationReceiptV1.from_dict(future)
         with self.assertRaisesRegex(ValueError, "E_INTEGRATION_PREPARE"):
             store.arm_integration_observe_only(
                 "TASK-SQUASH-MERGE",
                 effect_plan=plan,
-                receipt=IntegrationReceiptV1.from_dict(future),
+                receipt=future_receipt,
                 current_branch="codex/squash-contract",
+                observation=self._ready_observation(plan, future_receipt),
                 clock=lambda: "2026-08-09T10:06:30Z",
             )
 
@@ -890,6 +1048,7 @@ class SquashMergeContractTests(unittest.TestCase):
             effect_plan=plan,
             receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             clock=lambda: "2026-08-09T10:06:30Z",
         )
         with self.assertRaisesRegex(ValueError, "E_INTEGRATION_EXECUTION"):
@@ -940,12 +1099,14 @@ class SquashMergeContractTests(unittest.TestCase):
         def arm() -> None:
             started.set()
             try:
+                ready = self._ready_receipt(plan)
                 results.append(
                     store.arm_integration_observe_only(
                         "TASK-SQUASH-MERGE",
                         effect_plan=plan,
-                        receipt=self._ready_receipt(plan),
+                        receipt=ready,
                         current_branch="codex/squash-contract",
+                        observation=self._ready_observation(plan, ready),
                         clock=clock,
                     )
                 )
@@ -983,11 +1144,13 @@ class SquashMergeContractTests(unittest.TestCase):
             current_branch="codex/squash-contract",
             clock=lambda: "2026-08-09T10:06:00Z",
         )
+        ready = self._ready_receipt(plan)
         store.arm_integration_observe_only(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._ready_receipt(plan),
+            receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             clock=lambda: "2026-08-09T10:06:30Z",
         )
         current = ["2026-08-09T10:06:45Z"]
@@ -1052,11 +1215,13 @@ class SquashMergeContractTests(unittest.TestCase):
             current_branch="codex/squash-contract",
             now="2026-08-09T10:06:00Z",
         )
+        ready = self._ready_receipt(plan)
         store.arm_integration_observe_only(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._ready_receipt(plan),
+            receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             now="2026-08-09T10:06:30Z",
         )
         recovered = TaskStore(self.repository / ".git")
@@ -1095,11 +1260,13 @@ class SquashMergeContractTests(unittest.TestCase):
                 current_branch="codex/squash-contract",
                 now="2026-08-09T10:08:00Z",
             )
+        pass_receipt = self._pass_receipt(plan)
         observed = recovered.publish_integration(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._pass_receipt(plan),
+            receipt=pass_receipt,
             current_branch="codex/squash-contract",
+            observation=self._merge_observation(plan, pass_receipt),
         )
         self.assertEqual(observed["state"], "merged")
 
@@ -1122,11 +1289,13 @@ class SquashMergeContractTests(unittest.TestCase):
                 current_branch="codex/squash-contract",
                 now="2026-08-09T10:06:15Z",
             )
+        ready = self._ready_receipt(plan)
         armed = recovered.arm_integration_observe_only(
             "TASK-SQUASH-MERGE",
             effect_plan=plan,
-            receipt=self._ready_receipt(plan),
+            receipt=ready,
             current_branch="codex/squash-contract",
+            observation=self._ready_observation(plan, ready),
             now="2026-08-09T10:06:30Z",
         )
         self.assertEqual(

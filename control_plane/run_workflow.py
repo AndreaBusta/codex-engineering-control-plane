@@ -3405,7 +3405,7 @@ class RunStore:
 
 def _required_review_kinds(run_plan: Mapping[str, Any]) -> tuple[str, ...]:
     if run_plan.get("tier") not in {"T2", "T3"}:
-        raise ValueError("E_INDEPENDENT_REVIEW: tier does not require review")
+        return ()
     kinds = tuple(
         kind for gate_id, kind in (
             ("gate.independent-review", "independent"),
@@ -4839,7 +4839,7 @@ def verify_run(
     local_gates_passed = bool(receipts) and all(
         item["status"] == "PASS" for item in receipts
     )
-    if local_gates_passed and plan["tier"] in {"T2", "T3"}:
+    if local_gates_passed:
         try:
             review_manifest = ReviewArtifactStore(root).create_from_repository(
                 root,
@@ -4881,22 +4881,31 @@ def verify_run(
             "manifest": review_manifest,
             "artifact_digest": review_manifest["artifact_digest"],
         }
-    elif review_manifest is not None:
+    elif attempt_record["status"] != "PASS" and review_manifest is not None:
         ReviewArtifactStore(root).delete_exact(review_manifest)
     if attempt_record["status"] == "PASS" and plan["tier"] in {"T0", "T1"}:
-        state = task_store.transition(
+        if review_manifest is None:
+            raise ValueError(
+                "E_REVIEW_ARTIFACT: passed direct-tier run has no stable artifact"
+            )
+        state = task_store.handoff_to_local_review(
             task_id,
-            "review_ready",
-            evidence={
-                "gates_ok": True,
-                "documentation_decision": contract_digest(
-                    {
-                        "run_plan": plan["plan_digest"],
-                        "gates": [str(item["gate_id"]) for item in receipts],
-                    }
-                ),
-            },
-            current_branch=branch,
+            expected_generation=int(state["generation"]),
+            active_revision_digest=str(run_revision["revision_digest"]),
+            attempt_digest=str(attempt_record["attempt_digest"]),
+            artifact_digest=str(review_manifest["artifact_digest"]),
+            worktree=str(root),
+            branch=branch,
+            session=str(
+                state.get("implementation_session_id", plan["session_id"])
+            ),
+            policy_digest=contract_digest(policy),
+        )
+        state = publish_review_ready(
+            repository=root,
+            task_id=task_id,
+            expected_generation=int(state["generation"]),
+            receipt_digests=(),
         )
     elif attempt_record["blocked"]:
         state = block_run(

@@ -238,8 +238,9 @@ La cadena conserva `review_head → committed_head → pushed_head → PR →
 merge_sha`. Cada plan y receipt durable es cerrado, ligado y
 `authorizes=false`: evidencia y autoridad son fronteras distintas.
 
-Frontera real: el bridge Python ejecuta Git local allowlisted (`git add`/`git
-commit`). En prepare/arm/revalidate, el kernel hace observación remota con `git
+Frontera real: el bridge Python ejecuta Git local allowlisted (`git add`;
+commit con `git commit-tree` y `git update-ref` CAS). En
+prepare/arm/revalidate, el kernel hace observación remota con `git
 ls-remote` read-only. Las mutaciones push/PR/squash merge son host-native:
 Python no recibe autoridad. Sin adaptador nativo quedan `BLOCKED`; los fixtures
 de tests no hacen disponible esa ruta.
