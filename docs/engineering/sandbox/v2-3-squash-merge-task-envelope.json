@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "task_id": "TASK-V23-SANDBOX-SQUASH-MERGE",
+  "objective": "In a separately selected disposable private GitHub sandbox, implement one bounded fixture change and continue through an explicitly requested squash merge and observed base containment.",
+  "intent": "integrate",
+  "phase": "integrate",
+  "requested_outcome": "integration",
+  "goals": [
+    {
+      "id": "sandbox-change",
+      "summary": "Implement the bounded fixture change without touching the base branch directly.",
+      "domains": [
+        "project"
+      ],
+      "depends_on": []
+    },
+    {
+      "id": "sandbox-pr-ready",
+      "summary": "Verify the change and observe the exact ready pull request and required checks.",
+      "domains": [
+        "project"
+      ],
+      "depends_on": [
+        "sandbox-change"
+      ]
+    },
+    {
+      "id": "sandbox-squash",
+      "summary": "Perform only the separately requested squash merge and observe its merge SHA.",
+      "domains": [
+        "project"
+      ],
+      "depends_on": [
+        "sandbox-pr-ready"
+      ]
+    },
+    {
+      "id": "sandbox-base-observed",
+      "summary": "Refresh the exact base ref and prove that it contains the observed merge SHA.",
+      "domains": [
+        "project"
+      ],
+      "depends_on": [
+        "sandbox-squash"
+      ]
+    }
+  ],
+  "domains": [
+    "project"
+  ],
+  "signals": [
+    "multi_file",
+    "regression_risk",
+    "external_effect",
+    "irreversible"
+  ],
+  "scope_paths": [
+    "sandbox/change.txt",
+    "sandbox/test_change.py"
+  ],
+  "risk": {
+    "uncertainty": 2,
+    "blast_radius": 2,
+    "irreversibility": 3,
+    "verification_complexity": 3
+  },
+  "risk_provenance": "model_inference",
+  "effects": [
+    {
+      "name": "local_read",
+      "source": "model_inference"
+    },
+    {
+      "name": "local_write",
+      "source": "model_inference"
+    },
+    {
+      "name": "commit",
+      "source": "model_inference"
+    },
+    {
+      "name": "remote_write",
+      "source": "model_inference"
+    },
+    {
+      "name": "pull_request",
+      "source": "model_inference"
+    },
+    {
+      "name": "integration",
+      "source": "model_inference"
+    }
+  ],
+  "explicit_resources": [],
+  "excluded_resources": []
+}

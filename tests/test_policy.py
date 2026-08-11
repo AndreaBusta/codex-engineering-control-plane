@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 from hashlib import sha256
+import os
 import shutil
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -843,7 +845,95 @@ class PolicyContractTests(unittest.TestCase):
             )
             import control_plane.policy as policy_module
 
+            fake_bin = Path(temp_dir) / "fake-policy-bin"
+            fake_bin.mkdir()
+            fake_marker = Path(temp_dir) / "fake-policy-git-executed"
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/bin/sh\n"
+                f": > {shlex.quote(str(fake_marker))}\n"
+                f"printf '%s\\n' {shlex.quote(head)}\n",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o700)
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(root),
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "test: policy authorization head drift",
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            drift_head = subprocess.run(
+                ["/usr/bin/git", "-C", str(root), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            drift_authorization = write_authorization("head-drift")
+            try:
+                with patch.dict(
+                    os.environ, {"PATH": str(fake_bin)}, clear=False
+                ), patch(
+                    "control_plane.policy._atomic_policy_json",
+                    side_effect=RuntimeError(
+                        "reached policy mutation after stale HEAD"
+                    ),
+                ):
+                    try:
+                        apply_project_remote_policy_update(
+                            draft,
+                            governing_runtime=runtime,
+                            remote_policy_decision=decision,
+                            authorization=drift_authorization,
+                            expected_generation=0,
+                            clock=lambda: 100.0,
+                        )
+                    except Exception as error:
+                        drift_outcome = str(error)
+                    else:
+                        drift_outcome = "policy mutation returned"
+            finally:
+                subprocess.run(
+                    [
+                        "/usr/bin/git",
+                        "-C",
+                        str(root),
+                        "update-ref",
+                        "refs/heads/main",
+                        head,
+                        drift_head,
+                    ],
+                    check=True,
+                )
+
+            observed_head_environments: list[dict[str, str]] = []
+            actual_run = subprocess.run
+
+            def observe_policy_head(arguments, **kwargs):
+                closed = tuple(str(item) for item in arguments)
+                if closed[-2:] == ("rev-parse", "HEAD"):
+                    observed_head_environments.append(dict(kwargs["env"]))
+                return actual_run(arguments, **kwargs)
+
+            sensitive = {
+                "AWS_SECRET_ACCESS_KEY": "canary-not-a-secret",
+                "GH_TOKEN": "canary-not-a-secret",
+                "HTTPS_PROXY": "http://canary.invalid",
+                "SSH_AUTH_SOCK": "/tmp/canary-policy-agent.sock",
+            }
             with (
+                patch.dict(os.environ, sensitive, clear=False),
+                patch(
+                    "control_plane.policy.subprocess.run",
+                    side_effect=observe_policy_head,
+                ),
                 patch(
                     "control_plane.policy._recover_policy_update_locked",
                     side_effect=RuntimeError(
@@ -863,6 +953,20 @@ class PolicyContractTests(unittest.TestCase):
                     clock=lambda: 100.0,
                 )
 
+            sensitive_leaked = any(
+                set(sensitive).intersection(environment)
+                for environment in observed_head_environments
+            )
+            self.assertEqual(
+                (
+                    fake_marker.exists(),
+                    "E_AUTH_UNTRUSTED_CHANNEL" in drift_outcome,
+                    drift_authorization._consumed,
+                    bool(observed_head_environments),
+                    sensitive_leaked,
+                ),
+                (False, True, False, True, False),
+            )
             self.assertEqual(
                 load_policy(target)["git"]["remote"], "origin"
             )

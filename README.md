@@ -36,6 +36,14 @@ Un cambio local o un PR abierto no se describe como integrado hasta demostrar
 el squash en `origin/main`. La protección de rama, CI y los proveedores de
 release siguen siendo fronteras externas y requieren sus propias evidencias.
 
+La rama candidata v2.3 añade contratos cerrados para review, delivery y
+verificación de base. Frontera real: el bridge Python ejecuta Git local
+allowlisted (`git add`; commit con `git commit-tree` y `git update-ref` CAS).
+En prepare/arm/revalidate, el kernel hace
+observación remota con `git ls-remote` read-only. Las mutaciones push/PR/squash
+merge son host-native: Python no recibe autoridad. Sin adaptador nativo quedan
+`BLOCKED`; los adapters de tests solo validan el contrato.
+
 ## Inicio rápido
 
 ```bash
@@ -113,6 +121,35 @@ scripts/control-plane adopt rollback --target /ruta/al/repositorio
 scripts/control-plane upgrade plan --target /ruta/al/repositorio
 ```
 
+### Recorrido local acotado (candidato v2.2)
+
+La skill `control-plane-run` encuadra una petición de Codex como
+`TaskEnvelope v1`; la CLI conserva policy, lease, intentos y recibos. Esta
+superficie aún no es una release v2.2 ni realiza efectos Git remotos.
+
+```bash
+scripts/control-plane run prepare \
+  --repo /ruta/al/repositorio \
+  --task /ruta/segura/task-envelope.json \
+  --session-id session-example-001 \
+  --json
+scripts/control-plane run verify \
+  --repo /ruta/al/repositorio \
+  --task-id TASK-EXAMPLE-001 \
+  --json
+scripts/control-plane run status \
+  --repo /ruta/al/repositorio \
+  --task-id TASK-EXAMPLE-001 \
+  --json
+scripts/control-plane report --repo /ruta/al/repositorio --since 30d --format markdown
+```
+
+El perfil implementado está cerrado para este Control Plane. Admite tres
+ejecuciones totales y bloquea `UNKNOWN`, deriva de HEAD/branch/policy, cambios
+fuera del lease, alcance creciente o una causa de fallo repetida. `review_ready`
+es una entrega local revisable; no significa PR creada ni autoridad de
+commit/push/PR.
+
 ### Diagnosticar riesgo local
 
 ```bash
@@ -160,6 +197,10 @@ scripts/control-plane git-guard pre-push
 - [Multidominio y recomendación de `/plan` o `/goal`](docs/engineering/12-multidominio-y-modos.md)
 - [Aclaración y riesgo local-audit v2.1](docs/engineering/13-clarification-and-risk-local-audit.md)
 - [ADR 0003: núcleo local-audit](docs/adr/0003-local-audit-kernel-v2-1.md)
+- [ADR 0005: autoridad outcome host-bound](docs/adr/0005-host-bound-outcome-authorization.md)
+- [Threat model del outcome bridge v2.3](docs/security/2026-08-08-v2-3-outcome-bridge-threat-model.md)
+- [Rollback del outcome bridge](docs/engineering/16-outcome-bridge-rollback.md)
+- [Gobernador nativo y plugin fino v2.4](docs/engineering/18-native-governor-plugin.md)
 - [Threat model](SECURITY.md)
 
 ## Límites
@@ -172,6 +213,7 @@ El control plane no:
 - sustituye Rulesets o checks obligatorios;
 - prueba el estado de TestFlight sin consultar Apple;
 - calcula tokens exactos sin telemetría de plataforma;
+- descubre comandos genéricos de verificación fuera del perfil cerrado;
 - resuelve aclaraciones de forma durable sin interacción nativa;
 - instala workflows o modifica CI/CD durante la adopción local;
 - trata un hook o plugin como frontera completa de seguridad.

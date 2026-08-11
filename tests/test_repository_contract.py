@@ -24,6 +24,295 @@ def _read_python_tree(root: Path, pattern: str = "*.py") -> str:
 
 
 class RepositoryContractTests(unittest.TestCase):
+    def test_productive_git_diff_uses_the_shared_closed_normalizer(self) -> None:
+        from control_plane.repository import trusted_git_argv
+        from tests.contract_support import (
+            git_diff_contract,
+            git_subprocess_contract,
+        )
+
+        inventory, issues = git_diff_contract(ROOT / "control_plane")
+        subprocess_inventory, subprocess_issues = git_subprocess_contract(
+            ROOT / "control_plane"
+        )
+        argv = trusted_git_argv(ROOT, ("diff", "--check"))
+        separator = argv.index("diff")
+        path_argv = trusted_git_argv(
+            ROOT,
+            ("diff", "--no-textconv", "--", "--no-ext-diff"),
+        )
+        path_diff = path_argv[path_argv.index("diff") :]
+        path_separator = path_diff.index("--")
+
+        self.assertGreaterEqual(len(inventory), 7)
+        self.assertEqual(
+            argv[separator : separator + 3],
+            ["diff", "--no-ext-diff", "--no-textconv"],
+        )
+        self.assertEqual(
+            path_diff[:path_separator].count("--no-ext-diff"), 1
+        )
+        self.assertEqual(
+            path_diff[:path_separator].count("--no-textconv"), 1
+        )
+        self.assertEqual(path_diff[path_separator:], ["--", "--no-ext-diff"])
+        self.assertEqual(issues, ())
+        self.assertEqual(subprocess_issues, ())
+        for expected in (
+            ("run_workflow.py", "_capture_git"),
+            ("lifecycle.py", "_verification_git"),
+        ):
+            use = next(
+                item
+                for item in subprocess_inventory
+                if (item.relative_path, item.function) == expected
+            )
+            self.assertEqual(use.command_origin, "call:trusted_git_argv")
+
+    def test_cached_name_only_diff_exception_does_not_read_worktree_content(
+        self,
+    ) -> None:
+        from control_plane.host_bridge import (
+            _closed_git_argv,
+            _sanitized_git_environment,
+        )
+        from tests.git_test_support import (
+            GitScenario,
+            git,
+            install_external_diff_driver,
+        )
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        marker = install_external_diff_driver(
+            scenario.repo,
+            scenario.root,
+            tracked_path="baseline.txt",
+            driver_name="cached-name-only-driver",
+        )
+        git(scenario.repo, "add", "baseline.txt")
+
+        completed = subprocess.run(
+            _closed_git_argv(
+                scenario.repo,
+                ["diff", "--cached", "--name-only", "-z"],
+            ),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_sanitized_git_environment(),
+            timeout=10,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, b"baseline.txt\0")
+        self.assertFalse(marker.exists())
+
+    def test_productive_git_diff_contract_rejects_direct_absolute_bypass(
+        self,
+    ) -> None:
+        from tests.contract_support import git_diff_contract
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            (runtime / "repository.py").write_text(
+                """\
+def _normalize_trusted_git_arguments(arguments):
+    return arguments
+
+def trusted_git_argv(repository, arguments):
+    normalized = _normalize_trusted_git_arguments(arguments)
+    return [\"/usr/bin/git\", \"-C\", str(repository), *normalized]
+""",
+                encoding="utf-8",
+            )
+            (runtime / "unsafe.py").write_text(
+                """\
+import subprocess
+
+def observe(repository):
+    return subprocess.run(
+        [\"/usr/bin/git\", \"-C\", str(repository), \"diff\", \"HEAD\"],
+        env=trusted_git_environment(),
+    )
+
+def observe_resolved(repository):
+    executable = trusted_git_executable()
+    return subprocess.run(
+        [executable, \"-C\", str(repository), \"diff\", \"HEAD\"],
+        env=trusted_git_environment(),
+    )
+""",
+                encoding="utf-8",
+            )
+
+            _, issues = git_diff_contract(runtime)
+
+        self.assertTrue(
+            any(
+                issue.startswith(
+                    "GIT_DIFF_BYPASSES_NORMALIZER:unsafe.py:observe:"
+                )
+                for issue in issues
+            ),
+            issues,
+        )
+        self.assertTrue(
+            any(
+                issue.startswith(
+                    "GIT_DIFF_BYPASSES_NORMALIZER:unsafe.py:observe_resolved:"
+                )
+                for issue in issues
+            ),
+            issues,
+        )
+
+    def test_productive_git_subprocesses_are_closed_and_inventoried(self) -> None:
+        from tests.contract_support import git_subprocess_contract
+
+        inventory, issues = git_subprocess_contract(ROOT / "control_plane")
+        observed = {
+            (item.relative_path, item.function) for item in inventory
+        }
+
+        self.assertTrue(
+            {
+                ("adoption.py", "_git"),
+                ("cli.py", "_refresh_remote_base"),
+                ("cli.py", "_run_local_git"),
+                ("host_bridge.py", "commit_staged_change"),
+                ("host_bridge.py", "stage_allowlisted_paths"),
+                ("policy.py", "apply_project_remote_policy_update"),
+            }.issubset(observed)
+        )
+        self.assertEqual(issues, ())
+
+    def test_productive_git_subprocess_contract_rejects_ambient_git(self) -> None:
+        from tests.contract_support import git_subprocess_contract
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            (runtime / "unsafe.py").write_text(
+                """\
+import subprocess
+import shutil
+
+def observe(repo):
+    environment = git_environment()
+    return subprocess.run(["git", "-C", str(repo), "status"], env=environment)
+
+def observe_via_path(repo):
+    executable = shutil.which("git")
+    return subprocess.run(
+        [executable, "-C", str(repo), "status"],
+        env=trusted_git_environment(),
+    )
+
+def observe_via_env(repo):
+    return subprocess.run(
+        ["/usr/bin/env", "git", "-C", str(repo), "status"],
+        env=trusted_git_environment(),
+    )
+
+def observe_with_unknown_env(repo):
+    environment = inherited_environment()
+    return subprocess.run(
+        trusted_git_argv(repo, ("status",)),
+        env=environment,
+    )
+""",
+                encoding="utf-8",
+            )
+
+            inventory, issues = git_subprocess_contract(runtime)
+
+        self.assertEqual(len(inventory), 4)
+        self.assertEqual(
+            {issue.split(":", 1)[0] for issue in issues},
+            {
+                "GIT_AMBIENT_EXECUTABLE",
+                "GIT_AMBIENT_ENVIRONMENT",
+                "GIT_UNCLOSED_ENVIRONMENT",
+            },
+        )
+
+    def test_authenticated_refresh_exception_rejects_wholesale_environment(
+        self,
+    ) -> None:
+        from tests.contract_support import git_subprocess_contract
+
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            (runtime / "cli.py").write_text(
+                """\
+import subprocess
+
+def _refresh_remote_base(repo):
+    environment = git_environment()
+    return subprocess.run(
+        trusted_git_argv(repo, ("fetch", "origin")),
+        env=environment,
+    )
+""",
+                encoding="utf-8",
+            )
+
+            _, issues = git_subprocess_contract(runtime)
+
+        self.assertTrue(
+            any(
+                issue.startswith("GIT_AMBIENT_ENVIRONMENT:cli.py:")
+                for issue in issues
+            ),
+            issues,
+        )
+
+    def test_authenticated_refresh_exception_rejects_ambient_helper_builder(
+        self,
+    ) -> None:
+        from tests.contract_support import git_subprocess_contract
+
+        mutations = (
+            "environment.update(os.environ)",
+            'environment["GH_TOKEN"] = os.environ["GH_TOKEN"]',
+        )
+        for mutation in mutations:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                runtime = Path(temporary)
+                (runtime / "cli.py").write_text(
+                    f"""\
+import os
+import subprocess
+
+def _authenticated_git_environment(remote_url):
+    environment = trusted_git_environment()
+    {mutation}
+    return environment
+
+def _refresh_remote_base(repo):
+    environment = _authenticated_git_environment("https://example.invalid/repo")
+    return subprocess.run(
+        trusted_git_argv(repo, ("fetch", "https://example.invalid/repo")),
+        env=environment,
+    )
+""",
+                    encoding="utf-8",
+                )
+
+                _, issues = git_subprocess_contract(runtime)
+
+            self.assertTrue(
+                any(
+                    issue.startswith("GIT_UNCLOSED_ENVIRONMENT:cli.py:")
+                    for issue in issues
+                ),
+                issues,
+            )
+
     def test_shadow_receipt_detector_covers_factories_and_aliases(self) -> None:
         for source in (
             "def issue_authorization_receipt(): ...",
@@ -647,6 +936,428 @@ jobs:
                 for path in project_skills
             )
         )
+
+    def test_v23_outcome_bridge_decision_security_and_rollback_are_linked(self) -> None:
+        adr_path = (
+            ROOT / "docs" / "adr"
+            / "0005-host-bound-outcome-authorization.md"
+        )
+        threat_path = (
+            ROOT / "docs" / "security"
+            / "2026-08-08-v2-3-outcome-bridge-threat-model.md"
+        )
+        rollback_path = (
+            ROOT / "docs" / "engineering"
+            / "16-outcome-bridge-rollback.md"
+        )
+        for path in (adr_path, threat_path, rollback_path):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file())
+
+        adr = " ".join(adr_path.read_text(encoding="utf-8").lower().split())
+        for contract in (
+            "host-bound",
+            "per-effect",
+            "serializable grants",
+            "second agent",
+            "mutable cli",
+            "evidence is not authority",
+        ):
+            with self.subTest(adr=contract):
+                self.assertIn(contract, adr)
+
+        threat = threat_path.read_text(encoding="utf-8")
+        for contract in (
+            "Assets",
+            "Trust boundaries",
+            "replay",
+            "drift",
+            "stale review",
+            "uncertain write",
+            "commit-tree",
+            "update-ref",
+            "READY/PASS integration observations",
+            "Local guards are not GitHub branch protection",
+            "Residual risks",
+        ):
+            with self.subTest(threat=contract):
+                self.assertIn(contract, threat)
+
+        rollback = " ".join(
+            rollback_path.read_text(encoding="utf-8").lower().split()
+        )
+        for contract in (
+            "before commit",
+            "after local commit",
+            "after push or pr",
+            "uncertain remote write",
+            "post-merge verification",
+            "observe before retry",
+            "zero second write",
+            "`reset --hard`",
+            "force-push",
+            "automatic pr closure",
+            "automatic remote rollback",
+        ):
+            with self.subTest(rollback=contract):
+                self.assertIn(contract, rollback)
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        git_guide = (
+            ROOT / "docs" / "engineering" / "02-git-pr-merge.md"
+        ).read_text(encoding="utf-8")
+        recovery = (
+            ROOT / "docs" / "engineering" / "06-recovery.md"
+        ).read_text(encoding="utf-8")
+        lifecycle = (
+            ROOT / "docs" / "engineering"
+            / "11-lifecycle-hooks-adoption.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "docs/adr/0005-host-bound-outcome-authorization.md", readme
+        )
+        self.assertIn(
+            "docs/security/2026-08-08-v2-3-outcome-bridge-threat-model.md",
+            readme,
+        )
+        self.assertIn(
+            "docs/engineering/16-outcome-bridge-rollback.md", readme
+        )
+        self.assertIn(
+            "2026-08-08-v2-3-outcome-bridge-threat-model.md", security
+        )
+        self.assertIn("16-outcome-bridge-rollback.md", recovery)
+        self.assertIn("evidence != authority", git_guide)
+        self.assertIn("PR LISTA", lifecycle)
+        self.assertIn("native host adapter", lifecycle)
+
+    def test_v23_docs_state_the_real_execution_and_egress_boundaries(self) -> None:
+        documents = {
+            "README": ROOT / "README.md",
+            "lifecycle": (
+                ROOT / "docs" / "engineering"
+                / "11-lifecycle-hooks-adoption.md"
+            ),
+            "skill": ROOT / "skills" / "control-plane-run" / "SKILL.md",
+        }
+        required = (
+            "git local allowlisted",
+            "`git ls-remote` read-only",
+            "prepare/arm/revalidate",
+            "push/pr/squash merge",
+            "host-native",
+            "python no recibe autoridad",
+            "`blocked`",
+        )
+        forbidden = (
+            "python productivo no ejecuta esos efectos",
+            "kernel python no ejecuta git remoto",
+            "sin egress",
+        )
+        for name, path in documents.items():
+            text = " ".join(path.read_text(encoding="utf-8").lower().split())
+            for claim in required:
+                with self.subTest(document=name, required=claim):
+                    self.assertIn(claim, text)
+            for claim in forbidden:
+                with self.subTest(document=name, forbidden=claim):
+                    self.assertNotIn(claim, text)
+
+    def test_v23_promotion_truth_requires_pr_ready_before_separate_squash(self) -> None:
+        spec = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-08-control-plane-v2-3-outcome-bridge-design.md"
+        ).read_text(encoding="utf-8")
+        plan = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-08-08-control-plane-v2-3-outcome-bridge.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("implementación no iniciada", spec)
+        for text in (spec, plan):
+            with self.subTest(text=text[:20]):
+                self.assertIn("implementación local verificada", text)
+                self.assertIn("PR LISTA", text)
+                self.assertIn("sandbox privado", text)
+                self.assertIn("hasta squash merge", text)
+                self.assertIn("2.1.1", text)
+                self.assertIn("digest", text)
+
+        self.assertIn("gate operativo predeterminado", spec)
+        self.assertIn("promoción de release separada", spec)
+        self.assertIn("no se exige ni ejecuta", plan)
+
+        boundary = (
+            "`frame_effect_authorization` recibe `NativeUserInteractionEvent` "
+            "y `HostAdapterCapability`",
+            "Python bridge recibe y consume la autorización nativa solo para Git "
+            "local allowlisted (`git add`; commit con `git commit-tree` y "
+            "`git update-ref` CAS)",
+            "kernel puede observar con `git ls-remote` read-only",
+            "push/PR/squash merge son host-native",
+        )
+        for text in (spec, plan):
+            normalized = " ".join(text.split())
+            for claim in boundary:
+                with self.subTest(text=text[:20], claim=claim):
+                    self.assertIn(claim, normalized)
+            self.assertNotIn("«hasta merge»", text)
+            self.assertNotIn("703/703", text)
+
+        task_7 = plan.split("### Task 7:", 1)[1].split("### Task 8:", 1)[0]
+        self.assertIn("«hasta squash merge»", task_7)
+        self.assertNotIn("«hasta merge»", task_7)
+        self.assertIn("- [ ] **Step 4b:", plan)
+        self.assertNotIn("test_outcome_authorization", plan)
+        self.assertIn("`test_git_outcome_bridge`", plan)
+        self.assertIn("`test_independent_review`", plan)
+        self.assertIn("dirty worktree", plan)
+        self.assertIn("untracked", plan)
+        self.assertIn(
+            "codex-control-plane/candidates/v2-3-local-candidate.json", plan
+        )
+        self.assertIn("LocalCandidateReceiptV1", plan)
+        for dynamic_claim in (
+            "sha256:816a2e94c99f0b56f7c654682ab50d74cf31ee6487dd4c0651f646037fbf122c",
+            "705/705",
+            "18 tracked",
+            "14 untracked",
+            "review_status=",
+            "RECORDED_IN_CANDIDATE_RECEIPT",
+            "PENDING_FRESH_FULL_SUITE",
+            "PENDING_RUNTIME_DIGEST",
+            "PENDING_REVIEW_SUBJECT_DIGEST",
+            "PENDING_SECURITY_SNAPSHOT",
+        ):
+            with self.subTest(dynamic_claim=dynamic_claim):
+                self.assertNotIn(dynamic_claim, plan)
+
+        task_8 = plan.split("### Task 8:", 1)[1].split("## Verification matrix", 1)[0]
+        self.assertIn("- [ ] **Step 2:", task_8)
+        self.assertIn("LocalCandidateReceiptV1", task_8)
+        matrix = plan.split("## Verification matrix", 1)[1].split(
+            "## Continuación", 1
+        )[0]
+        authorization_row = next(
+            line for line in matrix.splitlines() if "Outcome authority" in line
+        )
+        self.assertIn("test_lifecycle", authorization_row)
+        self.assertIn("replay", authorization_row)
+        continuation = plan.split("## Continuación", 1)[1]
+        self.assertIn("LocalCandidateReceiptV1", continuation)
+        self.assertIn("codex-control-plane/candidates/v2-3-local-candidate.json", continuation)
+        self.assertNotIn("705/705", continuation)
+        self.assertNotIn("review_status", continuation)
+
+    def test_v23_native_sandbox_packets_are_valid_and_fail_closed(self) -> None:
+        from control_plane.contracts import validate_task_envelope
+
+        sandbox_root = ROOT / "docs" / "engineering" / "sandbox"
+        cases = (
+            (
+                sandbox_root / "v2-3-pr-ready-task-envelope.json",
+                "TASK-V23-SANDBOX-PR-READY",
+                "pull_request",
+                {"local_read", "local_write", "commit", "remote_write", "pull_request"},
+            ),
+            (
+                sandbox_root / "v2-3-squash-merge-task-envelope.json",
+                "TASK-V23-SANDBOX-SQUASH-MERGE",
+                "integration",
+                {
+                    "local_read",
+                    "local_write",
+                    "commit",
+                    "remote_write",
+                    "pull_request",
+                    "integration",
+                },
+            ),
+        )
+        for path, task_id, requested_outcome, effects in cases:
+            with self.subTest(path=path.name):
+                envelope = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(validate_task_envelope(envelope), [])
+                self.assertEqual(envelope["task_id"], task_id)
+                self.assertEqual(envelope["requested_outcome"], requested_outcome)
+                self.assertEqual(
+                    {effect["name"] for effect in envelope["effects"]}, effects
+                )
+                self.assertTrue(
+                    all(
+                        effect["source"] == "model_inference"
+                        for effect in envelope["effects"]
+                    )
+                )
+                serialized = json.dumps(envelope, sort_keys=True).lower()
+                for forbidden in (
+                    "trustedauthorization",
+                    "nativeuserinteractionevent",
+                    "hostadaptercapability",
+                    "outcomeauthorizationcontext",
+                    "nonce",
+                    "credential",
+                    "authorizes",
+                ):
+                    self.assertNotIn(forbidden, serialized)
+
+        bindings = json.loads(
+            (sandbox_root / "v2-3-native-sandbox-bindings.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            set(bindings), {"schema_version", "status", "authorizes", "packets"}
+        )
+        self.assertEqual(bindings["schema_version"], 1)
+        self.assertEqual(bindings["status"], "PENDING_SANDBOX_TARGET")
+        self.assertFalse(bindings["authorizes"])
+        self.assertEqual(len(bindings["packets"]), 2)
+        for packet in bindings["packets"]:
+            self.assertIsNone(packet["repository"])
+            self.assertIsNone(packet["base"])
+            self.assertIsNone(packet["review_head"])
+            self.assertIsNone(packet["required_checks"])
+            self.assertEqual(
+                packet["scope_paths"],
+                ["sandbox/change.txt", "sandbox/test_change.py"],
+            )
+            self.assertTrue(packet["recovery"])
+            self.assertTrue(packet["rollback"])
+
+        runbook = (
+            ROOT / "docs" / "engineering"
+            / "17-v2-3-native-sandbox-promotion.md"
+        ).read_text(encoding="utf-8")
+        for contract in (
+            "PENDING_SANDBOX_TARGET",
+            "authorizes=false",
+            "review_head → committed_head",
+            "merge_sha ∈ origin/<base>",
+            "observe before retry",
+            "zero second write",
+            "real Codex task and shell tools",
+            "never the Python test adapter",
+            "PR LISTA",
+            "hasta squash merge",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, runbook)
+
+    def test_v23_candidate_store_documents_durable_pair_and_recovery(self) -> None:
+        spec = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-08-control-plane-v2-3-outcome-bridge-design.md"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(spec.split())
+
+        for contract in (
+            "parent owner-safe `0755`",
+            "sin `chmod`",
+            "`candidates` permanece `0700`",
+            "canonical y exactamente un pending reservado",
+            "`nlink=2`",
+            "64 hex completos de su `receipt_digest`",
+            "nombre y contenido coincidan exactamente",
+            "`nlink=1` sigue siendo válido únicamente como formato legacy",
+            "orphan pending",
+            "inventario acotado",
+            "descriptor-relative",
+            "nunca ejecuta cleanup ni `unlink`",
+            "partial pre-link",
+            "ruta pública única",
+            "preserva y falla cerrado",
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, normalized)
+        self.assertNotIn("Crea ancestros privados `0700`", spec)
+
+    def test_v24_native_governor_plugin_has_a_reversible_operating_contract(self) -> None:
+        design = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-10-control-plane-v2-4-native-governor-design.md"
+        )
+        plan = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "plans"
+            / "2026-08-10-control-plane-v2-4-native-governor.md"
+        )
+        runbook = ROOT / "docs" / "engineering" / "18-native-governor-plugin.md"
+        manifest = ROOT / "plugins" / "control-plane" / ".codex-plugin" / "plugin.json"
+
+        missing = [path for path in (design, plan, runbook, manifest) if not path.is_file()]
+        self.assertEqual(missing, [])
+
+        normalized = " ".join(runbook.read_text(encoding="utf-8").lower().split())
+        for required in (
+            "skill-only",
+            "advisory",
+            "no scheduler",
+            "máximo dos workers",
+            "un solo writer",
+            "cursor",
+            "checkpoint terminal",
+            "facts_only",
+            "10/3",
+            "global skill",
+            "fail-closed",
+            "instalación transaccional",
+            "rollback",
+            "plugin candidate",
+            "no es una release",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized)
+
+        for required in (
+            "scaffold oficial solo en la instalación inicial",
+            "conservar la entrada y source existentes",
+            "cachebuster",
+            "codex plugin add",
+            "duplicado activo",
+            "$control-plane:control-plane-run",
+            "afecta solo esa operación",
+            "continúa todo trabajo local seguro",
+            "result, evidence, remaining_work, pending_effects, authorizes=false",
+            "tareas dogfood completadas",
+            "todo lo demás es false",
+            "counts unknown no disparan v2.5",
+        ):
+            with self.subTest(update_contract=required):
+                self.assertIn(required, normalized)
+        self.assertNotIn("se crea o actualiza la entrada mediante el scaffold", normalized)
+
+        design_text = " ".join(design.read_text(encoding="utf-8").lower().split())
+        plan_text = " ".join(plan.read_text(encoding="utf-8").lower().split())
+        for text in (design_text, plan_text):
+            self.assertIn("mensaje nativo actual", text)
+            self.assertIn("petición terminal sola", text)
+            self.assertIn("continúa sin crear", text)
+        self.assertNotIn("petición terminal explícita", plan_text)
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("docs/engineering/18-native-governor-plugin.md", readme)
+
+        plugin = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(plugin["name"], "control-plane")
+        self.assertEqual(plugin["version"], "3.0.0")
+        for forbidden in ("hooks", "mcpServers", "apps"):
+            self.assertNotIn(forbidden, plugin)
 
     def test_no_unresolved_placeholders(self) -> None:
         forbidden = re.compile(

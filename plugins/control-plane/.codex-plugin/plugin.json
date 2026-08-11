@@ -1,0 +1,18 @@
+{
+  "name": "control-plane",
+  "version": "3.0.0",
+  "description": "Native-governed Control Plane workflows for Codex.",
+  "author": {
+    "name": "Codex Engineering Control Plane"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Control Plane",
+    "shortDescription": "Run bounded engineering without internal prompts.",
+    "longDescription": "Routes verified work, governs native tasks, and preserves host-only authority.",
+    "developerName": "Codex Engineering Control Plane",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Use $control-plane:control-plane-run to finish this engineering task safely."
+  }
+}

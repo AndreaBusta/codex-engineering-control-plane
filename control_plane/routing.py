@@ -86,6 +86,15 @@ EFFECT_MINIMUM_OUTCOME = {
     "deploy": 5,
     "publish": 5,
 }
+_RUN_OUTCOMES = frozenset({
+    "local_change", "commit", "pull_request", "integration",
+})
+_DEFERRED_EFFECTS_BY_OUTCOME = {
+    "local_change": (),
+    "commit": ("commit",),
+    "pull_request": ("commit", "remote_write", "pull_request"),
+    "integration": ("commit", "remote_write", "pull_request", "integration"),
+}
 DOCUMENTS = (
     "plan",
     "adr",
@@ -114,6 +123,14 @@ CONTEXT_UNITS = {
     "medium": 4,
     "large": 8,
 }
+
+
+def deferred_effects_for_outcome(requested_outcome: object) -> list[str]:
+    """Return the closed, non-authorizing future-effect sequence for a run."""
+
+    if requested_outcome not in _RUN_OUTCOMES:
+        raise ValueError("E_RUN_OUTCOME: outcome is not supported by run prepare")
+    return list(_DEFERRED_EFFECTS_BY_OUTCOME[str(requested_outcome)])
 
 
 def _tier(task: Mapping[str, Any]) -> str:

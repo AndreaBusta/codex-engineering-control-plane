@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import argparse
 from contextlib import redirect_stdout
 import io
 import json
+import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.git_test_support import GitScenario
 from tests.git_test_support import FIXTURE_POLICY
@@ -393,6 +397,76 @@ class CliV2Tests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_verification_run_ignores_fake_path_and_binds_real_head(self) -> None:
+        from control_plane.cli import command_verification_run
+        from control_plane.lifecycle import TaskLease, TaskStore
+        from control_plane.repository import worktree_git_dir
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        branch = "codex/verification-real-head"
+        scenario.checkout_feature(branch)
+        state_dir = worktree_git_dir(scenario.repo)
+        task_id = "TASK-VERIFY-REAL-HEAD"
+        TaskStore(state_dir).start(
+            task_id,
+            outcome="local_change",
+            branch=branch,
+            task_digest=self.digest,
+            decision_digest=self.digest,
+        )
+        TaskLease.acquire(
+            state_dir,
+            task_id=task_id,
+            worktree=str(scenario.repo),
+            branch=branch,
+            session_id="session-verify-real-head",
+            paths=["."],
+            policy_digest=self.digest,
+        )
+        stale_head = git(scenario.repo, "rev-parse", "HEAD")
+        git(
+            scenario.repo,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "test: verification head drift",
+        )
+        current_head = git(scenario.repo, "rev-parse", "HEAD")
+        fake_bin = scenario.root / "fake-verification-bin"
+        fake_bin.mkdir()
+        marker = scenario.root / "fake-verification-git-executed"
+        executable = fake_bin / "git"
+        executable.write_text(
+            "#!/bin/sh\n"
+            f": > {shlex.quote(str(marker))}\n"
+            f"printf '%s\\n' {shlex.quote(stale_head)}\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+        captured: dict[str, object] = {}
+
+        def capture_context(**kwargs):
+            captured.update(kwargs)
+            raise ValueError("E_TEST_STOP: context captured")
+
+        with patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False), patch(
+            "control_plane.cli.create_verification_execution_context",
+            side_effect=capture_context,
+        ), redirect_stdout(io.StringIO()):
+            exit_code = command_verification_run(
+                argparse.Namespace(
+                    repo=scenario.repo,
+                    task_id=task_id,
+                    json=True,
+                )
+            )
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(marker.exists())
+        self.assertNotEqual(stale_head, current_head)
+        self.assertEqual(captured["expected_head"], current_head)
 
     def test_hook_smoke_cli_accepts_only_repo_task_and_output_mode(
         self,

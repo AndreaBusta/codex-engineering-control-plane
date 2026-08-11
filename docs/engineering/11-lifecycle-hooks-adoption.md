@@ -208,3 +208,51 @@ explícita; nunca se simula mediante un alias de `adopt apply`.
 El inventario `created_directories` es obligatorio para nuevos upgrades. Si un
 journal pre-release no lo contiene, el runtime nuevo falla antes de mutar: no
 puede inferir con seguridad qué directorios existían antes de la adopción.
+
+## Run local skill-led (candidato v2.2)
+
+`control-plane run prepare` recalcula el route desde el `TaskEnvelope`, policy,
+registry e inventory actuales; no acepta un RouteDecision serializado. Exige
+clarificación low/autonomous, `local_change`, preflight write, materialización
+completa y un lease exacto antes de llevar la task a `implementing`.
+
+`control-plane run verify` ejecuta secuencialmente el perfil cerrado de este
+repositorio: unittest discovery, policy-check, registry-check, doctor y
+`git diff --check`. Cada comando usa argv fijo, entorno saneado, salida acotada,
+timeout y snapshots antes/después. El estado guarda digests, no el output.
+
+Hay tres ejecuciones totales. Un `FAIL` distinto puede repararse; `UNKNOWN`,
+causa repetida, crecimiento de paths, deriva o agotamiento termina en
+`BLOCKED`. `run status` observa y `run block` detiene explícitamente. El éxito
+alcanza `review_ready`, no commit, push, PR ni integración. T2/T3 sigue
+bloqueado mientras el host no pueda publicar la revisión independiente tipada.
+
+## Outcome bridge v2.3
+
+El outcome pedido al inicio permanece inmutable. `pull_request` termina en
+`pr_ready`; por eso `PR LISTA` es la salida predeterminada. `integration`
+continúa por `merged → base_verified` solo con una petición nativa actual,
+fresca y exacta hasta squash merge y con observación posterior de la base.
+
+La cadena conserva `review_head → committed_head → pushed_head → PR →
+merge_sha`. Cada plan y receipt durable es cerrado, ligado y
+`authorizes=false`: evidencia y autoridad son fronteras distintas.
+
+Frontera real: el bridge Python ejecuta Git local allowlisted (`git add`;
+commit con `git commit-tree` y `git update-ref` CAS). En
+prepare/arm/revalidate, el kernel hace observación remota con `git
+ls-remote` read-only. Las mutaciones push/PR/squash merge son host-native:
+Python no recibe autoridad. Sin adaptador nativo quedan `BLOCKED`; los fixtures
+de tests no hacen disponible esa ruta.
+
+Ante escritura remota incierta, el marker durable ya está en observe-only. Se
+observa el target exacto antes de cualquier retry; `UNKNOWN` queda `BLOCKED` y
+no habilita segunda escritura ni reparación. Un receipt exacto puede
+reutilizarse solo si su sujeto e inputs no cambiaron.
+
+La ruta de mutación remota requiere un native host adapter real. Si falta,
+nunca se pide al usuario habilitar plumbing interno. La skill conserva solo los
+comandos locales `run prepare`, `run verify`, `run status` y `run block`.
+Véanse [ADR 0005](../adr/0005-host-bound-outcome-authorization.md), el
+[threat model](../security/2026-08-08-v2-3-outcome-bridge-threat-model.md) y el
+[rollback](16-outcome-bridge-rollback.md).

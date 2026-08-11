@@ -15,7 +15,11 @@ import tempfile
 
 from control_plane.contracts import contract_digest
 from control_plane.scopes import normalize_scope, scope_owns
-from control_plane.repository import git_environment, worktree_git_dir
+from control_plane.repository import (
+    trusted_git_argv,
+    trusted_git_environment,
+    worktree_git_dir,
+)
 from control_plane.host_bridge import (
     GoverningRuntimeObservation,
     HostAdapterCapability,
@@ -1368,14 +1372,21 @@ def apply_project_remote_policy_update(
         / "leases"
         / f"{draft.task_id}.json"
     )
-    head_process = subprocess.run(
-        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=git_environment(),
-    )
-    if head_process.returncode != 0:
+    try:
+        head_process = subprocess.run(
+            trusted_git_argv(worktree, ("rev-parse", "HEAD")),
+            check=False,
+            capture_output=True,
+            text=True,
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ValueError(
+            "E_REMOTE_POLICY_APPLY: policy task or lease binding drifted"
+        ) from error
+    if head_process.returncode != 0 or not head_process.stdout.strip():
         raise ValueError(
             "E_REMOTE_POLICY_APPLY: policy task or lease binding drifted"
         )

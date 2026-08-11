@@ -15,6 +15,17 @@ import tomllib
 
 root = Path(sys.argv[1]).resolve()
 lock_path = root / ".codex" / "control-plane.lock"
+SF_DATALESS = 0x40000000
+
+def require_materialized(path):
+    try:
+        flags = int(getattr(path.lstat(), "st_flags", 0))
+    except OSError:
+        raise SystemExit("E_RUNTIME_DATALESS: runtime path is unavailable")
+    if flags & SF_DATALESS:
+        raise SystemExit("E_RUNTIME_DATALESS: runtime contains an APFS placeholder")
+
+require_materialized(lock_path)
 try:
     lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
 except Exception as error:
@@ -34,6 +45,7 @@ hasher = sha256()
 for path in modules:
     if path.is_symlink() or not path.is_file():
         raise SystemExit("E_RUNTIME_LAYOUT: invalid source runtime module")
+    require_materialized(path)
     hasher.update(path.name.encode())
     hasher.update(bytes((0,)))
     hasher.update(path.read_bytes())

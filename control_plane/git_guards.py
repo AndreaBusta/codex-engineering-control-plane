@@ -83,8 +83,10 @@ def _git_environment() -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_GRAFT_FILE": "/dev/null",
+        "GIT_NO_LAZY_FETCH": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
     }
 
 
@@ -125,6 +127,17 @@ def _git_text(repo: Path, arguments: list[str]) -> str:
         raise ValueError(
             "GG_GIT_STATE_UNOBSERVABLE: Git output was not UTF-8."
         ) from error
+
+
+def _is_shallow_repository(repo: Path) -> bool:
+    """Return Git's exact shallow state, failing closed on ambiguity."""
+
+    value = _git_text(repo, ["rev-parse", "--is-shallow-repository"])
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError("GG_GIT_STATE_UNOBSERVABLE: shallow state is invalid")
 
 
 def _observed_repository(repo: Path) -> tuple[Path, Path]:
@@ -761,6 +774,24 @@ def guard_pre_push(
                 )
                 continue
             if ancestry.returncode == 1:
+                try:
+                    shallow = _is_shallow_repository(canonical)
+                except ValueError:
+                    errors.append(
+                        _error(
+                            "GG_GIT_STATE_UNOBSERVABLE",
+                            "Git shallow state could not be observed.",
+                        )
+                    )
+                    continue
+                if shallow:
+                    errors.append(
+                        _error(
+                            "GG_GIT_STATE_UNOBSERVABLE",
+                            "Git ancestry is incomplete in a shallow repository.",
+                        )
+                    )
+                    continue
                 errors.append(
                     _error(
                         "GG_NON_FAST_FORWARD",

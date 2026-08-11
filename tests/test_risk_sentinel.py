@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -16,6 +18,48 @@ ROOT = Path(__file__).parents[1]
 
 def risk_check(dimension: object, code: str):
     return next(check for check in dimension.checks if check.code == code)
+
+
+def install_fake_git(root: Path, marker: Path) -> Path:
+    fake_bin = root / "fake-bin"
+    fake_bin.mkdir()
+    executable = fake_bin / "git"
+    executable.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(marker))}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    return fake_bin
+
+
+def install_clean_filter(
+    scenario: GitScenario, *, driver: str, marker: Path
+) -> None:
+    attributes = scenario.repo / ".gitattributes"
+    attributes.write_text(
+        f"baseline.txt filter={driver}\n", encoding="utf-8"
+    )
+    git(scenario.repo, "add", ".gitattributes")
+    git(scenario.repo, "commit", "-m", "test: risk filter baseline")
+    executable = scenario.root / f"{driver}.sh"
+    executable.write_text(
+        "#!/bin/sh\n"
+        f": > {shlex.quote(str(marker))}\n"
+        "cat\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o700)
+    git(
+        scenario.repo,
+        "config",
+        f"filter.{driver}.clean",
+        shlex.quote(str(executable)),
+    )
+    (scenario.repo / "baseline.txt").write_text(
+        "modified through risk sentinel\n", encoding="utf-8"
+    )
 
 
 
@@ -349,6 +393,192 @@ class RiskSentinelContractTests(unittest.TestCase):
         authority = risk_check(result, "RS_AUTHORITY_REQUIRED")
         self.assertEqual(authority.status, "PASS")
         self.assertEqual(authority.facts["reason"], "NOT_APPLICABLE")
+
+    def test_unanchored_git_observation_ignores_fake_path(self) -> None:
+        from control_plane.risk_sentinel import evaluate_local_risk
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature()
+        expected_head = git(scenario.repo, "rev-parse", "HEAD")
+        marker = scenario.root / "fake-git-executed"
+        fake_bin = install_fake_git(scenario.root, marker)
+
+        with patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False):
+            result = evaluate_local_risk(scenario.repo, None)
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            risk_check(result, "RS_LOCAL_REPOSITORY").facts["head"],
+            expected_head,
+        )
+
+    def test_unanchored_status_blocks_clean_filter_before_execution(self) -> None:
+        from control_plane.risk_sentinel import evaluate_local_risk
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        scenario.checkout_feature()
+        marker = scenario.root / "risk-status-filter-executed"
+        install_clean_filter(
+            scenario, driver="risk-status-clean", marker=marker
+        )
+
+        result = evaluate_local_risk(scenario.repo, None)
+        dirty = risk_check(result, "RS_LOCAL_DIRTY")
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(dirty.status, "UNKNOWN")
+        self.assertIsNone(dirty.facts["dirty"])
+
+    def test_changed_paths_ignore_fake_path_and_preserve_real_inventory(self) -> None:
+        from control_plane.risk_sentinel import _git_changed_paths
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        (scenario.repo / "baseline.txt").write_text(
+            "changed\n", encoding="utf-8"
+        )
+        (scenario.repo / "untracked.txt").write_text(
+            "untracked\n", encoding="utf-8"
+        )
+        marker = scenario.root / "fake-changed-paths-git-executed"
+        fake_bin = install_fake_git(scenario.root, marker)
+
+        with patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False):
+            paths = _git_changed_paths(scenario.repo)
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(paths, ("baseline.txt", "untracked.txt"))
+
+    def test_changed_paths_block_clean_filter_before_execution(self) -> None:
+        from control_plane.risk_sentinel import _git_changed_paths
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        marker = scenario.root / "risk-diff-filter-executed"
+        install_clean_filter(
+            scenario, driver="risk-diff-clean", marker=marker
+        )
+
+        paths = _git_changed_paths(scenario.repo)
+
+        self.assertFalse(marker.exists())
+        self.assertIsNone(paths)
+
+    def test_git_config_ignores_fake_path_and_preserves_local_values(self) -> None:
+        from control_plane.risk_sentinel import _git_config_values
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        git(scenario.repo, "config", "risk.test", "expected-value")
+        marker = scenario.root / "fake-config-git-executed"
+        fake_bin = install_fake_git(scenario.root, marker)
+
+        with patch.dict(os.environ, {"PATH": str(fake_bin)}, clear=False):
+            result = _git_config_values(scenario.repo, "risk.test")
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(result, (0, ("expected-value",)))
+
+    def test_risk_git_observations_do_not_receive_sensitive_environment(self) -> None:
+        from control_plane.risk_sentinel import (
+            _git_changed_paths,
+            _git_config_values,
+            _unanchored_local_dimension,
+        )
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        observed: list[dict[str, str]] = []
+        actual_run = subprocess.run
+
+        def observe(arguments, **kwargs):
+            environment = kwargs.get("env")
+            if isinstance(environment, dict):
+                observed.append(dict(environment))
+            return actual_run(arguments, **kwargs)
+
+        sensitive = {
+            "AWS_SECRET_ACCESS_KEY": "canary-not-a-secret",
+            "GH_TOKEN": "canary-not-a-secret",
+            "HTTPS_PROXY": "http://canary.invalid",
+            "SSH_AUTH_SOCK": "/tmp/canary-risk-agent.sock",
+        }
+        with patch.dict(os.environ, sensitive, clear=False), patch(
+            "control_plane.risk_sentinel.subprocess.run",
+            side_effect=observe,
+        ):
+            _unanchored_local_dimension(
+                scenario.repo,
+                task_state=None,
+                message="test governing policy unavailable",
+            )
+            _git_changed_paths(scenario.repo)
+            _git_config_values(scenario.repo, "risk.test")
+
+        self.assertTrue(observed)
+        for environment in observed:
+            self.assertFalse(set(sensitive).intersection(environment))
+
+    def test_risk_git_timeouts_preserve_unknown_exit_contracts(self) -> None:
+        from control_plane.risk_sentinel import (
+            _git_changed_paths,
+            _git_config_values,
+        )
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        timeout = subprocess.TimeoutExpired(["git"], 5)
+
+        with patch(
+            "control_plane.risk_sentinel.subprocess.run",
+            side_effect=timeout,
+        ):
+            try:
+                changed = _git_changed_paths(scenario.repo)
+            except subprocess.TimeoutExpired:
+                changed = ("timeout-raised",)
+        with patch(
+            "control_plane.risk_sentinel.subprocess.run",
+            side_effect=timeout,
+        ):
+            try:
+                configured = _git_config_values(
+                    scenario.repo, "risk.test"
+                )
+            except subprocess.TimeoutExpired:
+                configured = (999, ("timeout-raised",))
+
+        self.assertIsNone(changed)
+        self.assertEqual(configured, (128, ()))
+
+    def test_changed_path_diff_failure_stops_before_untracked_observation(self) -> None:
+        from control_plane.risk_sentinel import _git_changed_paths
+
+        scenario = GitScenario()
+        self.addCleanup(scenario.close)
+        actual_run = subprocess.run
+        calls: list[tuple[str, ...]] = []
+
+        def fail_diff(arguments, **kwargs):
+            closed = tuple(str(item) for item in arguments)
+            calls.append(closed)
+            if "diff" in closed:
+                return subprocess.CompletedProcess(
+                    arguments, 1, stdout=b"", stderr=b"failed"
+                )
+            return actual_run(arguments, **kwargs)
+
+        with patch(
+            "control_plane.risk_sentinel.subprocess.run",
+            side_effect=fail_diff,
+        ):
+            self.assertIsNone(_git_changed_paths(scenario.repo))
+
+        self.assertFalse(
+            any("--others" in arguments for arguments in calls)
+        )
 
 
     def test_lease_anchor_uses_the_record_validated_under_flock(self) -> None:

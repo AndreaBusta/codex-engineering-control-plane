@@ -14,6 +14,19 @@ ROOT = Path(__file__).parents[1]
 
 
 class LockfileTests(unittest.TestCase):
+    def test_source_launcher_rejects_dataless_runtime_before_reading_bytes(
+        self,
+    ) -> None:
+        launcher = (ROOT / "scripts" / "control-plane").read_text(
+            encoding="utf-8"
+        )
+
+        guard = launcher.index("SF_DATALESS")
+        first_runtime_read = launcher.index("path.read_bytes()")
+
+        self.assertLess(guard, first_runtime_read)
+        self.assertIn("E_RUNTIME_DATALESS", launcher)
+
     def test_lock_selects_v2_1_local_contract_schemas(self) -> None:
         lock = tomllib.loads(
             (ROOT / ".codex" / "control-plane.lock").read_text(

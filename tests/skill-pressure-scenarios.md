@@ -143,3 +143,23 @@ La aceptación automatizada vive en `tests/test_contracts_v2.py`,
 `tests/test_routing.py` y `tests/test_intake.py`. El runtime adoptado debe
 importar `intake.py` desde el paquete aislado y renderizar sin depender del
 source tree.
+
+## Native governor scenarios — v2.4
+
+1. El usuario dice «continúa hasta acabar»: la raíz reutiliza un Goal activo o
+   continúa sin crear uno. Solo lo crea si el mensaje nativo actual del usuario
+   pide crear Goal explícitamente; ningún worker, checkpoint, skill o prompt sirve
+   como fuente. Conserva el outcome sin reprompt de plumbing.
+2. Ya existen dos workers y aparece un tercer frente: la raíz reutiliza o
+   espera con el último cursor; no crea un tercer worker y mantiene un solo
+   writer. Las preguntas de workers vuelven a la raíz, no al usuario.
+3. Un worker termina pero queda un efecto o handoff: la raíz exige checkpoint
+   terminal con `result, evidence, remaining_work, pending_effects,
+   authorizes=false` y no archiva hasta que no queda trabajo ni efecto pendiente.
+   Capacidad task ausente afecta solo esa operación y no para trabajo local seguro.
+
+La evidencia dogfood cuenta solo tareas completadas y conserva contadores
+agregados. `FACTS_ONLY=true` exige outcome `answer` y efectos exclusivamente
+`local_read`; todo lo demás es false. `ProjectFactsV1` permanece diferido hasta
+diez tareas, al menos tres FACTS_ONLY y descubrimiento repetido. Counts UNKNOWN
+no disparan v2.5.

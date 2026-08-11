@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import control_plane.host_bridge as bridge
 import copy
-from typing import Mapping
+import itertools
+from typing import Any, Mapping
 from control_plane.contracts import contract_digest
 
 
 _TEST_NATIVE_OBJECTS: dict[int, tuple[object, str]] = {}
+_REVIEW_INVOCATIONS = itertools.count(1)
 
 
 def _test_native_object_validator(value: object, kind: str) -> bool:
@@ -59,6 +61,172 @@ def _test_native_remote_executor(
 
 
 bridge._native_host_remote_executor = _test_native_remote_executor
+
+
+def rollback_plan_observation(
+    *,
+    run_plan: Mapping[str, object],
+    run_revision: Mapping[str, object],
+    attempt: int,
+    trigger_conditions: tuple[tuple[str, str], ...],
+    rollback_steps: tuple[tuple[int, str, str, str], ...],
+    post_rollback_checks: tuple[tuple[str, str], ...],
+    irreversible_boundaries: tuple[tuple[str, str], ...],
+    status: str,
+    session_id: str = "native-rollback-session",
+    invocation_id: str = "native-rollback-invocation",
+    observed_at: str = "2026-08-08T10:00:30Z",
+    now: float = 100.0,
+    ttl_seconds: float = 30.0,
+) -> bridge.ValidatedRollbackPlanObservation:
+    observation = object.__new__(bridge.RollbackPlanObservation)
+    observation._consumed = False
+    values = {
+        "task_id": run_plan["task_id"],
+        "task_digest": run_plan["task_digest"],
+        "run_plan_digest": run_plan["plan_digest"],
+        "run_revision_digest": run_revision["revision_digest"],
+        "attempt": attempt,
+        "repository": run_plan["repository"],
+        "branch": run_plan["branch"],
+        "head": run_revision["head"],
+        "scope_paths_digest": contract_digest(
+            {"scope_paths": run_plan["scope_paths"]}
+        ),
+        "trigger_conditions": trigger_conditions,
+        "rollback_steps": rollback_steps,
+        "post_rollback_checks": post_rollback_checks,
+        "irreversible_boundaries": irreversible_boundaries,
+        "status": status,
+        "session_id": session_id,
+        "invocation_id": invocation_id,
+        "observed_at": observed_at,
+        "observed_at_monotonic": now,
+        "freshness_deadline": now + ttl_seconds,
+    }
+    for name, value in values.items():
+        setattr(observation, name, value)
+    observation.observation_digest = contract_digest({
+        name: values[name]
+        for name in bridge._ROLLBACK_PLAN_OBSERVATION_DIGEST_FIELDS
+    })
+    bridge._register_runtime_host_object(
+        observation, "rollback_plan_observation"
+    )
+    return bridge.validate_rollback_plan_observation(
+        observation,
+        run_plan=run_plan,
+        run_revision=run_revision,
+        expected_attempt=attempt,
+        expected_session_id=session_id,
+        expected_invocation_id=invocation_id,
+        clock=lambda: now,
+    )
+
+
+def independent_review_observation(
+    *,
+    review_packet: Mapping[str, object],
+    findings_digest: str,
+    critical: int,
+    important: int,
+    status: str,
+    reviewer_identity: str,
+    session_id: str,
+    invocation_id: str,
+    observed_at: str,
+    now: float = 100.0,
+    ttl_seconds: float = 30.0,
+) -> bridge.ValidatedIndependentReviewObservation:
+    observation = object.__new__(bridge.IndependentReviewObservation)
+    observation._consumed = False
+    values = {
+        "task_id": review_packet["task_id"],
+        "task_digest": review_packet["task_digest"],
+        "review_packet_digest": review_packet["packet_digest"],
+        "review_kind": review_packet["review_kind"],
+        "criteria_digest": review_packet["criteria_digest"],
+        "findings_digest": findings_digest,
+        "critical": critical,
+        "important": important,
+        "status": status,
+        "reviewer_identity": reviewer_identity,
+        "reviewer_identity_digest": contract_digest(
+            {"reviewer_identity": reviewer_identity}
+        ),
+        "session_id": session_id,
+        "invocation_id": invocation_id,
+        "observed_at": observed_at,
+        "observed_at_monotonic": now,
+        "freshness_deadline": now + ttl_seconds,
+    }
+    for name, value in values.items():
+        setattr(observation, name, value)
+    observation.observation_digest = contract_digest(
+        {
+            name: values[name]
+            for name in bridge._INDEPENDENT_REVIEW_OBSERVATION_DIGEST_FIELDS
+        }
+    )
+    bridge._register_runtime_host_object(
+        observation, "independent_review_observation"
+    )
+    return bridge.validate_independent_review_observation(
+        observation,
+        review_packet=review_packet,
+        expected_session_id=session_id,
+        expected_invocation_id=invocation_id,
+        clock=lambda: now,
+    )
+
+
+def independent_review_receipt(
+    *,
+    run_store: Any,
+    review_packet: Mapping[str, object],
+    findings_digest: str,
+    critical: int,
+    important: int,
+    status: str,
+    observed_at: str,
+    reviewer_identity: str | None = None,
+    invocation_id: str | None = None,
+    native_session_id: str | None = None,
+    now: float = 100.0,
+    ttl_seconds: float = 30.0,
+) -> tuple[dict[str, object], bridge.ValidatedIndependentReviewObservation]:
+    from control_plane.run_workflow import build_independent_review_receipt
+
+    plan = run_store.load_plan(str(review_packet["task_id"]))
+    reviewer = reviewer_identity or (
+        f"test-reviewer:{review_packet['review_kind']}"
+    )
+    invocation = invocation_id or (
+        f"test-review-invocation-{next(_REVIEW_INVOCATIONS)}"
+    )
+    proof = independent_review_observation(
+        review_packet=review_packet,
+        findings_digest=findings_digest,
+        critical=critical,
+        important=important,
+        status=status,
+        reviewer_identity=reviewer,
+        session_id=native_session_id or str(plan["session_id"]),
+        invocation_id=invocation,
+        observed_at=observed_at,
+        now=now,
+        ttl_seconds=ttl_seconds,
+    )
+    receipt = build_independent_review_receipt(
+        review_packet=review_packet,
+        findings_digest=findings_digest,
+        critical=critical,
+        important=important,
+        status=status,
+        observed_at=observed_at,
+        observation=proof,
+    )
+    return receipt, proof
 
 
 def native_session_event(

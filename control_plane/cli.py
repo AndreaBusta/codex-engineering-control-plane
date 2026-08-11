@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 import os
 from pathlib import Path
-import shutil
+import re
 import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 from uuid import uuid4
 from typing import Any, Sequence
 
@@ -25,7 +27,11 @@ from control_plane.adoption import (
     upgrade_apply,
     upgrade_plan,
 )
-from control_plane.contracts import contract_digest, validate_task_envelope
+from control_plane.contracts import (
+    contract_digest,
+    validate_task_envelope,
+    validate_task_id,
+)
 from control_plane.git_state import GateError, evaluate_preflight
 from control_plane.lifecycle import (
     TaskLease,
@@ -35,12 +41,16 @@ from control_plane.lifecycle import (
     task_allows_writer_lease,
 )
 from control_plane.lockfile import validate_lock
+from control_plane.materialization import inspect_tracked_materialization
 from control_plane.policy import PolicyError, load_policy, validate_policy
 from control_plane.repository import (
     RepositoryError,
+    assert_no_external_git_filters,
     discover_repository,
     git_common_dir,
-    git_environment,
+    trusted_git_argv,
+    trusted_git_environment,
+    trusted_git_executable,
     worktree_git_dir,
 )
 from control_plane.resource_registry import (
@@ -72,6 +82,13 @@ from control_plane.routing import (
     compact_route_manifest,
     resolve_route,
     verify_route,
+)
+from control_plane.run_workflow import (
+    RunStore,
+    block_run,
+    build_run_summary,
+    prepare_run,
+    verify_run,
 )
 
 
@@ -322,27 +339,195 @@ def _emit(payload: dict[str, Any], as_json: bool) -> int:
     return 0 if payload.get("ok") else 1
 
 
+_MAX_REMOTE_URL_BYTES = 4_096
+_MAX_AUTHORIZATION_HEADER_BYTES = 4_096
+
+
+def _validated_remote_fetch_url(value: str) -> tuple[str, str | None]:
+    if (
+        not value
+        or value != value.strip()
+        or len(value.encode("utf-8")) > _MAX_REMOTE_URL_BYTES
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError("remote URL is invalid")
+    if Path(value).is_absolute():
+        return value, None
+
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("remote URL is invalid") from error
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or hostname != hostname.casefold()
+        or re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", hostname, re.ASCII
+        )
+        is None
+        or ".." in hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+        or parsed.path == "/"
+        or port == 0
+    ):
+        raise ValueError("remote URL is invalid")
+    authority = hostname if port is None else f"{hostname}:{port}"
+    canonical = f"https://{authority}{parsed.path}"
+    if value != canonical:
+        raise ValueError("remote URL is not canonical")
+    return canonical, f"https://{authority}/"
+
+
+def _authenticated_git_environment(remote_url: str) -> dict[str, str]:
+    """Bind the sole inherited auth channel to one exact HTTPS remote."""
+
+    environment = trusted_git_environment()
+    canonical_url, https_origin = _validated_remote_fetch_url(remote_url)
+    count = os.environ.get("GIT_CONFIG_COUNT")
+    auth_config_names = {
+        name
+        for name in os.environ
+        if name in {"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"}
+        or name.startswith("GIT_CONFIG_KEY_")
+        or name.startswith("GIT_CONFIG_VALUE_")
+    }
+    if https_origin is None:
+        if auth_config_names:
+            raise ValueError("remote authentication is unsupported")
+        return environment
+
+    exact_key = f"http.{canonical_url}.extraheader"
+    if count is None:
+        if auth_config_names:
+            raise ValueError("remote authentication config is incomplete")
+        environment.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": exact_key,
+                "GIT_CONFIG_VALUE_0": "",
+            }
+        )
+        return environment
+
+    expected_names = {
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+    }
+    if count != "1" or auth_config_names != expected_names:
+        raise ValueError("remote authentication config is invalid")
+    source_key = os.environ["GIT_CONFIG_KEY_0"]
+    source_value = os.environ["GIT_CONFIG_VALUE_0"]
+    if source_key not in {
+        exact_key,
+        f"http.{https_origin}.extraheader",
+    }:
+        raise ValueError("remote authentication config is not bound")
+    try:
+        encoded_header = source_value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("remote authentication header is invalid") from error
+    if (
+        not encoded_header
+        or len(encoded_header) > _MAX_AUTHORIZATION_HEADER_BYTES
+        or "\0" in source_value
+        or "\r" in source_value
+        or "\n" in source_value
+        or any(
+            ord(character) < 32 and character != "\t"
+            or ord(character) == 127
+            for character in source_value
+        )
+        or re.fullmatch(
+            r"(?i:authorization):[ \t]*[^ \t].*", source_value, re.ASCII
+        )
+        is None
+    ):
+        raise ValueError("remote authentication header is invalid")
+    environment.update(
+        {
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": exact_key,
+            "GIT_CONFIG_VALUE_0": "",
+            "GIT_CONFIG_KEY_1": exact_key,
+            "GIT_CONFIG_VALUE_1": source_value,
+        }
+    )
+    return environment
+
+
+def _remote_fetch_url(repo: Path, remote: str) -> str:
+    completed = _run_local_git(repo, ("remote", "get-url", remote), text=True)
+    remote_url = completed.stdout.rstrip("\n")
+    if (
+        completed.returncode != 0
+        or not remote_url
+        or "\n" in remote_url
+        or completed.stdout not in {remote_url, f"{remote_url}\n"}
+    ):
+        raise ValueError("remote URL is unavailable")
+    return _validated_remote_fetch_url(remote_url)[0]
+
+
 def _refresh_remote_base(
     repo: Path, remote: str, base_branch: str
 ) -> GateError | None:
     try:
+        remote_url = _remote_fetch_url(repo, remote)
+        environment = _authenticated_git_environment(remote_url)
+        fetch_config: tuple[str, ...] = (
+            "-c",
+            "credential.helper=",
+            "-c",
+            "core.askPass=",
+            "-c",
+            "http.proxy=",
+            "-c",
+            "http.cookieFile=",
+            "-c",
+            "http.saveCookies=false",
+            "-c",
+            "http.followRedirects=false",
+            "-c",
+            "http.sslVerify=true",
+            "-c",
+            "protocol.ext.allow=never",
+        )
+        if remote_url.startswith("https://"):
+            fetch_config += (
+                "-c",
+                f"http.{remote_url}.proxy=",
+                "-c",
+                f"http.{remote_url}.cookieFile=",
+            )
         completed = subprocess.run(
-            [
-                "git",
-                "fetch",
-                "--no-tags",
-                remote,
-                f"+refs/heads/{base_branch}:refs/remotes/{remote}/{base_branch}",
-            ],
-            cwd=repo,
+            trusted_git_argv(
+                repo,
+                (
+                    *fetch_config,
+                    "fetch",
+                    "--no-tags",
+                    remote_url,
+                    f"+refs/heads/{base_branch}:refs/remotes/{remote}/{base_branch}",
+                ),
+            ),
             check=False,
             capture_output=True,
             text=True,
-            env=git_environment(),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            timeout=30,
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError, ValueError):
         completed = subprocess.CompletedProcess(
-            args=["git", "fetch"],
+            args=["/usr/bin/git", "fetch"],
             returncode=128,
             stdout="",
             stderr="",
@@ -355,15 +540,32 @@ def _refresh_remote_base(
     )
 
 
-def _git_current_branch(repo: Path) -> str:
-    completed = subprocess.run(
-        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
-        cwd=repo,
+def _run_local_git(
+    repo: Path, arguments: tuple[str, ...], *, text: bool
+) -> subprocess.CompletedProcess[Any]:
+    return subprocess.run(
+        trusted_git_argv(repo, arguments),
         check=False,
-        capture_output=True,
-        text=True,
-        env=git_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        env=trusted_git_environment(),
+        stdin=subprocess.DEVNULL,
+        timeout=10,
     )
+
+
+def _git_current_branch(repo: Path) -> str:
+    try:
+        completed = _run_local_git(
+            repo,
+            ("symbolic-ref", "--quiet", "--short", "HEAD"),
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ValueError(
+            "E_STATE_BRANCH: task lifecycle requires a named branch"
+        ) from error
     branch = completed.stdout.strip()
     if completed.returncode != 0 or not branch:
         raise ValueError("E_STATE_BRANCH: task lifecycle requires a named branch")
@@ -371,36 +573,44 @@ def _git_current_branch(repo: Path) -> str:
 
 
 def _git_changed_paths(repo: Path) -> list[str]:
-    changed = subprocess.run(
-        [
-            "git",
-            "diff",
-            "--no-renames",
-            "--name-only",
-            "-z",
-            "HEAD",
-        ],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        env=git_environment(),
-    )
-    untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-        cwd=repo,
-        check=False,
-        capture_output=True,
-        env=git_environment(),
-    )
-    if changed.returncode != 0 or untracked.returncode != 0:
-        raise ValueError("E_LEASE_SCOPE: could not enumerate changed paths")
-    values = set()
-    for payload in (changed.stdout, untracked.stdout):
-        values.update(
-            item.decode("utf-8", errors="strict")
-            for item in payload.split(b"\0")
-            if item
+    try:
+        assert_no_external_git_filters(repo)
+        changed = _run_local_git(
+            repo,
+            (
+                "diff",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                "HEAD",
+            ),
+            text=False,
         )
+        if changed.returncode != 0:
+            raise ValueError("changed-path diff failed")
+        untracked = _run_local_git(
+            repo,
+            ("ls-files", "--others", "--exclude-standard", "-z"),
+            text=False,
+        )
+        if untracked.returncode != 0:
+            raise ValueError("untracked-path inventory failed")
+        values = set()
+        for payload in (changed.stdout, untracked.stdout):
+            values.update(
+                item.decode("utf-8", errors="strict")
+                for item in payload.split(b"\0")
+                if item
+            )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        subprocess.SubprocessError,
+        ValueError,
+    ) as error:
+        raise ValueError(
+            "E_LEASE_SCOPE: could not enumerate changed paths"
+        ) from error
     return sorted(values)
 
 
@@ -506,23 +716,25 @@ def command_preflight(arguments: argparse.Namespace) -> int:
 def command_doctor(arguments: argparse.Namespace) -> int:
     policy_path = _policy_path(arguments.repo, arguments.policy)
     _, policy_payload = _load_validated_policy(policy_path)
-    git_available = shutil.which("git") is not None
+    try:
+        trusted_git_executable()
+    except OSError:
+        git_available = False
+    else:
+        git_available = True
     python_compatible = sys.version_info >= (3, 11)
 
     git_repository = False
     if git_available:
         try:
-            completed = subprocess.run(
-                ["git", "rev-parse", "--is-inside-work-tree"],
-                cwd=arguments.repo,
-                check=False,
-                capture_output=True,
+            completed = _run_local_git(
+                arguments.repo,
+                ("rev-parse", "--is-inside-work-tree"),
                 text=True,
-                env=git_environment(),
             )
-        except OSError:
+        except (OSError, subprocess.SubprocessError, ValueError):
             completed = subprocess.CompletedProcess(
-                args=["git", "rev-parse"],
+                args=["/usr/bin/git", "rev-parse"],
                 returncode=128,
                 stdout="",
                 stderr="",
@@ -539,6 +751,9 @@ def command_doctor(arguments: argparse.Namespace) -> int:
         "python_version": ".".join(str(item) for item in sys.version_info[:3]),
         "registry_valid": None,
         "lock_valid": None,
+        "tracked_files_materialized": None,
+        "dataless_tracked_files": None,
+        "materialization_status": "UNKNOWN",
     }
     errors: list[dict[str, str]] = []
     if not git_available:
@@ -569,6 +784,23 @@ def command_doctor(arguments: argparse.Namespace) -> int:
     if arguments.policy is None and git_repository:
         try:
             root = discover_repository(arguments.repo)
+            materialization = inspect_tracked_materialization(root)
+            facts["tracked_files_materialized"] = materialization.ok
+            facts["dataless_tracked_files"] = len(
+                materialization.dataless_paths
+            )
+            facts["materialization_status"] = materialization.status
+            if not materialization.ok:
+                errors.append(
+                    {
+                        "code": materialization.error_code
+                        or "E_MATERIALIZATION_UNKNOWN",
+                        "message": (
+                            "Tracked file materialization is incomplete or "
+                            "could not be proved."
+                        ),
+                    }
+                )
             registry = load_registry(_registry_path(root, None))
             registry_issues = validate_registry(registry)
             policy, _ = _load_validated_policy(_policy_path(root, None))
@@ -804,6 +1036,236 @@ def command_route_verify(arguments: argparse.Namespace) -> int:
             },
             arguments.json,
         )
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _current_branch(repository: Path) -> str:
+    try:
+        completed = _run_local_git(
+            repository, ("branch", "--show-current"), text=True
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ValueError(
+            "E_RUN_GIT: current branch is unavailable"
+        ) from error
+    branch = completed.stdout.strip()
+    if completed.returncode != 0 or not branch:
+        raise ValueError("E_RUN_GIT: current branch is unavailable")
+    return branch
+
+
+def _verification_head(repository: Path) -> str:
+    try:
+        completed = _run_local_git(
+            repository, ("rev-parse", "HEAD"), text=True
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise ValueError(
+            "E_VERIFICATION_UNKNOWN: repository HEAD is unavailable"
+        ) from error
+    head = completed.stdout.strip()
+    if completed.returncode != 0 or not head:
+        raise ValueError(
+            "E_VERIFICATION_UNKNOWN: repository HEAD is unavailable"
+        )
+    return head
+
+
+def _resolve_current_task_route(
+    *,
+    root: Path,
+    task: dict[str, Any],
+    policy_path: Path,
+    registry_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    task_issues = validate_task_envelope(task)
+    policy = load_policy(policy_path)
+    registry = load_registry(registry_path)
+    issues = [
+        *task_issues,
+        *validate_policy(policy),
+        *validate_registry(registry),
+        *validate_policy_references(policy, registry),
+    ]
+    if issues:
+        raise ValueError(f"E_RUN_INPUT: {issues[0].code}")
+    invocation_id = f"run-prepare-{uuid4().hex}"
+    observation = observe_inventory(
+        registry,
+        root,
+        root,
+        contract_digest(task),
+        invocation_id,
+        clock=time.monotonic,
+        ttl_seconds=30,
+    )
+    inventory = validate_inventory_observation(
+        observation,
+        expected_repo=root,
+        expected_worktree=root,
+        expected_registry_digest=registry_contract_digest(registry),
+        expected_task_digest=contract_digest(task),
+        expected_invocation_id=invocation_id,
+        clock=time.monotonic,
+    )
+    decision = resolve_route(
+        task,
+        policy,
+        registry,
+        inventory,
+        mode="enforce",
+        host_capability=HOST_ADAPTER_UNAVAILABLE,
+    )
+    return policy, decision
+
+
+def command_run(arguments: argparse.Namespace) -> int:
+    try:
+        root = discover_repository(arguments.repo)
+        state_dir = worktree_git_dir(root)
+        if arguments.run_action == "prepare":
+            task = _read_json(arguments.task)
+            policy, decision = _resolve_current_task_route(
+                root=root,
+                task=task,
+                policy_path=_policy_path(root, arguments.policy),
+                registry_path=_registry_path(root, arguments.registry),
+            )
+            result = prepare_run(
+                task=task,
+                decision=decision,
+                repository=root,
+                policy=policy,
+                session_id=arguments.session_id,
+                prepared_at=_utc_timestamp(),
+            )
+            payload = {
+                "schema_version": 1,
+                "command": "run-prepare",
+                "ok": True,
+                **result,
+            }
+        elif arguments.run_action == "verify":
+            result = verify_run(
+                repository=root,
+                task_id=arguments.task_id,
+                observed_at=_utc_timestamp(),
+            )
+            payload = {
+                "schema_version": 1,
+                "command": "run-verify",
+                "ok": result["summary"]["gate_status"] == "PASS",
+                **result,
+            }
+        else:
+            run_store = RunStore(state_dir)
+            plan = run_store.load_plan(arguments.task_id)
+            task_store = TaskStore(state_dir)
+            state = task_store.status(arguments.task_id)
+            if arguments.run_action == "block" and state["state"] != "blocked":
+                state = block_run(
+                    repository=root,
+                    task_id=arguments.task_id,
+                    reason_code=arguments.reason,
+                )
+            attempts = run_store.attempts(arguments.task_id)
+            latest = attempts[-1] if attempts else None
+            summary = build_run_summary(
+                run_plan=plan,
+                head=str(plan["head"]),
+                lifecycle_state=str(state["state"]),
+                attempt_count=len(attempts),
+                gate_statuses=(
+                    (str(latest["status"]),) if latest is not None else ()
+                ),
+                gate_receipt_digests=(
+                    tuple(str(item) for item in latest["gate_receipt_digests"])
+                    if latest is not None
+                    else ()
+                ),
+                review_result_digest=None,
+                blocked_reason_code=(
+                    str(state.get("block_reason"))
+                    if state["state"] == "blocked"
+                    and validate_task_id(state.get("block_reason"))
+                    else None
+                ),
+                observed_at=_utc_timestamp(),
+            )
+            payload = {
+                "schema_version": 1,
+                "command": f"run-{arguments.run_action}",
+                "ok": True,
+                "run_plan": plan,
+                "task": state,
+                "attempts": attempts,
+                "summary": summary,
+            }
+        return _emit(payload, arguments.json)
+    except (
+        RepositoryError,
+        PolicyError,
+        RegistryError,
+        ValueError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as error:
+        code = getattr(error, "code", str(error).split(":", 1)[0])
+        return _emit(
+            {
+                "schema_version": 1,
+                "command": f"run-{arguments.run_action}",
+                "ok": False,
+                "errors": [{"code": code, "message": str(error)}],
+            },
+            arguments.json,
+        )
+
+
+def command_report(arguments: argparse.Namespace) -> int:
+    try:
+        root = discover_repository(arguments.repo)
+        state_dir = worktree_git_dir(root)
+        match = re.fullmatch(r"([1-9][0-9]*)d", arguments.since)
+        if match is None:
+            raise ValueError("E_REPORT_SINCE: expected a positive day window such as 30d")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(match.group(1)))
+        runs_root = state_dir / "codex-control-plane" / "runs"
+        rows: list[tuple[str, str, int, str]] = []
+        if runs_root.exists():
+            if runs_root.is_symlink():
+                raise ValueError("E_RUN_STATE: run directory is unsafe")
+            for path in sorted(runs_root.iterdir()):
+                if path.is_symlink() or not path.is_dir():
+                    raise ValueError("E_RUN_STATE: run entry is unsafe")
+                store = RunStore(state_dir)
+                plan = store.load_plan(path.name)
+                prepared = datetime.fromisoformat(
+                    str(plan["prepared_at"]).replace("Z", "+00:00")
+                )
+                if prepared < cutoff:
+                    continue
+                attempts = store.attempts(path.name)
+                task = TaskStore(state_dir).status(path.name)
+                gate = str(attempts[-1]["status"]) if attempts else "UNKNOWN"
+                rows.append((path.name, str(task["state"]), len(attempts), gate))
+        lines = [
+            f"# Control Plane report ({arguments.since})",
+            "",
+            f"Runs: {len(rows)}",
+            "",
+            "| Task | Lifecycle | Attempts | Gates |",
+            "|---|---:|---:|---:|",
+        ]
+        lines.extend(f"| {task} | {state} | {attempts} | {gate} |" for task, state, attempts, gate in rows)
+        print("\n".join(lines))
+        return 0
+    except (RepositoryError, ValueError, OSError) as error:
+        print(f"FAIL report\nERROR {str(error).split(':', 1)[0]}: {error}")
+        return 1
 
 
 def command_risk_status(arguments: argparse.Namespace) -> int:
@@ -1085,13 +1547,7 @@ def command_verification_run(arguments: argparse.Namespace) -> int:
             / f"{arguments.task_id}.json"
         )
         lease = json.loads(lease_path.read_text(encoding="utf-8"))
-        head = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=git_environment(),
-        ).stdout.strip()
+        head = _verification_head(root)
         context = create_verification_execution_context(
             task_context=task,
             lease=lease,
@@ -1341,18 +1797,12 @@ def _installed_runtime_manifest_digest() -> str:
 
 def _configured_installed_manifest_digest(repo: Path) -> str:
     try:
-        completed = subprocess.run(
-            ["/usr/bin/git", "config", "--get-all", "core.hooksPath"],
-            cwd=repo,
-            env=git_environment(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5.0,
-            check=False,
+        completed = _run_local_git(
+            repo,
+            ("config", "--local", "--get-all", "core.hooksPath"),
             text=True,
         )
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
         raise ValueError(
             "GG_INSTALLED_POLICY_INVALID: hook config is not observable"
         ) from error
@@ -1519,6 +1969,35 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--mode", choices=("audit", "enforce"), default="audit")
     _add_output_option(verify_parser)
     verify_parser.set_defaults(handler=command_route_verify)
+
+    run_parser = subparsers.add_parser(
+        "run", help="Prepare, verify, inspect, or block one bounded local run."
+    )
+    run_subparsers = run_parser.add_subparsers(dest="run_action", required=True)
+    run_prepare = run_subparsers.add_parser("prepare")
+    run_prepare.add_argument("--repo", type=Path, default=Path.cwd())
+    run_prepare.add_argument("--task", type=Path, required=True)
+    run_prepare.add_argument("--session-id", required=True)
+    run_prepare.add_argument("--policy", type=Path)
+    run_prepare.add_argument("--registry", type=Path)
+    _add_output_option(run_prepare)
+    run_prepare.set_defaults(handler=command_run)
+    for action in ("verify", "status", "block"):
+        action_parser = run_subparsers.add_parser(action)
+        action_parser.add_argument("--repo", type=Path, default=Path.cwd())
+        action_parser.add_argument("--task-id", required=True)
+        if action == "block":
+            action_parser.add_argument("--reason", required=True)
+        _add_output_option(action_parser)
+        action_parser.set_defaults(handler=command_run)
+
+    report_parser = subparsers.add_parser(
+        "report", help="Summarize bounded local run receipts."
+    )
+    report_parser.add_argument("--repo", type=Path, default=Path.cwd())
+    report_parser.add_argument("--since", default="30d")
+    report_parser.add_argument("--format", choices=("markdown",), default="markdown")
+    report_parser.set_defaults(handler=command_report)
 
     risk_parser = subparsers.add_parser(
         "risk-status",
