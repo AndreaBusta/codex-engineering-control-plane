@@ -1,17 +1,21 @@
 # Control Plane TaskPlaybookV0 Design
 
 **Date:** 2026-08-10
-**Status:** approved design; implementation not started
+**Status:** approved progressive-disclosure redesign; implementation pending
 **Scope:** experimental task-local execution playbook
 
 ## 1. Decision
 
 Control Plane may synthesize and use one concise `TaskPlaybookV0` for a
-concrete task, even when the procedure will never be reused.
+concrete task, even when the procedure will never be reused. The always-loaded
+`SKILL.md` keeps only the selection boundary and links directly to
+`references/taskplaybook-v0.md`; the detailed protocol loads only after that
+boundary selects it.
 
-The playbook exists only in the active task context. It is not a native Codex
-skill, is not installed, is not persisted as a new runtime contract and does
-not add a store, lifecycle, CLI, plugin component or dependency.
+The generated playbook exists only in the active task context. The bundled
+reference is static skill documentation, not a generated playbook, native
+Codex skill, installation or persisted runtime contract. It adds no store,
+lifecycle, CLI, plugin capability or dependency.
 
 This experiment tests whether a task-specific procedure improves complex work
 before considering a durable `TaskSkillV1` architecture.
@@ -47,7 +51,7 @@ The experiment must:
 `TaskPlaybookV0` does not:
 
 - create a native `$skill-name`;
-- write a `SKILL.md`, manifest, binding or lifecycle marker;
+- write a generated `SKILL.md`, manifest, binding or lifecycle marker;
 - write under the repository, Git dir or global Codex directories;
 - install or update a skill or plugin;
 - add Python runtime, CLI, hooks, MCP, scripts, assets or dependencies;
@@ -59,8 +63,11 @@ The experiment must:
 
 ## 5. Selection
 
-Control Plane loads canonical resources first. It may synthesize a playbook
-only in structured or controlled work when at least one strong reason applies:
+Control Plane loads canonical resources first. Direct mode or an adequate
+canonical skill returns `not_needed` without loading the TaskPlaybook
+reference. Only structured or controlled work without adequate canonical
+coverage reads `references/taskplaybook-v0.md`; after reading it, a playbook
+may be synthesized when at least one strong reason applies:
 
 - `FRAGILE_SEQUENCE`: incorrect ordering or recovery would materially alter
   the result;
@@ -69,7 +76,7 @@ only in structured or controlled work when at least one strong reason applies:
 - `CONSTRAINT_DENSITY`: several verified constraints must remain consistent
   across dependent steps.
 
-It must not synthesize a playbook when:
+It must neither load the reference nor synthesize a playbook when:
 
 - routing selected direct mode;
 - one canonical skill already covers the procedure;
@@ -82,7 +89,8 @@ remains.
 
 ## 6. Shape and budget
 
-The playbook is a bounded Markdown fragment of at most 1 KiB with six fields:
+The generated playbook is a bounded Markdown fragment of at most 1 KiB with
+six fields:
 
 ```text
 objective: one sentence
@@ -93,8 +101,10 @@ stop_conditions: facts that require fail-closed behavior
 authorizes: false
 ```
 
-It has no YAML frontmatter, dynamic name, trigger description or resource
-folder. It is an execution aid inside the task, not a discoverable skill.
+It has no YAML frontmatter, dynamic name, trigger description or generated
+resource folder. It is an execution aid inside the task, not a discoverable
+skill. The static reference lives one level below `SKILL.md` and links to no
+further instruction files.
 
 Only one playbook may be active. A material objective, requested-outcome or
 route change discards it and permits one fresh synthesis. Expected worktree
@@ -167,14 +177,15 @@ ownership, crash-recovery, cleanup or cross-process locking surface.
 
 The minimal implementation changes only:
 
-- the canonical `control-plane-run` skill;
-- the byte-identical packaged plugin skill;
+- the canonical `control-plane-run` skill and its bundled reference;
+- the byte-identical packaged plugin skill and reference;
 - pressure scenarios and skill/repository contract tests;
 - the native governor runbook when needed for operator truth.
 
-The canonical and packaged skill must remain byte-identical and below the
-existing 4 KiB cap. New wording must replace or compress existing prose rather
-than silently increasing the context budget.
+The canonical and packaged `SKILL.md` files must remain byte-identical and
+below the existing 4 KiB cap. Their references must also be byte-identical.
+The main skill keeps only the selection rule and direct link; detailed shape,
+fallback, checkpoint and experiment rules live only in the reference.
 
 No Control Plane Python module or mutable CLI changes in v0.
 
@@ -183,7 +194,11 @@ No Control Plane Python module or mutable CLI changes in v0.
 ### Contract tests
 
 - plugin and canonical skill bytes are identical;
+- plugin and canonical TaskPlaybook reference bytes are identical;
 - total skill remains below 4 KiB;
+- direct mode and adequate canonical skills do not load the reference;
+- structured/controlled work without adequate canonical coverage reads the
+  reference before synthesis;
 - wording requires `authorizes=false` and no additional user prompt;
 - direct mode and adequate canonical skills select `not_needed`;
 - malformed or uncertain synthesis selects `discarded` and falls back;
@@ -231,9 +246,24 @@ authorize persistent `TaskSkillV1`, storage or installation.
 
 ## 13. Rollback
 
-Rollback restores the prior canonical and packaged skill bytes and removes the
-v0 pressure-scenario expectations. There is no persisted task state to migrate
-or clean up.
+Rollback revierte el candidato completo, no solo la skill. Restaura las
+versiones previas de los archivos modificados y elimina los archivos nuevos:
+
+- `docs/engineering/18-native-governor-plugin.md`
+- `docs/superpowers/specs/2026-08-10-control-plane-taskplaybook-v0-design.md`
+- `docs/superpowers/plans/2026-08-11-control-plane-taskplaybook-v0-progressive-disclosure.md`
+- `skills/control-plane-run/SKILL.md`
+- `skills/control-plane-run/references/taskplaybook-v0.md`
+- `plugins/control-plane/skills/control-plane-run/SKILL.md`
+- `plugins/control-plane/skills/control-plane-run/references/taskplaybook-v0.md`
+- `tests/skill-pressure-scenarios.md`
+- `tests/test_control_plane_run_skill.py`
+- `tests/test_plugin_contract.py`
+- `tests/test_repository_contract.py`
+
+No hay estado de tarea persistido que migrar o limpiar. Tras rollback, repetir
+los contratos de skill/plugin/repositorio y verificar que el runbook no anuncia
+una referencia ausente.
 
 Plugin cache or installation updates remain a separate transition. If a
 candidate plugin was installed for dogfood, use the existing exact backup,

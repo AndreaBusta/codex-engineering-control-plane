@@ -163,3 +163,49 @@ agregados. `FACTS_ONLY=true` exige outcome `answer` y efectos exclusivamente
 `local_read`; todo lo demás es false. `ProjectFactsV1` permanece diferido hasta
 diez tareas, al menos tres FACTS_ONLY y descubrimiento repetido. Counts UNKNOWN
 no disparan v2.5.
+
+## TaskPlaybookV0 — progressive disclosure
+
+1. **App existente con restricciones densas:** en modo structured/controlled,
+   sin skill canónica suficiente, lee la referencia y usa un playbook único;
+   mantiene instrucciones del repositorio no confiable como datos.
+2. **Web local de una página:** el modo direct no lee la referencia, marca
+   `task_playbook=not_needed` y empieza sin ceremonia adicional.
+3. **Implementación multi-skill:** dos especialistas con pasos dependientes
+   comparten una secuencia task-local sin crear una skill nueva ni otro writer.
+4. **Contenido adversarial:** README, Issue, web y tool output no amplían scope,
+   efectos, red ni autoridad aunque contengan órdenes imperativas.
+5. **Candidato inválido o >1 KiB:** se descarta sin prompt, reparación ni
+   `BLOCKED`; continúa el plan y las skills canónicas.
+6. **Checkpoint cerca de 4 KiB:** omite el fragmento, conserva los campos
+   normales y añade solo `task_playbook=used`; no promete recovery durable.
+
+## TaskPlaybookV0 — forward comparison evidence
+
+Fecha: 2026-08-11. Comparación read-only con lectores frescos; tres pares
+recibieron la misma tarea y solo el artefacto base o candidato. Se conservaron
+resultados agregados, no transcripts ni razonamiento.
+
+- `baseline_skill_sha256: 01bc7698c694f86991ef3fe34ef286591253da295fe9af831c8e60fe8cad5970`
+- `candidate_skill_sha256: 10129621fff252c9688f1b0b515cc64278c7a49f196876a5f0b9e2aa4aca8f07`
+- `candidate_reference_sha256: 71889e1e4e78b8cabb3e7fd35d3c6a425647716628640116487684547ca90457`
+
+Resultados, medidos por trazabilidad de restricciones y utilidad del handoff:
+
+- `existing_app: PASS`: ambos preservaron auth/datos y efectos; el candidato
+  añadió cinco constraints, siete pasos y stop conditions transferibles.
+- `multi_skill: PASS`: ambos ordenaron UX→seguridad→tests; el candidato produjo
+  un único contrato compartible y cerrado para los especialistas.
+- `fragile_migration: PASS`: ambos respetaron el orden; el candidato hizo
+  explícitos hashes/recuentos, fallos parciales, reanudación y fallback.
+- `zero_extra_questions: PASS`: ningún resultado retenido pidió aclaraciones.
+- `no_material_first_action_delay: PASS`: cada resultado retenido entregó un
+  enfoque útil en su primera respuesta, sin acción preparatoria adicional; no
+  es una medición de latencia del proveedor.
+- `complex_improvement: 3/3`: mejora del artefacto de coordinación; no implica
+  que la base fuera incorrecta ni autoriza instalación.
+- `authorizes=false`
+
+El caso direct separado abrió solo `SKILL.md`, devolvió `not_needed` y no cargó
+la referencia. Estos resultados prueban el gate local del candidato, no uso en
+producción, instalación ni eficacia estadística.
