@@ -40,9 +40,16 @@ UNKNOWN no disparan v2.5.
 
 ## Plugin candidate
 
-`plugins/control-plane` contiene solo el manifest y la copia byte-exacta de
-`control-plane-run`. La versión `3.0.0` identifica un plugin candidate; no es
-una release del producto, no instala nada y no habilita efectos remotos.
+`plugins/control-plane` contiene solo el manifest, la copia byte-exacta de
+`control-plane-run` y su referencia condicional `TaskPlaybookV0`. La versión
+`3.0.0` identifica un plugin candidate; no es una release del producto, no
+instala nada y no habilita efectos remotos.
+
+TaskPlaybookV0 usa solo contexto activo y `authorizes=false`. Direct o skill
+canónica suficiente no carga la referencia. Structured/controlled sin skill
+canónica suficiente la lee antes de sintetizar; un candidato inválido o
+incierto se descarta sin bloquear. El fragmento no persiste, no instala nada y
+no crea runtime, CLI, store, Goal, worker ni autoridad.
 
 Antes de instalar:
 

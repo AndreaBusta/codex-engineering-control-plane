@@ -1359,6 +1359,93 @@ jobs:
         for forbidden in ("hooks", "mcpServers", "apps"):
             self.assertNotIn(forbidden, plugin)
 
+    def test_taskplaybook_reference_is_progressive_and_uninstalled(self) -> None:
+        runbook = ROOT / "docs" / "engineering" / "18-native-governor-plugin.md"
+        skill = ROOT / "skills" / "control-plane-run" / "SKILL.md"
+        reference = (
+            ROOT
+            / "skills"
+            / "control-plane-run"
+            / "references"
+            / "taskplaybook-v0.md"
+        )
+        packaged_reference = (
+            ROOT
+            / "plugins"
+            / "control-plane"
+            / "skills"
+            / "control-plane-run"
+            / "references"
+            / "taskplaybook-v0.md"
+        )
+
+        normalized = " ".join(runbook.read_text(encoding="utf-8").lower().split())
+        for required in (
+            "taskplaybookv0",
+            "referencia condicional",
+            "direct o skill canónica suficiente no carga la referencia",
+            "structured/controlled sin skill canónica suficiente",
+            "solo contexto activo",
+            "no persiste",
+            "no instala",
+            "authorizes=false",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, normalized)
+
+        self.assertLess(len(skill.read_bytes()), 4096)
+        self.assertEqual(reference.read_bytes(), packaged_reference.read_bytes())
+
+    def test_taskplaybook_rollback_covers_the_complete_candidate(self) -> None:
+        design = (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-10-control-plane-taskplaybook-v0-design.md"
+        )
+        rollback = design.read_text(encoding="utf-8").split("## 13. Rollback", 1)[1]
+        expected_paths = {
+            "docs/engineering/18-native-governor-plugin.md",
+            "docs/superpowers/specs/2026-08-10-control-plane-taskplaybook-v0-design.md",
+            "docs/superpowers/plans/2026-08-11-control-plane-taskplaybook-v0-progressive-disclosure.md",
+            "skills/control-plane-run/SKILL.md",
+            "skills/control-plane-run/references/taskplaybook-v0.md",
+            "plugins/control-plane/skills/control-plane-run/SKILL.md",
+            "plugins/control-plane/skills/control-plane-run/references/taskplaybook-v0.md",
+            "tests/skill-pressure-scenarios.md",
+            "tests/test_control_plane_run_skill.py",
+            "tests/test_plugin_contract.py",
+            "tests/test_repository_contract.py",
+        }
+        for path in expected_paths:
+            with self.subTest(path=path):
+                self.assertIn(f"`{path}`", rollback)
+
+    def test_taskplaybook_forward_comparison_evidence_is_recorded(self) -> None:
+        scenarios = (
+            ROOT / "tests" / "skill-pressure-scenarios.md"
+        ).read_text(encoding="utf-8")
+        section = scenarios.split(
+            "## TaskPlaybookV0 — forward comparison evidence", 1
+        )
+        self.assertEqual(len(section), 2)
+        evidence = section[1]
+        for required in (
+            "baseline_skill_sha256:",
+            "candidate_skill_sha256:",
+            "candidate_reference_sha256:",
+            "existing_app:",
+            "multi_skill:",
+            "fragile_migration:",
+            "zero_extra_questions: PASS",
+            "no_material_first_action_delay: PASS",
+            "complex_improvement: 3/3",
+            "authorizes=false",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, evidence)
+
     def test_no_unresolved_placeholders(self) -> None:
         forbidden = re.compile(
             r"\bT[B]D\b|\bT[O]DO\b|"

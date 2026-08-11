@@ -10,6 +10,20 @@ PLUGIN = ROOT / "plugins" / "control-plane"
 MANIFEST = PLUGIN / ".codex-plugin" / "plugin.json"
 PACKAGED_SKILL = PLUGIN / "skills" / "control-plane-run" / "SKILL.md"
 CANONICAL_SKILL = ROOT / "skills" / "control-plane-run" / "SKILL.md"
+PACKAGED_TASKPLAYBOOK_REFERENCE = (
+    PLUGIN
+    / "skills"
+    / "control-plane-run"
+    / "references"
+    / "taskplaybook-v0.md"
+)
+CANONICAL_TASKPLAYBOOK_REFERENCE = (
+    ROOT
+    / "skills"
+    / "control-plane-run"
+    / "references"
+    / "taskplaybook-v0.md"
+)
 
 
 EXPECTED_MANIFEST = {
@@ -55,6 +69,16 @@ class ControlPlanePluginContractTests(unittest.TestCase):
         self.assertTrue(PACKAGED_SKILL.is_file(), "packaged skill is missing")
         self.assertEqual(PACKAGED_SKILL.read_bytes(), CANONICAL_SKILL.read_bytes())
 
+    def test_packaged_taskplaybook_reference_is_byte_identical(self) -> None:
+        self.assertTrue(
+            PACKAGED_TASKPLAYBOOK_REFERENCE.is_file(),
+            "packaged TaskPlaybookV0 reference is missing",
+        )
+        self.assertEqual(
+            PACKAGED_TASKPLAYBOOK_REFERENCE.read_bytes(),
+            CANONICAL_TASKPLAYBOOK_REFERENCE.read_bytes(),
+        )
+
     def test_plugin_contains_no_unproved_component(self) -> None:
         self.assertTrue(PLUGIN.is_dir(), "control-plane plugin is missing")
         files = {
@@ -67,6 +91,7 @@ class ControlPlanePluginContractTests(unittest.TestCase):
             {
                 ".codex-plugin/plugin.json",
                 "skills/control-plane-run/SKILL.md",
+                "skills/control-plane-run/references/taskplaybook-v0.md",
             },
         )
         for forbidden in ("hooks", "scripts", "assets"):
