@@ -1012,6 +1012,67 @@ class RunVerificationTests(unittest.TestCase):
         self.assertEqual(result["summary"]["attempt_count"], 1)
         self.assertEqual(len(result["receipts"]), 5)
 
+    def test_t1_commit_pass_publishes_delivery_ready_binding_and_releases_writer(
+        self,
+    ) -> None:
+        from control_plane.contracts import contract_digest
+        from control_plane.lifecycle import TaskStore
+        from control_plane.policy import load_policy
+        from control_plane.repository import worktree_git_dir
+        from control_plane.run_workflow import verify_run
+
+        self.task["requested_outcome"] = "commit"
+        self.task["effects"] = [
+            {"name": "local_read", "source": "model_inference"},
+            {"name": "local_write", "source": "user_explicit"},
+            {"name": "commit", "source": "user_explicit"},
+        ]
+        self.decision["facts"] = {"task_digest": contract_digest(self.task)}
+        self.decision["approval_boundaries"] = ["commit"]
+        self.decision["decision_digest"] = contract_digest(
+            {
+                key: value
+                for key, value in self.decision.items()
+                if key != "decision_digest"
+            }
+        )
+        scenario = self._prepared_scenario()
+
+        verify_run(
+            repository=scenario.repo,
+            task_id=self.task["task_id"],
+            observed_at="2026-08-08T10:01:00Z",
+        )
+
+        state_dir = worktree_git_dir(scenario.repo)
+        task_store = TaskStore(state_dir)
+        state = task_store.status(self.task["task_id"])
+        binding = state.get("delivery_review_binding")
+        self.assertEqual(state["state"], "review_ready")
+        self.assertIsInstance(binding, dict)
+        self.assertEqual(binding["receipt_digests"], [])
+        implementation_lease = (
+            state_dir
+            / "codex-control-plane"
+            / "leases"
+            / f"{self.task['task_id']}.json"
+        )
+        self.assertFalse(implementation_lease.exists())
+        delivery_lease = task_store.acquire_delivery_lease(
+            self.task["task_id"],
+            worktree=str(scenario.repo),
+            branch="codex/run-verify",
+            session_id="session-delivery-001",
+            paths=list(binding["scope_paths"]),
+            policy_digest=contract_digest(
+                load_policy(scenario.repo / ".codex" / "project-policy.toml")
+            ),
+            expected_head=str(binding["reviewed_head"]),
+            diff_digest=str(binding["diff_digest"]),
+            expected_generation=int(state["generation"]),
+        )
+        self.assertEqual(delivery_lease["task_id"], self.task["task_id"])
+
     def test_delivery_audit_is_compact_read_only_and_binds_durable_running_state(
         self,
     ) -> None:

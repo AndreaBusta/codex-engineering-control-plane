@@ -232,8 +232,9 @@ los únicos efectos `local_write`, `commit`, `remote_write`, `pull_request` e
 `integration`. En la frontera local real, `frame_effect_authorization` recibe
 `NativeUserInteractionEvent` y `HostAdapterCapability`; esos objetos opacos no
 se serializan ni se reconstruyen desde un receipt. Python bridge recibe y
-consume la autorización nativa solo para Git local allowlisted (`git add` y
-`git commit`). El kernel puede observar con `git ls-remote` read-only;
+consume la autorización nativa solo para Git local allowlisted (`git add`;
+commit con `git commit-tree` y `git update-ref` CAS). El kernel puede observar
+con `git ls-remote` read-only;
 push/PR/squash merge son host-native y Python solo valida sus planes y receipts
 no autorizantes.
 
@@ -296,6 +297,11 @@ y bindings, pero no afirma su procedencia nativa. Esa procedencia solo se
 demuestra en el sandbox nativo. Los objetos
 `ValidatedPullRequestMutationObservation` y los adapters de tests existentes
 no son la vía de producción.
+
+La integración es más estricta: tanto el receipt `READY` previo al merge como
+el `PASS` posterior requieren una `ValidatedGitHubObservation` fresca,
+host-bound y one-shot, ligada al plan, PR, checks, estado y SHA exactos. Un
+receipt escalar nunca arma el ticket ni publica `merged`.
 
 ### 4.6 `StableReviewDiffArtifactV1`
 

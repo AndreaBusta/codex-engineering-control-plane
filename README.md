@@ -38,7 +38,8 @@ release siguen siendo fronteras externas y requieren sus propias evidencias.
 
 La rama candidata v2.3 añade contratos cerrados para review, delivery y
 verificación de base. Frontera real: el bridge Python ejecuta Git local
-allowlisted (`git add`/`git commit`). En prepare/arm/revalidate, el kernel hace
+allowlisted (`git add`; commit con `git commit-tree` y `git update-ref` CAS).
+En prepare/arm/revalidate, el kernel hace
 observación remota con `git ls-remote` read-only. Las mutaciones push/PR/squash
 merge son host-native: Python no recibe autoridad. Sin adaptador nativo quedan
 `BLOCKED`; los adapters de tests solo validan el contrato.

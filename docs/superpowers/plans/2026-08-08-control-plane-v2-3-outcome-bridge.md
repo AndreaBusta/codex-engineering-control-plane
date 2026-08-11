@@ -57,7 +57,8 @@ the local candidate is identified by its reproducible contract and diff digest.
 - [x] `frame_effect_authorization` recibe `NativeUserInteractionEvent` y
   `HostAdapterCapability`; nunca los reconstruye desde JSON. Python bridge
   recibe y consume la autorización nativa solo para Git local allowlisted
-  (`git add` y `git commit`). El kernel puede observar con `git ls-remote`
+  (`git add`; commit con `git commit-tree` y `git update-ref` CAS). El kernel
+  puede observar con `git ls-remote`
   read-only; push/PR/squash merge son host-native.
 - [x] Derive a single host-only root grant-set from the current request. Its
   one-shot claims follow the expected lineage `review_head → committed_head →
@@ -175,7 +176,7 @@ not represented as `PASS`.
 
 - [x] **Step 3: Change only the state preconditions necessary for the handoff.** In `control_plane/run_workflow.py`, preserve the task's immutable final outcome. In `control_plane/lifecycle.py`, leave `task_allows_writer_lease()` unchanged and add a separate delivery-lease predicate/acquisition allowed only at matching `review_ready`. A validated staged-index observation leaves state at `review_ready`; a validated commit observation transitions directly to `committed` and releases the delivery lease owner-bound and idempotently. Do not allow delivery from `planned`, `implementing`, `verifying`, stale `review_ready`, or a task with an implementation lease.
 
-- [x] **Step 3a: Make staging and delivery commit crash-consistent.** Write `finalizing_delivery_commit.prepared` durably before `git add`, binding snapshot, allowlist, expected index, parent, tree and message digest. Add fault-injection tests after marker creation, immediately after staging, after native Git commit, after lifecycle publication and before lease release. Implement marker phases `prepared → index_observed → git_committed → state_committed → lease_released`; `index_observed` is recovery metadata, not a lifecycle state. Recovery may finalize only when index, parent, tree, message digest and observed SHA match; otherwise it blocks without repeating stage/commit or using destructive reset.
+- [x] **Step 3a: Make staging and delivery commit crash-consistent.** Write `finalizing_delivery_commit.prepared` durably before `git add`, binding snapshot, allowlist, expected index, parent, tree and message digest. Build the commit object with `git commit-tree` from that exact tree and sole parent, then move only the bound branch with `git update-ref <new> <expected-old>` CAS; recheck parent, tree, HEAD and index after the CAS. Add fault-injection tests after marker creation, immediately after staging, after the native commit effect, after lifecycle publication and before lease release. Implement marker phases `prepared → index_observed → git_committed → state_committed → lease_released`; `index_observed` is recovery metadata, not a lifecycle state. Recovery may finalize only when index, parent, tree, message digest and observed SHA match; otherwise it blocks without repeating stage/commit or using destructive reset.
 
 - [x] **Step 4: Add red guard tests for local integrity.** Cover dirty worktree, unrelated staged path, untracked file in scope, changed file after review, release by a different owner, missing required gate, foreign change, HEAD/base divergence and a remote result of `UNKNOWN`. Each must reject the next transition or leave the task `BLOCKED`; no test may assert `PASS` from absence of evidence.
 
@@ -274,7 +275,7 @@ not represented as `PASS`.
   python3 -m unittest tests.test_squash_merge -v
   ```
 
-- [x] **Step 4: Implement a closed squash-only host handoff.** The kernel emits only canonical `integration` with strategy `squash`; the root consumes its native claim and invokes exact `gh` argv through the host tool. No plan or skill path may represent another merge method or auto-merge. A missing/failed host tool is `BLOCKED` and never falls back to a Python test provider.
+- [x] **Step 4: Implement a closed squash-only host handoff.** The kernel emits only canonical `integration` with strategy `squash`; the root consumes its native claim and invokes exact `gh` argv through the host tool. Both the `READY` pre-read and the post-effect `PASS` require fresh one-shot `ValidatedGitHubObservation` objects bound to the exact plan, PR, checks and provider result; scalar receipts cannot arm or publish. No plan or skill path may represent another merge method or auto-merge. A missing/failed host tool is `BLOCKED` and never falls back to a Python test provider.
 
 - [x] **Step 5: Implement base verification through the host boundary.** Keep `git_state.py` read-only. The root host invokes a closed fetch for only the bound `origin/<base>`; `git_state.py` then reads the refreshed ref and `host_bridge.py` validates merge metadata/containment. In `control_plane/lifecycle.py`, permit `merged → base_verified → close` only after this evidence; retain a clear recovery record if it fails or is unknown.
 

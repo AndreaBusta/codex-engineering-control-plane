@@ -2033,7 +2033,6 @@ class TaskStore:
             or binding.get("scope_paths") != paths
             or not isinstance(binding.get("untracked_modes"), list)
             or not isinstance(binding.get("receipt_digests"), list)
-            or not binding["receipt_digests"]
         ):
             raise ValueError("E_DELIVERY_REVIEW: review binding drifted")
         try:
@@ -3968,6 +3967,7 @@ class TaskStore:
         effect_plan: IntegrationEffectPlanV1,
         receipt: IntegrationReceiptV1,
         current_branch: str,
+        observation: object | None = None,
         now: str | None = None,
         clock: object | None = None,
     ) -> dict[str, Any]:
@@ -4007,6 +4007,35 @@ class TaskStore:
                 code="E_INTEGRATION_PREPARE",
             ):
                 raise ValueError("E_INTEGRATION_PREPARE: READY binding drifted")
+            expected_observation = {
+                "effect_plan_digest": effect_plan.plan_digest,
+                "integration_receipt_digest": receipt.receipt_digest,
+                "pull_request_digest": effect_plan.pull_request_digest,
+                "checks_digest": effect_plan.checks_digest,
+                "pull_request_state": "OPEN",
+                "draft": False,
+            }
+            if (
+                not isinstance(observation, ValidatedGitHubObservation)
+                or observation.task_digest != state.get("task_digest")
+                or observation.branch != current_branch
+                or observation.prior_head != effect_plan.head_sha
+                or observation.target_state != "integration_ready"
+                or observation.evidence != expected_observation
+            ):
+                raise ValueError(
+                    "E_INTEGRATION_OBSERVATION: exact READY observation is required"
+                )
+            try:
+                observed = consume_lifecycle_observation(observation)
+            except ValueError as error:
+                raise ValueError(
+                    "E_INTEGRATION_OBSERVATION: READY observation is unavailable"
+                ) from error
+            if observed != expected_observation:
+                raise ValueError(
+                    "E_INTEGRATION_OBSERVATION: READY observation drifted"
+                )
             marker_core = {
                 **{
                     key: value
@@ -4111,6 +4140,7 @@ class TaskStore:
         effect_plan: IntegrationEffectPlanV1,
         receipt: IntegrationReceiptV1,
         current_branch: str,
+        observation: object | None = None,
     ) -> dict[str, Any]:
         """Publish only an exact observation; never execute or retry merge."""
 
@@ -4178,6 +4208,35 @@ class TaskStore:
                 return state
             if receipt.status != "PASS":
                 raise ValueError("E_INTEGRATION_RECEIPT: PASS observation required")
+            expected_observation = {
+                "effect_plan_digest": effect_plan.plan_digest,
+                "integration_receipt_digest": receipt.receipt_digest,
+                "pull_request_digest": effect_plan.pull_request_digest,
+                "checks_digest": effect_plan.checks_digest,
+                "merge_commit": receipt.observed_merge_sha,
+                "strategy": "squash",
+            }
+            if (
+                not isinstance(observation, ValidatedGitHubObservation)
+                or observation.task_digest != state.get("task_digest")
+                or observation.branch != current_branch
+                or observation.prior_head != effect_plan.head_sha
+                or observation.target_state != "merged"
+                or observation.evidence != expected_observation
+            ):
+                raise ValueError(
+                    "E_INTEGRATION_OBSERVATION: exact host observation is required"
+                )
+            try:
+                observed = consume_lifecycle_observation(observation)
+            except ValueError as error:
+                raise ValueError(
+                    "E_INTEGRATION_OBSERVATION: host observation is unavailable"
+                ) from error
+            if observed != expected_observation:
+                raise ValueError(
+                    "E_INTEGRATION_OBSERVATION: host observation drifted"
+                )
             successor = apply_integration_receipt(
                 outcome_binding=state["outcome_binding"],
                 effect_plan=effect_plan,
@@ -5561,7 +5620,6 @@ class TaskStore:
                 isinstance(value, str) and SHA256_DIGEST.fullmatch(value)
                 for value in (run_plan_digest, run_revision_digest, attempt_digest, promotion_digest, *receipt_digests)
             )
-            or not receipt_digests
         ):
             raise ValueError("E_INDEPENDENT_REVIEW: promotion proof is invalid")
         try:

@@ -974,6 +974,9 @@ jobs:
             "drift",
             "stale review",
             "uncertain write",
+            "commit-tree",
+            "update-ref",
+            "READY/PASS integration observations",
             "Local guards are not GitHub branch protection",
             "Residual risks",
         ):
@@ -1095,7 +1098,8 @@ jobs:
             "`frame_effect_authorization` recibe `NativeUserInteractionEvent` "
             "y `HostAdapterCapability`",
             "Python bridge recibe y consume la autorización nativa solo para Git "
-            "local allowlisted (`git add` y `git commit`)",
+            "local allowlisted (`git add`; commit con `git commit-tree` y "
+            "`git update-ref` CAS)",
             "kernel puede observar con `git ls-remote` read-only",
             "push/PR/squash merge son host-native",
         )

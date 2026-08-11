@@ -7712,9 +7712,43 @@ def commit_staged_change(
                 session_id=session_id,
                 invocation_id=invocation_id,
             )
-            completed = subprocess.run(
+            created = subprocess.run(
                 _closed_git_argv(
-                    worktree, ["commit", "-m", message]
+                    worktree,
+                    [
+                        "commit-tree",
+                        str(index_observation.index_tree),
+                        "-p",
+                        expected_prior_head,
+                    ],
+                ),
+                check=False,
+                input=(message + "\n").encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_sanitized_git_environment(),
+            )
+            candidate = (
+                created.stdout.decode("ascii", errors="strict").strip()
+                if created.stdout is not None
+                else ""
+            )
+            if (
+                created.returncode != 0
+                or _GIT_OBJECT_ID.fullmatch(candidate) is None
+            ):
+                raise ValueError(
+                    "E_GIT_EFFECT: exact commit object was not created"
+                )
+            updated = subprocess.run(
+                _closed_git_argv(
+                    worktree,
+                    [
+                        "update-ref",
+                        f"refs/heads/{lease_mapping['branch']}",
+                        candidate,
+                        expected_prior_head,
+                    ],
                 ),
                 check=False,
                 stdout=subprocess.PIPE,
@@ -7722,10 +7756,17 @@ def commit_staged_change(
                 env=_sanitized_git_environment(),
             )
             head = _git_text(worktree, ["rev-parse", "HEAD"])
+            parents = _git_text(
+                worktree, ["rev-list", "--parents", "-n", "1", candidate]
+            ).split()
+            committed_tree = _git_text(
+                worktree, ["show", "-s", "--format=%T", candidate]
+            )
             if (
-                completed.returncode != 0
-                or head == expected_prior_head
-                or _GIT_OBJECT_ID.fullmatch(head) is None
+                updated.returncode != 0
+                or head != candidate
+                or parents != [candidate, expected_prior_head]
+                or committed_tree != index_observation.index_tree
                 or _git_text(
                     worktree, ["diff", "--cached", "--name-only"]
                 )
