@@ -1,15 +1,15 @@
 {
   "name": "control-plane",
-  "version": "3.0.0",
-  "description": "Native-governed Control Plane workflows for Codex.",
+  "version": "3.1.0-core.1",
+  "description": "Local-first, non-authorizing Control Plane Core workflows for Codex.",
   "author": {
     "name": "Codex Engineering Control Plane"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Control Plane",
-    "shortDescription": "Run bounded engineering without internal prompts.",
-    "longDescription": "Routes verified work, governs native tasks, and preserves host-only authority.",
+    "shortDescription": "Run bounded local-first Core engineering.",
+    "longDescription": "Routes verified local work with non-authorizing evidence and explicit external authority boundaries.",
     "developerName": "Codex Engineering Control Plane",
     "category": "Productivity",
     "capabilities": [],

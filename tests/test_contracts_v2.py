@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import unittest
 
-from tests.router_test_support import task_envelope
+from tests.core_router_test_support import task_envelope
 
 
 class ContractTestsV2(unittest.TestCase):

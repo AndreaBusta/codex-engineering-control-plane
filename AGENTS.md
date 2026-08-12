@@ -18,8 +18,8 @@ La prosa no sustituye a los gates, GitHub, CI ni al proveedor de release.
    scripts/control-plane preflight --mode write
    ```
 
-4. Antes de una transición que dependa del remote, repite con `--refresh`.
-   `--offline` y el modo por defecto no son comprobación remota actual.
+4. Core no refresca ni muta remotes. Una transición que dependa del remote usa
+   observación host separada y queda `UNKNOWN` si esa evidencia no existe.
 5. Si el repositorio aún no tiene commit inicial, informa de esa limitación y
    no simules un worktree seguro.
 
@@ -89,6 +89,7 @@ autocontenido con estos campos:
 - Mensaje exacto: texto breve listo para copiar y enviar.
 - Estado de partida: repositorio, worktree, rama, HEAD, PR y gate relevantes.
 - No hacer todavía: transiciones o efectos aún no autorizados.
+- Autoridad: `authorizes=false`.
 
 Usa la tarea padre u orquestadora como destino normal del usuario. Señala otra
 tarea solo tras verificar por separado de Git su identidad visible, estado activo
@@ -105,14 +106,19 @@ Para una referencia exacta `codex://threads/<UUID>`, usa solo la lectura nativa 
 - Nunca despiertes, escribas, dirijas, archives ni modifiques la tarea consultada.
 - El lookup no satisface gates de revisión ni autorización y no concede continuación automática.
 
-## Autoridad visual y tareas shadow
+## Core y autoridad
 
-- Para merge, deploy o publicación, muestra `PREPARADO — NO EJECUTADO` con acción, proyecto/repositorio, rama, commit/target exactos, efecto, evidencias/gates, rollback, límites y la frase exacta; siempre `authorizes=false`.
-- `sí`, `ok`, texto ambiguo o la propia tarjeta nunca autorizan; tampoco la frase exacta por sí sola. Separa preparación, autorización verificada, ejecución y observación con texto/orden, no solo color.
-- Una transferencia queda `PENDING_NATIVE_REISSUE` o `UNKNOWN`, con `authorizes=false`. No reutilices ni serialices autoridad entre tareas o sesiones: un host futuro debe reemitir `TrustedAuthorization` nueva desde una autorización fuente nativa exacta, ligada a tarea origen, tarea/sesión destino, repo, acción, target, SHA, `scope_paths` y `subject_digest`; falla cerrado si está ausente, fabricado, expirado, reutilizado o no coincide en repo, acción, target o SHA, tarea, sesión, `scope_paths` o `subject_digest`.
-- El mandato solo permite proponer abrir, supervisar, relevar y cerrar, con máximo dos workers y ningún writer solapado. No propongas cierre/archivo sin checkpoint completo, estado terminal verificable y cero trabajo o efectos pendientes.
-- El mandato no concede commit, push, PR, merge, deploy, release, secretos ni pagos; el runtime no crea, despierta, escribe ni archiva tareas: produce solo planes shadow para un host futuro.
-- Ponytail `ponytail-review` queda deferido tras inspeccionar `DietrichGebert/ponytail@16f29800fd2681bdf24f3eb4ccffe38be3baec6b` (`sha256:40df33b58fc6ef889b93585733feb9566b76e9586efa7f376785c1e995197ac0`): no se instala ni registra. Si se usa el checklist delete/stdlib/native/yagni/shrink y net LOC, será read-only, opcional y no autorizante; la deriva real se comprueba con `TaskEnvelope` frente a changed paths.
+- Core acepta solo `answer` y `local_change`. Commit, push, Pull Request, merge,
+  deploy, release, instalación y upgrade quedan fuera del runtime activo.
+- Task, lease, plan, receipt, checkpoint, documento, skill y plugin son
+  `authorizes=false`; no serializan, transfieren ni reconstruyen autoridad.
+- Una petición de efecto externo requiere la autorización exacta que impongan
+  las capas superiores y observación independiente del proveedor. Ausencia,
+  deriva o incertidumbre es `UNKNOWN` o bloqueo, nunca permiso implícito.
+- Mantén máximo dos workers y ningún writer solapado. El lease local prueba
+  ownership y continuidad, no autorización para otra transición.
+- `external_consumer_adoption=PROHIBITED` mientras el candidato permanezca
+  `GREEN_LOCAL / PENDING_STABLE_ADOPTION`.
 
 ## Seguridad
 

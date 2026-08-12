@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+import os
 from pathlib import Path, PurePosixPath
+import pwd
 import re
+import selectors
+import subprocess
 import tomllib
 from typing import Any, Mapping
 
@@ -18,6 +22,7 @@ from control_plane.contracts import (
     contract_digest,
 )
 from control_plane.project_profiles import detect_project_profile
+from control_plane.repository import trusted_git_argv, trusted_git_environment
 
 
 SUPPORTED_SCHEMA_VERSION = 1
@@ -90,6 +95,9 @@ ROUTE_KEYS = frozenset(
 )
 REQUIRED_ROUTE_KEYS = ROUTE_KEYS
 RESOURCE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{0,126}$", re.ASCII)
+LOCAL_SUPERPOWERS_LOCATOR = re.compile(
+    r"^plugin://local-superpowers/([0-9a-f]{40})$", re.ASCII
+)
 SAFE_LOCATOR_SCHEMES = frozenset(
     {"repo", "user-skill", "builtin", "mcp", "plugin", "agent", "template"}
 )
@@ -225,6 +233,8 @@ def _valid_locator(locator: Any) -> bool:
         )
     ):
         return False
+    if scheme == "plugin" and path.parts[:1] == ("local-superpowers",):
+        return LOCAL_SUPERPOWERS_LOCATOR.fullmatch(locator) is not None
     return True
 
 
@@ -828,8 +838,221 @@ def _file_digest(path: Path) -> str:
     return f"sha256:{hasher.hexdigest()}"
 
 
+def _bounded_git_observation(root: Path, arguments: tuple[str, ...]) -> str | None:
+    """Return one strict bounded line from a closed system-Git observation."""
+
+    try:
+        completed = subprocess.run(
+            trusted_git_argv(root, arguments),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    output = completed.stdout
+    if completed.returncode != 0 or not isinstance(output, bytes) or len(output) > 4096:
+        return None
+    try:
+        value = output.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError:
+        return None
+    if not value or "\x00" in value or "\n" in value or "\r" in value:
+        return None
+    return value
+
+
+def _effective_user_home() -> Path | None:
+    """Resolve the OS account home without trusting HOME or shell state."""
+
+    try:
+        value = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return None
+    return candidate
+
+
+def _tracked_checkout_clean(root: Path) -> bool | None:
+    """Observe tracked checkout integrity without capturing command output."""
+
+    try:
+        completed = subprocess.run(
+            trusted_git_argv(root, ("diff-index", "--quiet", "HEAD", "--")),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    return None
+
+
+def _cleanup_untracked_probe(
+    process: subprocess.Popen[bytes] | None,
+    selector: selectors.BaseSelector | None,
+) -> None:
+    """Best-effort bounded cleanup that cannot replace the probe result."""
+
+    if selector is not None:
+        try:
+            selector.close()
+        except Exception:
+            pass
+    if process is None:
+        return
+    if process.stdout is not None:
+        try:
+            process.stdout.close()
+        except Exception:
+            pass
+
+    try:
+        if process.poll() is not None:
+            try:
+                process.wait(timeout=0)
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
+    try:
+        process.terminate()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=0.25)
+        return
+    except Exception:
+        pass
+    try:
+        process.kill()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=0.25)
+        return
+    except Exception:
+        pass
+
+    # A non-cooperative process cannot be synchronously reaped without
+    # violating the bound. Make one final nonblocking poll/wait attempt.
+    try:
+        process.poll()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=0)
+    except Exception:
+        pass
+
+
+def _untracked_checkout_clean(root: Path, *, ignored: bool = False) -> bool | None:
+    """Read at most one output byte from a closed untracked-file probe."""
+
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
+    try:
+        arguments = ["ls-files", "--others"]
+        if ignored:
+            arguments.append("--ignored")
+        arguments.extend(("--exclude-standard", "-z"))
+        process = subprocess.Popen(
+            trusted_git_argv(root, tuple(arguments)),
+            env=trusted_git_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+        )
+        if process.stdout is None:
+            return None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        if not selector.select(timeout=5.0):
+            return None
+        observed = os.read(process.stdout.fileno(), 1)
+        if observed:
+            return False
+        try:
+            return True if process.wait(timeout=0.25) == 0 else None
+        except subprocess.TimeoutExpired:
+            return None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    finally:
+        _cleanup_untracked_probe(process, selector)
+
+
+def _observe_local_superpowers(
+    root: Path, expected_revision: str
+) -> tuple[str, list[str]]:
+    """Observe the canonical local Superpowers checkout without serializing paths."""
+
+    candidate = Path(root).absolute()
+    try:
+        if candidate.is_symlink():
+            return "invalid", ["R_SYMLINK_ESCAPE"]
+        resolved = candidate.resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return "unavailable", ["R_NOT_FOUND"]
+    if not resolved.is_dir():
+        return "invalid", ["R_LOCAL_SUPERPOWERS_ROOT"]
+
+    top_level = _bounded_git_observation(resolved, ("rev-parse", "--show-toplevel"))
+    if top_level is None:
+        return "unknown", ["R_GIT_UNOBSERVABLE"]
+    try:
+        observed_top_level = Path(top_level).resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return "unknown", ["R_GIT_UNOBSERVABLE"]
+    if observed_top_level != resolved:
+        return "invalid", ["R_REPOSITORY_TOPLEVEL_MISMATCH"]
+
+    revision = _bounded_git_observation(
+        resolved, ("rev-parse", "--verify", "HEAD^{commit}")
+    )
+    if revision is None or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+        return "unknown", ["R_GIT_UNOBSERVABLE"]
+    if revision != expected_revision:
+        raise RegistryError(
+            "E_RESOURCE_REVISION_DRIFT",
+            "Canonical Superpowers revision does not match the registry pin.",
+        )
+    tracked_clean = _tracked_checkout_clean(resolved)
+    untracked_clean = _untracked_checkout_clean(resolved)
+    ignored_clean = _untracked_checkout_clean(resolved, ignored=True)
+    if tracked_clean is False or untracked_clean is False or ignored_clean is False:
+        raise RegistryError(
+            "E_RESOURCE_REVISION_DRIFT",
+            "Canonical Superpowers checkout does not match the clean registry pin.",
+        )
+    if tracked_clean is None or untracked_clean is None or ignored_clean is None:
+        return "unknown", ["R_GIT_UNOBSERVABLE"]
+    return "available", []
+
+
 def build_inventory(
-    registry: Mapping[str, Any], repo_root: Path
+    registry: Mapping[str, Any],
+    repo_root: Path,
+    *,
+    local_superpowers_root: Path | None = None,
 ) -> dict[str, Any]:
     """Discover resource metadata without reading content into the snapshot."""
 
@@ -844,7 +1067,24 @@ def build_inventory(
         reason_codes: list[str] = []
         size_bytes = 0
         locator_digest = contract_digest({"id": identifier, "locator": locator})
-        if locator.startswith("repo://"):
+        local_superpowers_match = LOCAL_SUPERPOWERS_LOCATOR.fullmatch(locator)
+        if local_superpowers_match is not None:
+            effective_home = (
+                None if local_superpowers_root is not None else _effective_user_home()
+            )
+            if local_superpowers_root is None and effective_home is None:
+                availability = "unknown"
+                reason_codes = ["R_EFFECTIVE_HOME_UNOBSERVABLE"]
+            else:
+                superpowers_root = (
+                    local_superpowers_root
+                    if local_superpowers_root is not None
+                    else effective_home / ".codex" / "superpowers"
+                )
+                availability, reason_codes = _observe_local_superpowers(
+                    superpowers_root, local_superpowers_match.group(1)
+                )
+        elif locator.startswith("repo://"):
             relative = locator.removeprefix("repo://")
             candidate = root.joinpath(*PurePosixPath(relative).parts)
             try:
@@ -918,9 +1158,13 @@ def build_inventory(
             "enabled": availability == "available",
             "trusted": str(resource.get("trust", "")).startswith("trusted_"),
             "authenticated": (
-                "unknown"
-                if resource.get("kind") in {"mcp_server", "mcp_tool", "plugin"}
-                else "not_applicable"
+                "not_applicable"
+                if local_superpowers_match is not None
+                else (
+                    "unknown"
+                    if resource.get("kind") in {"mcp_server", "mcp_tool", "plugin"}
+                    else "not_applicable"
+                )
             ),
             "healthy": availability,
             "authorized_for_task": False,

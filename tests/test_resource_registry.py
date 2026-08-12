@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.router_test_support import VALID_POLICY, VALID_REGISTRY
+from tests.core_router_test_support import VALID_POLICY, VALID_REGISTRY
 
 
 ROOT = Path(__file__).parents[1]
@@ -185,7 +185,7 @@ class ResourceRegistryTests(unittest.TestCase):
             load_registry,
             validate_inventory,
         )
-        from tests.router_test_support import inventory_snapshot
+        from tests.core_router_test_support import inventory_snapshot
 
         registry = load_registry(VALID_REGISTRY)
         inventory = inventory_snapshot()
