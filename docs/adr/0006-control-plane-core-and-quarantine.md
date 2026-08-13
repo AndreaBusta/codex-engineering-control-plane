@@ -18,9 +18,10 @@ safety, task ownership, bounded verification, and recoverable checkpoints.
 
 Build `3.1.0-core.1` as an exact runtime allowlist with no import edge to the
 quarantined implementation. Core accepts only `answer` and `local_change`:
-facts-only answers do not create durable task state, while local changes use
-`CoreTaskStateV1` and revision-scoped generational leases below the worktree Git
-dir. Every durable artifact remains `authorizes=false`.
+facts-only answers do not create durable task state. Local changes store
+`CoreTaskStateV1` below the worktree Git dir, while revision-scoped generational
+leases and release receipts live below the Git common dir to coordinate Core
+writers across worktrees. Every durable artifact remains `authorizes=false`.
 
 Verification is serialized once per Git common dir. Maintenance has one lineage
 and at most one structural reframe. Legacy state is bounded, read-only, and

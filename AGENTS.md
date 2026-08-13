@@ -52,8 +52,9 @@ La prosa no sustituye a los gates, GitHub, CI ni al proveedor de release.
 - No amplíes silenciosamente el alcance.
 - Ejecución secuencial por defecto; grafo solo con independencia demostrable.
 - Máximo normal de dos workers y ningún writer solapado.
-- Conserva el estado efímero y leases bajo el Git dir del worktree; no los
-  versiones ni los compartas entre worktrees.
+- Conserva `CoreTaskStateV1` bajo el worktree Git dir. Conserva leases y
+  recibos Core bajo el Git common dir para coordinar writers across worktrees;
+  nunca versiones ninguno de estos estados.
 
 ## Git y autoridad
 

@@ -67,6 +67,7 @@ _TASK_STATE_FIELDS = frozenset(
         "decision_digest",
         "owner_runtime_digest",
         "lease_generation",
+        "lease_generation_floor",
         "revision",
         "created_at",
         "updated_at",
@@ -425,38 +426,46 @@ class CoreTaskStore:
                 if any(existing.get(key) != value for key, value in immutable.items()):
                     raise ValueError("E_CORE_STATE_REPLAY: existing task binding differs")
                 return existing, False
-            value: dict[str, Any] = {
-                "schema_version": 1,
-                "kind": "CoreTaskStateV1",
-                "task_id": task,
-                "revision_id": revision_id,
-                "requested_outcome": outcome,
-                "state": "framed",
-                "resume_state": None,
-                "block_reason": None,
-                "repository": str(self.repository),
-                "worktree": str(self.repository),
-                "branch": branch,
-                "protected_base": protected_base,
-                "head": head,
-                "scope_paths": scopes,
-                "task_digest": task_digest,
-                "decision_digest": decision_digest,
-                "owner_runtime_digest": _locked_runtime_digest(self.repository),
-                "lease_generation": 0,
-                "revision": 0,
-                "created_at": _now(),
-                "updated_at": _now(),
-                "authorizes": False,
-            }
-            value["state_digest"] = contract_digest(value)
-            _atomic_json(path, value)
-            return value, True
+            from control_plane.leases import LeaseStore
+
+            with LeaseStore(self.repository).claim_no_active(task):
+                value: dict[str, Any] = {
+                    "schema_version": 1,
+                    "kind": "CoreTaskStateV1",
+                    "task_id": task,
+                    "revision_id": revision_id,
+                    "requested_outcome": outcome,
+                    "state": "framed",
+                    "resume_state": None,
+                    "block_reason": None,
+                    "repository": str(self.repository),
+                    "worktree": str(self.repository),
+                    "branch": branch,
+                    "protected_base": protected_base,
+                    "head": head,
+                    "scope_paths": scopes,
+                    "task_digest": task_digest,
+                    "decision_digest": decision_digest,
+                    "owner_runtime_digest": _locked_runtime_digest(self.repository),
+                    "lease_generation": 0,
+                    "lease_generation_floor": 0,
+                    "revision": 0,
+                    "created_at": _now(),
+                    "updated_at": _now(),
+                    "authorizes": False,
+                }
+                value["state_digest"] = contract_digest(value)
+                _atomic_json(path, value)
+                return value, True
 
     def rollback_start(self, state: Mapping[str, Any]) -> None:
         task = _safe_task_id(state.get("task_id"))
         self._validate(state, expected_task_id=task)
-        if state.get("revision") != 0 or state.get("lease_generation") != 0:
+        if (
+            state.get("revision") != 0
+            or state.get("lease_generation") != 0
+            or state.get("lease_generation_floor") != 0
+        ):
             raise ValueError("E_CORE_STATE_ROLLBACK: task is no longer pristine")
         path = self._path(task)
         with _task_lock(self.git_dir, task):
@@ -466,7 +475,10 @@ class CoreTaskStore:
             self._validate(current, expected_task_id=task)
             if current != dict(state):
                 raise ValueError("E_CORE_STATE_ROLLBACK: task changed after start")
-            _unlink_durable(path)
+            from control_plane.leases import LeaseStore
+
+            with LeaseStore(self.repository).claim_no_active(task):
+                _unlink_durable(path)
 
     def restore_after_failed_binding(
         self,
@@ -474,12 +486,19 @@ class CoreTaskStore:
         *,
         expected_revision_id: str,
         expected_generation: int,
+        session_id: str | None,
     ) -> None:
         task = _safe_task_id(original.get("task_id"))
         self._validate(original, expected_task_id=task)
         with _task_lock(self.git_dir, task):
             current = self.status(task)
-            mutable = {"lease_generation", "revision", "updated_at", "state_digest"}
+            mutable = {
+                "lease_generation",
+                "lease_generation_floor",
+                "revision",
+                "updated_at",
+                "state_digest",
+            }
             original_stable = {
                 key: value for key, value in original.items() if key not in mutable
             }
@@ -491,13 +510,23 @@ class CoreTaskStore:
                 or
                 current.get("revision_id") != expected_revision_id
                 or current.get("lease_generation") != expected_generation
+                or current.get("lease_generation_floor") != expected_generation
                 or current.get("revision") != int(original.get("revision", -1)) + 1
                 or current.get("state") != original.get("state")
             ):
                 raise ValueError(
                     "E_CORE_STATE_ROLLBACK: task changed after lease binding"
                 )
-            _atomic_json(self._path(task), original)
+            from control_plane.leases import LeaseStore
+
+            with LeaseStore(self.repository).claim_binding(
+                original,
+                revision_id=expected_revision_id,
+                generation=expected_generation,
+                acquired_state_digest=str(original["state_digest"]),
+                session_id=session_id,
+            ):
+                _atomic_json(self._path(task), original)
 
     def transition(
         self,
@@ -506,7 +535,10 @@ class CoreTaskStore:
         *,
         reason: str | None = None,
         current_branch: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
+        from control_plane.leases import LeaseStore
+
         task = _safe_task_id(task_id)
         if state not in CORE_STATES:
             raise ValueError("E_CORE_STATE_TRANSITION: target state is unsupported")
@@ -514,50 +546,172 @@ class CoreTaskStore:
             current = self.status(task)
             if current_branch is not None and current.get("branch") != current_branch:
                 raise ValueError("E_CORE_STATE_BRANCH: branch binding drifted")
-            previous = str(current["state"])
-            if state == previous:
+            if current.get("owner_runtime_digest") != _locked_runtime_digest(
+                self.repository
+            ):
+                raise ValueError("E_CORE_RUNTIME: task owner runtime differs from lock")
+            with LeaseStore(self.repository).claim_mutation(
+                current, session_id=session_id
+            ):
+                previous = str(current["state"])
+                if state == previous:
+                    return current
+                if state not in _TRANSITIONS[previous]:
+                    raise ValueError(
+                        f"E_CORE_STATE_TRANSITION: illegal transition {previous}->{state}"
+                    )
+                if state == "blocked":
+                    if not isinstance(reason, str) or not reason or len(reason) > 256:
+                        raise ValueError("E_CORE_STATE_BLOCK: bounded reason is required")
+                    current["resume_state"] = previous
+                    current["block_reason"] = reason
+                else:
+                    current["resume_state"] = None
+                    current["block_reason"] = None
+                current["state"] = state
+                current["revision"] = int(current["revision"]) + 1
+                current["updated_at"] = _now()
+                current.pop("state_digest", None)
+                current["state_digest"] = contract_digest(current)
+                _atomic_json(self._path(task), current)
                 return current
-            if state not in _TRANSITIONS[previous]:
-                raise ValueError(
-                    f"E_CORE_STATE_TRANSITION: illegal transition {previous}->{state}"
-                )
-            if state == "blocked":
-                if not isinstance(reason, str) or not reason or len(reason) > 256:
-                    raise ValueError("E_CORE_STATE_BLOCK: bounded reason is required")
-                current["resume_state"] = previous
-                current["block_reason"] = reason
-            else:
-                current["resume_state"] = None
-                current["block_reason"] = None
-            current["state"] = state
-            current["revision"] = int(current["revision"]) + 1
-            current["updated_at"] = _now()
-            current.pop("state_digest", None)
-            current["state_digest"] = contract_digest(current)
-            _atomic_json(self._path(task), current)
-            return current
 
-    def resume(self, task_id: object, *, current_branch: str) -> dict[str, Any]:
+    def resume(
+        self,
+        task_id: object,
+        *,
+        current_branch: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        from control_plane.leases import LeaseStore
+
         task = _safe_task_id(task_id)
         with _task_lock(self.git_dir, task):
             current = self.status(task)
             if current.get("branch") != current_branch:
                 raise ValueError("E_CORE_STATE_BRANCH: branch binding drifted")
-            target = current.get("resume_state")
-            if current.get("state") != "blocked" or target not in CORE_STATES:
-                raise ValueError("E_CORE_STATE_RESUME: task is not resumable")
-            current["state"] = target
-            current["resume_state"] = None
-            current["block_reason"] = None
-            current["revision"] = int(current["revision"]) + 1
-            current["updated_at"] = _now()
-            current.pop("state_digest", None)
-            current["state_digest"] = contract_digest(current)
-            _atomic_json(self._path(task), current)
-            return current
+            if current.get("owner_runtime_digest") != _locked_runtime_digest(
+                self.repository
+            ):
+                raise ValueError("E_CORE_RUNTIME: task owner runtime differs from lock")
+            with LeaseStore(self.repository).claim_mutation(
+                current, session_id=session_id
+            ):
+                target = current.get("resume_state")
+                if current.get("state") != "blocked" or target not in CORE_STATES:
+                    raise ValueError("E_CORE_STATE_RESUME: task is not resumable")
+                current["state"] = target
+                current["resume_state"] = None
+                current["block_reason"] = None
+                current["revision"] = int(current["revision"]) + 1
+                current["updated_at"] = _now()
+                current.pop("state_digest", None)
+                current["state_digest"] = contract_digest(current)
+                _atomic_json(self._path(task), current)
+                return current
 
-    def close(self, task_id: object, *, current_branch: str) -> dict[str, Any]:
-        return self.transition(task_id, "closed", current_branch=current_branch)
+    def close(
+        self,
+        task_id: object,
+        *,
+        current_branch: str,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.transition(
+            task_id,
+            "closed",
+            current_branch=current_branch,
+            session_id=session_id,
+        )
+
+    def next_revision(
+        self,
+        task_id: object,
+        *,
+        current_branch: str,
+        head: str,
+        task_digest: str,
+        decision_digest: str,
+        scope_paths: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Replace one closed task with its next exact, lease-free revision."""
+
+        from control_plane.leases import LeaseStore
+
+        task = _safe_task_id(task_id)
+        if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+            raise ValueError("E_CORE_STATE_HEAD: HEAD must be an exact commit")
+        for label, digest in (("task", task_digest), ("decision", decision_digest)):
+            if not isinstance(digest, str) or SHA256_DIGEST.fullmatch(digest) is None:
+                raise ValueError(f"E_CORE_STATE_DIGEST: {label} digest is invalid")
+        scopes = sorted({normalize_scope(item) for item in scope_paths})
+        if not scopes:
+            scopes = ["."]
+        assert_no_active_legacy_state(self.repository)
+        with _task_lock(self.git_dir, task):
+            current = self.status(task)
+            current_runtime = _locked_runtime_digest(self.repository)
+            if current.get("owner_runtime_digest") != current_runtime:
+                raise ValueError("E_CORE_RUNTIME: task owner runtime differs from lock")
+            if current.get("branch") != current_branch:
+                raise ValueError("E_CORE_STATE_BRANCH: branch binding drifted")
+            revision_id = "rev-" + sha256(
+                f"{task_digest}\0{head}".encode()
+            ).hexdigest()[:16]
+            with LeaseStore(self.repository).claim_next_revision(
+                current
+            ) as generation_floor:
+                exact_replay = (
+                    current.get("state") == "framed"
+                    and current.get("lease_generation") == 0
+                    and int(current.get("revision", 0)) > 0
+                    and current.get("revision_id") == revision_id
+                    and current.get("head") == head
+                    and current.get("task_digest") == task_digest
+                    and current.get("decision_digest") == decision_digest
+                    and current.get("scope_paths") == scopes
+                )
+                if exact_replay:
+                    if current.get("lease_generation_floor") != generation_floor:
+                        raise ValueError(
+                            "E_CORE_REVISION_HISTORY: generation history drifted"
+                        )
+                    return current
+                if current.get("state") != "closed":
+                    raise ValueError(
+                        "E_CORE_REVISION_STATE: only a closed task can be revised"
+                    )
+                if (
+                    current.get("task_digest") == task_digest
+                    or current.get("decision_digest") == decision_digest
+                    or revision_id == current.get("revision_id")
+                ):
+                    raise ValueError(
+                        "E_CORE_REVISION_DIGEST: task and decision digests must both change"
+                    )
+                value = dict(current)
+                value.update(
+                    {
+                        "revision_id": revision_id,
+                        "state": "framed",
+                        "resume_state": None,
+                        "block_reason": None,
+                        "head": head,
+                        "scope_paths": scopes,
+                        "task_digest": task_digest,
+                        "decision_digest": decision_digest,
+                        "owner_runtime_digest": current_runtime,
+                        "lease_generation": 0,
+                        "lease_generation_floor": generation_floor,
+                        "revision": int(current["revision"]) + 1,
+                        "updated_at": _now(),
+                        "authorizes": False,
+                    }
+                )
+                value.pop("state_digest", None)
+                value["state_digest"] = contract_digest(value)
+                _atomic_json(self._path(task), value)
+                return value
 
     def bind_lease_generation(
         self,
@@ -566,6 +720,7 @@ class CoreTaskStore:
         revision_id: str,
         generation: int,
         expected_state_digest: str,
+        session_id: str | None,
     ) -> dict[str, Any]:
         task = _safe_task_id(task_id)
         with _task_lock(self.git_dir, task):
@@ -575,19 +730,40 @@ class CoreTaskStore:
             if not task_allows_writer_lease(current):
                 raise ValueError("E_CORE_LEASE_BINDING: task is not an active writer")
             existing = int(current.get("lease_generation", 0))
+            generation_floor = int(current.get("lease_generation_floor", 0))
             if existing not in {0, generation}:
                 raise ValueError("E_CORE_LEASE_BINDING: generation drifted")
+            from control_plane.leases import LeaseStore
+
             if existing == generation:
-                return current
+                with LeaseStore(self.repository).claim_binding(
+                    current,
+                    revision_id=revision_id,
+                    generation=generation,
+                    acquired_state_digest=expected_state_digest,
+                    session_id=session_id,
+                ):
+                    return current
             if current.get("state_digest") != expected_state_digest:
                 raise ValueError("E_CORE_LEASE_BINDING: task state changed before binding")
-            current["lease_generation"] = generation
-            current["revision"] = int(current["revision"]) + 1
-            current["updated_at"] = _now()
-            current.pop("state_digest", None)
-            current["state_digest"] = contract_digest(current)
-            _atomic_json(self._path(task), current)
-            return current
+            if generation <= generation_floor:
+                raise ValueError("E_CORE_LEASE_BINDING: generation is not monotonic")
+
+            with LeaseStore(self.repository).claim_binding(
+                current,
+                revision_id=revision_id,
+                generation=generation,
+                acquired_state_digest=expected_state_digest,
+                session_id=session_id,
+            ):
+                current["lease_generation"] = generation
+                current["lease_generation_floor"] = generation
+                current["revision"] = int(current["revision"]) + 1
+                current["updated_at"] = _now()
+                current.pop("state_digest", None)
+                current["state_digest"] = contract_digest(current)
+                _atomic_json(self._path(task), current)
+                return current
 
     @staticmethod
     def _validate(value: Mapping[str, Any], *, expected_task_id: str) -> None:
@@ -657,6 +833,9 @@ class CoreTaskStore:
             + sha256(f"{task_digest}\0{head}".encode()).hexdigest()[:16]
             and type(value.get("lease_generation")) is int
             and int(value.get("lease_generation", -1)) >= 0
+            and type(value.get("lease_generation_floor")) is int
+            and int(value.get("lease_generation_floor", -1))
+            >= int(value.get("lease_generation", -1))
             and type(value.get("revision")) is int
             and int(value.get("revision", -1)) >= 0
             and all(

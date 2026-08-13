@@ -48,7 +48,7 @@ un gate ni modifica la precedencia.
 | Traversal o symlink escape | locators sin ejecución y resolución confinada | `R_LOCATOR`, `R_SYMLINK_ESCAPE` | filesystem alterado tras snapshot |
 | Exfiltración por MCP/plugin | egress y data classes; autorización separada | inventory + receipt | proveedor comprometido |
 | Escritura en worktree equivocado | task ligada y lease generacional exacto | `CoreTaskStateV1` + lease digest | proceso fuera del control plane |
-| Dos writers se pisan | scope, generación y locks por Git dir | `E_CORE_LEASE_CONFLICT` | edición externa no cooperativa |
+| Dos writers se pisan | task por worktree Git dir; lease/recibo por Git common dir, scope y generación across worktrees | `E_CORE_LEASE_CONFLICT` | edición externa no cooperativa |
 | Dos verificadores duplican la suite | mutex no bloqueante por Git common dir | `E_VERIFICATION_BUSY`, `executed=false` | proceso externo no cooperativo |
 | Reparación estructural infinita | una sola reframación por lineage | `E_BOOTSTRAP_REFRAME_LIMIT` | decisión humana aún necesaria |
 | Estado legacy se reanuda con Core | inventario bounded, read-only y `resumable=false` | `origin=legacy`, `E_ACTIVE_LEGACY_STATE` | requiere runtime propietario |

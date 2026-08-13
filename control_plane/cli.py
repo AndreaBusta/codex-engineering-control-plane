@@ -649,11 +649,33 @@ def command_task(arguments: argparse.Namespace) -> int:
     from control_plane.task_state import CoreTaskStore
 
     command = f"task-{arguments.task_action}"
+
+    def release_binding(lease: Mapping[str, object] | None) -> dict[str, object] | None:
+        if lease is None:
+            return None
+        fields = (
+            "task_id",
+            "revision_id",
+            "lease_generation",
+            "worktree",
+            "branch",
+            "session_id",
+            "policy_digest",
+            "lease_digest",
+        )
+        return {
+            "schema_version": 1,
+            "kind": "CoreLeaseReleaseBindingV1",
+            **{field: lease[field] for field in fields},
+            "authorizes": False,
+        }
+
     try:
         root = _repository(arguments.repo)
         store = CoreTaskStore(root)
         leases = LeaseStore(root)
         action = arguments.task_action
+        lease = None
         if action == "start":
             current_branch = _branch(root)
             if arguments.branch != current_branch:
@@ -677,7 +699,6 @@ def command_task(arguments: argparse.Namespace) -> int:
                 scope_paths=arguments.scope_path or ["."],
             )
             if arguments.session_id and result.get("kind") == "CoreTaskStateV1":
-                lease = None
                 created_lease = False
                 unbound = result
                 try:
@@ -691,6 +712,7 @@ def command_task(arguments: argparse.Namespace) -> int:
                         revision_id=str(lease["revision_id"]),
                         generation=int(lease["lease_generation"]),
                         expected_state_digest=str(lease["acquired_state_digest"]),
+                        session_id=str(lease["session_id"]),
                     )
                 except Exception as start_error:
                     try:
@@ -707,6 +729,7 @@ def command_task(arguments: argparse.Namespace) -> int:
                                     unbound,
                                     expected_revision_id=str(lease["revision_id"]),
                                     expected_generation=int(lease["lease_generation"]),
+                                    session_id=str(lease["session_id"]),
                                 )
                         if created_lease and lease is not None:
                             leases.rollback_acquire(lease)
@@ -719,24 +742,51 @@ def command_task(arguments: argparse.Namespace) -> int:
                     raise
         elif action == "status":
             result = store.status(arguments.task_id)
+            lease = leases.find(arguments.task_id)
+        elif action == "revise":
+            result = store.next_revision(
+                arguments.task_id,
+                current_branch=_branch(root),
+                head=_head(root),
+                task_digest=arguments.task_digest,
+                decision_digest=arguments.decision_digest,
+                scope_paths=arguments.scope_path or ["."],
+            )
         elif action == "transition":
             result = store.transition(
                 arguments.task_id,
                 arguments.state,
                 reason=arguments.reason,
                 current_branch=_branch(root),
+                session_id=arguments.session_id,
             )
         elif action == "resume":
-            result = store.resume(arguments.task_id, current_branch=_branch(root))
+            result = store.resume(
+                arguments.task_id,
+                current_branch=_branch(root),
+                session_id=arguments.session_id,
+            )
         elif action == "close":
-            result = store.close(arguments.task_id, current_branch=_branch(root))
+            result = store.close(
+                arguments.task_id,
+                current_branch=_branch(root),
+                session_id=arguments.session_id,
+            )
         else:
-            lease = leases.find(arguments.task_id)
-            if lease is None:
-                raise ValueError("E_CORE_LEASE_NOT_FOUND: active lease is unavailable")
+            lease = None
+            if arguments.revision_id is None or arguments.lease_generation is None:
+                lease = leases.find(arguments.task_id)
+                if lease is None:
+                    raise ValueError(
+                        "E_CORE_LEASE_NOT_FOUND: active lease is unavailable"
+                    )
             result = leases.release(
                 task_id=arguments.task_id,
-                revision_id=arguments.revision_id or str(lease["revision_id"]),
+                revision_id=(
+                    arguments.revision_id
+                    if arguments.revision_id is not None
+                    else str(lease["revision_id"])
+                ),
                 lease_generation=(
                     arguments.lease_generation
                     if arguments.lease_generation is not None
@@ -755,6 +805,11 @@ def command_task(arguments: argparse.Namespace) -> int:
             "task": result,
             "authorizes": False,
         }
+        if action in {"start", "status", "revise"}:
+            payload["lease"] = release_binding(lease)
+        elif action == "lease-release":
+            payload["lease"] = None
+            payload["receipt"] = result
     except Exception as error:
         payload = _failure(command, error)
     return _emit(payload, arguments.json)
@@ -992,7 +1047,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     task = commands.add_parser("task")
     task_actions = task.add_subparsers(dest="task_action", required=True)
-    for action in ("start", "resume", "status", "transition", "close", "lease-release"):
+    for action in (
+        "start", "revise", "resume", "status", "transition", "close",
+        "lease-release",
+    ):
         action_parser = task_actions.add_parser(action)
         action_parser.add_argument("--repo", type=Path, default=Path.cwd())
         action_parser.add_argument("--task-id", required=True)
@@ -1008,9 +1066,16 @@ def build_parser() -> argparse.ArgumentParser:
             action_parser.add_argument("--session-id")
             action_parser.add_argument("--scope-path", action="append")
             action_parser.add_argument("--policy", type=Path)
+        elif action == "revise":
+            action_parser.add_argument("--task-digest", required=True)
+            action_parser.add_argument("--decision-digest", required=True)
+            action_parser.add_argument("--scope-path", action="append")
         elif action == "transition":
             action_parser.add_argument("--state", choices=_CORE_STATES, required=True)
             action_parser.add_argument("--reason")
+            action_parser.add_argument("--session-id")
+        elif action in {"resume", "close"}:
+            action_parser.add_argument("--session-id")
         elif action == "lease-release":
             action_parser.add_argument("--revision-id")
             action_parser.add_argument("--lease-generation", type=int)

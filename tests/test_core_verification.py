@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import multiprocessing
 import os
 from pathlib import Path
@@ -460,6 +461,47 @@ class CoreVerificationTests(unittest.TestCase):
                 check=False,
                 timeout=10,
             )
+
+        self.assertEqual(busy.returncode, 2, busy.stderr)
+        self.assertEqual(busy.stderr, "")
+        self.assertEqual(
+            json.loads(busy.stdout),
+            {
+                "authorizes": False,
+                "consumes_reframe": False,
+                "error_code": "E_VERIFICATION_BUSY",
+                "executed": False,
+                "status": "UNKNOWN",
+            },
+        )
+
+    def test_busy_runner_locates_mutex_without_invoking_git(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "repo"
+            tests = repository / "tests"
+            tests.mkdir(parents=True)
+            shutil.copy2(ROOT / "tests" / "run.sh", tests / "run.sh")
+            locks = repository / ".git" / "codex-control-plane-core" / "locks"
+            locks.mkdir(parents=True, mode=0o700)
+            locks.parent.chmod(0o700)
+            lock_path = locks / "verification.lock"
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            os.fchmod(descriptor, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                busy = subprocess.run(
+                    ["/bin/sh", str(tests / "run.sh")],
+                    cwd=repository,
+                    env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
         self.assertEqual(busy.returncode, 2, busy.stderr)
         self.assertEqual(busy.stderr, "")

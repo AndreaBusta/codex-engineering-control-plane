@@ -843,6 +843,31 @@ class CoreDocumentationTests(unittest.TestCase):
         route = next(item for item in registry["routes"] if item["id"] == "structured-engineering")
         self.assertIn("document.lifecycle-adoption-guide", route["recommended_resources"])
 
+    def test_active_registry_never_routes_historical_non_governing_documents(self) -> None:
+        registry = tomllib.loads(read(ROOT / ".codex" / "resource-registry.toml"))
+        statuses = index_statuses()
+        resources = {item["id"]: item for item in registry["resources"]}
+        routed = {
+            resource_id
+            for route in registry["routes"]
+            for field in ("recommended_resources", "forbidden_resources")
+            for resource_id in route[field]
+        }
+        for resource_id, resource in resources.items():
+            if resource.get("kind") != "document" or not resource.get("canonical"):
+                continue
+            locator = resource.get("locator", "")
+            if not locator.startswith("repo://"):
+                continue
+            relative = locator.removeprefix("repo://")
+            self.assertNotEqual(
+                statuses.get(relative),
+                "HISTORICAL_NON_GOVERNING",
+                resource_id,
+            )
+        resource_ids = set(resources)
+        self.assertTrue(routed.issubset(resource_ids), sorted(routed - resource_ids))
+
     def test_maintenance_runbook_is_fail_closed_and_time_bounded(self) -> None:
         content = read(MAINTENANCE)
         for token in (
@@ -888,8 +913,30 @@ class CoreDocumentationTests(unittest.TestCase):
                 rf"(?m)^\| `{re.escape(command)}` \| `E_CAPABILITY_QUARANTINED` \| `2` \|",
             )
 
+    def test_core_task_and_lease_state_locations_match_runtime(self) -> None:
+        agents = read(ROOT / "AGENTS.md")
+        adr = read(ROOT / "docs" / "adr" / "0006-control-plane-core-and-quarantine.md")
+        maintenance = read(MAINTENANCE)
+        readme = read(ROOT / "README.md")
+        for content in (agents, adr, maintenance, readme):
+            self.assertRegex(content, r"worktree Git\s+dir")
+            self.assertRegex(content, r"Git common\s+dir")
+            self.assertRegex(content, r"across\s+worktrees")
+        self.assertNotIn(
+            "leases bajo el Git dir del worktree",
+            agents,
+        )
+
     def test_manual_dogfood_scorecard_is_closed(self) -> None:
         content = read(DOGFOOD)
+        self.assertEqual(
+            [line for line in content.splitlines() if line.startswith("Status:")],
+            ["Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`."],
+        )
+        self.assertIsNone(
+            re.search(r"(?i)\bAutopilot\s*=\s*ON\b", content),
+            "Autopilot must remain OFF everywhere in the scorecard",
+        )
         rows = [
             line
             for line in content.splitlines()
@@ -900,46 +947,346 @@ class CoreDocumentationTests(unittest.TestCase):
             [cell.strip().strip("`") for cell in row.strip("|").split("|")]
             for row in rows
         ]
-        self.assertEqual(
-            [row[0] for row in parsed],
-            [f"CORE-DOGFOOD-{index:02d}" for index in range(1, 11)],
-        )
+        expected_rows = [
+            ["CORE-DOGFOOD-01", "local", "true", "answer", "local_read", "0", "PASS", "CORE-DOGFOOD-01-E1"],
+            ["CORE-DOGFOOD-02", "hybrid", "true", "answer", "local_read", "0", "PASS", "CORE-DOGFOOD-02-E1"],
+            ["CORE-DOGFOOD-03", "controlled", "true", "answer", "local_read", "0", "PASS", "CORE-DOGFOOD-03-E1"],
+            ["CORE-DOGFOOD-04", "local", "false", "local_change", "local_read+local_write", "1", "PASS", "CORE-DOGFOOD-04-E1"],
+            ["CORE-DOGFOOD-05", "local", "false", "local_change", "local_read+local_write", "1", "PASS", "CORE-DOGFOOD-05-E1"],
+            ["CORE-DOGFOOD-06", "hybrid", "false", "local_change", "local_read+local_write", "1", "PASS", "CORE-DOGFOOD-06-E1"],
+            ["CORE-DOGFOOD-07", "hybrid", "false", "local_change", "local_read+local_write", "1", "PASS", "CORE-DOGFOOD-07-E1"],
+            ["CORE-DOGFOOD-08", "controlled", "false", "local_change", "local_read+local_write", "1", "PASS", "CORE-DOGFOOD-08-E1"],
+            ["CORE-DOGFOOD-09", "controlled", "false", "local_change", "local_read+local_write", "1", "PASS", "CORE-DOGFOOD-09-E1"],
+            ["CORE-DOGFOOD-10", "controlled", "false", "local_change", "local_read+local_write", "1", "PASS", "CORE-DOGFOOD-10-E1"],
+        ]
+        self.assertEqual(parsed, expected_rows)
         self.assertGreaterEqual(sum(row[2] == "true" for row in parsed), 3)
         self.assertTrue({"local", "hybrid", "controlled"}.issubset({row[1] for row in parsed}))
-        self.assertTrue(all(row[6] == "PENDING" and row[7] == "NONE" for row in parsed))
+        self.assertEqual(
+            [row[6:8] for row in parsed],
+            [["PASS", f"CORE-DOGFOOD-{index:02d}-E1"] for index in range(1, 11)],
+        )
         for row in parsed:
             if row[2] == "true":
                 self.assertEqual(row[3:6], ["answer", "local_read", "0"])
         for token in (
             "Autopilot=OFF",
-            "PENDING_10_TASK_DOGFOOD",
+            "PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE",
             "tasks_completed=10",
-            "facts_only_total>=3",
+            "facts_only_total=3",
             "duplicated_effects=0",
             "fabricated_effects=0",
             "overlapping_writers=0",
-            "nuisance_warnings<=1",
+            "nuisance_warnings=0",
             "duplicated_full_suites=0",
+            "authoritative_full_gate=PENDING",
             "No prompts, transcripts, or telemetry",
         ):
             self.assertIn(token, content)
+
+        expected_digest_by_reference = {
+            "CORE-DOGFOOD-01-E1": (
+                "sha256:f4c03568ee778872ed35cd5b1ba9397875c68e89e5e830278e755a2da21c0ab7"
+            ),
+            "CORE-DOGFOOD-02-E1": (
+                "sha256:f5b8e541742b434f65610092828d00252341dc8df3d04570dacc022e60553849"
+            ),
+            "CORE-DOGFOOD-03-E1": (
+                "sha256:b3ef611e3fbbea8bd54ba15688425aa94822cc517477533094ab5bf0306c23f8"
+            ),
+            "CORE-DOGFOOD-04-E1": (
+                "sha256:f4c31e70e80df5d51d892d552856c9128c408a548246b8d37f629525ced2ac56"
+            ),
+            "CORE-DOGFOOD-05-E1": (
+                "sha256:347e67cd18fe64538805c0b3ba578a243e50099fe8887bfe9a26c4aaab0ec734"
+            ),
+            "CORE-DOGFOOD-06-E1": (
+                "sha256:fb7c3f0ae0a2ff0a39bfd4927d6aba7d7dca04d3cb7d190f0943dfc13c67ac24"
+            ),
+            "CORE-DOGFOOD-07-E1": (
+                "sha256:ebe5ecf36f0d445e6a3dcd7ec9b53c3f571323205d9a0e3c3c7d766c0cedf074"
+            ),
+            "CORE-DOGFOOD-08-E1": (
+                "sha256:2cd791638d31ed8fadaf5adb29541d8a9e1483c0df41e9035d1b1b0f6dc08b25"
+            ),
+            "CORE-DOGFOOD-09-E1": (
+                "sha256:78ae6111baa5503f411961c974433e4cba3f136b514a17faa9f6ad5a7daed42e"
+            ),
+            "CORE-DOGFOOD-10-E1": (
+                "sha256:ec29389f6afb3492d85f21f4e92ca20e699a2605f66a97c466e12292c408d8e8"
+            ),
+        }
+        self.assertEqual(
+            re.findall(r"(?m)^## Evidence registry$", content),
+            ["## Evidence registry"],
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^## Continuación$", content),
+            ["## Continuación"],
+        )
+        _, evidence_marker, after_evidence_marker = content.partition(
+            "## Evidence registry\n\n"
+        )
+        self.assertEqual(evidence_marker, "## Evidence registry\n\n")
+        evidence_section, continuation_marker, continuation = (
+            after_evidence_marker.partition("\n## Continuación\n")
+        )
+        self.assertEqual(continuation_marker, "\n## Continuación\n")
+        evidence_matches = list(
+            re.finditer(
+                r"(?m)^### `(?P<reference>CORE-DOGFOOD-[0-9]{2}-E[0-9]+)`\n\n"
+                r"```json\n(?P<payload>\{[^\n]*\})\n```\n\n"
+                r"Evidence digest: `(?P<digest>sha256:[0-9a-f]{64})`$",
+                evidence_section,
+            )
+        )
+        self.assertEqual(
+            evidence_section.strip(),
+            "\n\n".join(match.group(0) for match in evidence_matches),
+        )
+        self.assertEqual(
+            [match.group("reference") for match in evidence_matches],
+            list(expected_digest_by_reference),
+        )
+        rows_by_id = {row[0]: row for row in parsed}
+
+        def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise AssertionError(f"duplicate evidence key: {key}")
+                result[key] = value
+            return result
+
+        for match in evidence_matches:
+            reference = match.group("reference")
+            evidence = json.loads(
+                match.group("payload"), object_pairs_hook=reject_duplicate_keys
+            )
+            self.assertEqual(evidence["schema_version"], 1)
+            self.assertEqual(evidence["kind"], "CoreDogfoodEvidenceV1")
+            self.assertEqual(evidence["task_id"], reference.removesuffix("-E1"))
+            self.assertEqual(evidence["result"], "PASS")
+            self.assertEqual(evidence["review"], "APPROVED")
+            self.assertIs(evidence["authorizes"], False)
+            row = rows_by_id[str(evidence["task_id"])]
+            contract = evidence["contract"]
+            self.assertIsInstance(contract, dict)
+            assert isinstance(contract, dict)
+            self.assertEqual(contract["facts_only"], row[2] == "true")
+            self.assertEqual(contract["requested_outcome"], row[3])
+            self.assertEqual(
+                contract.get("effects", contract.get("allowed_effects")),
+                row[4].split("+"),
+            )
+            self.assertEqual(contract["writers"], int(row[5]))
+            self.assertEqual(
+                contract.get("workload", contract.get("workflow")), row[1]
+            )
+            self.assertFalse(
+                contract.get("durable_task_state", contract.get("durable"))
+            )
+            def assert_non_authorizing(value: object) -> None:
+                if isinstance(value, dict):
+                    for key, nested in value.items():
+                        if key == "authorizes":
+                            self.assertIs(nested, False)
+                        assert_non_authorizing(nested)
+                elif isinstance(value, list):
+                    for nested in value:
+                        assert_non_authorizing(nested)
+
+            assert_non_authorizing(evidence)
+            canonical = json.dumps(
+                evidence,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            self.assertEqual(
+                match.group("digest"),
+                f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}",
+            )
+            self.assertEqual(
+                match.group("digest"), expected_digest_by_reference[reference]
+            )
+            for forbidden_key in (
+                "objective",
+                "prompt",
+                "transcript",
+                "telemetry",
+                "secret",
+                "authority",
+                "authorization",
+            ):
+                self.assertNotIn(f'"{forbidden_key}"', canonical)
+            self.assertNotIn("tests/run.sh", canonical)
+            self.assertNotRegex(canonical, r"(?i)full[_ -]?(gate|suite).*PASS")
+        self.assertEqual(
+            re.findall(r"(?m)^- \*\*([^*]+):\*\*", continuation),
+            [
+                "Escribe en",
+                "Rol",
+                "Para continuar",
+                "Mensaje exacto",
+                "Estado de partida",
+                "No hacer todavía",
+                "Autoridad",
+            ],
+        )
+        self.assertEqual(
+            continuation.strip(),
+            "\n".join(
+                (
+                    "- **Escribe en:** este hilo.",
+                    "- **Rol:** orquestadora del candidato Core y scorecard manual.",
+                    "- **Para continuar:** ejecutar una única vez `bash tests/run.sh` "
+                    "sobre estos bytes finales y detenerse si no es `PASS`.",
+                    "- **Mensaje exacto:** `Ejecuta el único gate integral de Control "
+                    "Plane Core 3.1; no edites ni realices efectos remotos después.`",
+                    "- **Estado de partida:** `3.1.0-core.1`, diez filas `PASS`, gate "
+                    "dogfood satisfecho, gate integral aún no observado y adopción "
+                    "estable no autorizada.",
+                    "- **No hacer todavía:** instalar, adoptar externamente, "
+                    "commit, push, PR, merge, deploy, publicación o release.",
+                    "- **Autoridad:** `authorizes=false`",
+                )
+            ),
+        )
+
+    def test_manual_dogfood_scorecard_rejects_resigned_or_structural_drift(self) -> None:
+        content = read(DOGFOOD)
+        evidence_match = re.search(
+            r"(?ms)^### `CORE-DOGFOOD-01-E1`\n\n"
+            r"```json\n(?P<payload>\{.*?\})\n```\n\n"
+            r"Evidence digest: `(?P<digest>sha256:[0-9a-f]{64})`$",
+            content,
+        )
+        self.assertIsNotNone(evidence_match)
+        assert evidence_match is not None
+
+        def resigned(mutator: object) -> str:
+            payload = json.loads(evidence_match.group("payload"))
+            assert callable(mutator)
+            mutator(payload)
+            canonical = json.dumps(
+                payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            digest = f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"
+            changed = content.replace(evidence_match.group("payload"), canonical, 1)
+            return changed.replace(evidence_match.group("digest"), digest, 1)
+
+        mutations = {
+            "duplicate_json_key": content.replace(
+                evidence_match.group("payload"),
+                evidence_match.group("payload").replace(
+                    "{", '{"authorizes":true,', 1
+                ),
+                1,
+            ),
+            "extra_malformed_evidence_block": content.replace(
+                "\n## Continuación\n",
+                "\n### `CORE-DOGFOOD-99-E1`\n\n```json\n{}\n```\n\n"
+                "Evidence digest: `sha256:"
+                + "0" * 64
+                + "`\n\n## Continuación\n",
+                1,
+            ),
+            "duplicate_continuation_heading": content.replace(
+                "\n## Evidence registry\n",
+                "\n## Continuación\n\n- stale\n\n## Evidence registry\n",
+                1,
+            ),
+            "row_payload_workload_mismatch": content.replace(
+                "| `CORE-DOGFOOD-01` | `local` |",
+                "| `CORE-DOGFOOD-01` | `hybrid` |",
+                1,
+            ),
+            "stray_autopilot_on": content.replace(
+                "This is a manual evidence gate",
+                "Autopilot=ON\n\nThis is a manual evidence gate",
+                1,
+            ),
+            "resigned_workload": resigned(
+                lambda payload: payload["contract"].__setitem__(
+                    "workload", "controlled"
+                )
+            ),
+            "resigned_extra_key": resigned(
+                lambda payload: payload.__setitem__("prompt_text", "synthetic")
+            ),
+            "contradictory_autopilot": content.replace(
+                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`.",
+                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=ON`.\n\n"
+                "<!-- stale marker: Autopilot=OFF -->",
+                1,
+            ),
+            "wrong_continuation": content.replace(
+                "ejecutar una única vez `bash tests/run.sh`",
+                "ejecutar dos veces `bash tests/run.sh`",
+                1,
+            ).replace(
+                "Ejecuta el único gate integral",
+                "Ejecuta dos gates integrales",
+                1,
+            ),
+            "duplicate_status": content.replace(
+                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`.",
+                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`.\n"
+                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=ON`.",
+                1,
+            ),
+            "duplicate_continuation": content.replace(
+                "- **Para continuar:** ejecutar una única vez `bash tests/run.sh` "
+                "sobre estos bytes finales y detenerse si no es `PASS`.",
+                "- **Para continuar:** ejecutar una única vez `bash tests/run.sh` "
+                "sobre estos bytes finales y detenerse si no es `PASS`.\n"
+                "- **Para continuar:** ejecutar un segundo gate.",
+                1,
+            ),
+            "authority_true": content.replace(
+                "- **Autoridad:** `authorizes=false`",
+                "- **Autoridad:** `authorizes=true`",
+                1,
+            ),
+            "remote_effect_allowed": content.replace(
+                "- **No hacer todavía:** instalar, adoptar externamente, commit, "
+                "push, PR, merge, deploy, publicación o release.",
+                "- **No hacer todavía:** nada; push permitido.",
+                1,
+            ),
+        }
+        for label, mutated in mutations.items():
+            with self.subTest(label=label):
+                case = CoreDocumentationTests(
+                    methodName="test_manual_dogfood_scorecard_is_closed"
+                )
+                with patch(f"{__name__}.read", return_value=mutated):
+                    with self.assertRaises(AssertionError):
+                        case.test_manual_dogfood_scorecard_is_closed()
 
     def test_continuation_is_compact_and_non_authorizing(self) -> None:
         content = read(DOGFOOD)
         _, separator, continuation = content.rpartition("## Continuación")
         self.assertEqual(separator, "## Continuación")
         self.assertLessEqual(len(continuation.encode("utf-8")), 2_048)
-        for field in (
-            "Escribe en:",
-            "Rol:",
-            "Para continuar:",
-            "Mensaje exacto:",
-            "Estado de partida:",
-            "No hacer todavía:",
-            "Autoridad:",
-        ):
-            self.assertIn(field, continuation)
-        self.assertIn("authorizes=false", continuation)
+        self.assertEqual(
+            re.findall(r"(?m)^- \*\*([^*]+):\*\*", continuation),
+            [
+                "Escribe en",
+                "Rol",
+                "Para continuar",
+                "Mensaje exacto",
+                "Estado de partida",
+                "No hacer todavía",
+                "Autoridad",
+            ],
+        )
+        self.assertIn("- **Autoridad:** `authorizes=false`", continuation)
+        self.assertNotIn("authorizes=true", continuation)
 
     def test_threat_model_is_repository_scoped_and_snapshot_bound(self) -> None:
         content = read(THREAT_MODEL)

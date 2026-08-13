@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from control_plane.contracts import contract_digest
 from control_plane.leases import LeaseStore
+from control_plane.project_profiles import detect_project_profile
 from control_plane.task_state import CoreTaskStore
 from tests.git_test_support import FIXTURE_POLICY
 from tests.core_router_test_support import (
@@ -648,6 +649,16 @@ class CoreCliTests(unittest.TestCase):
     def test_task_start_and_status_use_core_state_and_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = make_repo(Path(directory) / "repo")
+            (repo / "ios" / "App.xcodeproj").mkdir(parents=True)
+            (repo / "ios" / "App.xcodeproj" / "project.pbxproj").write_text(
+                "fixture\n", encoding="utf-8"
+            )
+            (repo / "functions").mkdir()
+            (repo / "firebase.json").write_text("{}\n", encoding="utf-8")
+            (repo / "functions" / "package.json").write_text("{}\n", encoding="utf-8")
+            self.assertEqual(
+                detect_project_profile(repo)["profiles"], ["ios", "saas_backend"]
+            )
             task_digest = contract_digest({"task": "cli"})
             decision_digest = contract_digest({"decision": "cli"})
             started = run_cli(
@@ -693,7 +704,72 @@ class CoreCliTests(unittest.TestCase):
             lease = LeaseStore(repo).find("TASK-CORE-CLI")
             self.assertIsNotNone(lease)
             self.assertEqual(lease["lease_generation"], 1)
+            expected_binding = {
+                "schema_version": 1,
+                "kind": "CoreLeaseReleaseBindingV1",
+                "task_id": lease["task_id"],
+                "revision_id": lease["revision_id"],
+                "lease_generation": lease["lease_generation"],
+                "worktree": lease["worktree"],
+                "branch": lease["branch"],
+                "session_id": lease["session_id"],
+                "policy_digest": lease["policy_digest"],
+                "lease_digest": lease["lease_digest"],
+                "authorizes": False,
+            }
+            self.assertEqual(started_payload["lease"], expected_binding)
+            self.assertEqual(status_payload["lease"], expected_binding)
             self.assertFalse(started_payload["authorizes"])
+
+            release_arguments = (
+                "task",
+                "lease-release",
+                "--repo",
+                str(repo),
+                "--task-id",
+                str(expected_binding["task_id"]),
+                "--revision-id",
+                str(expected_binding["revision_id"]),
+                "--lease-generation",
+                str(expected_binding["lease_generation"]),
+                "--worktree",
+                str(expected_binding["worktree"]),
+                "--branch",
+                str(expected_binding["branch"]),
+                "--session-id",
+                str(expected_binding["session_id"]),
+                "--policy-digest",
+                str(expected_binding["policy_digest"]),
+                "--lease-digest",
+                str(expected_binding["lease_digest"]),
+                "--json",
+            )
+            wrong_arguments = list(release_arguments)
+            wrong_arguments[wrong_arguments.index("--policy-digest") + 1] = (
+                "sha256:" + "0" * 64
+            )
+            rejected = run_cli(*wrong_arguments)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(
+                json.loads(rejected.stdout)["errors"][0]["code"],
+                "E_CORE_LEASE_RELEASE",
+            )
+            self.assertIsNotNone(LeaseStore(repo).find("TASK-CORE-CLI"))
+
+            released = run_cli(*release_arguments)
+            replayed = run_cli(*release_arguments)
+            after_release = run_cli(
+                "task", "status", "--repo", str(repo), "--task-id",
+                "TASK-CORE-CLI", "--json",
+            )
+
+            self.assertEqual(released.returncode, 0, released.stderr)
+            released_payload = json.loads(released.stdout)
+            self.assertEqual(replayed.returncode, 0, replayed.stderr)
+            self.assertEqual(json.loads(replayed.stdout), released_payload)
+            self.assertEqual(released_payload["receipt"]["kind"], "CoreLeaseReleaseReceiptV1")
+            self.assertEqual(json.loads(after_release.stdout)["lease"], None)
+            self.assertFalse(released_payload["authorizes"])
 
     def test_task_start_with_unusable_policy_leaves_no_core_records(self) -> None:
         for scenario, expected_code in (
@@ -716,6 +792,195 @@ class CoreCliTests(unittest.TestCase):
                 self.assertFalse(payload["ok"])
                 self.assertEqual(payload["errors"][0]["code"], expected_code)
                 self.assertEqual(core_record_snapshot(repo), before)
+
+    def test_task_mutations_require_the_exact_lease_session_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            task_id = "TASK-OWNED-MUTATIONS"
+            session_id = f"SESSION-{task_id}"
+            started = run_cli(
+                *task_start_arguments(repo, task_id, FIXTURE_POLICY)
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+
+            def mutate(
+                action: str,
+                session: str | None,
+                *,
+                state: str | None = None,
+                reason: str | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                arguments = [
+                    "task", action, "--repo", str(repo), "--task-id", task_id,
+                ]
+                if session is not None:
+                    arguments.extend(("--session-id", session))
+                if state is not None:
+                    arguments.extend(("--state", state))
+                if reason is not None:
+                    arguments.extend(("--reason", reason))
+                arguments.append("--json")
+                return run_cli(*arguments)
+
+            before = core_record_snapshot(repo)
+            for session in (None, "SESSION-FOREIGN"):
+                rejected = mutate("transition", session, state="planned")
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertEqual(
+                    json.loads(rejected.stdout)["errors"][0]["code"],
+                    "E_CORE_LEASE_OWNER",
+                )
+                self.assertEqual(core_record_snapshot(repo), before)
+
+            self.assertEqual(mutate("transition", session_id, state="planned").returncode, 0)
+            self.assertEqual(
+                mutate("transition", session_id, state="blocked", reason="fixture").returncode,
+                0,
+            )
+            blocked = core_record_snapshot(repo)
+            rejected_resume = mutate("resume", "SESSION-FOREIGN")
+            self.assertNotEqual(rejected_resume.returncode, 0)
+            self.assertEqual(core_record_snapshot(repo), blocked)
+            self.assertEqual(mutate("resume", session_id).returncode, 0)
+
+            for state in ("ready", "implementing", "verifying", "review_ready"):
+                self.assertEqual(
+                    mutate("transition", session_id, state=state).returncode,
+                    0,
+                )
+            review_ready = core_record_snapshot(repo)
+            rejected_close = mutate("close", "SESSION-FOREIGN")
+            self.assertNotEqual(rejected_close.returncode, 0)
+            self.assertEqual(core_record_snapshot(repo), review_ready)
+            closed = mutate("close", session_id)
+            self.assertEqual(closed.returncode, 0, closed.stdout)
+            self.assertEqual(json.loads(closed.stdout)["task"]["state"], "closed")
+            self.assertFalse(json.loads(closed.stdout)["authorizes"])
+
+    def test_task_revise_is_closed_lease_free_idempotent_and_generational(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            task_id = "TASK-PUBLIC-REVISION"
+            session_one = f"SESSION-{task_id}"
+            started = run_cli(*task_start_arguments(repo, task_id, FIXTURE_POLICY))
+            self.assertEqual(started.returncode, 0, started.stderr)
+            first_payload = json.loads(started.stdout)
+            first_binding = first_payload["lease"]
+
+            for state in ("planned", "ready", "implementing", "verifying", "review_ready"):
+                transition = run_cli(
+                    "task", "transition", "--repo", str(repo), "--task-id", task_id,
+                    "--state", state, "--session-id", session_one, "--json",
+                )
+                self.assertEqual(transition.returncode, 0, transition.stdout)
+            closed = run_cli(
+                "task", "close", "--repo", str(repo), "--task-id", task_id,
+                "--session-id", session_one, "--json",
+            )
+            self.assertEqual(closed.returncode, 0, closed.stdout)
+
+            task_digest = contract_digest({"task": "public-revision-two"})
+            decision_digest = contract_digest({"decision": "public-revision-two"})
+            revise_arguments = (
+                "task", "revise", "--repo", str(repo), "--task-id", task_id,
+                "--task-digest", task_digest, "--decision-digest", decision_digest,
+                "--scope-path", "control_plane/cli.py", "--json",
+            )
+            before_active_rejection = core_record_snapshot(repo)
+            rejected = run_cli(*revise_arguments)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(
+                json.loads(rejected.stdout)["errors"][0]["code"],
+                "E_CORE_REVISION_LEASE_ACTIVE",
+            )
+            self.assertEqual(core_record_snapshot(repo), before_active_rejection)
+
+            release = run_cli(
+                "task", "lease-release", "--repo", str(repo), "--task-id", task_id,
+                "--revision-id", str(first_binding["revision_id"]),
+                "--lease-generation", str(first_binding["lease_generation"]),
+                "--worktree", str(first_binding["worktree"]),
+                "--branch", str(first_binding["branch"]),
+                "--session-id", str(first_binding["session_id"]),
+                "--policy-digest", str(first_binding["policy_digest"]),
+                "--lease-digest", str(first_binding["lease_digest"]), "--json",
+            )
+            self.assertEqual(release.returncode, 0, release.stdout)
+
+            receipt_path = LeaseStore(repo).receipts / (
+                "lease-"
+                + __import__("hashlib").sha256(
+                    f'{task_id}\0{first_binding["revision_id"]}\0'
+                    f'{first_binding["lease_generation"]}'.encode()
+                ).hexdigest()
+                + ".json"
+            )
+            receipt_bytes = receipt_path.read_bytes()
+            receipt_path.unlink()
+            missing_receipt_before = core_record_snapshot(repo)
+            missing_receipt = run_cli(*revise_arguments)
+            self.assertNotEqual(missing_receipt.returncode, 0)
+            self.assertEqual(
+                json.loads(missing_receipt.stdout)["errors"][0]["code"],
+                "E_CORE_REVISION_RECEIPT",
+            )
+            self.assertEqual(core_record_snapshot(repo), missing_receipt_before)
+            receipt_path.write_bytes(receipt_bytes)
+            receipt_path.chmod(0o600)
+
+            revised = run_cli(*revise_arguments)
+            replayed = run_cli(*revise_arguments)
+            self.assertEqual(revised.returncode, 0, revised.stdout)
+            self.assertEqual(replayed.returncode, 0, replayed.stdout)
+            revised_payload = json.loads(revised.stdout)
+            self.assertEqual(json.loads(replayed.stdout), revised_payload)
+            self.assertEqual(revised_payload["task"]["state"], "framed")
+            self.assertEqual(revised_payload["task"]["lease_generation"], 0)
+            self.assertNotEqual(
+                revised_payload["task"]["revision_id"],
+                first_payload["task"]["revision_id"],
+            )
+
+            second_start = run_cli(
+                "task", "start", "--repo", str(repo), "--task-id", task_id,
+                "--outcome", "local_change", "--branch", "codex/core-test",
+                "--task-digest", task_digest, "--decision-digest", decision_digest,
+                "--session-id", "SESSION-PUBLIC-REVISION-TWO", "--scope-path",
+                "control_plane/cli.py", "--policy", str(FIXTURE_POLICY), "--json",
+            )
+            self.assertEqual(second_start.returncode, 0, second_start.stdout)
+            second_payload = json.loads(second_start.stdout)
+            self.assertEqual(second_payload["lease"]["lease_generation"], 2)
+            self.assertFalse(second_payload["authorizes"])
+
+    def test_task_revise_never_treats_initial_framed_state_as_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            task_id = "TASK-INITIAL-FRAMED-REVISION"
+            task_digest = contract_digest({"task": task_id})
+            decision_digest = contract_digest({"decision": task_id})
+            started = run_cli(
+                "task", "start", "--repo", str(repo), "--task-id", task_id,
+                "--outcome", "local_change", "--branch", "codex/core-test",
+                "--task-digest", task_digest, "--decision-digest", decision_digest,
+                "--scope-path", "control_plane/cli.py", "--policy",
+                str(FIXTURE_POLICY), "--json",
+            )
+            self.assertEqual(started.returncode, 0, started.stdout)
+            before = core_record_snapshot(repo)
+
+            revised = run_cli(
+                "task", "revise", "--repo", str(repo), "--task-id", task_id,
+                "--task-digest", task_digest, "--decision-digest", decision_digest,
+                "--scope-path", "control_plane/cli.py", "--json",
+            )
+
+            self.assertNotEqual(revised.returncode, 0, revised.stdout)
+            self.assertEqual(
+                json.loads(revised.stdout)["errors"][0]["code"],
+                "E_CORE_REVISION_STATE",
+            )
+            self.assertEqual(core_record_snapshot(repo), before)
 
     def test_task_start_faults_preserve_exact_new_and_existing_core_records(self) -> None:
         for fault, target in (
@@ -827,6 +1092,7 @@ class CoreCliTests(unittest.TestCase):
                     task_id,
                     "planned",
                     current_branch="codex/core-test",
+                    session_id=f"SESSION-{task_id}",
                 )
                 return lease, created
 
@@ -880,6 +1146,7 @@ class CoreCliTests(unittest.TestCase):
                 revision_id=lease["revision_id"],
                 generation=lease["lease_generation"],
                 expected_state_digest=state["state_digest"],
+                session_id="SESSION-SHARED-CONTINUATION",
             )
             (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
             observation = {"task": state, "lease": lease, "authorizes": False}

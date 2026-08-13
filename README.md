@@ -104,6 +104,10 @@ scripts/control-plane adopt verify --target /ruta/al/repositorio
 revisión, worktree, sesión, policy y scope. Un resultado `review_ready` no es
 commit, push, PR ni integración.
 
+La task queda bajo el worktree Git dir. El lease Core y su recibo de liberación
+quedan bajo el Git common dir para coordinar scopes y generaciones across
+worktrees; ninguno se versiona.
+
 Los leases Core coordinan únicamente writers Core. Antes de persistir una
 task, Core bloquea cualquier estado legacy observable, pero un binario legacy
 del mismo usuario no consulta el namespace Core y no comparte una exclusión de

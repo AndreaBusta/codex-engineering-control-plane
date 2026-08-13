@@ -18,6 +18,11 @@ The active package is an exact allowlist. Core admits only the outcomes
 Remote uncertainty remains `UNKNOWN`. Policy, routing, evidence, or task text
 never creates authority.
 
+State placement is deliberate: `CoreTaskStateV1` is private to the worktree Git
+dir, while Core writer leases and immutable release receipts are private to the
+Git common dir so overlap and generations are coordinated across worktrees.
+None of these records is versioned.
+
 ## Legacy recovery
 
 Legacy task, lease, delivery-lease, and run records are inventoried with

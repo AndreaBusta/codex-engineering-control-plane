@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 import control_plane.adoption_recovery as recovery
 from control_plane.adoption_recovery import adoption_rollback, adoption_status, adoption_verify
+from control_plane.project_profiles import detect_project_profile
 from tests.git_test_support import FIXTURE_POLICY
 from tests.test_core_task_state import git, make_repo
 
@@ -126,6 +128,96 @@ def modern_journal(
 
 
 class CoreAdoptionRecoveryTests(unittest.TestCase):
+    def test_core_recovery_runtime_contains_no_unreachable_rollback_mutators(self) -> None:
+        source = Path(recovery.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        forbidden_functions = {
+            "_atomic_json",
+            "_durable_copy",
+            "_restore_config",
+            "_remove_created_directories",
+            "_remove_snapshot_contents",
+            "_remove_snapshot_tree",
+            "_rollback_with_proven_quiescence",
+            "_recovery_lock",
+        }
+        definitions = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertTrue(forbidden_functions.isdisjoint(definitions))
+        forbidden_attributes = {"mkdir", "write_bytes", "write_text", "unlink", "rmdir", "replace", "chmod", "fchmod", "fsync"}
+        observed_attributes = {
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        }
+        self.assertTrue(forbidden_attributes.isdisjoint(observed_attributes))
+        self.assertNotIn("--replace-all", source)
+        self.assertNotIn("--unset-all", source)
+
+    def test_status_validates_closed_journal_and_never_echoes_private_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            managed = repo / "managed.txt"
+            installed = b"installed\n"
+            managed.write_bytes(installed)
+            journal, state = modern_journal(
+                repo,
+                records=[
+                    {
+                        "path": "managed.txt",
+                        "before_digest": None,
+                        "installed_digest": digest(installed),
+                        "backup": None,
+                    }
+                ],
+            )
+
+            valid = adoption_status(repo)
+            self.assertEqual(
+                valid,
+                {
+                    "schema_version": 2,
+                    "command": "adopt-status",
+                    "ok": True,
+                    "status": "applied",
+                    "plan_id": state["plan_id"],
+                    "errors": [],
+                    "authorizes": False,
+                },
+            )
+
+            marker = "private-journal-value-must-not-be-echoed"
+            state["unexpected"] = marker
+            journal.write_text(
+                json.dumps(state, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            journal.chmod(0o600)
+            rejected = adoption_status(repo)
+            self.assertEqual(rejected["ok"], False)
+            self.assertEqual(rejected["status"], "UNKNOWN")
+            self.assertEqual(
+                rejected["errors"][0]["code"], "E_ADOPT_ROLLBACK_SCHEMA"
+            )
+            self.assertNotIn(marker, json.dumps(rejected, sort_keys=True))
+            self.assertEqual(rejected["authorizes"], False)
+
+            for raw, expected_code in (
+                (b'{"schema_version":2,"marker":"private-broken-json"',
+                 "E_ADOPT_RECOVERY_UNKNOWN"),
+                (b'{"schema_version":1,"marker":"private-old-schema"}\n',
+                 "E_ADOPT_ROLLBACK_SCHEMA"),
+            ):
+                with self.subTest(expected_code=expected_code):
+                    journal.write_bytes(raw)
+                    journal.chmod(0o600)
+                    malformed = adoption_status(repo)
+                    self.assertFalse(malformed["ok"])
+                    self.assertEqual(malformed["status"], "UNKNOWN")
+                    self.assertEqual(malformed["errors"][0]["code"], expected_code)
+                    self.assertNotIn("private-", json.dumps(malformed, sort_keys=True))
+                    self.assertFalse(malformed["authorizes"])
+
     def test_created_directory_traversal_is_bounded_and_accepts_small_tree(self) -> None:
         for scenario in ("small", "too-many"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
@@ -199,6 +291,17 @@ class CoreAdoptionRecoveryTests(unittest.TestCase):
     def test_rollback_fails_closed_when_legacy_quiescence_cannot_be_proven(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = make_repo(Path(directory) / "repo")
+            (repo / "ios" / "App.xcodeproj").mkdir(parents=True)
+            (repo / "ios" / "App.xcodeproj" / "project.pbxproj").write_text(
+                "fixture\n", encoding="utf-8"
+            )
+            (repo / "functions").mkdir()
+            (repo / "firebase.json").write_text("{}\n", encoding="utf-8")
+            (repo / "functions" / "package.json").write_text("{}\n", encoding="utf-8")
+            profile = detect_project_profile(repo)
+            self.assertEqual(profile["kind"], "hybrid")
+            self.assertEqual(profile["profiles"], ["ios", "saas_backend"])
+            self.assertFalse(profile["truncated"])
             managed = repo / "managed.txt"
             managed.write_text("installed\n", encoding="utf-8")
             managed.chmod(0o644)
@@ -434,7 +537,12 @@ class CoreAdoptionRecoveryTests(unittest.TestCase):
             journal.chmod(0o600)
             before = (managed.read_bytes(), journal.read_bytes())
 
-            self.assertEqual(adoption_status(repo)["status"], "applied")
+            status = adoption_status(repo)
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["status"], "UNKNOWN")
+            self.assertEqual(
+                status["errors"][0]["code"], "E_ADOPT_ROLLBACK_SCHEMA"
+            )
             verification = adoption_verify(repo)
             self.assertFalse(verification["ok"])
             self.assertEqual(verification["status"], "UNKNOWN")

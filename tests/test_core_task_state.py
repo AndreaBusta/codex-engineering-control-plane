@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from control_plane.contracts import contract_digest
+from control_plane.leases import LeaseStore
 from control_plane.task_state import (
     CoreTaskStore,
     assert_no_active_legacy_state,
@@ -243,11 +244,17 @@ class CoreTaskStateTests(unittest.TestCase):
                 decision_digest=contract_digest({"decision": "original"}),
                 scope_paths=["control_plane/task_state.py"],
             )
+            lease = LeaseStore(repo).acquire(
+                original,
+                session_id="SESSION-ROLLBACK-DRIFT",
+                policy_digest=contract_digest({"policy": "rollback-drift"}),
+            )
             current = store.bind_lease_generation(
                 original["task_id"],
                 revision_id=original["revision_id"],
-                generation=1,
+                generation=lease["lease_generation"],
                 expected_state_digest=original["state_digest"],
+                session_id="SESSION-ROLLBACK-DRIFT",
             )
             mutated = dict(current)
             mutated["decision_digest"] = contract_digest({"decision": "drifted"})
@@ -264,6 +271,7 @@ class CoreTaskStateTests(unittest.TestCase):
                     original,
                     expected_revision_id=original["revision_id"],
                     expected_generation=1,
+                    session_id="SESSION-ROLLBACK-DRIFT",
                 )
 
             self.assertEqual(path.read_bytes(), before)

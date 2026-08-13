@@ -3,10 +3,11 @@ from __future__ import annotations
 from hashlib import sha256
 import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 
-from control_plane.adoption_recovery import _recovery_lock, adoption_status
+from control_plane.adoption_recovery import adoption_status
 from control_plane.contracts import contract_digest
 from control_plane.leases import LeaseStore
 from control_plane.maintenance import MaintenanceStore
@@ -195,25 +196,19 @@ class CoreStatePathTests(unittest.TestCase):
                     ),
                 )
             )
-            cases.append(
-                (
-                    "adoption",
-                    "E_ADOPT_RECOVERY_UNKNOWN",
-                    str(
-                        common
-                        / "codex-control-plane"
-                        / "locks"
-                        / "adoption.lock"
-                    ),
-                    lambda: enter_context(_recovery_lock(repo)),
-                )
-            )
-
             for name, code, raw_lock, operation in cases:
                 with self.subTest(name=name):
                     lock = Path(raw_lock)
                     lock.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
                     os.chmod(lock.parent, 0o700)
+                    try:
+                        existing = lock.lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        self.assertTrue(stat.S_ISREG(existing.st_mode))
+                        self.assertEqual(existing.st_nlink, 1)
+                        lock.unlink()
                     lock.symlink_to(external)
                     with self.assertRaisesRegex(ValueError, code):
                         operation()
@@ -236,8 +231,12 @@ class CoreStatePathTests(unittest.TestCase):
                 outside, target_is_directory=True
             )
 
-            with self.assertRaisesRegex(ValueError, "E_ADOPT_RECOVERY_UNKNOWN"):
-                adoption_status(repo)
+            result = adoption_status(repo)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "UNKNOWN")
+            self.assertEqual(
+                result["errors"][0]["code"], "E_ADOPT_RECOVERY_UNKNOWN"
+            )
 
             self.assertEqual(external_file_snapshot(journal), before)
 

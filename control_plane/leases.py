@@ -185,6 +185,147 @@ class LeaseStore:
             raise ValueError("E_CORE_LEASE_INVALID: task has multiple active leases")
         return matches[0] if matches else None
 
+    @contextmanager
+    def claim_mutation(
+        self,
+        state: Mapping[str, Any],
+        *,
+        session_id: str | None,
+    ) -> Iterator[dict[str, Any] | None]:
+        """Hold the lease mutex while a bound owner mutates one task."""
+
+        with _lease_lock(self.common_git_dir):
+            lease = self.find(str(state.get("task_id", "")))
+            if (
+                lease is None
+                and session_id is None
+                and state.get("lease_generation") == 0
+            ):
+                yield None
+                return
+            if not validate_task_id(session_id):
+                raise ValueError("E_CORE_LEASE_OWNER: session identity is invalid")
+            expected = {
+                "task_id": state.get("task_id"),
+                "revision_id": state.get("revision_id"),
+                "worktree": state.get("worktree"),
+                "branch": state.get("branch"),
+                "session_id": session_id,
+                "owner_runtime_digest": state.get("owner_runtime_digest"),
+            }
+            if lease is None or any(
+                lease.get(key) != value for key, value in expected.items()
+            ):
+                raise ValueError(
+                    "E_CORE_LEASE_OWNER: task mutation requires the exact lease owner"
+                )
+            generation = state.get("lease_generation")
+            if (
+                generation == 0
+                and lease.get("acquired_state_digest") != state.get("state_digest")
+            ) or (
+                generation != 0
+                and lease.get("lease_generation") != generation
+            ):
+                raise ValueError(
+                    "E_CORE_LEASE_OWNER: task mutation lease generation drifted"
+                )
+            yield lease
+
+    @contextmanager
+    def claim_next_revision(self, state: Mapping[str, Any]) -> Iterator[int]:
+        """Prove a prior writer was released before replacing its revision."""
+
+        task_id = state.get("task_id")
+        revision_id = state.get("revision_id")
+        generation = state.get("lease_generation")
+        if (
+            not validate_task_id(task_id)
+            or not isinstance(revision_id, str)
+            or _REVISION_ID.fullmatch(revision_id) is None
+            or type(generation) is not int
+            or generation < 0
+        ):
+            raise ValueError("E_CORE_REVISION: task revision binding is invalid")
+        with _lease_lock(self.common_git_dir):
+            if self.find(str(task_id)) is not None:
+                raise ValueError(
+                    "E_CORE_REVISION_LEASE_ACTIVE: active lease blocks revision"
+                )
+            receipts = self._records(self.receipts)
+            for receipt in receipts:
+                self._validate_receipt(receipt)
+            task_receipts = [
+                receipt for receipt in receipts if receipt.get("task_id") == task_id
+            ]
+            if generation > 0:
+                matching = [
+                    receipt
+                    for receipt in task_receipts
+                    if receipt.get("revision_id") == revision_id
+                    and receipt.get("lease_generation") == generation
+                ]
+                if len(matching) != 1:
+                    raise ValueError(
+                        "E_CORE_REVISION_RECEIPT: exact lease release receipt is required"
+                    )
+            yield max(
+                [
+                    int(state.get("lease_generation_floor", 0)),
+                    *(int(receipt["lease_generation"]) for receipt in task_receipts),
+                ]
+            )
+
+    @contextmanager
+    def claim_no_active(self, task_id: str) -> Iterator[None]:
+        """Hold the lease mutex while proving a task has no active lease."""
+
+        if not validate_task_id(task_id):
+            raise ValueError("E_CORE_LEASE_BINDING: task identity is invalid")
+        with _lease_lock(self.common_git_dir):
+            if self.find(task_id) is not None:
+                raise ValueError(
+                    "E_CORE_LEASE_ACTIVE: active lease blocks task mutation"
+                )
+            yield
+
+    @contextmanager
+    def claim_binding(
+        self,
+        state: Mapping[str, Any],
+        *,
+        revision_id: str,
+        generation: int,
+        acquired_state_digest: str,
+        session_id: str | None,
+    ) -> Iterator[dict[str, Any]]:
+        """Hold the lease mutex while an exact acquired binding is consumed."""
+
+        with _lease_lock(self.common_git_dir):
+            if not validate_task_id(session_id):
+                raise ValueError(
+                    "E_CORE_LEASE_OWNER: exact lease session is required"
+                )
+            lease = self.find(str(state.get("task_id", "")))
+            if lease is None:
+                raise ValueError("E_CORE_LEASE_NOT_FOUND: active lease is unavailable")
+            if lease.get("session_id") != session_id:
+                raise ValueError(
+                    "E_CORE_LEASE_OWNER: exact lease session does not match"
+                )
+            expected = {
+                "task_id": state.get("task_id"),
+                "revision_id": revision_id,
+                "lease_generation": generation,
+                "worktree": state.get("worktree"),
+                "branch": state.get("branch"),
+                "owner_runtime_digest": state.get("owner_runtime_digest"),
+                "acquired_state_digest": acquired_state_digest,
+            }
+            if any(lease.get(key) != value for key, value in expected.items()):
+                raise ValueError("E_CORE_LEASE_BINDING: active lease binding drifted")
+            yield lease
+
     def acquire(
         self,
         state: Mapping[str, Any],
@@ -299,12 +440,14 @@ class LeaseStore:
                 self._validate_receipt(receipt)
             historical = [*active, *receipts]
             generation = 1 + max(
-                (
+                [
+                    int(state.get("lease_generation_floor", 0)),
+                    *(
                     int(item.get("lease_generation", 0))
                     for item in historical
                     if item.get("task_id") == task_id
-                ),
-                default=0,
+                    ),
+                ]
             )
             lease_id = "lease-" + sha256(
                 f"{task_id}\0{revision_id}\0{generation}".encode()

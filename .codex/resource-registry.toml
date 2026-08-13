@@ -123,30 +123,6 @@ aliases = []
 output_contract = "verified-workflow-v1"
 
 [[resources]]
-id = "document.operating-model"
-kind = "document"
-provider = "repository"
-locator = "repo://docs/engineering/01-operating-model.md"
-capabilities = ["documentation.operating-model"]
-scope = "project"
-authority = "project"
-trust = "trusted_project"
-selection = "available"
-effects = ["local_read"]
-egress = "none"
-data_classes = ["project_metadata"]
-approval = "none"
-load_strategy = "progressive"
-context_class = "small"
-canonical = true
-priority = 500
-requires = []
-conflicts = []
-supersedes = []
-aliases = []
-output_contract = "markdown"
-
-[[resources]]
 id = "document.profile-generic"
 kind = "document"
 provider = "repository"
@@ -699,7 +675,7 @@ signals_any = []
 signals_all = []
 effects_any = []
 required_capabilities = ["workflow.verified"]
-recommended_resources = ["document.operating-model", "document.lifecycle-adoption-guide", "skill.decision-stress-test"]
+recommended_resources = ["document.lifecycle-adoption-guide", "skill.decision-stress-test"]
 forbidden_resources = []
 
 [[routes]]

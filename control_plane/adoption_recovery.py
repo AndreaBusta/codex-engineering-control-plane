@@ -1,9 +1,7 @@
-"""Read-only inspection and exact rollback for already installed generations."""
+"""Read-only inspection and fail-closed recovery diagnostics for legacy installs."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-import fcntl
 from hashlib import sha256
 import json
 import os
@@ -11,13 +9,11 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
-import tempfile
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 
 from control_plane.repository import (
     discover_repository,
     git_common_dir,
-    open_private_state_lock,
     private_state_directory,
     trusted_git_environment,
     trusted_git_executable,
@@ -236,34 +232,6 @@ def _read_journal(repository: Path) -> dict[str, Any] | None:
     if not isinstance(value, dict) or value.get("schema_version") != 2:
         raise ValueError("E_ADOPT_ROLLBACK_SCHEMA: installed journal is unsupported")
     return value
-
-
-def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.parent.is_symlink() or path.is_symlink():
-        raise ValueError("E_ADOPT_RECOVERY_UNKNOWN: journal path is unsafe")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            descriptor = -1
-            handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
-        path.chmod(0o600)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
 
 
 def _records(state: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -627,26 +595,20 @@ def _preflight(repository: Path, state: Mapping[str, Any], *, recovering: bool) 
                 ) from error
 
 
-@contextmanager
-def _recovery_lock(repository: Path) -> Iterator[None]:
-    common = git_common_dir(repository)
-    descriptor = open_private_state_lock(
-        common,
-        ("codex-control-plane", "locks"),
-        "adoption.lock",
-        code="E_ADOPT_RECOVERY_UNKNOWN",
-    )
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
-    finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-
-
 def adoption_status(target: Path | str) -> dict[str, Any]:
     repository = discover_repository(Path(target))
-    state = _read_journal(repository)
+    try:
+        state = _read_journal(repository)
+    except ValueError as error:
+        code = str(error).split(":", 1)[0]
+        return {
+            "schema_version": 2,
+            "command": "adopt-status",
+            "ok": False,
+            "status": "UNKNOWN",
+            "errors": [{"code": code, "message": str(error)}],
+            "authorizes": False,
+        }
     if state is None:
         return {
             "schema_version": 2,
@@ -655,10 +617,25 @@ def adoption_status(target: Path | str) -> dict[str, Any]:
             "status": "not_applied",
             "authorizes": False,
         }
+    try:
+        _journal_contract(state)
+    except ValueError as error:
+        code = str(error).split(":", 1)[0]
+        return {
+            "schema_version": 2,
+            "command": "adopt-status",
+            "ok": False,
+            "status": "UNKNOWN",
+            "errors": [{"code": code, "message": str(error)}],
+            "authorizes": False,
+        }
     return {
+        "schema_version": 2,
         "command": "adopt-status",
         "ok": True,
-        **state,
+        "status": state["status"],
+        "plan_id": state["plan_id"],
+        "errors": [],
         "authorizes": False,
     }
 
@@ -694,201 +671,6 @@ def adoption_verify(target: Path | str) -> dict[str, Any]:
         "status": "applied",
         "plan_id": state.get("plan_id"),
         "errors": [],
-        "authorizes": False,
-    }
-
-
-def _durable_copy(source: Path, target: Path, expected_digest: str) -> None:
-    payload, metadata = _read_regular(source)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
-    try:
-        os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode))
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary = Path(temporary_name)
-        if _digest(temporary) != expected_digest:
-            raise ValueError("E_ADOPT_RECOVERY_FAILED: backup digest changed")
-        os.replace(temporary, target)
-        target.chmod(stat.S_IMODE(metadata.st_mode))
-        directory = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
-
-
-def _restore_config(repository: Path, values: list[str]) -> None:
-    base = [trusted_git_executable(), "-C", str(repository), "config", "--local"]
-    environment = trusted_git_environment()
-    if values:
-        replace = subprocess.run(
-            [*base, "--replace-all", "core.hooksPath", values[0]],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-            timeout=5.0,
-        )
-        if replace.returncode != 0:
-            raise ValueError("E_ADOPT_HOOK_CONFIG: prior Git config could not be restored")
-        return
-    unset = subprocess.run(
-        [*base, "--unset-all", "core.hooksPath"],
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=False,
-        timeout=5.0,
-    )
-    if unset.returncode not in {0, 5}:
-        raise ValueError("E_ADOPT_HOOK_CONFIG: prior Git config could not be restored")
-
-
-def _remove_created_directories(repository: Path, values: list[str]) -> None:
-    paths = [_safe_target(repository, value) for value in values]
-    for path in sorted(paths, key=lambda item: len(item.parts), reverse=True):
-        if not path.exists():
-            continue
-        try:
-            path.rmdir()
-        except OSError as error:
-            raise ValueError("E_ADOPT_RECOVERY_FAILED: created directory is not empty") from error
-
-
-def _remove_snapshot_contents(descriptor: int, *, remaining: list[int]) -> None:
-    try:
-        entries = list(os.scandir(descriptor))
-    except OSError as error:
-        raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot inventory is unavailable") from error
-    for entry in entries:
-        remaining[0] -= 1
-        if remaining[0] < 0:
-            raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot inventory is unbounded")
-        try:
-            metadata = entry.stat(follow_symlinks=False)
-        except OSError as error:
-            raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot entry is unavailable") from error
-        if stat.S_ISREG(metadata.st_mode):
-            if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
-                raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot entry is unsafe")
-            os.unlink(entry.name, dir_fd=descriptor)
-            continue
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
-            raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot entry is unsafe")
-        child = os.open(
-            entry.name,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=descriptor,
-        )
-        try:
-            opened = os.fstat(child)
-            if _identity(opened) != _identity(metadata):
-                raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot entry changed")
-            _remove_snapshot_contents(child, remaining=remaining)
-        finally:
-            os.close(child)
-        os.rmdir(entry.name, dir_fd=descriptor)
-
-
-def _remove_snapshot_tree(repository: Path, snapshot: Mapping[str, Any]) -> None:
-    value, expected_path = _snapshot_structure(repository, snapshot, record=True)
-    common = git_common_dir(repository)
-    with private_state_directory(
-        common,
-        ("codex-control-plane", "installs"),
-        create=False,
-        missing_ok=True,
-        code="E_ADOPT_RECOVERY_FAILED",
-    ) as opened:
-        if opened is None:
-            return
-        installs, installs_descriptor = opened
-        if expected_path.parent != installs:
-            raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot path escaped installs")
-        name = str(value["manifest_digest"])
-        try:
-            snapshot_descriptor = os.open(
-                name,
-                os.O_RDONLY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_DIRECTORY", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=installs_descriptor,
-            )
-        except FileNotFoundError:
-            return
-        except OSError as error:
-            raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot cannot be opened safely") from error
-        try:
-            metadata = os.fstat(snapshot_descriptor)
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or stat.S_IMODE(metadata.st_mode) & 0o022
-            ):
-                raise ValueError("E_ADOPT_RECOVERY_FAILED: snapshot directory is unsafe")
-            _remove_snapshot_contents(
-                snapshot_descriptor,
-                remaining=[_MAX_RECORDS * 16],
-            )
-        finally:
-            os.close(snapshot_descriptor)
-        os.rmdir(name, dir_fd=installs_descriptor)
-        os.fsync(installs_descriptor)
-
-
-def _rollback_with_proven_quiescence(
-    repository: Path,
-    journal: Path,
-) -> dict[str, Any]:
-    """Recovery mechanics reserved for an owning runtime with a shared barrier."""
-
-    with _recovery_lock(repository):
-        state = _read_journal(repository)
-        if state is None or state.get("status") not in {"applied", "rolling_back"}:
-            raise ValueError("E_ADOPT_NOT_APPLIED: no adoption to roll back")
-        recovering = state.get("status") == "rolling_back"
-        _preflight(repository, state, recovering=recovering)
-        if not recovering:
-            state = dict(state)
-            state["status"] = "rolling_back"
-            _atomic_json(journal, state)
-        for record in reversed(_records(state)):
-            target_path = _safe_target(repository, str(record["path"]))
-            backup = record.get("backup")
-            if backup is not None:
-                source = _safe_target(worktree_git_dir(repository), str(backup))
-                if _digest(target_path) != record.get("before_digest"):
-                    _durable_copy(source, target_path, str(record["before_digest"]))
-            elif target_path.exists():
-                target_path.unlink()
-        _restore_config(repository, _initial_config(state))
-        for snapshot in reversed(_snapshot_records(repository, state, recovering=True)):
-            if snapshot["created"] is True:
-                _remove_snapshot_tree(repository, snapshot)
-        _remove_created_directories(repository, list(state.get("created_directories", [])))
-        state = dict(state)
-        state["status"] = "rolled_back"
-        _atomic_json(journal, state)
-    return {
-        "schema_version": 2,
-        "command": "adopt-rollback",
-        "ok": True,
-        "status": "rolled_back",
         "authorizes": False,
     }
 

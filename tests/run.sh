@@ -285,57 +285,6 @@ def executable_metadata(path: Path, *, name: str) -> None:
 executable_metadata(Path("/usr/bin/git"), name="Git")
 
 
-def common_git_directory(root: Path) -> Path:
-    environment = {
-        "LC_ALL": "C",
-        "PATH": "/usr/bin:/bin",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_SYSTEM": "/dev/null",
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_COUNT": "0",
-        "GIT_NO_REPLACE_OBJECTS": "1",
-        "GIT_OPTIONAL_LOCKS": "0",
-        "GIT_TERMINAL_PROMPT": "0",
-    }
-    completed = subprocess.run(
-        [
-            "/usr/bin/git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "-C",
-            str(root),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ],
-        cwd=root,
-        env=environment,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-        timeout=5.0,
-        close_fds=True,
-    )
-    output = completed.stdout
-    if (
-        completed.returncode != 0
-        or len(output) > 4_096
-        or len(completed.stderr) > 4_096
-        or b"\0" in output
-        or output.count(b"\n") != 1
-    ):
-        fail("E_TEST_MUTEX", "Git common directory is not observable")
-    common = Path(os.fsdecode(output[:-1]))
-    if not common.is_absolute() or common.resolve(strict=True) != common:
-        fail("E_TEST_MUTEX", "Git common directory is not canonical")
-    return common
-
-
 def identity(value: os.stat_result) -> tuple[int, ...]:
     return (
         value.st_dev,
@@ -348,6 +297,119 @@ def identity(value: os.stat_result) -> tuple[int, ...]:
         value.st_mtime_ns,
         value.st_ctime_ns,
     )
+
+
+def bounded_git_control_file(path: Path, *, label: str) -> str:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        fail("E_TEST_MUTEX", f"{label} is not observable")
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) & 0o022
+        or before.st_size > 4_096
+    ):
+        fail("E_TEST_MUTEX", f"{label} is unsafe")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        payload = os.read(descriptor, 4_097)
+        trailing = os.read(descriptor, 1)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        fail("E_TEST_MUTEX", f"{label} cannot be read")
+    finally:
+        os.close(descriptor)
+    try:
+        observed = path.lstat()
+    except OSError as error:
+        fail("E_TEST_MUTEX", f"{label} changed after read")
+    if (
+        identity(before) != identity(opened)
+        or identity(before) != identity(after)
+        or identity(before) != identity(observed)
+        or trailing
+        or len(payload) != before.st_size
+        or b"\0" in payload
+    ):
+        fail("E_TEST_MUTEX", f"{label} changed during read")
+    try:
+        value = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("E_TEST_MUTEX", f"{label} is not UTF-8")
+    if value.endswith("\n"):
+        value = value[:-1]
+    if not value or "\n" in value or "\r" in value:
+        fail("E_TEST_MUTEX", f"{label} is malformed")
+    return value
+
+
+def canonical_git_directory(path: Path, *, label: str) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.lstat()
+    except OSError:
+        fail("E_TEST_MUTEX", f"{label} is not observable")
+    if (
+        resolved != path
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink < 1
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        fail("E_TEST_MUTEX", f"{label} is unsafe")
+    return path
+
+
+def common_git_directory(root: Path) -> Path:
+    entry = root / ".git"
+    try:
+        metadata = entry.lstat()
+    except OSError:
+        fail("E_TEST_MUTEX", "Git directory is not observable")
+    if stat.S_ISDIR(metadata.st_mode):
+        git_directory = canonical_git_directory(entry, label="Git directory")
+    elif stat.S_ISREG(metadata.st_mode):
+        pointer = bounded_git_control_file(entry, label="Git directory pointer")
+        if not pointer.startswith("gitdir: "):
+            fail("E_TEST_MUTEX", "Git directory pointer is malformed")
+        candidate = Path(pointer.removeprefix("gitdir: "))
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            candidate = candidate.resolve(strict=True)
+        except OSError:
+            fail("E_TEST_MUTEX", "Git directory pointer is unresolved")
+        git_directory = canonical_git_directory(candidate, label="Git directory")
+    else:
+        fail("E_TEST_MUTEX", "Git directory entry is unsafe")
+
+    commondir = git_directory / "commondir"
+    try:
+        commondir.lstat()
+    except FileNotFoundError:
+        return git_directory
+    except OSError:
+        fail("E_TEST_MUTEX", "Git common directory pointer is not observable")
+    value = bounded_git_control_file(
+        commondir, label="Git common directory pointer"
+    )
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = git_directory / candidate
+    try:
+        candidate = candidate.resolve(strict=True)
+    except OSError:
+        fail("E_TEST_MUTEX", "Git common directory pointer is unresolved")
+    return canonical_git_directory(candidate, label="Git common directory")
 
 
 def validate_directory(value: os.stat_result, *, exact_private: bool) -> None:

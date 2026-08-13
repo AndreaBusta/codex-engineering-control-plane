@@ -15,6 +15,96 @@ from control_plane.task_state import CoreTaskStore
 
 
 class CoreLeaseTests(unittest.TestCase):
+    def test_task_compensation_and_binding_cannot_bypass_lease_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            tasks = CoreTaskStore(repo)
+            leases = LeaseStore(repo)
+            state = self._state(repo, "TASK-INTERNAL-MUTATION", "control_plane")
+            lease = leases.acquire(
+                state,
+                session_id="SESSION-INTERNAL-MUTATION",
+                policy_digest=contract_digest({"policy": "internal-mutation"}),
+            )
+            task_path = tasks.tasks / "TASK-INTERNAL-MUTATION.json"
+            before = (task_path.read_bytes(), leases.active())
+
+            with self.assertRaisesRegex(ValueError, "E_CORE_LEASE_ACTIVE"):
+                tasks.rollback_start(state)
+
+            self.assertEqual((task_path.read_bytes(), leases.active()), before)
+            self.assertEqual(leases.find(state["task_id"]), lease)
+
+            unleased = self._state(repo, "TASK-FABRICATED-GENERATION", "tests")
+            unleased_path = tasks.tasks / "TASK-FABRICATED-GENERATION.json"
+            unleased_before = unleased_path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "E_CORE_LEASE_NOT_FOUND"):
+                tasks.bind_lease_generation(
+                    unleased["task_id"],
+                    revision_id=unleased["revision_id"],
+                    generation=7,
+                    expected_state_digest=unleased["state_digest"],
+                    session_id="SESSION-FABRICATED-GENERATION",
+                )
+            self.assertEqual(unleased_path.read_bytes(), unleased_before)
+
+            leased_bytes = task_path.read_bytes()
+            for owner in (None, "SESSION-FOREIGN"):
+                with self.subTest(owner=owner), self.assertRaisesRegex(
+                    ValueError, "E_CORE_LEASE_OWNER"
+                ):
+                    tasks.bind_lease_generation(
+                        state["task_id"],
+                        revision_id=lease["revision_id"],
+                        generation=lease["lease_generation"],
+                        expected_state_digest=state["state_digest"],
+                        session_id=owner,
+                    )
+                self.assertEqual(task_path.read_bytes(), leased_bytes)
+
+            bound = tasks.bind_lease_generation(
+                state["task_id"],
+                revision_id=lease["revision_id"],
+                generation=lease["lease_generation"],
+                expected_state_digest=state["state_digest"],
+                session_id=lease["session_id"],
+            )
+            bound_bytes = task_path.read_bytes()
+            for owner in (None, "SESSION-FOREIGN"):
+                with self.subTest(restore_owner=owner), self.assertRaisesRegex(
+                    ValueError, "E_CORE_LEASE_OWNER"
+                ):
+                    tasks.restore_after_failed_binding(
+                        state,
+                        expected_revision_id=lease["revision_id"],
+                        expected_generation=lease["lease_generation"],
+                        session_id=owner,
+                    )
+                self.assertEqual(task_path.read_bytes(), bound_bytes)
+                self.assertEqual(leases.find(state["task_id"]), lease)
+
+            leases.release(
+                task_id=lease["task_id"],
+                revision_id=lease["revision_id"],
+                lease_generation=lease["lease_generation"],
+                worktree=lease["worktree"],
+                branch=lease["branch"],
+                session_id=lease["session_id"],
+                policy_digest=lease["policy_digest"],
+                lease_digest=lease["lease_digest"],
+            )
+            bound_bytes = task_path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "E_CORE_LEASE_NOT_FOUND"):
+                tasks.bind_lease_generation(
+                    state["task_id"],
+                    revision_id=lease["revision_id"],
+                    generation=lease["lease_generation"],
+                    expected_state_digest=state["state_digest"],
+                    session_id=lease["session_id"],
+                )
+            self.assertEqual(task_path.read_bytes(), bound_bytes)
+            self.assertEqual(tasks.status(state["task_id"]), bound)
+
     def test_resigned_lease_and_receipt_reject_extra_fields_and_authority(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = make_repo(Path(directory) / "repo")
@@ -107,6 +197,7 @@ class CoreLeaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_repo(Path(directory) / "repo")
             leases = LeaseStore(repo)
+            tasks = CoreTaskStore(repo)
             policy_digest = contract_digest({"policy": 1})
             first = self._state(repo, "TASK-REV", "control_plane")
             lease1 = leases.acquire(
@@ -122,19 +213,23 @@ class CoreLeaseTests(unittest.TestCase):
                 policy_digest=policy_digest,
                 lease_digest=lease1["lease_digest"],
             )
-            second = dict(first)
-            second["task_digest"] = contract_digest({"task": "TASK-REV-SECOND"})
-            second["revision_id"] = "rev-" + sha256(
-                f'{second["task_digest"]}\0{second["head"]}'.encode("utf-8")
-            ).hexdigest()[:16]
-            second.pop("state_digest")
-            second["state_digest"] = contract_digest(second)
-            task_path = CoreTaskStore(repo).tasks / "TASK-REV.json"
-            task_path.write_text(
-                json.dumps(second, sort_keys=True, separators=(",", ":")) + "\n",
-                encoding="utf-8",
+            for target in ("planned", "ready", "implementing", "verifying", "review_ready", "closed"):
+                first = tasks.transition(
+                    first["task_id"], target, current_branch="codex/core-test"
+                )
+            second = tasks.next_revision(
+                first["task_id"],
+                current_branch="codex/core-test",
+                head=git(repo, "rev-parse", "HEAD"),
+                task_digest=contract_digest({"task": "TASK-REV-SECOND"}),
+                decision_digest=contract_digest({"decision": "TASK-REV-SECOND"}),
+                scope_paths=["control_plane"],
             )
-            task_path.chmod(0o600)
+            self.assertEqual(second["state"], "framed")
+            self.assertEqual(second["lease_generation"], 0)
+            self.assertNotEqual(second["revision_id"], first["revision_id"])
+            receipt_path = leases.receipts / f'{lease1["lease_id"]}.json'
+            receipt_path.unlink()
             lease2 = leases.acquire(
                 second, session_id="SESSION-TWO", policy_digest=policy_digest
             )
@@ -323,6 +418,7 @@ class CoreLeaseTests(unittest.TestCase):
                 revision_id=lease["revision_id"],
                 generation=lease["lease_generation"],
                 expected_state_digest=state["state_digest"],
+                session_id="SESSION-CONTINUATION",
             )
             observed = validate_writer_continuation(
                 repo,
@@ -339,6 +435,7 @@ class CoreLeaseTests(unittest.TestCase):
                 "blocked",
                 reason="test",
                 current_branch="codex/core-test",
+                session_id="SESSION-CONTINUATION",
             )
             with self.assertRaisesRegex(ValueError, "E_CORE_STATE_CONTINUATION"):
                 validate_writer_continuation(
@@ -370,6 +467,7 @@ class CoreLeaseTests(unittest.TestCase):
                 revision_id=lease["revision_id"],
                 generation=lease["lease_generation"],
                 expected_state_digest=state["state_digest"],
+                session_id="SESSION-INTERLEAVING",
             )
             validation_entered = threading.Event()
             allow_validation = threading.Event()
@@ -402,6 +500,7 @@ class CoreLeaseTests(unittest.TestCase):
                     "blocked",
                     reason="later drift",
                     current_branch="codex/core-test",
+                    session_id="SESSION-INTERLEAVING",
                 )
                 transition_finished.set()
 
@@ -438,6 +537,7 @@ class CoreLeaseTests(unittest.TestCase):
                     target,
                     reason="fixture" if target == "blocked" else None,
                     current_branch="codex/core-test",
+                    session_id=f"SESSION-BIND-{target.upper()}",
                 )
 
                 with self.assertRaisesRegex(ValueError, "E_CORE_LEASE_BINDING"):
@@ -446,6 +546,7 @@ class CoreLeaseTests(unittest.TestCase):
                         revision_id=lease["revision_id"],
                         generation=lease["lease_generation"],
                         expected_state_digest=state["state_digest"],
+                        session_id=f"SESSION-BIND-{target.upper()}",
                     )
 
                 self.assertEqual(store.status(state["task_id"]), transitioned)
@@ -468,6 +569,7 @@ class CoreLeaseTests(unittest.TestCase):
                 revision_id=lease["revision_id"],
                 generation=lease["lease_generation"],
                 expected_state_digest=state["state_digest"],
+                session_id="SESSION-RUNTIME-DRIFT",
             )
             (repo / ".codex" / "control-plane.lock").write_text(
                 'schema_version = 2\n[digests]\nruntime = "sha256:' + "2" * 64 + '"\n',
