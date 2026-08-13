@@ -426,6 +426,33 @@ def _safe_read_rejected(
     )
 
 
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Kill one live child session without treating an exited zombie as active."""
+
+    if process.poll() is not None:
+        return
+    try:
+        process_group = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return
+    if process_group != process.pid:
+        raise ValueError(
+            "E_SAFE_READ_PROCESS: child process group binding changed"
+        )
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError as error:
+        try:
+            os.getpgid(process.pid)
+        except ProcessLookupError:
+            return
+        raise ValueError(
+            "E_SAFE_READ_PROCESS: child process group cannot be terminated"
+        ) from error
+
+
 def _bounded_process(
     command: Sequence[str],
     *,
@@ -461,10 +488,7 @@ def _bounded_process(
             now = time.monotonic()
             if now >= deadline and status == "completed":
                 status = "timeout"
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _kill_process_group(process)
             wait_seconds = max(0.0, min(0.05, deadline - now))
             if selector.get_map():
                 events = selector.select(wait_seconds)
@@ -492,20 +516,14 @@ def _bounded_process(
                         buffers[name].extend(chunk[:remaining])
                     if status == "completed":
                         status = "truncated"
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _kill_process_group(process)
                 else:
                     buffers[name].extend(chunk)
             if status in {"timeout", "truncated"}:
                 try:
                     process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _kill_process_group(process)
                     process.wait(timeout=1)
         return_code = process.wait(timeout=1)
     finally:
@@ -1609,6 +1627,26 @@ def _record_hook_output_metric(
 def run_hook(raw_input: bytes, *, expected_root: Path | None = None) -> str:
     if len(raw_input) > MAX_INPUT_BYTES:
         raise ValueError("E_HOOK_INPUT_LIMIT: hook input exceeds 1 MiB")
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in raw_input:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):
+            depth += 1
+            if depth > 128:
+                raise ValueError("E_HOOK_INPUT: hook JSON nesting exceeds limit")
+        elif byte in (0x5D, 0x7D) and depth > 0:
+            depth -= 1
     try:
         payload = json.loads(raw_input.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:

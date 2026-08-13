@@ -301,7 +301,13 @@ class CorePluginTests(unittest.TestCase):
         )
         drifted = source.replace(PIN, "0" * 40, 1)
         with tempfile.TemporaryDirectory() as temp_dir:
-            registry_path = Path(temp_dir) / "registry.toml"
+            temporary = Path(temp_dir)
+            effective_home = temporary / "effective-home"
+            local_root = effective_home / ".codex" / "superpowers"
+            local_root.mkdir(parents=True)
+            actual_revision = _temporary_git_repository(local_root)
+            self.assertNotEqual(actual_revision, "0" * 40)
+            registry_path = temporary / "registry.toml"
             registry_path.write_text(drifted, encoding="utf-8")
             arguments = build_parser().parse_args(
                 [
@@ -314,7 +320,13 @@ class CorePluginTests(unittest.TestCase):
                 ]
             )
             output = io.StringIO()
-            with contextlib.redirect_stdout(output):
+            with (
+                mock.patch(
+                    "control_plane.resource_registry._effective_user_home",
+                    return_value=effective_home,
+                ),
+                contextlib.redirect_stdout(output),
+            ):
                 return_code = arguments.handler(arguments)
 
         payload = json.loads(output.getvalue())

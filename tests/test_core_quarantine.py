@@ -131,6 +131,8 @@ class CoreQuarantineTests(unittest.TestCase):
         self.assertNotIn("shell: /bin/bash", source)
         self.assertIn("actions: read", source)
         self.assertIn("contents: read", source)
+        self.assertIn("fetch-depth: 0", source)
+        self.assertNotIn("fetch-depth: 1", source)
         for forbidden in (
             "release-candidate:",
             "macos-smoke:",

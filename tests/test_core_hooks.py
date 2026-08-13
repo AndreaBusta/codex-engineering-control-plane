@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from control_plane.core_types import observe_current_worktree
 from tests.test_core_task_state import make_repo
@@ -52,10 +53,13 @@ class CoreHookTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             repo = make_repo(Path(temporary) / "repo").resolve()
-            (repo / "large.txt").write_text("x" * 16_384, encoding="utf-8")
+            for index in range(64):
+                (repo / f"untracked-{index:03d}.txt").write_text(
+                    "x\n", encoding="utf-8"
+                )
             inventory = observe_current_worktree(repo)
             result = execute_safe_read(
-                ("rg", "--no-config", "--quiet", "-e", "x", "--", "large.txt"),
+                ("git", "status", "--short"),
                 root=repo,
                 worktree_inventory=inventory,
                 timeout_seconds=2,
@@ -73,6 +77,38 @@ class CoreHookTests(unittest.TestCase):
         self.assertIn(result.status, {"completed", "truncated"})
         self.assertLessEqual(result.stdout_bytes, 128)
         self.assertLessEqual(result.stderr_bytes, 128)
+
+    def test_hook_rejects_excessive_nesting_before_json_decode(self) -> None:
+        from control_plane.hooks import run_hook
+
+        raw = b'{"hook_event_name":"Unknown","tool_input":' + b"[" * 256
+        raw += b"0" + b"]" * 256 + b"}"
+        decoded = {
+            "hook_event_name": "Unknown",
+            "tool_input": [],
+        }
+        with mock.patch(
+            "control_plane.hooks.json.loads", return_value=decoded
+        ) as decoder:
+            with self.assertRaisesRegex(ValueError, "E_HOOK_INPUT"):
+                run_hook(raw)
+
+        decoder.assert_not_called()
+
+    def test_hook_nesting_scan_ignores_brackets_inside_strings(self) -> None:
+        from control_plane.hooks import run_hook
+
+        rendered = run_hook(
+            json.dumps(
+                {
+                    "hook_event_name": "Unknown",
+                    "tool_input": "[" * 256 + "]" * 256,
+                },
+                separators=(",", ":"),
+            ).encode()
+        )
+
+        self.assertEqual(rendered, "")
 
     def test_hook_input_is_bounded_and_never_authorizes(self) -> None:
         from control_plane.hooks import MAX_INPUT_BYTES, run_hook
