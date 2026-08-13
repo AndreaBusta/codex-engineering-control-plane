@@ -34,7 +34,7 @@ from control_plane.intake import (
     InteractionRecommendationView,
     render_interaction_recommendation,
 )
-from control_plane.policy import GoverningPolicy, _governing_policy_is_issued
+from control_plane.policy import GoverningPolicy, _governing_policy_snapshot
 from control_plane.risk_sentinel import RiskStatus, evaluate_risk_status
 
 
@@ -426,6 +426,33 @@ def _safe_read_rejected(
     )
 
 
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Kill one live child session without treating an exited zombie as active."""
+
+    if process.poll() is not None:
+        return
+    try:
+        process_group = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return
+    if process_group != process.pid:
+        raise ValueError(
+            "E_SAFE_READ_PROCESS: child process group binding changed"
+        )
+    try:
+        os.killpg(process_group, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError as error:
+        try:
+            os.getpgid(process.pid)
+        except ProcessLookupError:
+            return
+        raise ValueError(
+            "E_SAFE_READ_PROCESS: child process group cannot be terminated"
+        ) from error
+
+
 def _bounded_process(
     command: Sequence[str],
     *,
@@ -461,10 +488,7 @@ def _bounded_process(
             now = time.monotonic()
             if now >= deadline and status == "completed":
                 status = "timeout"
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _kill_process_group(process)
             wait_seconds = max(0.0, min(0.05, deadline - now))
             if selector.get_map():
                 events = selector.select(wait_seconds)
@@ -492,20 +516,14 @@ def _bounded_process(
                         buffers[name].extend(chunk[:remaining])
                     if status == "completed":
                         status = "truncated"
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _kill_process_group(process)
                 else:
                     buffers[name].extend(chunk)
             if status in {"timeout", "truncated"}:
                 try:
                     process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
+                    _kill_process_group(process)
                     process.wait(timeout=1)
         return_code = process.wait(timeout=1)
     finally:
@@ -624,6 +642,9 @@ def _safe_read_regex_fallback_command(
         executable,
         "-I",
         "-S",
+        "-B",
+        "-X",
+        "pycache_prefix=/dev/null",
         "-c",
         _SAFE_READ_REGEX_FALLBACK,
         str(MAX_INPUT_BYTES),
@@ -800,14 +821,11 @@ def execute_safe_read(
 ) -> CompletedSafeRead:
     """Execute one closed read with exact worktree and bounded process effects."""
 
-    from control_plane.host_bridge import (
+    from control_plane.core_types import (
         ValidatedWorktreeInventoryObservation,
         _consume_worktree_inventory,
     )
 
-    repository, git_dir, common_dir = _safe_read_repository_identity(
-        Path(root)
-    )
     if (
         type(worktree_inventory)
         is not ValidatedWorktreeInventoryObservation
@@ -825,10 +843,27 @@ def execute_safe_read(
         or not 1 <= output_limit_bytes <= 1_048_576
     ):
         raise ValueError("E_SAFE_READ_LIMIT: limits are invalid")
+    snapshot = _consume_worktree_inventory(worktree_inventory)
+    if snapshot is None:
+        raise ValueError(
+            "E_SAFE_READ_INVENTORY: inventory expired or drifted"
+        )
+    repository, git_dir, common_dir = _safe_read_repository_identity(
+        Path(root)
+    )
+    records = snapshot.get("records")
+    observed_common_dir = snapshot.get("common_git_dir")
+    if not isinstance(records, tuple) or not isinstance(
+        observed_common_dir,
+        str,
+    ):
+        raise ValueError(
+            "E_SAFE_READ_INVENTORY: inventory expired or drifted"
+        )
     owner = next(
         (
             record
-            for record in worktree_inventory.records
+            for record in records
             if record.worktree == str(repository)
             and Path(record.git_dir).resolve() == git_dir
         ),
@@ -836,7 +871,7 @@ def execute_safe_read(
     )
     if (
         owner is None
-        or Path(worktree_inventory.common_git_dir).resolve() != common_dir
+        or Path(observed_common_dir).resolve() != common_dir
     ):
         raise ValueError(
             "E_SAFE_READ_INVENTORY: target worktree is not registered"
@@ -872,15 +907,6 @@ def execute_safe_read(
                 "pattern_set_digest": governing_pattern_digest,
             }
         )
-    try:
-        records = _consume_worktree_inventory(
-            worktree_inventory,
-            expected_common_git_dir=common_dir,
-        )
-    except ValueError as error:
-        raise ValueError(
-            "E_SAFE_READ_INVENTORY: inventory expired or drifted"
-        ) from error
     if not any(
         record.worktree == str(repository)
         and Path(record.git_dir).resolve() == git_dir
@@ -1229,12 +1255,10 @@ def _fingerprint_base_observation(
     governing_policy: GoverningPolicy | None,
 ) -> tuple[str, str]:
     if governing_policy is not None:
-        if (
-            type(governing_policy) is not GoverningPolicy
-            or not _governing_policy_is_issued(governing_policy)
-        ):
+        snapshot = _governing_policy_snapshot(governing_policy)
+        if snapshot is None:
             raise ValueError("E_HOOK_POLICY: governing policy is required")
-        policy: object = governing_policy.policy
+        policy: object = snapshot.get("policy")
     else:
         path = repository / ".codex" / "project-policy.toml"
         try:
@@ -1468,7 +1492,7 @@ def _manifest(root: Path) -> str:
             except (KeyError, OSError, json.JSONDecodeError):
                 state = "invalid"
     return (
-        "CONTROL_PLANE_AUDIT_V2 "
+        "CONTROL_PLANE_CORE_AUDIT "
         f"task={rendered_task_id} state={state} "
         f"policy={_digest(root / '.codex/project-policy.toml')} "
         f"registry={_digest(root / '.codex/resource-registry.toml')} "
@@ -1480,15 +1504,34 @@ def _manifest(root: Path) -> str:
     )
 
 
-def evaluate_hook(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+def evaluate_hook(
+    payload: Mapping[str, Any],
+    *,
+    expected_root: Path | None = None,
+) -> dict[str, Any] | None:
     """Return bounded JSON output, or None for a silent passing hook."""
 
     event = str(payload.get("hook_event_name", ""))
     cwd = Path(str(payload.get("cwd", ".")))
     try:
         root = _trusted_discover_repository(cwd)
-    except Exception:
+    except Exception as error:
+        if expected_root is not None:
+            raise ValueError(
+                "E_HOOK_REPOSITORY: hook cwd does not match bootstrap repository"
+            ) from error
         return None
+    if expected_root is not None:
+        try:
+            bound_root = _trusted_discover_repository(Path(expected_root))
+        except Exception as error:
+            raise ValueError(
+                "E_HOOK_REPOSITORY: bootstrap repository is unavailable"
+            ) from error
+        if root != bound_root:
+            raise ValueError(
+                "E_HOOK_REPOSITORY: hook cwd does not match bootstrap repository"
+            )
     if event == "UserPromptSubmit":
         session_id = payload.get("session_id")
         warning = _minimal_unknown_warning(
@@ -1575,96 +1618,42 @@ def evaluate_hook(payload: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _record_hook_output_metric(
-    payload: Mapping[str, Any],
-    rendered: str,
+    payload: Mapping[str, Any], rendered: str
 ) -> None:
-    """Record only the byte count, bound to the active task and lease."""
+    """Core uses the manual dogfood scorecard; it persists no hook telemetry."""
 
-    if not rendered:
-        return
-    task_id = os.environ.get("CODEX_CONTROL_PLANE_TASK_ID", "")
-    session_id = payload.get("session_id")
-    event = payload.get("hook_event_name")
-    if (
-        not validate_task_id(task_id)
-        or not validate_task_id(session_id)
-        or not isinstance(event, str)
-        or not event
-    ):
-        return
-    try:
-        root = _trusted_discover_repository(
-            Path(str(payload.get("cwd", ".")))
-        )
-        state_dir = _trusted_worktree_git_dir(root)
-        from control_plane.lifecycle import TaskStore
+    del payload, rendered
 
-        store = TaskStore(state_dir)
-        state = store.status(task_id)
-        lease = store._read_owner_lease(task_id)
-    except (OSError, ValueError):
-        return
-    task_digest = state.get("task_digest")
-    route_digest = state.get("decision_digest")
-    if (
-        not isinstance(lease, Mapping)
-        or lease.get("task_id") != task_id
-        or lease.get("worktree") != str(root)
-        or lease.get("session_id") != session_id
-        or not isinstance(task_digest, str)
-        or SHA256_DIGEST.fullmatch(task_digest) is None
-        or not isinstance(route_digest, str)
-        or SHA256_DIGEST.fullmatch(route_digest) is None
-    ):
-        return
-    raw_event_identity = payload.get("tool_use_id", payload.get("turn_id", ""))
-    event_identity_digest = contract_digest(
-        {
-            "event": event,
-            "identity": (
-                raw_event_identity
-                if isinstance(raw_event_identity, str)
-                else ""
-            ),
-        }
-    )
-    invocation_id = (
-        "hook-"
-        + contract_digest(
-            {
-                "task_id": task_id,
-                "session_id": session_id,
-                "event_identity_digest": event_identity_digest,
-                "output_digest": contract_digest({"rendered": rendered}),
-            }
-        ).removeprefix("sha256:")
-    )
-    tool_use_id = payload.get("tool_use_id")
-    store.record_context_metrics(
-        task_id,
-        task_digest=task_digest,
-        session_id=session_id,
-        invocation_id=invocation_id,
-        subject_digest=route_digest,
-        runtime_metrics={
-            "hook_output_bytes": len(rendered.encode("utf-8")),
-            "tool_use_id": (
-                tool_use_id if validate_task_id(tool_use_id) else None
-            ),
-        },
-    )
-
-
-def run_hook(raw_input: bytes) -> str:
+def run_hook(raw_input: bytes, *, expected_root: Path | None = None) -> str:
     if len(raw_input) > MAX_INPUT_BYTES:
         raise ValueError("E_HOOK_INPUT_LIMIT: hook input exceeds 1 MiB")
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in raw_input:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:
+                escaped = True
+            elif byte == 0x22:
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x5B, 0x7B):
+            depth += 1
+            if depth > 128:
+                raise ValueError("E_HOOK_INPUT: hook JSON nesting exceeds limit")
+        elif byte in (0x5D, 0x7D) and depth > 0:
+            depth -= 1
     try:
         payload = json.loads(raw_input.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError("E_HOOK_INPUT: invalid hook JSON") from error
     if not isinstance(payload, Mapping):
         raise ValueError("E_HOOK_INPUT: hook input must be an object")
-    result = evaluate_hook(payload)
+    result = evaluate_hook(payload, expected_root=expected_root)
     rendered = "" if result is None else _compact_output(result)
     _record_hook_output_metric(payload, rendered)
     return rendered

@@ -11,15 +11,43 @@ from control_plane.policy import load_policy
 
 
 FIXTURE_POLICY = Path(__file__).parent / "fixtures" / "valid-policy.toml"
+GIT = "/usr/bin/git"
+GIT_ENV = {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def _git_command(*arguments: str) -> list[str]:
+    return [
+        GIT,
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        *arguments,
+    ]
 
 
 def git(repo: Path, *arguments: str) -> str:
     completed = subprocess.run(
-        ["git", *arguments],
+        _git_command(*arguments),
         cwd=repo,
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        env=GIT_ENV,
+        timeout=10,
     )
     return completed.stdout.strip()
 
@@ -63,16 +91,22 @@ class GitScenario:
         self.base_branch = base_branch
 
         subprocess.run(
-            ["git", "init", "--bare", str(self.remote)],
+            _git_command("init", "--bare", str(self.remote)),
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
+            env=GIT_ENV,
+            timeout=10,
         )
         subprocess.run(
-            ["git", "init", "-b", base_branch, str(self.repo)],
+            _git_command("init", "-b", base_branch, str(self.repo)),
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
+            env=GIT_ENV,
+            timeout=10,
         )
         git(self.repo, "config", "user.name", "Control Plane Tests")
         git(self.repo, "config", "user.email", "control-plane@example.invalid")
@@ -97,10 +131,13 @@ class GitScenario:
     def advance_remote_base(self) -> None:
         secondary = self.root / "secondary"
         subprocess.run(
-            ["git", "clone", str(self.remote), str(secondary)],
+            _git_command("clone", str(self.remote), str(secondary)),
             check=True,
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,
+            env=GIT_ENV,
+            timeout=10,
         )
         git(secondary, "config", "user.name", "Control Plane Tests")
         git(secondary, "config", "user.email", "control-plane@example.invalid")
@@ -115,9 +152,12 @@ def create_unborn_repository() -> tuple[tempfile.TemporaryDirectory[str], Path]:
     temp = tempfile.TemporaryDirectory()
     repo = Path(temp.name) / "unborn"
     subprocess.run(
-        ["git", "init", "-b", "main", str(repo)],
+        _git_command("init", "-b", "main", str(repo)),
         check=True,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
+        env=GIT_ENV,
+        timeout=10,
     )
     return temp, repo

@@ -1,12 +1,12 @@
 {
-  "description": "Codex Engineering Control Plane v2 audit hooks; review exact hashes with /hooks before trusting.",
+  "description": "Control Plane Core 3.1 audit-only hooks; authorizes=false and trust remains pending separate adoption.",
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -B \"$(/usr/bin/git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "command": "/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /bin/sh -c 'root=$(/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 /usr/bin/git rev-parse --show-toplevel) || exit 1; exec \"$root/scripts/control-plane\" __hook__'",
             "timeout": 3,
             "additionalContextLimit": 4096
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -B \"$(/usr/bin/git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "command": "/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /bin/sh -c 'root=$(/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 /usr/bin/git rev-parse --show-toplevel) || exit 1; exec \"$root/scripts/control-plane\" __hook__'",
             "timeout": 3,
             "additionalContextLimit": 4096
           }
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -B \"$(/usr/bin/git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "command": "/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /bin/sh -c 'root=$(/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 /usr/bin/git rev-parse --show-toplevel) || exit 1; exec \"$root/scripts/control-plane\" __hook__'",
             "timeout": 3
           }
         ]
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -I -B \"$(/usr/bin/git rev-parse --show-toplevel)/.codex/hooks/control_plane_hook.py\"",
+            "command": "/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /bin/sh -c 'root=$(/usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 /usr/bin/git rev-parse --show-toplevel) || exit 1; exec \"$root/scripts/control-plane\" __hook__'",
             "timeout": 3,
             "additionalContextLimit": 4096
           }

@@ -14,7 +14,7 @@ from control_plane.contracts import (
     validate_task_envelope,
 )
 from control_plane.clarification import evaluate_clarification_gate
-from control_plane.host_bridge import (
+from control_plane.core_types import (
     HOST_ADAPTER_UNAVAILABLE,
     HostAdapterCapability,
     HostAdapterUnavailable,
@@ -784,6 +784,7 @@ def resolve_route(
         "matched_routes": [str(item.get("id")) for item in matched_routes],
         "facts": facts,
         "errors": errors,
+        "authorizes": False,
     }
     decision["decision_digest"] = contract_digest(decision)
     return _seal_trusted_route_decision(decision)
@@ -797,6 +798,8 @@ def verify_route(
 ) -> dict[str, Any]:
     """Verify a serialized receipt diagnostically without host authority."""
 
+    if type(decision) is TrustedRouteDecision:
+        decision = decision._payload_for_diagnostic()
     if mode not in {"audit", "enforce"}:
         raise ValueError("mode must be audit or enforce")
     errors: list[dict[str, str]] = []
@@ -816,6 +819,7 @@ def verify_route(
         "matched_routes",
         "facts",
         "errors",
+        "authorizes",
         "decision_digest",
     }
     decision_allowed = decision_required.union({"command"})
@@ -837,6 +841,7 @@ def verify_route(
         or not isinstance(decision.get("summary"), Mapping)
         or not isinstance(decision.get("facts"), Mapping)
         or not isinstance(decision.get("selected_resource_digests"), Mapping)
+        or decision.get("authorizes") is not False
     ):
         errors.append(
             {
@@ -1140,6 +1145,8 @@ def verify_route(
 def compact_route_manifest(decision: Mapping[str, Any]) -> str:
     """Render only the route facts Codex needs to rehydrate after compaction."""
 
+    if type(decision) is TrustedRouteDecision:
+        decision = decision._payload_for_diagnostic()
     summary = decision.get("summary", {})
     project_profile = summary.get("project_profile", {})
     if isinstance(project_profile, Mapping):

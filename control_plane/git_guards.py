@@ -63,6 +63,16 @@ def _invalid(message: str) -> ValueError:
     return ValueError(f"GG_INSTALLED_POLICY_INVALID: {message}")
 
 
+def _clock_now(clock: Callable[[], float]) -> float | None:
+    """Read one registered monotonic clock and fail closed on bad output."""
+
+    try:
+        observed = float(clock())
+    except Exception:
+        return None
+    return observed if math.isfinite(observed) else None
+
+
 def _canonical_existing_directory(value: Path | str, *, label: str) -> Path:
     try:
         path = Path(value)
@@ -481,7 +491,15 @@ _PROTECTED_BINDINGS = (
     "freshness_deadline",
     "binding_digest",
 )
-_ISSUED_PROTECTED: dict[int, tuple[ProtectedGitPolicy, tuple[Any, ...], str]] = {}
+_ISSUED_PROTECTED: dict[
+    int,
+    tuple[
+        ProtectedGitPolicy,
+        tuple[Any, ...],
+        str,
+        Callable[[], float],
+    ],
+] = {}
 
 
 def _protected_binding(policy: ProtectedGitPolicy) -> tuple[Any, ...]:
@@ -492,14 +510,20 @@ def _protected_is_live(policy: object) -> bool:
     if type(policy) is not ProtectedGitPolicy:
         return False
     issued = _ISSUED_PROTECTED.get(id(policy))
-    return (
-        issued is not None
-        and issued[0] is policy
-        and issued[1] == _protected_binding(policy)
-        and issued[2] == contract_digest(policy.policy)
-        and not policy._consumed
-        and float(policy._clock()) <= policy.freshness_deadline
-    )
+    if issued is None or issued[0] is not policy:
+        return False
+    try:
+        now = _clock_now(issued[3])
+        return bool(
+            policy._clock is issued[3]
+            and issued[1] == _protected_binding(policy)
+            and issued[2] == contract_digest(policy.policy)
+            and not policy._consumed
+            and now is not None
+            and now <= policy.freshness_deadline
+        )
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        return False
 
 
 def _consume_protected(policy: object) -> bool:
@@ -539,11 +563,8 @@ def load_protected_git_policy(
 
     if not isinstance(invocation_id, str) or not invocation_id:
         raise _invalid("invocation identity is invalid")
-    try:
-        now = float(clock())
-    except (TypeError, ValueError) as error:
-        raise _invalid("clock is invalid") from error
-    if not math.isfinite(now):
+    now = _clock_now(clock)
+    if now is None:
         raise _invalid("clock is invalid")
     snapshot = _validate_snapshot(
         canonical_repo=canonical_repo,
@@ -584,6 +605,7 @@ def load_protected_git_policy(
         result,
         _protected_binding(result),
         contract_digest(result.policy),
+        clock,
     )
     return result
 
@@ -852,10 +874,22 @@ _OBSERVATION_BINDINGS = tuple(
     if name not in {"_consumed", "_clock"}
 )
 _ISSUED_OBSERVATIONS: dict[
-    int, tuple[InstalledPolicyObservation, tuple[Any, ...], str]
+    int,
+    tuple[
+        InstalledPolicyObservation,
+        tuple[Any, ...],
+        str,
+        Callable[[], float],
+    ],
 ] = {}
 _ISSUED_VALIDATED: dict[
-    int, tuple[ValidatedInstalledPolicyObservation, tuple[Any, ...], str]
+    int,
+    tuple[
+        ValidatedInstalledPolicyObservation,
+        tuple[Any, ...],
+        str,
+        Callable[[], float],
+    ],
 ] = {}
 
 
@@ -875,14 +909,21 @@ def _observation_live(
     if type(value) is not expected_type:
         return False
     issued = registry.get(id(value))
-    return (
-        issued is not None
-        and issued[0] is value
-        and issued[1] == _observation_binding(value)
-        and issued[2] == contract_digest(value.policy)
-        and not value._consumed
-        and float(clock()) <= value.freshness_deadline
-    )
+    if issued is None or issued[0] is not value:
+        return False
+    try:
+        now = _clock_now(issued[3])
+        return bool(
+            clock is issued[3]
+            and value._clock is issued[3]
+            and issued[1] == _observation_binding(value)
+            and issued[2] == contract_digest(value.policy)
+            and not value._consumed
+            and now is not None
+            and now <= value.freshness_deadline
+        )
+    except (AttributeError, RecursionError, TypeError, ValueError):
+        return False
 
 
 def _revalidate_observation_snapshot(
@@ -923,13 +964,14 @@ def observe_installed_policy_source(
 
     try:
         canonical = Path(canonical_repo).resolve(strict=True)
-        now = float(clock())
     except (TypeError, ValueError, OSError) as error:
         raise ValueError(
             "GG_INSTALLED_POLICY_OBSERVATION: invalid observation binding"
         ) from error
+    now = _clock_now(clock)
     if (
         not _protected_is_live(protected_policy)
+        or clock is not protected_policy._clock
         or str(canonical) != protected_policy.canonical_repo
         or expected_manifest_digest != protected_policy.manifest_digest
         or invocation_id != protected_policy.invocation_id
@@ -938,7 +980,7 @@ def observe_installed_policy_source(
         or not isinstance(ttl_seconds, (int, float))
         or isinstance(ttl_seconds, bool)
         or not 0 < float(ttl_seconds) <= 300
-        or not math.isfinite(now)
+        or now is None
         or not _revalidate_observation_snapshot(protected_policy)
     ):
         raise ValueError(
@@ -978,6 +1020,7 @@ def observe_installed_policy_source(
         result,
         _observation_binding(result),
         contract_digest(result.policy),
+        clock,
     )
     return result
 
@@ -1020,6 +1063,7 @@ def validate_installed_policy_source(
         result,
         _observation_binding(result),
         contract_digest(result.policy),
+        clock,
     )
     return result
 
@@ -1032,8 +1076,12 @@ def _validated_installed_policy_is_live(
     )
 
 
-def _consume_validated_installed_policy(observation: object) -> bool:
-    if type(observation) is not ValidatedInstalledPolicyObservation:
+def _consume_validated_installed_policy(
+    observation: object,
+    *,
+    clock: Callable[[], float],
+) -> bool:
+    if not _validated_installed_policy_is_live(observation, clock=clock):
         return False
     issued = _ISSUED_VALIDATED.pop(id(observation), None)
     if (
@@ -1041,6 +1089,8 @@ def _consume_validated_installed_policy(observation: object) -> bool:
         or issued[0] is not observation
         or issued[1] != _observation_binding(observation)
         or issued[2] != contract_digest(observation.policy)
+        or issued[3] is not clock
+        or observation._clock is not clock
         or observation._consumed
     ):
         return False

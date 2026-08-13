@@ -1,4 +1,4 @@
-name: Control Plane
+name: Control Plane Core
 
 on:
   pull_request:
@@ -12,182 +12,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: control-plane-${{ github.workflow }}-${{ github.ref }}
+  group: control-plane-core-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   verify:
-    name: verify
+    name: core-verify
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Bind manual verification to main
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          test "$GITHUB_REF" = "refs/heads/main"
-          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
-
-      - name: Run local control-plane gates
-        shell: bash
-        run: |
-          bash tests/run.sh
-          scripts/control-plane policy-check --policy .codex/project-policy.toml
-          scripts/control-plane registry-check \
-            --registry .codex/resource-registry.toml \
-            --policy .codex/project-policy.toml
-          scripts/control-plane doctor
-          git diff --check
-
-  macos-smoke:
-    name: macos-smoke
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: macos-15
-    timeout-minutes: 10
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Bind manual smoke to main
-        shell: bash
-        run: |
-          test "$GITHUB_REF" = "refs/heads/main"
-          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
-
-      - name: Run smoke verification
-        shell: bash
-        run: |
-          bash tests/run.sh
-          scripts/control-plane policy-check --policy .codex/project-policy.toml
-          python3 -m unittest -v \
-            tests.macos_hook_smoke.MacOSHookSmokeTests.test_real_darwin_child_emits_closed_audit_only_contract
-
-  release-candidate:
-    name: release-candidate
-    if: github.event_name == 'workflow_dispatch'
-    needs: [verify, macos-smoke]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check out full remote-base history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Bind release candidate to manual main SHA
-        shell: bash
-        run: |
-          test "$GITHUB_REF" = "refs/heads/main"
-          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
-
-      - name: Refresh release gate against private main
-        id: release-preflight
-        shell: bash
-        env:
-          CONTROL_PLANE_GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          git switch -C main --track origin/main
-          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
-          authorization="$(
-            printf 'x-access-token:%s' "$CONTROL_PLANE_GITHUB_TOKEN" |
-              base64 | tr -d '\n'
-          )"
-          echo "::add-mask::$authorization"
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization" \
-            scripts/control-plane preflight --mode release --refresh
-          unset CONTROL_PLANE_GITHUB_TOKEN authorization
-
-      - name: Run supported adoption matrix
-        id: adoption-matrix
-        shell: bash
-        run: python3 -m unittest -v tests.test_supported_adoption_acceptance
-
-      - name: Build reproducible non-authorizing candidate
-        shell: bash
-        env:
-          ADOPTION_MATRIX_RESULT: ${{ steps.adoption-matrix.outcome }}
-          CONTROL_PLANE_GITHUB_TOKEN: ${{ github.token }}
-          MACOS_SMOKE_RESULT: ${{ needs.macos-smoke.result }}
-          RELEASE_PREFLIGHT_RESULT: ${{ steps.release-preflight.outcome }}
-          VERIFY_RESULT: ${{ needs.verify.result }}
-          WORKFLOW_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
-        run: |
-          candidate_parent="$RUNNER_TEMP/control-plane-release-${GITHUB_RUN_ID}"
-          mkdir -m 700 "$candidate_parent"
-          export WORKFLOW_EVIDENCE_PATH="$candidate_parent/workflow-evidence.json"
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-
-          results = dict(
-              [
-                  ("adoption-matrix", os.environ["ADOPTION_MATRIX_RESULT"]),
-                  ("macos-smoke", os.environ["MACOS_SMOKE_RESULT"]),
-                  ("release-preflight", os.environ["RELEASE_PREFLIGHT_RESULT"]),
-                  ("verify", os.environ["VERIFY_RESULT"]),
-              ]
-          )
-          if set(results.values()) != {"success"}:
-              raise SystemExit("workflow gate evidence is not fully successful")
-          payload = dict(
-              schema_version=1,
-              source=dict(
-                  repository=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}",
-                  commit=os.environ["GITHUB_SHA"],
-                  tree=subprocess.check_output(
-                      ["git", "rev-parse", "HEAD^{tree}"], text=True
-                  ).strip(),
-              ),
-              workflow=dict(
-                  event="workflow_dispatch",
-                  run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),
-                  run_id=int(os.environ["GITHUB_RUN_ID"]),
-                  url=os.environ["WORKFLOW_URL"],
-              ),
-              gates=[
-                  dict(name=name, result=result)
-                  for name, result in sorted(results.items())
-              ],
-              authorizes=False,
-          )
-          path = Path(os.environ["WORKFLOW_EVIDENCE_PATH"])
-          path.write_text(
-              json.dumps(payload, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          path.chmod(0o600)
-          print("WORKFLOW_EVIDENCE=" + json.dumps(payload, sort_keys=True))
-          PY
-          scripts/build-release-candidate \
-            --repo "$PWD" \
-            --output-dir "$candidate_parent/candidate" \
-            --workflow-url \
-              "$WORKFLOW_URL" \
-            --workflow-evidence "$WORKFLOW_EVIDENCE_PATH"
-
-      - name: Upload verified v2.1.1 assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: control-plane-v2.1.1-${{ github.sha }}-attempt-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/control-plane-release-${{ github.run_id }}/candidate/codex-engineering-control-plane-2.1.1.tar.gz
-            ${{ runner.temp }}/control-plane-release-${{ github.run_id }}/candidate/SHA256SUMS
-            ${{ runner.temp }}/control-plane-release-${{ github.run_id }}/candidate/codex-engineering-control-plane-2.1.1.manifest.json
-            ${{ runner.temp }}/control-plane-release-${{ github.run_id }}/candidate/codex-engineering-control-plane-2.1.1.receipt.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
+      - name: Run the exact Core verification manifest
+        shell: /bin/sh -e {0}
+        run: /usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin /bin/sh tests/run.sh
