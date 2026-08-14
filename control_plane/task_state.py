@@ -15,7 +15,12 @@ import tempfile
 import tomllib
 from typing import Any, Iterator, Mapping
 
-from control_plane.contracts import SHA256_DIGEST, contract_digest, validate_task_id
+from control_plane.contracts import (
+    SHA256_DIGEST,
+    TASK_OUTCOMES,
+    contract_digest,
+    validate_task_id,
+)
 from control_plane.repository import (
     discover_repository,
     ensure_private_state_directory,
@@ -93,6 +98,21 @@ _LEGACY_RUN_KINDS = frozenset(
         "RunRevisionV1",
         "RunSummaryV1",
         "StableReviewDiffArtifactV1",
+    }
+)
+_LEGACY_LOCAL_UNKNOWN_RUN_KINDS = frozenset({"GateReceiptV1", "RunAttemptV1"})
+_LEGACY_TASK_FIELDS = frozenset(
+    {
+        "schema_version",
+        "task_id",
+        "state",
+        "resume_state",
+        "resume_forbidden",
+        "outcome",
+        "branch",
+        "task_digest",
+        "decision_digest",
+        "owner_runtime_digest",
     }
 )
 
@@ -409,54 +429,64 @@ class CoreTaskStore:
         assert_no_active_legacy_state(self.repository)
         revision_id = "rev-" + sha256(f"{task_digest}\0{head}".encode()).hexdigest()[:16]
         path = self._path(task)
-        with _task_lock(self.git_dir, task):
-            if path.exists():
-                existing = self.status(task)
-                immutable = {
-                    "task_id": task,
-                    "revision_id": revision_id,
-                    "requested_outcome": outcome,
-                    "branch": branch,
-                    "protected_base": protected_base,
-                    "head": head,
-                    "task_digest": task_digest,
-                    "decision_digest": decision_digest,
-                    "scope_paths": scopes,
-                }
-                if any(existing.get(key) != value for key, value in immutable.items()):
-                    raise ValueError("E_CORE_STATE_REPLAY: existing task binding differs")
-                return existing, False
-            from control_plane.leases import LeaseStore
+        from control_plane.leases import LeaseStore
 
-            with LeaseStore(self.repository).claim_no_active(task):
-                value: dict[str, Any] = {
-                    "schema_version": 1,
-                    "kind": "CoreTaskStateV1",
-                    "task_id": task,
-                    "revision_id": revision_id,
-                    "requested_outcome": outcome,
-                    "state": "framed",
-                    "resume_state": None,
-                    "block_reason": None,
-                    "repository": str(self.repository),
-                    "worktree": str(self.repository),
-                    "branch": branch,
-                    "protected_base": protected_base,
-                    "head": head,
-                    "scope_paths": scopes,
-                    "task_digest": task_digest,
-                    "decision_digest": decision_digest,
-                    "owner_runtime_digest": _locked_runtime_digest(self.repository),
-                    "lease_generation": 0,
-                    "lease_generation_floor": 0,
-                    "revision": 0,
-                    "created_at": _now(),
-                    "updated_at": _now(),
-                    "authorizes": False,
-                }
-                value["state_digest"] = contract_digest(value)
-                _atomic_json(path, value)
-                return value, True
+        lease_store = LeaseStore(self.repository)
+        with lease_store.adoption_claims() as adoption_claims:
+            with _task_lock(self.git_dir, task):
+                if path.exists():
+                    existing = self.status(task)
+                    immutable = {
+                        "task_id": task,
+                        "revision_id": revision_id,
+                        "requested_outcome": outcome,
+                        "branch": branch,
+                        "protected_base": protected_base,
+                        "head": head,
+                        "task_digest": task_digest,
+                        "decision_digest": decision_digest,
+                        "scope_paths": scopes,
+                    }
+                    if any(
+                        existing.get(key) != value
+                        for key, value in immutable.items()
+                    ):
+                        raise ValueError(
+                            "E_CORE_STATE_REPLAY: existing task binding differs"
+                        )
+                    return existing, False
+
+                with adoption_claims.claim_no_active(task):
+                    value: dict[str, Any] = {
+                        "schema_version": 1,
+                        "kind": "CoreTaskStateV1",
+                        "task_id": task,
+                        "revision_id": revision_id,
+                        "requested_outcome": outcome,
+                        "state": "framed",
+                        "resume_state": None,
+                        "block_reason": None,
+                        "repository": str(self.repository),
+                        "worktree": str(self.repository),
+                        "branch": branch,
+                        "protected_base": protected_base,
+                        "head": head,
+                        "scope_paths": scopes,
+                        "task_digest": task_digest,
+                        "decision_digest": decision_digest,
+                        "owner_runtime_digest": _locked_runtime_digest(
+                            self.repository
+                        ),
+                        "lease_generation": 0,
+                        "lease_generation_floor": 0,
+                        "revision": 0,
+                        "created_at": _now(),
+                        "updated_at": _now(),
+                        "authorizes": False,
+                    }
+                    value["state_digest"] = contract_digest(value)
+                    _atomic_json(path, value)
+                    return value, True
 
     def rollback_start(self, state: Mapping[str, Any]) -> None:
         task = _safe_task_id(state.get("task_id"))
@@ -468,17 +498,19 @@ class CoreTaskStore:
         ):
             raise ValueError("E_CORE_STATE_ROLLBACK: task is no longer pristine")
         path = self._path(task)
-        with _task_lock(self.git_dir, task):
-            if not path.exists():
-                return
-            current = _read_json(path)
-            self._validate(current, expected_task_id=task)
-            if current != dict(state):
-                raise ValueError("E_CORE_STATE_ROLLBACK: task changed after start")
-            from control_plane.leases import LeaseStore
+        from control_plane.leases import LeaseStore
 
-            with LeaseStore(self.repository).claim_no_active(task):
-                _unlink_durable(path)
+        lease_store = LeaseStore(self.repository)
+        with lease_store.adoption_claims() as adoption_claims:
+            with _task_lock(self.git_dir, task):
+                if not path.exists():
+                    return
+                current = _read_json(path)
+                self._validate(current, expected_task_id=task)
+                if current != dict(state):
+                    raise ValueError("E_CORE_STATE_ROLLBACK: task changed after start")
+                with adoption_claims.claim_no_active(task):
+                    _unlink_durable(path)
 
     def restore_after_failed_binding(
         self,
@@ -490,43 +522,45 @@ class CoreTaskStore:
     ) -> None:
         task = _safe_task_id(original.get("task_id"))
         self._validate(original, expected_task_id=task)
-        with _task_lock(self.git_dir, task):
-            current = self.status(task)
-            mutable = {
-                "lease_generation",
-                "lease_generation_floor",
-                "revision",
-                "updated_at",
-                "state_digest",
-            }
-            original_stable = {
-                key: value for key, value in original.items() if key not in mutable
-            }
-            current_stable = {
-                key: value for key, value in current.items() if key not in mutable
-            }
-            if (
-                current_stable != original_stable
-                or
-                current.get("revision_id") != expected_revision_id
-                or current.get("lease_generation") != expected_generation
-                or current.get("lease_generation_floor") != expected_generation
-                or current.get("revision") != int(original.get("revision", -1)) + 1
-                or current.get("state") != original.get("state")
-            ):
-                raise ValueError(
-                    "E_CORE_STATE_ROLLBACK: task changed after lease binding"
-                )
-            from control_plane.leases import LeaseStore
+        from control_plane.leases import LeaseStore
 
-            with LeaseStore(self.repository).claim_binding(
-                original,
-                revision_id=expected_revision_id,
-                generation=expected_generation,
-                acquired_state_digest=str(original["state_digest"]),
-                session_id=session_id,
-            ):
-                _atomic_json(self._path(task), original)
+        lease_store = LeaseStore(self.repository)
+        with lease_store.adoption_claims() as adoption_claims:
+            with _task_lock(self.git_dir, task):
+                current = self.status(task)
+                mutable = {
+                    "lease_generation",
+                    "lease_generation_floor",
+                    "revision",
+                    "updated_at",
+                    "state_digest",
+                }
+                original_stable = {
+                    key: value for key, value in original.items() if key not in mutable
+                }
+                current_stable = {
+                    key: value for key, value in current.items() if key not in mutable
+                }
+                if (
+                    current_stable != original_stable
+                    or current.get("revision_id") != expected_revision_id
+                    or current.get("lease_generation") != expected_generation
+                    or current.get("lease_generation_floor") != expected_generation
+                    or current.get("revision") != int(original.get("revision", -1)) + 1
+                    or current.get("state") != original.get("state")
+                ):
+                    raise ValueError(
+                        "E_CORE_STATE_ROLLBACK: task changed after lease binding"
+                    )
+                with lease_store.claim_binding(
+                    original,
+                    revision_id=expected_revision_id,
+                    generation=expected_generation,
+                    acquired_state_digest=str(original["state_digest"]),
+                    session_id=session_id,
+                    _claims=adoption_claims,
+                ):
+                    _atomic_json(self._path(task), original)
 
     def transition(
         self,
@@ -542,39 +576,43 @@ class CoreTaskStore:
         task = _safe_task_id(task_id)
         if state not in CORE_STATES:
             raise ValueError("E_CORE_STATE_TRANSITION: target state is unsupported")
-        with _task_lock(self.git_dir, task):
-            current = self.status(task)
-            if current_branch is not None and current.get("branch") != current_branch:
-                raise ValueError("E_CORE_STATE_BRANCH: branch binding drifted")
-            if current.get("owner_runtime_digest") != _locked_runtime_digest(
-                self.repository
-            ):
-                raise ValueError("E_CORE_RUNTIME: task owner runtime differs from lock")
-            with LeaseStore(self.repository).claim_mutation(
-                current, session_id=session_id
-            ):
-                previous = str(current["state"])
-                if state == previous:
+        lease_store = LeaseStore(self.repository)
+        with lease_store.adoption_claims() as adoption_claims:
+            with _task_lock(self.git_dir, task):
+                current = self.status(task)
+                if current_branch is not None and current.get("branch") != current_branch:
+                    raise ValueError("E_CORE_STATE_BRANCH: branch binding drifted")
+                if current.get("owner_runtime_digest") != _locked_runtime_digest(
+                    self.repository
+                ):
+                    raise ValueError("E_CORE_RUNTIME: task owner runtime differs from lock")
+                with lease_store.claim_mutation(
+                    current,
+                    session_id=session_id,
+                    _claims=adoption_claims,
+                ):
+                    previous = str(current["state"])
+                    if state == previous:
+                        return current
+                    if state not in _TRANSITIONS[previous]:
+                        raise ValueError(
+                            f"E_CORE_STATE_TRANSITION: illegal transition {previous}->{state}"
+                        )
+                    if state == "blocked":
+                        if not isinstance(reason, str) or not reason or len(reason) > 256:
+                            raise ValueError("E_CORE_STATE_BLOCK: bounded reason is required")
+                        current["resume_state"] = previous
+                        current["block_reason"] = reason
+                    else:
+                        current["resume_state"] = None
+                        current["block_reason"] = None
+                    current["state"] = state
+                    current["revision"] = int(current["revision"]) + 1
+                    current["updated_at"] = _now()
+                    current.pop("state_digest", None)
+                    current["state_digest"] = contract_digest(current)
+                    _atomic_json(self._path(task), current)
                     return current
-                if state not in _TRANSITIONS[previous]:
-                    raise ValueError(
-                        f"E_CORE_STATE_TRANSITION: illegal transition {previous}->{state}"
-                    )
-                if state == "blocked":
-                    if not isinstance(reason, str) or not reason or len(reason) > 256:
-                        raise ValueError("E_CORE_STATE_BLOCK: bounded reason is required")
-                    current["resume_state"] = previous
-                    current["block_reason"] = reason
-                else:
-                    current["resume_state"] = None
-                    current["block_reason"] = None
-                current["state"] = state
-                current["revision"] = int(current["revision"]) + 1
-                current["updated_at"] = _now()
-                current.pop("state_digest", None)
-                current["state_digest"] = contract_digest(current)
-                _atomic_json(self._path(task), current)
-                return current
 
     def resume(
         self,
@@ -586,29 +624,33 @@ class CoreTaskStore:
         from control_plane.leases import LeaseStore
 
         task = _safe_task_id(task_id)
-        with _task_lock(self.git_dir, task):
-            current = self.status(task)
-            if current.get("branch") != current_branch:
-                raise ValueError("E_CORE_STATE_BRANCH: branch binding drifted")
-            if current.get("owner_runtime_digest") != _locked_runtime_digest(
-                self.repository
-            ):
-                raise ValueError("E_CORE_RUNTIME: task owner runtime differs from lock")
-            with LeaseStore(self.repository).claim_mutation(
-                current, session_id=session_id
-            ):
-                target = current.get("resume_state")
-                if current.get("state") != "blocked" or target not in CORE_STATES:
-                    raise ValueError("E_CORE_STATE_RESUME: task is not resumable")
-                current["state"] = target
-                current["resume_state"] = None
-                current["block_reason"] = None
-                current["revision"] = int(current["revision"]) + 1
-                current["updated_at"] = _now()
-                current.pop("state_digest", None)
-                current["state_digest"] = contract_digest(current)
-                _atomic_json(self._path(task), current)
-                return current
+        lease_store = LeaseStore(self.repository)
+        with lease_store.adoption_claims() as adoption_claims:
+            with _task_lock(self.git_dir, task):
+                current = self.status(task)
+                if current.get("branch") != current_branch:
+                    raise ValueError("E_CORE_STATE_BRANCH: branch binding drifted")
+                if current.get("owner_runtime_digest") != _locked_runtime_digest(
+                    self.repository
+                ):
+                    raise ValueError("E_CORE_RUNTIME: task owner runtime differs from lock")
+                with lease_store.claim_mutation(
+                    current,
+                    session_id=session_id,
+                    _claims=adoption_claims,
+                ):
+                    target = current.get("resume_state")
+                    if current.get("state") != "blocked" or target not in CORE_STATES:
+                        raise ValueError("E_CORE_STATE_RESUME: task is not resumable")
+                    current["state"] = target
+                    current["resume_state"] = None
+                    current["block_reason"] = None
+                    current["revision"] = int(current["revision"]) + 1
+                    current["updated_at"] = _now()
+                    current.pop("state_digest", None)
+                    current["state_digest"] = contract_digest(current)
+                    _atomic_json(self._path(task), current)
+                    return current
 
     def close(
         self,
@@ -648,7 +690,10 @@ class CoreTaskStore:
         if not scopes:
             scopes = ["."]
         assert_no_active_legacy_state(self.repository)
-        with _task_lock(self.git_dir, task):
+        lease_store = LeaseStore(self.repository)
+        with lease_store.adoption_claims() as adoption_claims, _task_lock(
+            self.git_dir, task
+        ):
             current = self.status(task)
             current_runtime = _locked_runtime_digest(self.repository)
             if current.get("owner_runtime_digest") != current_runtime:
@@ -658,9 +703,14 @@ class CoreTaskStore:
             revision_id = "rev-" + sha256(
                 f"{task_digest}\0{head}".encode()
             ).hexdigest()[:16]
-            with LeaseStore(self.repository).claim_next_revision(
-                current
+            with lease_store.claim_next_revision(
+                current,
+                _claims=adoption_claims,
             ) as generation_floor:
+                if _locked_runtime_digest(self.repository) != current_runtime:
+                    raise ValueError(
+                        "E_CORE_RUNTIME: task owner runtime differs from lock"
+                    )
                 exact_replay = (
                     current.get("state") == "framed"
                     and current.get("lease_generation") == 0
@@ -722,8 +772,13 @@ class CoreTaskStore:
         expected_state_digest: str,
         session_id: str | None,
     ) -> dict[str, Any]:
+        from control_plane.leases import LeaseStore
+
         task = _safe_task_id(task_id)
-        with _task_lock(self.git_dir, task):
+        lease_store = LeaseStore(self.repository)
+        with lease_store.adoption_claims() as adoption_claims, _task_lock(
+            self.git_dir, task
+        ):
             current = self.status(task)
             if current.get("revision_id") != revision_id:
                 raise ValueError("E_CORE_LEASE_BINDING: revision drifted")
@@ -733,15 +788,14 @@ class CoreTaskStore:
             generation_floor = int(current.get("lease_generation_floor", 0))
             if existing not in {0, generation}:
                 raise ValueError("E_CORE_LEASE_BINDING: generation drifted")
-            from control_plane.leases import LeaseStore
-
             if existing == generation:
-                with LeaseStore(self.repository).claim_binding(
+                with lease_store.claim_binding(
                     current,
                     revision_id=revision_id,
                     generation=generation,
                     acquired_state_digest=expected_state_digest,
                     session_id=session_id,
+                    _claims=adoption_claims,
                 ):
                     return current
             if current.get("state_digest") != expected_state_digest:
@@ -749,12 +803,13 @@ class CoreTaskStore:
             if generation <= generation_floor:
                 raise ValueError("E_CORE_LEASE_BINDING: generation is not monotonic")
 
-            with LeaseStore(self.repository).claim_binding(
+            with lease_store.claim_binding(
                 current,
                 revision_id=revision_id,
                 generation=generation,
                 acquired_state_digest=expected_state_digest,
                 session_id=session_id,
+                _claims=adoption_claims,
             ):
                 current["lease_generation"] = generation
                 current["lease_generation_floor"] = generation
@@ -869,7 +924,10 @@ def validate_writer_continuation(
 
     store = CoreTaskStore(repository)
     task = _safe_task_id(task_id)
-    with _task_lock(store.git_dir, task):
+    lease_store = LeaseStore(store.repository)
+    with lease_store.adoption_claims() as adoption_claims, _task_lock(
+        store.git_dir, task
+    ):
         state = store.status(task)
         try:
             generation = int(state["lease_generation"])
@@ -892,7 +950,7 @@ def validate_writer_continuation(
             raise ValueError(
                 "E_CORE_STATE_CONTINUATION: task is not an active bound writer"
             )
-        lease = LeaseStore(store.repository).validate_continuation(
+        lease = lease_store.validate_continuation(
             task_id=task,
             worktree=worktree,
             branch=branch,
@@ -902,6 +960,7 @@ def validate_writer_continuation(
             expected_lease_generation=generation,
             expected_owner_runtime_digest=str(state["owner_runtime_digest"]),
             changed_paths=changed_paths,
+            _claims=adoption_claims,
         )
         after = store.status(task)
         if after.get("state_digest") != state.get("state_digest"):
@@ -1048,28 +1107,30 @@ def _read_legacy_payload(
     return value if isinstance(value, Mapping) else None
 
 
-def _contains_remote_unknown(value: object) -> bool:
-    pending: list[tuple[object, int, str | None]] = [(value, 0, None)]
+def _contains_remote_unknown(
+    value: object, *, allow_local_root_status_unknown: bool = False
+) -> bool:
+    pending: list[tuple[object, int]] = [(value, 0)]
     observed = 0
     while pending:
-        current, depth, owning_key = pending.pop()
+        current, depth = pending.pop()
         observed += 1
         if observed > 4_096 or depth > 32:
             return True
         if isinstance(current, Mapping):
-            if current.get("status") == "UNKNOWN" or current.get("remote_status") == "UNKNOWN":
-                return True
-            if owning_key is not None and owning_key.startswith("pending_") and (
-                current.get("phase") == "observe_only"
-                or current.get("retry") == "observe_only"
+            if current.get("remote_status") == "UNKNOWN" or (
+                current.get("status") == "UNKNOWN"
+                and not (allow_local_root_status_unknown and depth == 0)
             ):
                 return True
+            if any(str(key).startswith("pending_") for key in current):
+                return True
             pending.extend(
-                (child, depth + 1, str(key))
-                for key, child in current.items()
+                (child, depth + 1)
+                for child in current.values()
             )
         elif isinstance(current, list):
-            pending.extend((child, depth + 1, owning_key) for child in current)
+            pending.extend((child, depth + 1) for child in current)
     return False
 
 
@@ -1077,13 +1138,29 @@ def _legacy_task_contract(
     path: Path, payload: Mapping[str, Any] | None
 ) -> tuple[str | None, str, bool, bool]:
     task_id = path.stem if validate_task_id(path.stem) else None
+    state_value = payload.get("state") if payload is not None else None
+    resume_state = payload.get("resume_state") if payload is not None else None
+    branch = payload.get("branch") if payload is not None else None
     if (
         payload is None
+        or set(payload) != _LEGACY_TASK_FIELDS
+        or type(payload.get("schema_version")) is not int
         or payload.get("schema_version") != 1
         or payload.get("task_id") != task_id
-        or not isinstance(payload.get("state"), str)
-        or not isinstance(payload.get("outcome"), str)
-        or not isinstance(payload.get("branch"), str)
+        or not isinstance(state_value, str)
+        or not 0 < len(state_value) <= 64
+        or (
+            resume_state is not None
+            and (
+                not isinstance(resume_state, str)
+                or not 0 < len(resume_state) <= 64
+            )
+        )
+        or type(payload.get("resume_forbidden")) is not bool
+        or payload.get("outcome") not in TASK_OUTCOMES
+        or not isinstance(branch, str)
+        or not 0 < len(branch) <= 256
+        or any(character in branch for character in ("\0", "\n", "\r"))
         or not isinstance(payload.get("task_digest"), str)
         or SHA256_DIGEST.fullmatch(str(payload.get("task_digest"))) is None
         or not isinstance(payload.get("decision_digest"), str)
@@ -1092,12 +1169,12 @@ def _legacy_task_contract(
         or SHA256_DIGEST.fullmatch(str(payload.get("owner_runtime_digest"))) is None
     ):
         return task_id, "UNKNOWN", False, True
-    state = str(payload["state"])
+    state = str(state_value)
     remote_unknown = _contains_remote_unknown(payload)
-    terminal = state == "closed" or (
+    terminal = (state == "closed" and resume_state is None) or (
         state == "blocked"
         and payload.get("resume_forbidden") is True
-        and payload.get("resume_state") is None
+        and resume_state is None
     )
     return task_id, state, True, remote_unknown or not terminal
 
@@ -1108,7 +1185,7 @@ def _legacy_run_contract(
     payload: Mapping[str, Any] | None,
     tasks: Mapping[str, Mapping[str, Any]],
     leased_tasks: frozenset[str],
-) -> tuple[str | None, str, bool]:
+) -> tuple[str | None, str, bool, bool]:
     relative = path.relative_to(root)
     path_task_id = relative.parts[1] if len(relative.parts) > 2 else None
     task_id = path_task_id if validate_task_id(path_task_id) else None
@@ -1119,20 +1196,25 @@ def _legacy_run_contract(
         and payload.get("task_id") == task_id
     )
     if not valid:
-        return task_id, "UNKNOWN", True
+        return task_id, "UNKNOWN", False, True
     state = payload.get("state")
     if not isinstance(state, str):
         status = payload.get("status")
         state = status if isinstance(status, str) else "historical"
     owner = tasks.get(str(task_id))
     active = (
-        _contains_remote_unknown(payload)
+        _contains_remote_unknown(
+            payload,
+            allow_local_root_status_unknown=(
+                payload.get("kind") in _LEGACY_LOCAL_UNKNOWN_RUN_KINDS
+            ),
+        )
         or owner is None
         or owner.get("contract_status") != "valid"
         or bool(owner.get("active"))
         or task_id in leased_tasks
     )
-    return task_id, state, active
+    return task_id, state, True, active
 
 
 def inventory_legacy_state(repository: Path | str) -> dict[str, Any]:
@@ -1213,7 +1295,7 @@ def inventory_legacy_state(repository: Path | str) -> dict[str, Any]:
                 )
         for path in paths_by_kind["run"]:
             payload = _read_legacy_payload(path, counters=counters)
-            task_id, state, active = _legacy_run_contract(
+            task_id, state, valid, active = _legacy_run_contract(
                 root,
                 path,
                 payload,
@@ -1231,7 +1313,7 @@ def inventory_legacy_state(repository: Path | str) -> dict[str, Any]:
                     "remote_status": (
                         payload.get("remote_status") if payload is not None else "UNKNOWN"
                     ),
-                    "contract_status": "valid" if state != "UNKNOWN" else "unknown",
+                    "contract_status": "valid" if valid else "unknown",
                     "active": bool(active),
                 }
             )

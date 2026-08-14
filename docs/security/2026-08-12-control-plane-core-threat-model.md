@@ -7,7 +7,9 @@ external authority issuer. Its active product surfaces are the exact Python
 runtime allowlist, launcher and hooks, project policy and resource registry,
 local Git observations, `CoreTaskStateV1`, generational leases, serialized
 verification, maintenance lineage, installed-generation recovery, and the
-source-only Control Plane plugin.
+source-only Control Plane plugin. The separately locked
+`adoption_enablement` package is an implemented local verification tool outside
+that active Core boundary; it is not a consumer installer authority.
 
 Assets include current user authority; project source and documentation; Git
 history, refs, worktrees, index, and configuration; policy, registry, lock, and
@@ -51,8 +53,14 @@ Repository invariants:
    `authorizes=false`.
 4. Each Core writer is bound to one task revision, worktree, branch, session,
    policy digest, scope, and generational lease; overlapping Core writers fail.
-5. Full verification is serialized by Git common dir. `E_VERIFICATION_BUSY`
-   executes nothing and consumes no repair or reframe.
+5. Full verification is serialized by one persistent Git-common-dir mutex.
+   Fresh apply seals its stable-directory/full-file `verification_lock`;
+   Core verification, the full-gate runner and adoption rollback are
+   `create=false` and reuse-only, never unlink it, retain common/state/locks/file
+   descriptors and revalidate named directory/file identities after flock.
+   After locking, Core and the runner validate the same closed active journal
+   before any test, task or lease mutation.
+   `E_VERIFICATION_BUSY` executes nothing and consumes no repair or reframe.
 6. Maintenance permits one structural reframe. A second stops with
    `E_BOOTSTRAP_REFRAME_LIMIT` and preserves the stable runtime.
 7. Legacy inventory is `origin=legacy`, read-only, bounded, and non-resumable.
@@ -61,6 +69,31 @@ Repository invariants:
    `legacy_writer_exclusion=COOPERATIVE_ONLY`: an observed legacy writer blocks
    Core, but a same-UID v2.1 process started after that observation does not
    participate in Core locks.
+8. Local adoption plans, journals, locks and receipts use closed bounded
+   schemas, exact source and target bindings and `authorizes=false`. Target
+   policy and registry are evaluated only by `scripts/control-plane` from the
+   selected source, and the full source manifest is compared before journaling.
+   `adoption_tool=IMPLEMENTED_LOCAL` and `temporary_repository_e2e=PASS` do not
+   change `external_consumer_adoption=PROHIBITED`, `canary=NOT_PREPARED`,
+   `stable_adoption=NOT_DECIDED` or `Autopilot OFF`.
+9. Adoption snapshots bind `managed_parent_directories` and
+   `managed_repository_scan=managed-repositories-v1`. The generated target lock
+   declares `adoption_lifecycle=journal-bound-v1`; the journal and receipt bind
+   the exact `lifecycle_lock` identity. Every Core task/lease mutation creates
+   or reuses the lifecycle inode before the task lock, including an initially
+   absent state; fresh apply and rollback take that same inode exclusively.
+   Installed Core additionally requires exact marker, active journal and lock
+   identity after flock.
+10. A journal-less provisioning crash is recoverable only in `ROOT_EMPTY`,
+    `P1`, `P2`, `P2Q`, `P3`, `P3Q`, `P4` or `P4T` with the reviewed plan still
+    exact. Recovery uses nonblocking post-open validation and no-replace durable
+    quarantine for directory cleanup; any extra or substituted entry blocks. A
+    pre-existing Core-owned verification mutex is not crash provenance and
+    remains untouched.
+11. Rollback conditionally removes only the exact-value Adoption hooks setting.
+    It moves activation and managed leaves into linked durable quarantine,
+    revalidates them before the receipt, and leaves reclamation to a separate GC
+    that this implementation neither provides nor authorizes.
 
 ## Attack Surface, Mitigations, and Attacker Stories
 
@@ -76,6 +109,28 @@ Repository invariants:
 | A recovery journal drifts or a legacy writer starts during recovery | Partial or attacker-directed rollback | Complete mutation-free preflight followed by `E_ADOPT_QUIESCENCE_UNKNOWN`; no caller-forgeable flag substitutes for a shared writer barrier. |
 | `HOME`, Git variables, locators, or executable lookup are redirected | Resource or repository substitution | Trusted toolchain context, canonical exact resource revision, bounded subprocesses, and fail-closed unknown. |
 | A local green result is presented as stable adoption | Self-certification or supply-chain promotion | `GREEN_LOCAL / PENDING_STABLE_ADOPTION`, `self_certified=false`, manual dogfood, and separate adoption authority. |
+| source substitution changes managed bytes after preview | A different runtime is published under a reviewed plan | Apply repeats the immutable source observation, manifest and plan binding; any drift is `E_ADOPTION_SOURCE_DRIFT` with zero target mutation. |
+| selected-source authority substitution makes the host checkout decide target validity | A different parser approves policy or registry than the Core bytes being installed | Execute only `scripts/control-plane` from the selected source and compare its full source manifest, including HEAD and tree, before journal creation. |
+| wrong-target selection redirects a valid plan | A fresh but unintended repository is mutated | Canonical repo, common-dir, worktree, branch, HEAD, policy and registry bindings are re-observed before journal creation. |
+| nested-repository smuggling hides `.git`, bare markers or a Gitlink under managed scope | Publication or rollback crosses repository semantics that preview did not bind | The bounded, descriptor-relative `managed-repositories-v1` scan rejects markers and Gitlinks in preview/apply/verify/rollback; drift stops before deactivation. |
+| partial publication leaves launchable files | Incomplete managed bytes execute | All managed bytes are published inactive; launcher and hooks fail closed until the target lock is atomically published last. |
+| journal tampering changes recovery intent | Rollback overwrites or deletes unrelated state | Closed schema, separate expected digests, private no-follow storage and exact record revalidation stop before compensation. |
+| rollback deletion removes user data | A created-path record is stale or substituted | Deactivate first; remove only exact journal-owned bytes and empty directories with unchanged descriptor identity, otherwise preserve and fail closed. |
+| A normal target already has `scripts/` or `.codex/hooks/` | Apply claims a consumer-owned parent, then fails partially or rollback deletes it | Bind the pre-existing parent's device/inode and mode in the reviewed snapshot, create only parents observed absent, and preserve pre-existing parents across exact rollback. |
+| A closed Core task waits to revise while adoption rollback begins | Rollback emits PASS, then the queued revision recreates active lifecycle state after deactivation | Every task/lease mutation takes `adoption.lock` shared; rollback holds it exclusive through receipt durability, and `next_revision` revalidates the activation/runtime binding after entering that barrier. |
+| lifecycle-lock substitution unlinks or replaces `adoption.lock` | Core and rollback form independent flock domains and both mutate | `journal-bound-v1` makes the mutex mandatory; sealed `lifecycle_lock` metadata and post-flock path identity must match, and recovery never recreates a bound mutex. |
+| verification-mutex substitution unlinks, replaces or redirects `verification.lock` or an ancestor | Core, runner or rollback form independent flock domains | Closed `verification_lock`, descriptor-relative no-follow journal reads and retained common/state/locks/file descriptors make every active consumer reuse-only; name/binding drift fails immediately after flock. |
+| pre-existing Core-owned verification mutex is mistaken for an Adoption provisioning crash | Fresh apply deletes a legitimate mutex and opens a second exclusion domain | Recovery requires the exact journal-less inventory, revalidates the reviewed plan before cleanup and uses exclusive create; a normal Core mutex blocks unchanged. |
+| active-journal schema is only partially checked | Core task/lease writes or the full runner proceed on state that Adoption rejects | A dependency-free Core validator enforces the complete closed active journal before verification, runner execution, or task/lease mutation. |
+| a first Core writer observes no Adoption state and waits before its task lock | Fresh apply creates a second lifecycle domain and both write | Core creates or reuses and holds the lifecycle inode before the task lock; apply must acquire that exact inode exclusively. |
+| `P2` or `P3` provisioning names are substituted during cleanup | Recovery removes a concurrent directory | Exact `P2Q`/`P3Q` no-replace durable quarantine retains the observed inode and fails if the original name reappears or identity changes. |
+| a regular state leaf becomes a FIFO after `stat` | Apply, verify or rollback blocks indefinitely while holding exclusion | Every bounded read/cleanup open is nonblocking, then checks regular type, owner, mode, links, bounds and opened/named identity. |
+| `core.hooksPath` changes after rollback preflight | Unconditional unset deletes a consumer's new value | exact-value conditional unset targets only `.codex/git-hooks`; a concurrent value is preserved and rollback reports drift. |
+| rollback unlinks a managed inode while another descriptor remains open | Later writes evade final path verification and receipt evidence | Activation and managed leaves remain linked in durable quarantine and are revalidated after the move and before PASS; separate GC is outside scope. |
+| filter execution is triggered by Git observation | Target-controlled clean, smudge, textconv or external diff code executes | Closed Git argv disables hooks, filters, textconv and external diff; unsafe attributes fail before content observation. |
+| hostile environment redirects Python, Git or startup code | Unverified code executes before lock validation | POSIX `env -i`, absolute tool candidates, `-I -S -B`, disabled bytecode cache and verified captured-byte loaders. |
+| lock replay reuses another source, target or plan | A prior local result is treated as current | Adoption and target locks bind exact schema, runtime, source, target and manifest digests; non-exact replay is `E_ADOPTION_REPLAY`. |
+| serialized-authority confusion treats a receipt as permission | A plan or receipt is replayed as canary approval | Every nested artifact requires boolean `authorizes=false`; the host must obtain a later ADR and separate native authorization. |
 
 Web-application classes such as XSS, CSRF, SQL injection, or tenant isolation
 are not primary runtime surfaces because this repository does not serve a web
@@ -121,7 +176,12 @@ authority, project bytes, or external state.
   v2.1 does not inspect the Core namespace and holds no writer lock for the
   lifetime of an edit. Host-level serialization is required until a future
   bilateral migration; Core does not claim atomic legacy exclusion.
-- Manual dogfood is pending and stable external adoption is unproven.
+- Fresh `3.1.0-core.2` manual dogfood is pending; the `3.1.0-core.1` rows are
+  historical only, and stable external adoption is unproven.
+- The local adoption tool has passed only harness-owned temporary repository
+  tests. It has not been run against a consumer, and no canary has been
+  prepared. A later independently accepted ADR and separate native
+  authorization remain mandatory boundaries.
 - The snapshot binds immutable anchor
   `929d3f8a0656fed190bb65ceb3a29deef8de07d6`, its canonical final tracked
   overlay, non-ignored untracked regular files excluding this threat-model
@@ -135,4 +195,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:c3d962218df99c4fe475ebe0b0854afe7dbb9d014cb280a0393c51f3ca0a805a
+Version: codex-security-snapshot/v1:sha256:8cb0f2854cba3ab3d29722826c0e23b32588ed4e58454c4773b083df83bdcf48

@@ -21,7 +21,7 @@ FORBIDDEN_MODULES = {
 
 class CoreContractTests(unittest.TestCase):
     def test_core_candidate_version_and_active_loc_budget_are_exact(self) -> None:
-        self.assertEqual(__version__, "3.1.0-core.1")
+        self.assertEqual(__version__, "3.1.0-core.2")
         active_lines = sum(
             (ROOT / "control_plane" / module).read_text(encoding="utf-8").count("\n")
             + 1

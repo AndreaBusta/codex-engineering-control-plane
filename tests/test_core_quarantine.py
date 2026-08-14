@@ -22,6 +22,40 @@ def tree_snapshot(root: Path) -> tuple[tuple[str, bytes], ...]:
 
 
 class CoreQuarantineTests(unittest.TestCase):
+    def test_adoption_enablement_is_structurally_separate_from_core(self) -> None:
+        core_lock = (ROOT / ".codex" / "control-plane.lock").read_text(encoding="utf-8")
+        core_launcher = (ROOT / "scripts" / "control-plane").read_text(encoding="utf-8")
+        adoption_lock = (ROOT / ".codex" / "adoption-enablement.lock").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("adoption_enablement", core_lock)
+        self.assertNotIn("control-plane-adoption", core_launcher)
+        self.assertIn('runtime_package = "adoption_enablement"', adoption_lock)
+        self.assertNotIn('runtime_package = "control_plane"', adoption_lock)
+
+        for arguments in (("adopt", "plan"), ("adopt", "apply"), ("upgrade", "plan"), ("upgrade", "apply")):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory:
+                scratch = Path(directory)
+                plan = scratch / "plan.json"
+                plan.write_text("{}\n", encoding="utf-8")
+                completed = subprocess.run(
+                    [
+                        str(ROOT / "scripts" / "control-plane-adoption"),
+                        *arguments,
+                    ],
+                    cwd=ROOT,
+                    env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=5,
+                )
+                self.assertEqual(completed.returncode, 2)
+                payload = json.loads(completed.stdout)
+                self.assertEqual(payload["error_code"], "E_ADOPTION_USAGE")
+                self.assertFalse(payload["authorizes"])
+
     def _assert_quarantined(self, build_arguments) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory)

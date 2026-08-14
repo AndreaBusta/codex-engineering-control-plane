@@ -1,6 +1,7 @@
 # ADR 0006: Control Plane Core and structural quarantine
 
-Status: accepted for the local `3.1.0-core.1` prerelease candidate.
+Status: accepted and carried forward for the local `3.1.0-core.2` prerelease
+candidate; the original decision below remains historical provenance.
 
 ## Context
 
@@ -31,6 +32,29 @@ and rollback recovery, but Core cannot create a new adoption or upgrade.
 The source plugin may be prepared for review, but
 `external_consumer_adoption=PROHIBITED` until a later, separately authorized
 stable-adoption decision.
+
+## Local adoption enablement
+
+A separately locked, stdlib-only `adoption_enablement` package may implement
+`preview`, `apply`, `status`, `verify` and `rollback` outside the 25-module Core
+runtime. It is accepted only as local transaction and recovery evidence from
+harness-owned temporary repositories:
+
+```text
+adoption_tool=IMPLEMENTED_LOCAL
+temporary_repository_e2e=PASS
+canary=NOT_PREPARED
+stable_adoption=NOT_DECIDED
+Autopilot OFF
+authorizes=false
+```
+
+This additive implementation does not supersede the adoption prohibition.
+`external_consumer_adoption=PROHIBITED` remains the governing decision, and the
+Core compatibility parsers remain quarantined with
+`E_CAPABILITY_QUARANTINED`. A later independently accepted ADR is mandatory
+before even preparing one disposable canary; executing that exact canary would
+then require a separate native authorization.
 
 ## Alternatives
 
@@ -64,7 +88,7 @@ inside that window.
 
 Until stable adoption is separately authorized, rollback of this candidate is
 to stop using its isolated worktree. The stable source remains
-`origin/main@929d3f8a0656fed190bb65ceb3a29deef8de07d6`. Existing installations may
+`origin/main@b07418364409f76c900f0595a76c9e3e388ac433`. Existing installations may
 be inspected and verified from their exact recovery journal. Core rollback
 stops with `E_ADOPT_QUIESCENCE_UNKNOWN` because v2.1 has no shared global writer
 barrier; no caller assertion substitutes for that proof, and no rollback

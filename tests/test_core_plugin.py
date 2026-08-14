@@ -558,7 +558,7 @@ class CorePluginTests(unittest.TestCase):
             if path.is_file()
         )
 
-        self.assertEqual(manifest["version"], "3.1.0-core.1")
+        self.assertEqual(manifest["version"], "3.1.0-core.2")
         rendered_metadata = " ".join(
             (
                 str(manifest.get("description", "")),

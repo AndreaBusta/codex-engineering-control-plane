@@ -96,7 +96,7 @@ ACTIVE_RUNTIME_MODULES = (
     "toolchain.py",
     "verification.py",
 )
-PRODUCT_VERSION = "3.1.0-core.1"
+PRODUCT_VERSION = "3.1.0-core.2"
 LOCK_MAX_BYTES = 64 * 1024
 BOOTSTRAP_MAX_BYTES = 1024 * 1024
 RUNTIME_MODULE_MAX_BYTES = 1024 * 1024
@@ -164,7 +164,12 @@ def read_private(path, limit, code):
         fail("E_RUNTIME_DATALESS", "runtime contains an APFS placeholder")
     if not private_regular(before, limit):
         fail(code, "runtime path is not bounded regular private content")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError:

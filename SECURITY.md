@@ -3,7 +3,7 @@
 ## Objetivo
 
 Este repositorio reduce errores de proceso mediante Control Plane Core
-`3.1.0-core.1`; no es un sandbox, un gestor de secretos ni una frontera completa
+`3.1.0-core.2`; no es un sandbox, un gestor de secretos ni una frontera completa
 frente a un agente, plugin o proceso comprometido. Los controles locales
 complementan las aprobaciones humanas, Git, CI y los proveedores externos.
 
@@ -49,7 +49,7 @@ un gate ni modifica la precedencia.
 | Exfiltración por MCP/plugin | egress y data classes; autorización separada | inventory + receipt | proveedor comprometido |
 | Escritura en worktree equivocado | task ligada y lease generacional exacto | `CoreTaskStateV1` + lease digest | proceso fuera del control plane |
 | Dos writers se pisan | task por worktree Git dir; lease/recibo por Git common dir, scope y generación across worktrees | `E_CORE_LEASE_CONFLICT` | edición externa no cooperativa |
-| Dos verificadores duplican la suite | mutex no bloqueante por Git common dir | `E_VERIFICATION_BUSY`, `executed=false` | proceso externo no cooperativo |
+| Dos verificadores duplican la suite | un inode persistente `locks/verification.lock` por Git common dir; el journal sella `verification_lock` y Core, runner y Adoption retienen common/state/locks/file descriptors hasta revalidar nombres después de flock | `E_VERIFICATION_BUSY`, `executed=false`; active paths son `create=false` y reuse-only | proceso externo no cooperativo |
 | Reparación estructural infinita | una sola reframación por lineage | `E_BOOTSTRAP_REFRAME_LIMIT` | decisión humana aún necesaria |
 | Estado legacy se reanuda con Core | inventario bounded, read-only y `resumable=false` | `origin=legacy`, `E_ACTIVE_LEGACY_STATE` | requiere runtime propietario |
 | Rollback parcial o redirigido | preflight completo, digests, modos y paths confinados antes de mutar | journal schema 2 y tests de drift | caída del SO durante fsync |
@@ -63,6 +63,18 @@ un gate ni modifica la precedencia.
 | Perfil técnico mal clasificado | evidencia acotada, híbridos y fallback genérico | `project_profile` + tests por stack | estructura atípica sin marcadores |
 | Supply chain CI | stdlib, acciones por SHA y permisos read-only | contrato CI | runner o acción fijada comprometida |
 | Candidato local se presenta como estable | adopción externa prohibida y no self-certification | `GREEN_LOCAL / PENDING_STABLE_ADOPTION` | promoción humana incorrecta |
+| Tool local de adoption se presenta como instalador autorizado | allowlist y lock separados; pruebas solo en repositorios temporales | `adoption_tool=IMPLEMENTED_LOCAL`, `canary=NOT_PREPARED` | operador ignora la prohibición gobernante |
+| Un task Core cerrado espera para revisarse mientras comienza rollback | la revisión muta estado después de la desactivación | cada mutación task/lease toma `adoption.lock` compartido; rollback lo mantiene exclusivo hasta el recibo y la revisión revalida el runtime dentro de la barrera | proceso externo no cooperativo |
+| Nested repository se oculta bajo una ruta gestionada | `.git`, bare repo o Gitlink altera la semántica de publicación | `managed_repository_scan=managed-repositories-v1` recorre solo roots acotados, no-follow y vuelve a comprobar antes de verify/rollback | filesystem comprometido tras el último descriptor check |
+| La autoridad se valida con otro checkout | un parser host distinto aprueba policy/registry | solo `scripts/control-plane` from the selected source decide la autoridad y el manifest completo se compara antes del journal | sustitución transitoria bajo cuenta comprometida |
+| Se sustituye el mutex de Adoption | Core y rollback toman inodes distintos | `adoption_lifecycle=journal-bound-v1`; el journal sella `lifecycle_lock` y ambos lados revalidan path e identidad después de flock | OS/filesystem comprometido |
+| Se sustituye o elimina el mutex de verificación | Core, runner o rollback toman inodes distintos | Fresh Adoption apply provisiona con exclusive create un único `locks/verification.lock`; un pre-existing Core-owned verification mutex no es recovery provenance y bloquea sin mutación; `verification_lock` sella directorio estable y fichero completo; consumidores reuse-only comparan descriptores y nombres después de flock | OS/filesystem comprometido |
+| El journal activo se resigna con una forma no canónica | Core o el runner aceptan autoridad que Adoption rechazará | Un único validador Core dependency-free exige el closed active journal completo antes de verificar, ejecutar el gate o mutar task/lease | proceso same-UID capaz de alterar estado privado y todos sus bindings |
+| Un primer task observa que Adoption está ausente y espera su task lock | apply crea otro dominio y ambos escriben | Core crea o reutiliza `adoption.lock` y conserva el lifecycle inode before the task lock; apply toma ese mismo inode exclusivo | proceso externo que ignora el mutex |
+| Un nombre `adoption/` o `locks/` cambia durante recovery | cleanup elimina un directorio ajeno | solo `ROOT_EMPTY`, `P1`, `P2`, `P2Q`, `P3`, `P3Q`, `P4`, `P4T`; rename no-replace a durable quarantine y revalidación por descriptor | filesystem comprometido tras la última comprobación |
+| Un regular se sustituye por FIFO después del stat | apply/verify/rollback bloquea reteniendo mutexes | apertura nonblocking, `fstat` completo e igualdad entre descriptor y nombre antes de leer o limpiar | denegación por filesystem comprometido |
+| `core.hooksPath` cambia mientras rollback restaura | unset incondicional borra valor del consumidor | exact-value conditional unset solo de `.codex/git-hooks`; cualquier valor concurrente se preserva y produce drift | escritor Git externo no cooperativo |
+| Rollback desvincula un inode todavía abierto | una escritura posterior queda invisible al recibo | activation y managed leaves se mueven por no-replace a durable quarantine, permanecen enlazados y se revalidan antes de PASS; separate GC queda fuera de alcance | filesystem comprometido tras la revalidación final |
 
 ## Hooks
 
@@ -99,6 +111,13 @@ preflight exacto pero `adopt rollback` falla cerrado con
 `E_ADOPT_QUIESCENCE_UNKNOWN` porque el runtime legacy no comparte una barrera
 global de writers.
 
+El entrypoint local `scripts/control-plane-adoption` no cambia esa frontera:
+`temporary_repository_e2e=PASS`, `stable_adoption=NOT_DECIDED`, `Autopilot OFF`
+y `authorizes=false`. Está fuera del runtime Core, verifica su propia allowlist
+y solo se ha ejercitado en repositorios temporales del harness. No debe
+ejecutarse contra un consumidor ni usarse para preparar un canary sin un ADR
+posterior aceptado de forma independiente y una autorización nativa exacta.
+
 GitHub, CI y los proveedores de release permanecen `pending_external_evidence`
 hasta consultar la frontera correspondiente. Los hooks y guards locales no son
 branch protection. El modelo repositorio-completo está en el
@@ -111,13 +130,47 @@ branch protection. El modelo repositorio-completo está en el
 - Toda task/lease queda ligada a revisión, worktree, rama, sesión, policy y scope.
 - Un segundo verificador ejecuta cero comandos; una segunda reframación
   estructural bloquea.
+- `locks/verification.lock` conserva un único inode privado durante apply,
+  verificación y rollback; el journal sella `verification_lock`. Core, el
+  runner y Adoption mantienen abiertos common/state/locks/file, revalidan
+  directorio y archivo después de flock y nunca eliminan el mutex al liberar
+  la sección crítica. Solo fresh apply crea; active replay, verify y rollback
+  son `create=false` y reuse-only.
+- La única recuperación de provisioning sin journal exige el inventario exacto
+  de ese apply interrumpido y valida de nuevo el plan revisado antes de limpiar; un
+  pre-existing Core-owned verification mutex queda intacto y no se atribuye a
+  Adoption. Core verification, el runner y toda mutación task/lease validan el
+  mismo closed active journal completo antes de actuar.
 - Estado legacy nunca se reescribe ni se reanuda con Core.
 - `legacy_writer_exclusion=COOPERATIVE_ONLY`: Core bloquea todo estado legacy
   observable, pero un proceso v2.1 del mismo usuario que arranque después de
   esa observación no participa en los locks Core. No ejecutes writers legacy y
   Core en paralelo; una garantía bilateral requiere cambiar ambos runtimes.
-- El rollback valida targets y backups y, sin una barrera global compartida,
-  falla antes de mutar el primero.
+- El rollback de una generación legacy valida targets y backups y, sin una
+  barrera global compartida, falla antes de mutar el primero.
+- Para una generación instalada por Adoption Enablement, `adoption.lock` sí es
+  una barrera bilateral `journal-bound-v1`: Core lo toma compartido para toda
+  mutación task/lease. Incluso sin marker o journal, Core crea o reutiliza el
+  lifecycle inode before the task lock y lo conserva hasta terminar la
+  mutación; fresh apply y rollback toman ese mismo inode exclusivo. El target
+  lock, journal `active` y `lifecycle_lock` deben coincidir después de flock
+  para una instalación; ausencia, sustitución o estado transicional bloquean
+  sin formar un segundo dominio.
+- Recovery sin journal acepta únicamente `ROOT_EMPTY`, `P1`, `P2`, `P2Q`,
+  `P3`, `P3Q`, `P4` y `P4T`. La limpieza usa apertura nonblocking,
+  revalidación del descriptor y durable quarantine por rename no-replace; una
+  sustitución se conserva y falla cerrada.
+- Rollback restaura `core.hooksPath` con exact-value conditional unset y mueve
+  cada leaf gestionado y la activación a durable quarantine antes de decidir
+  su retirada. Los inodes quedan enlazados y se revalidan antes del recibo;
+  una separate GC futura requiere diseño y autoridad propios.
+- `managed_parent_directories` conserva la propiedad e identidad de padres
+  preexistentes; `managed_repository_scan=managed-repositories-v1` rechaza
+  marcadores `.git`, repos bare, Gitlinks y límites excedidos antes de mutar o
+  compensar.
+- La policy y el registry del target se validan exclusivamente con
+  `scripts/control-plane` from the selected source, cuyo manifest completo se
+  vuelve a ligar antes del primer journal durable.
 - Evidencia, documentos y resultados conservan `authorizes=false`.
 
 ## Hallazgos reportables y severidad

@@ -1,6 +1,6 @@
 # Control Plane Core maintenance
 
-This is the governing runbook for the local `3.1.0-core.1` candidate. It does
+This is the governing runbook for the local `3.1.0-core.2` candidate. It does
 not grant an effect: every status, receipt, checkpoint, and recovery result is
 `authorizes=false`.
 
@@ -63,6 +63,43 @@ the repository Git common dir. A second verifier receives
 `consumes_reframe=false`; it executes no Git or test command. Verification is
 serial even when task analysis can otherwise be parallel.
 
+The mutex is the persistent `locks/verification.lock` inode. Fresh Adoption apply
+is the only path that provisions and seals its `verification_lock` for a
+journal-bound generation. Active Core, the full-gate runner, replay, verify and
+rollback are `create=false` and reuse-only: they retain common/state/locks/file
+descriptors through flock, revalidate every named identity, validate the same
+closed active journal, and never unlink the mutex on release. Missing or
+substituted state fails with `E_VERIFICATION_LOCK` or `E_TEST_MUTEX` instead of
+recreating or repairing it.
+
+A pre-existing Core-owned verification mutex is not evidence of an interrupted
+Adoption apply. Fresh apply leaves it unchanged and fails eligibility. Only the
+exact journal-less provisioning inventory created by that same interrupted
+apply may be cleaned after the reviewed plan is revalidated. This behavior is
+non-authorizing and records `authorizes=false`.
+
+## Adoption rollback quarantine
+
+Core creates or reuses `adoption.lock` and retains the lifecycle inode before the task lock
+even when no journal or activation marker exists. Fresh Adoption
+apply and rollback acquire that same inode exclusively, so an absence-to-write
+race cannot form a second lifecycle domain. An exact raced `ROOT_EMPTY`
+bootstrap removes only the lock created by the failed apply; it never removes a
+Core writer's inode.
+
+Journal-less recovery accepts only `ROOT_EMPTY`, `P1`, `P2`, `P2Q`, `P3`,
+`P3Q`, `P4` and `P4T`. It uses nonblocking opens, complete descriptor/name
+revalidation, and no-replace moves into durable quarantine before removing an
+empty provisioning directory. Any other inventory or substitution is
+`E_ADOPTION_RECOVERY_REQUIRED` and remains untouched.
+
+Product rollback conditionally removes only the exact-value
+`core.hooksPath=.codex/git-hooks` entry. It moves the activation and every
+managed leaf into linked durable quarantine, revalidates them after the move
+and again before the receipt, and does not unlink them during the certifying
+rollback. A separate GC is outside this implementation and would need its own
+contract and authority. This operational record remains `authorizes=false`.
+
 ## Maintenance circuit breaker
 
 `MaintenanceLineageV1` binds one stable runtime digest to one different
@@ -103,7 +140,7 @@ supersedes ADR 0006.
 
 The candidate is isolated and uncommitted. Before stable adoption, rollback is
 to stop using this worktree; the stable source remains
-`origin/main@929d3f8a0656fed190bb65ceb3a29deef8de07d6`. Do not delete or rewrite
+`origin/main@b07418364409f76c900f0595a76c9e3e388ac433`. Do not delete or rewrite
 legacy JSON, installed runtimes, external repositories, or Git history to make
 the candidate appear clean.
 
@@ -111,6 +148,34 @@ If an existing installation needs rollback, use the owning stable runtime or a
 future recovery runtime that implements a mechanically shared barrier. Core
 3.1 only verifies the exact journal and then fails closed; it does not reverse
 a commit, remote write, Pull Request, merge, deploy, or release.
+
+## Local adoption enablement
+
+The separate `scripts/control-plane-adoption` entrypoint is implemented for
+closed local verification only. It is not part of `scripts/control-plane`, the
+25-module Core allowlist or the compatibility parser surface.
+
+```text
+adoption_tool=IMPLEMENTED_LOCAL
+temporary_repository_e2e=PASS
+external_consumer_adoption=PROHIBITED
+canary=NOT_PREPARED
+stable_adoption=NOT_DECIDED
+Autopilot OFF
+authorizes=false
+```
+
+Only harness-owned temporary repositories may exercise `preview`, `apply`,
+`status`, `verify` and `rollback` under this implementation decision. Do not
+run the tool against a consumer or prepare a canary. The Core parsers `adopt
+plan`, `adopt apply`, `upgrade plan` and `upgrade apply` remain zero-mutation
+`E_CAPABILITY_QUARANTINED` stubs.
+
+Local implementation rollback removes only the adoption package, entrypoint,
+lock, tests and documentation enumerated by its plan, then proves the Core
+runtime digest unchanged. Transaction rollback inside a harness-owned target
+deactivates the target lock first and removes only exact journal-owned records;
+any identity or digest drift is preserved and fails closed.
 
 ## External adoption
 
