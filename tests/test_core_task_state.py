@@ -967,6 +967,69 @@ class CoreTaskStateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "E_ACTIVE_LEGACY_STATE"):
                 assert_no_active_legacy_state(repo)
 
+    def test_real_legacy_terminal_schema_variants_are_historical(self) -> None:
+        variants = ("task", "task-with-run-binding")
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                repo = make_repo(Path(directory) / "repo")
+                git_dir = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-dir"))
+                root = git_dir / "codex-control-plane"
+                tasks = root / "tasks"
+                tasks.mkdir(parents=True)
+                task_id = f"TASK-REAL-LEGACY-{variant.upper()}"
+                owner = legacy_task(
+                    task_id,
+                    state="blocked",
+                    resume_state=None,
+                    resume_forbidden=True,
+                )
+                owner.update(
+                    {
+                        "block_reason": "E_REFRAME_REQUIRED",
+                        "evidence": {"ready": {"preflight_ok": True}},
+                        "generation": 5,
+                        "revision": 0,
+                        "updated_at": "2026-08-12T07:03:18.085940Z",
+                        "verification_aborted": False,
+                    }
+                )
+                if variant == "task-with-run-binding":
+                    owner.update(
+                        {
+                            "active_run_revision_digest": contract_digest(
+                                {"legacy-run-revision": task_id}
+                            ),
+                            "run_plan_digest": contract_digest(
+                                {"legacy-run-plan": task_id}
+                            ),
+                        }
+                    )
+                (tasks / f"{task_id}.json").write_text(
+                    json.dumps(owner) + "\n",
+                    encoding="utf-8",
+                )
+                attempts = root / "runs" / task_id
+                attempts.mkdir(parents=True)
+                (attempts / "attempt-1.json").write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "kind": "RunAttemptV1",
+                            "task_id": task_id,
+                            "status": "UNKNOWN",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                result = inventory_legacy_state(repo)
+
+                self.assertFalse(result["active"])
+                self.assertTrue(result["records"])
+                self.assertTrue(all(not record["active"] for record in result["records"]))
+                assert_no_active_legacy_state(repo)
+
     def test_remote_unknown_is_active_on_every_legacy_record_kind(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = make_repo(Path(directory) / "repo")

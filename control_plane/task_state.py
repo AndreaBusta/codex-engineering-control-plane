@@ -115,6 +115,19 @@ _LEGACY_TASK_FIELDS = frozenset(
         "owner_runtime_digest",
     }
 )
+_LEGACY_TASK_V21_FIELDS = _LEGACY_TASK_FIELDS | frozenset(
+    {
+        "block_reason",
+        "evidence",
+        "generation",
+        "revision",
+        "updated_at",
+        "verification_aborted",
+    }
+)
+_LEGACY_TASK_V21_RUN_FIELDS = _LEGACY_TASK_V21_FIELDS | frozenset(
+    {"active_run_revision_digest", "run_plan_digest"}
+)
 
 
 def _now() -> str:
@@ -1141,9 +1154,70 @@ def _legacy_task_contract(
     state_value = payload.get("state") if payload is not None else None
     resume_state = payload.get("resume_state") if payload is not None else None
     branch = payload.get("branch") if payload is not None else None
+    fields = frozenset(payload) if payload is not None else frozenset()
+    historical_v21 = fields in {
+        _LEGACY_TASK_V21_FIELDS,
+        _LEGACY_TASK_V21_RUN_FIELDS,
+    }
+    block_reason = payload.get("block_reason") if payload is not None else None
+    historical_v21_valid = (
+        not historical_v21
+        or (
+            isinstance(payload.get("evidence"), Mapping)
+            and type(payload.get("generation")) is int
+            and 0 <= int(payload["generation"]) <= (2**63 - 1)
+            and type(payload.get("revision")) is int
+            and 0 <= int(payload["revision"]) <= (2**63 - 1)
+            and isinstance(payload.get("updated_at"), str)
+            and 0 < len(str(payload["updated_at"])) <= 128
+            and not any(
+                character in str(payload["updated_at"])
+                for character in ("\0", "\n", "\r")
+            )
+            and type(payload.get("verification_aborted")) is bool
+            and (
+                block_reason is None
+                or (
+                    isinstance(block_reason, str)
+                    and 0 < len(block_reason) <= 256
+                    and not any(
+                        character in block_reason
+                        for character in ("\0", "\n", "\r")
+                    )
+                )
+            )
+            and (
+                state_value != "closed"
+                or block_reason is None
+            )
+            and (
+                state_value != "blocked"
+                or isinstance(block_reason, str)
+            )
+            and (
+                fields != _LEGACY_TASK_V21_RUN_FIELDS
+                or (
+                    isinstance(payload.get("active_run_revision_digest"), str)
+                    and SHA256_DIGEST.fullmatch(
+                        str(payload["active_run_revision_digest"])
+                    )
+                    is not None
+                    and isinstance(payload.get("run_plan_digest"), str)
+                    and SHA256_DIGEST.fullmatch(str(payload["run_plan_digest"]))
+                    is not None
+                )
+            )
+        )
+    )
     if (
         payload is None
-        or set(payload) != _LEGACY_TASK_FIELDS
+        or fields
+        not in {
+            _LEGACY_TASK_FIELDS,
+            _LEGACY_TASK_V21_FIELDS,
+            _LEGACY_TASK_V21_RUN_FIELDS,
+        }
+        or not historical_v21_valid
         or type(payload.get("schema_version")) is not int
         or payload.get("schema_version") != 1
         or payload.get("task_id") != task_id
