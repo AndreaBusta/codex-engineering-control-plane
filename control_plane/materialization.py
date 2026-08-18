@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
 
@@ -114,5 +115,122 @@ def inspect_tracked_materialization(
         "PASS" if not dataless else "FAIL",
         len(relative_paths),
         dataless,
+        None if not dataless else "E_MATERIALIZATION_DATALESS",
+    )
+
+
+_GIT_STATE_AREAS = {
+    "objects": "objects",
+    "codex-control-plane-core": "core_state",
+    "codex-control-plane": "core_state",
+    "worktrees": "worktrees",
+    "refs": "refs",
+}
+
+
+@dataclass(frozen=True)
+class GitStateMaterialization:
+    ok: bool
+    status: str
+    scanned_files: int
+    dataless_files: int
+    areas: tuple[str, ...]
+    truncated: bool
+    error_code: str | None
+
+
+def _git_state_roots(repository: Path) -> tuple[Path, ...]:
+    roots: list[Path] = []
+    for arguments in (
+        ("rev-parse", "--absolute-git-dir"),
+        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
+    ):
+        try:
+            completed = subprocess.run(
+                trusted_git_argv(repository, arguments),
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=trusted_git_environment(),
+                stdin=subprocess.DEVNULL,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ()
+        if completed.returncode != 0:
+            return ()
+        candidate = Path(completed.stdout.decode("utf-8", errors="replace").strip())
+        if candidate.is_absolute() and candidate not in roots:
+            roots.append(candidate)
+    return tuple(roots)
+
+
+def _area_for(root: Path, path: Path) -> str:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return "git_dir"
+    head = relative.parts[0] if relative.parts else ""
+    return _GIT_STATE_AREAS.get(head, "git_dir")
+
+
+def inspect_git_state_materialization(
+    repository: Path,
+    *,
+    max_files: int = 50_000,
+) -> GitStateMaterialization:
+    """Inspect Git state inode flags without following links or reading content."""
+
+    if (
+        not isinstance(max_files, int)
+        or isinstance(max_files, bool)
+        or not 1 <= max_files <= 100_000
+    ):
+        raise ValueError("E_MATERIALIZATION_LIMIT: invalid git state file limit")
+    roots = _git_state_roots(repository.resolve())
+    if not roots:
+        return GitStateMaterialization(
+            False, "UNKNOWN", 0, 0, (), False, "E_MATERIALIZATION_INVENTORY"
+        )
+    scanned = 0
+    areas: set[str] = set()
+    dataless = 0
+    try:
+        for root in roots:
+            for current, directories, files in os.walk(root, followlinks=False):
+                directories[:] = [
+                    name
+                    for name in directories
+                    if not (Path(current) / name).is_symlink()
+                ]
+                for name in files:
+                    path = Path(current) / name
+                    if path.is_symlink():
+                        continue
+                    scanned += 1
+                    if scanned > max_files:
+                        return GitStateMaterialization(
+                            False,
+                            "UNKNOWN",
+                            scanned,
+                            0,
+                            (),
+                            True,
+                            "E_MATERIALIZATION_LIMIT",
+                        )
+                    if _file_flags(path) & DATALESS_FLAG:
+                        dataless += 1
+                        areas.add(_area_for(root, path))
+    except OSError:
+        return GitStateMaterialization(
+            False, "UNKNOWN", scanned, 0, (), False, "E_MATERIALIZATION_STAT"
+        )
+    return GitStateMaterialization(
+        not dataless,
+        "PASS" if not dataless else "FAIL",
+        scanned,
+        dataless,
+        tuple(sorted(areas)),
+        False,
         None if not dataless else "E_MATERIALIZATION_DATALESS",
     )
