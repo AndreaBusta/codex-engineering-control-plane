@@ -12,7 +12,11 @@ a quarantined capability or grant authority.
 - 3.1.0-core.1 — superseded local prerelease candidate; its ten-task dogfood and
   other version-bound evidence remain historical only.
 - 3.1.0-core.2 — current local prerelease candidate; its maximum truthful status
-  is `GREEN_LOCAL / PENDING_STABLE_ADOPTION`. Fresh ten-task dogfood is required for `3.1.0-core.2` before any separate stable-adoption decision.
+  is `GREEN_LOCAL / PENDING_STABLE_ADOPTION`. Stable Pause v1 is
+  `IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE` in the 26-module candidate;
+  this invalidates earlier Core byte-bound evidence without creating a new
+  product version. Fresh ten-task dogfood is required for `3.1.0-core.2`
+  before any separate stable-adoption decision.
 
 ## Governing Core documents
 
@@ -32,6 +36,8 @@ a quarantined capability or grant authority.
 | `docs/engineering/19-control-plane-core-maintenance.md` | `GOVERNING_CORE` | Core operation, compatibility, recovery, and rollback. |
 | `docs/engineering/20-control-plane-core-dogfood.md` | `GOVERNING_CORE` | Historical core.1 evidence plus the fresh core.2 dogfood gate. |
 | `docs/security/2026-08-12-control-plane-core-threat-model.md` | `GOVERNING_CORE` | Repository-scoped threat model. |
+| `docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md` | `GOVERNING_CORE` | Stable Pause v1 WHAT/WHY verify-only contract; `IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE`. |
+| `docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md` | `GOVERNING_CORE` | Stable Pause v1 HOW, TDD traceability and rollback; `IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE`. |
 
 ## Governing local enablement documents
 

@@ -7,7 +7,9 @@ external authority issuer. Its active product surfaces are the exact Python
 runtime allowlist, launcher and hooks, project policy and resource registry,
 local Git observations, `CoreTaskStateV1`, generational leases, serialized
 verification, maintenance lineage, installed-generation recovery, and the
-source-only Control Plane plugin. The separately locked
+source-only Control Plane plugin. Stable Pause v1 is a verify-only local Core
+observer with a progressive native-host join; it creates no lifecycle state or
+authority. The separately locked
 `adoption_enablement` package is an implemented local verification tool outside
 that active Core boundary; it is not a consumer installer authority.
 
@@ -94,6 +96,18 @@ Repository invariants:
     It moves activation and managed leaves into linked durable quarantine,
     revalidates them before the receipt, and leaves reclamation to a separate GC
     that this implementation neither provides nor authorizes.
+12. Stable Pause requires one exact task ID and the exact selected repository
+    root, captures two content-bound local snapshots, and takes only
+    pre-existing mutexes with `create=false` in
+    `adoption.lifecycle -> verification -> named task -> leases` order. Fixed
+    bounded Git commands run with `GIT_OPTIONAL_LOCKS=0`, `core.filemode=true`,
+    no external excludes, rejected index hints, and a single
+    `cat-file --batch`; ignored caches stay outside the unsafe-type inventory
+    but remain path-bound. Nested repositories are unsupported. Leaf reads are
+    no-follow/nonblocking and revalidate descriptor/name identity. A terminal
+    generation requires its exact release receipt. Output is canonical, at
+    most 4096 bytes, excludes transcripts, full diffs, raw tool output, secrets
+    and personal data, and always has `authorizes=false`.
 
 ## Attack Surface, Mitigations, and Attacker Stories
 
@@ -131,6 +145,15 @@ Repository invariants:
 | hostile environment redirects Python, Git or startup code | Unverified code executes before lock validation | POSIX `env -i`, absolute tool candidates, `-I -S -B`, disabled bytecode cache and verified captured-byte loaders. |
 | lock replay reuses another source, target or plan | A prior local result is treated as current | Adoption and target locks bind exact schema, runtime, source, target and manifest digests; non-exact replay is `E_ADOPTION_REPLAY`. |
 | serialized-authority confusion treats a receipt as permission | A plan or receipt is replayed as canary approval | Every nested artifact requires boolean `authorizes=false`; the host must obtain a later ADR and separate native authorization. |
+| repository byte substitution during Stable Pause | The checkpoint certifies bytes different from those observed | Two bounded snapshots bind status, index, types, modes, symlink targets and raw changed bytes; same-UID/filesystem compromise after the last descriptor check remains residual. |
+| lock-domain substitution during Stable Pause | Observer and writer hold different inodes | `create=false`, canonical order, nonblocking flock, retained descriptors and named-identity revalidation; a compromised OS/filesystem remains outside the model. |
+| malicious Git config or filter redirects observation | Hostile helpers or filters execute or hide bytes | Fixed absolute Git, closed environment, allowlisted read-only plumbing, `GIT_OPTIONAL_LOCKS=0`, bounded output/time and direct blob verification. |
+| index-hint hiding uses `assume-unchanged`, `skip-worktree`, mode suppression, or external excludes | Changed indexed bytes or executable modes disappear from the checkpoint | The exact selected root, closed Git config, hint rejection, all-indexed-path byte/mode binding, and one globally bounded blob batch fail closed. |
+| nested repository collapse hides a `.git`, bare repository, or Gitlink beneath an untracked directory | The observer digests a collapsed name instead of the repository boundary and its bytes | Bounded descriptor traversal rejects every nested marker and Gitlink; nested repositories are unsupported. |
+| terminal receipt deletion removes proof for a prior lease generation | A closed task is reported safely terminal without an exact completed lease lifecycle | Any nonzero terminal generation requires the exact release receipt and matching task, lease, owner, generation, digest, and filename identity. |
+| residue smuggling under a protected Core state root | Recovery or staging bytes are mistaken for durable state | Closed bounded owned-residue classifications; unknown entries yield `UNSAFE_PAUSE` or `UNKNOWN` and are never cleaned. |
+| digest-as-authority confusion | `checkpoint_digest` is replayed as a capability or approval | Digest means bounded equality only; observation and capsule are `authorizes=false` and cannot transfer authority. |
+| host-visibility uncertainty | Core is quiet while a yielded native operation remains active | Native host checks before and after the foreground observer may only downgrade; unavailable visibility is `UNKNOWN` and never upgrades Core. |
 
 Web-application classes such as XSS, CSRF, SQL injection, or tenant isolation
 are not primary runtime surfaces because this repository does not serve a web
@@ -169,6 +192,9 @@ authority, project bytes, or external state.
 
 - A compromised OS account, Codex host, Git binary, filesystem, or provider can
   bypass or falsify its own trust boundary.
+- Stable Pause cannot exclude same-UID/filesystem compromise after the last
+  descriptor check or non-cooperating external writers that ignore its lock
+  domains. It is an observation, not an OS freeze.
 - Hooks remain advisory and may be skipped or coexist with other hooks.
 - Existing installed and legacy generations may need their owning stable
   runtime for safe closure; Core deliberately will not resume them.
@@ -195,4 +221,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:fe048c2862001725305915bc2b5b291ecd61720cc6ef219d00837cf6f174d824
+Version: codex-security-snapshot/v1:sha256:a5912d2b7265bd1673644d9345d38b194a3441b09abceca35750e27b29ffa579

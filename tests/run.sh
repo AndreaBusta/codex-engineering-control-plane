@@ -72,6 +72,7 @@ tests.test_core_repository
 tests.test_core_risk_sentinel
 tests.test_core_routing
 tests.test_core_state_paths
+tests.test_core_stable_pause
 tests.test_core_task_state
 tests.test_core_toolchain
 tests.test_core_types
@@ -99,6 +100,7 @@ control_plane/resource_registry.py
 control_plane/risk_sentinel.py
 control_plane/routing.py
 control_plane/scopes.py
+control_plane/stable_pause.py
 control_plane/task_state.py
 control_plane/toolchain.py
 control_plane/verification.py'
@@ -128,6 +130,7 @@ tests/test_core_repository.py
 tests/test_core_risk_sentinel.py
 tests/test_core_routing.py
 tests/test_core_state_paths.py
+tests/test_core_stable_pause.py
 tests/test_core_task_state.py
 tests/test_core_toolchain.py
 tests/test_core_types.py
@@ -135,6 +138,7 @@ tests/test_core_verification.py'
 
 CORE_TEST_HELPERS='tests/core_gate.py
 tests/core_router_test_support.py
+tests/core_stable_pause_test_support.py
 tests/git_test_support.py'
 
 CORE_TEST_PACKAGE='tests/__init__.py'

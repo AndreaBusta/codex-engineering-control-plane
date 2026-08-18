@@ -519,6 +519,58 @@ class CorePluginTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, text.lower())
 
+    def test_stable_pause_reference_is_progressive_and_packaged(self) -> None:
+        canonical = ROOT / "skills" / "control-plane-run"
+        packaged = ROOT / "plugins" / "control-plane" / "skills" / "control-plane-run"
+        skill = (canonical / "SKILL.md").read_text(encoding="utf-8")
+        reference_path = canonical / "references" / "stable-pause-v1.md"
+
+        self.assertTrue(reference_path.is_file())
+        reference = reference_path.read_bytes()
+        self.assertEqual(
+            reference,
+            (packaged / "references" / "stable-pause-v1.md").read_bytes(),
+        )
+        self.assertLessEqual(len(reference), 4096)
+        self.assertIn("references/stable-pause-v1.md", skill)
+        self.assertIn("only when", skill)
+        self.assertIn("stable pause", skill.lower())
+        self.assertIn("Do not load", skill)
+        self.assertIn("ordinary Control Plane work", skill)
+        text = reference.decode("utf-8")
+        for marker in (
+            "scripts/control-plane task checkpoint --mode stable-pause --task-id EXACT-TASK-ID --json",
+            "SAFE_PAUSE_ACTIVE",
+            "SAFE_PAUSE_TERMINAL",
+            "UNSAFE_PAUSE",
+            "UNKNOWN",
+            "exit 0",
+            "exit 1",
+            "exit 2",
+            "before",
+            "after",
+            "native host",
+            "same task",
+            "checkpoint_digest",
+            "authorizes=false",
+        ):
+            self.assertIn(marker, text)
+        self.assertRegex(
+            text,
+            r"Core `UNSAFE_PAUSE` or `UNKNOWN`.*never.*upgrade",
+        )
+        for forbidden_command in (
+            "kill -",
+            "pkill ",
+            "rm -",
+            "git clean",
+            "git reset",
+            "git commit",
+            "git push",
+            "tests/run.sh",
+        ):
+            self.assertNotIn(forbidden_command, text)
+
     def test_taskplaybook_is_small_ephemeral_and_non_authorizing(self) -> None:
         path = (
             ROOT
@@ -579,6 +631,7 @@ class CorePluginTests(unittest.TestCase):
             [
                 ".codex-plugin/plugin.json",
                 "skills/control-plane-run/SKILL.md",
+                "skills/control-plane-run/references/stable-pause-v1.md",
                 "skills/control-plane-run/references/taskplaybook-v0.md",
             ],
         )

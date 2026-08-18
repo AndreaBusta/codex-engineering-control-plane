@@ -47,6 +47,7 @@ EXPECTED_CORE_MODULES = (
     "risk_sentinel.py",
     "routing.py",
     "scopes.py",
+    "stable_pause.py",
     "task_state.py",
     "toolchain.py",
     "verification.py",
@@ -266,6 +267,7 @@ class CoreLockfileTests(unittest.TestCase):
         )
 
         self.assertEqual(ACTIVE_RUNTIME_MODULES, EXPECTED_CORE_MODULES)
+        self.assertEqual(len(EXPECTED_CORE_MODULES), 26)
         self.assertEqual(getattr(lockfile, "LOCK_MAX_BYTES", None), LOCK_MAX_BYTES)
         self.assertEqual(getattr(lockfile, "READ_CHUNK_BYTES", None), READ_CHUNK_BYTES)
         self.assertEqual(

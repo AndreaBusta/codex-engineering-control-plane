@@ -20,6 +20,16 @@ FORBIDDEN_MODULES = {
 
 
 class CoreContractTests(unittest.TestCase):
+    def test_stable_pause_contract_is_closed(self) -> None:
+        from control_plane.contracts import validate_stable_pause_observation
+        from tests.core_stable_pause_test_support import stable_pause_observation
+
+        value = stable_pause_observation()
+        self.assertEqual(validate_stable_pause_observation(value), value)
+        value["unexpected"] = False
+        with self.assertRaisesRegex(ValueError, "stable pause"):
+            validate_stable_pause_observation(value)
+
     def test_core_candidate_version_and_active_loc_budget_are_exact(self) -> None:
         self.assertEqual(__version__, "3.1.0-core.2")
         active_lines = sum(

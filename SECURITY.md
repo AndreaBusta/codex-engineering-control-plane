@@ -15,6 +15,8 @@ complementan las aprobaciones humanas, Git, CI y los proveedores externos.
 - credenciales gestionadas fuera del repositorio;
 - policy, registry, lock, allowlist exacta y runtime digests;
 - `CoreTaskStateV1`, leases generacionales y estado de mantenimiento;
+- `StablePauseObservationV1`, su `checkpoint_digest` y la cápsula semántica
+  unida por el host nativo;
 - journals y backups de generaciones ya instaladas;
 - evidencia de PR, integración y release;
 - presupuesto de contexto y datos enviados fuera del equipo.
@@ -75,6 +77,15 @@ un gate ni modifica la precedencia.
 | Un regular se sustituye por FIFO después del stat | apply/verify/rollback bloquea reteniendo mutexes | apertura nonblocking, `fstat` completo e igualdad entre descriptor y nombre antes de leer o limpiar | denegación por filesystem comprometido |
 | `core.hooksPath` cambia mientras rollback restaura | unset incondicional borra valor del consumidor | exact-value conditional unset solo de `.codex/git-hooks`; cualquier valor concurrente se preserva y produce drift | escritor Git externo no cooperativo |
 | Rollback desvincula un inode todavía abierto | una escritura posterior queda invisible al recibo | activation y managed leaves se mueven por no-replace a durable quarantine, permanecen enlazados y se revalidan antes de PASS; separate GC queda fuera de alcance | filesystem comprometido tras la revalidación final |
+| repository byte substitution durante Stable Pause | un checkpoint certifica bytes distintos de los observados | dos snapshots acotados ligan status, index, tipos, modos, enlaces y bytes mediante Git fijo y lecturas descriptor/no-follow | same-UID/filesystem compromise after the last descriptor check |
+| lock-domain substitution durante Stable Pause | el observador toma un inode distinto al writer | `create=false`, orden `adoption.lifecycle -> verification -> named task -> leases`, flock no bloqueante e igualdad descriptor/nombre antes de liberar | OS o filesystem comprometido |
+| malicious Git config or filter redirige la observación | comandos, filtros o helpers interpretan contenido hostil | entorno Git cerrado, `GIT_OPTIONAL_LOCKS=0`, argumentos allowlisted, límites de tiempo/salida y lectura directa bounded de blobs | binario Git comprometido |
+| index-hint hiding mediante `assume-unchanged`, `skip-worktree`, `core.filemode=false` o excludes externos | el checkpoint omite bytes o modos cambiados | raíz seleccionada exacta, configuración cerrada, rechazo de hints y digest de todos los paths indexados; ignored caches stay outside del inventario de tipos pero su conjunto se liga | Git o filesystem comprometido tras la última comprobación |
+| nested repository collapse dentro de un directorio untracked | `.git`, bare o Gitlink oculta bytes y semántica de otro repositorio | recorrido descriptor-relative bounded y rechazo fail-closed; nested repositories are unsupported | actor same-UID después de la última comprobación |
+| terminal receipt deletion | una task cerrada con generación previa parece estable sin demostrar release | `lease_generation > 0` exige el exact release receipt y binding de filenames/IDs antes de `SAFE_PAUSE_TERMINAL` | borrado posterior por filesystem comprometido |
+| residue smuggling dentro de un root protegido | staging/recovery desconocido se presenta como estado durable | inventario cerrado y bounded de residuos Core; entrada desconocida degrada a `UNSAFE_PAUSE` o `UNKNOWN`, nunca se limpia | nuevo formato no registrado bloquea hasta revisión |
+| digest-as-authority confusion | `checkpoint_digest` se trata como capability, recibo o aprobación | el digest solo detecta deriva, toda observación/cápsula conserva `authorizes=false` y no transfiere autoridad | host emisor comprometido |
+| host-visibility uncertainty | Core parece quieto mientras una operación nativa sigue activa | join nativo antes/después; visibilidad ausente produce `UNKNOWN` y nunca mejora el resultado Core | operación externa no visible al host |
 
 ## Hooks
 
@@ -172,6 +183,11 @@ branch protection. El modelo repositorio-completo está en el
   `scripts/control-plane` from the selected source, cuyo manifest completo se
   vuelve a ligar antes del primer journal durable.
 - Evidencia, documentos y resultados conservan `authorizes=false`.
+- Stable Pause usa una task exacta, snapshots bounded, mutexes preexistentes
+  `create=false` y salida canónica de hasta 4096 bytes. No persiste prompt,
+  transcript, diff completo, raw tool output, secreto, telemetría ni dato
+  personal. El join del host nativo solo degrada; nunca mejora `UNSAFE_PAUSE` o
+  `UNKNOWN`. El digest detecta deriva y no autentica ni autoriza.
 
 ## Hallazgos reportables y severidad
 
@@ -187,6 +203,9 @@ es evidencia suficiente.
   mientras el repositorio no sirva una aplicación web.
 - Un OS account, host Codex, Git binary, filesystem o proveedor totalmente
   comprometido queda fuera de las garantías cooperativas locales.
+- Permanece el residual de same-UID/filesystem compromise after the last
+  descriptor check y de non-cooperating external writers que ignoran los
+  mutexes Core. Stable Pause observa; no congela el sistema operativo.
 - Los documentos históricos v2.3/v2.4 son evidencia de diseño, no contratos
   gobernantes ni exclusiones de seguridad.
 - El dogfood de diez tareas y la adopción estable siguen pendientes; no se

@@ -78,6 +78,50 @@ exact journal-less provisioning inventory created by that same interrupted
 apply may be cleaned after the reviewed plan is revalidated. This behavior is
 non-authorizing and records `authorizes=false`.
 
+## Stable Pause v1
+
+Stable Pause is a verify-only local checkpoint for one exact task ID:
+
+```bash
+scripts/control-plane task checkpoint \
+  --mode stable-pause \
+  --task-id EXACT-TASK-ID \
+  --json
+```
+
+The output is one canonical `StablePauseObservationV1` line of at most
+4096 bytes. `SAFE_PAUSE_ACTIVE` and `SAFE_PAUSE_TERMINAL` return exit 0;
+`UNSAFE_PAUSE` returns exit 1; `UNKNOWN` returns exit 2. Every variant contains
+`checkpoint_digest` and `authorizes=false`. A dirty worktree, failing RED, or
+`git diff --check` failure stays visible as quality evidence but is not
+automatically unsafe unless it also proves drift, lifecycle contradiction, or
+an active operation.
+
+The progressive `control-plane-run` reference performs the
+native host before and after quiescence check around the single foreground observer. Native facts
+may downgrade the effective result but never upgrades a Core `UNSAFE_PAUSE` or
+`UNKNOWN`. Render the bounded continuation capsule only after that join. On
+resume, rerun the command for the same task and worktree, compare
+`checkpoint_digest`, explain any drift, and repeat normal route, preflight,
+authority, and lifecycle gates before a write.
+
+This procedure is zero mutation: no cleanup, no lifecycle transition, no Goal,
+no test or gate, no Git transition, no remote effect, no consumer, and no
+canary. It never creates or repairs a mutex or checkpoint artifact. A held or
+missing required mutex, lifecycle/residue contradiction, bounds failure, or
+unknown host visibility is a fail-closed result, not a reason to clean or infer
+authority.
+
+Repository evidence is tied to the exact selected repository root. The closed
+Git context forces `core.filemode=true` and `/dev/null` external excludes,
+rejects `assume-unchanged` and `skip-worktree`, and reads all required blobs
+through a single `cat-file --batch`. Ignored caches stay outside the global
+unsafe-type scan but their bounded path set remains digest-bound. Gitlinks,
+`.git` markers, and bare markers are rejected because nested repositories are
+unsupported. For a terminal task with a nonzero lease generation, safe output
+also requires the exact release receipt. These checks are observational and
+remain `authorizes=false`.
+
 ## Adoption rollback quarantine
 
 Core creates or reuses `adoption.lock` and retains the lifecycle inode before the task lock
@@ -153,7 +197,7 @@ a commit, remote write, Pull Request, merge, deploy, or release.
 
 The separate `scripts/control-plane-adoption` entrypoint is implemented for
 closed local verification only. It is not part of `scripts/control-plane`, the
-25-module Core allowlist or the compatibility parser surface.
+26-module Core allowlist or the compatibility parser surface.
 
 ```text
 adoption_tool=IMPLEMENTED_LOCAL

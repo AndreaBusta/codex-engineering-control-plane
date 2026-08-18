@@ -37,6 +37,20 @@ ADOPTION_ENABLEMENT_PLAN = (
     / "plans"
     / "2026-08-13-control-plane-core-adoption-enablement.md"
 )
+STABLE_PAUSE_SPEC = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-14-control-plane-stable-pause-v1-design.md"
+)
+STABLE_PAUSE_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-14-control-plane-stable-pause-v1.md"
+)
 THREAT_PATH = Path("docs/security/2026-08-12-control-plane-core-threat-model.md")
 THREAT_MODEL = ROOT / THREAT_PATH
 REPOSITORY_ID = "sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959"
@@ -165,6 +179,8 @@ GOVERNING_DOCUMENTS = (
     "docs/engineering/19-control-plane-core-maintenance.md",
     "docs/engineering/20-control-plane-core-dogfood.md",
     "docs/security/2026-08-12-control-plane-core-threat-model.md",
+    "docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md",
+    "docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md",
 )
 
 LOCAL_ENABLEMENT_DOCUMENTS = (
@@ -184,6 +200,8 @@ ADVANCED_OPERATION_PATTERN = re.compile(
 )
 ADVANCED_MARKER_CORE_ALLOWLIST = {
     "docs/engineering/19-control-plane-core-maintenance.md",
+    "docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md",
+    "docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md",
 }
 
 
@@ -705,6 +723,213 @@ def normalized_snapshot_version() -> str:
 
 
 class CoreDocumentationTests(unittest.TestCase):
+    def test_stable_pause_governing_contract(self) -> None:
+        specification = read(STABLE_PAUSE_SPEC)
+        plan = read(STABLE_PAUSE_PLAN)
+        readme = read(ROOT / "README.md")
+        dogfood = read(DOGFOOD)
+        index = read(CANONICAL_INDEX)
+        combined = "\n".join((specification, plan, readme, dogfood))
+
+        for document in (specification, plan):
+            document_flat = " ".join(document.split())
+            self.assertIn("GOVERNING_CORE / IMPLEMENTED_LOCAL", document_flat)
+            self.assertIn("CLOSES_ON_FINAL_EVIDENCE", document_flat)
+            self.assertIn("final frozen-byte evidence", document_flat)
+            self.assertIn("authorizes=false", document_flat)
+        self.assertIn("## Pre-freeze implementation evidence", plan)
+        self.assertIn("E_GIT_DIRTY", plan)
+        self.assertIn("Task 8 checkboxes remain intentionally open", plan)
+        self.assertIn("native Goal and final handoff", plan)
+        self.assertIn(
+            "### Task 8 calibration remediation: exact Adoption projection",
+            plan,
+        )
+        self.assertIn(
+            "The prior unchanged-Adoption assumption was falsified",
+            plan,
+        )
+        for status in (
+            "SAFE_PAUSE_ACTIVE",
+            "SAFE_PAUSE_TERMINAL",
+            "UNSAFE_PAUSE",
+            "UNKNOWN",
+        ):
+            self.assertIn(status, combined)
+        for token in (
+            "scripts/control-plane task checkpoint",
+            "--mode stable-pause",
+            "--task-id EXACT-TASK-ID",
+            "--json",
+            "exact task ID",
+            "create=false",
+            "adoption.lifecycle -> verification -> named task -> leases",
+            "zero mutation",
+            "dirty worktree",
+            "failing RED",
+            "not automatically unsafe",
+            "native host before and after",
+            "never upgrades",
+            "4096 bytes",
+            "checkpoint_digest",
+            "exact selected repository root",
+            "assume-unchanged",
+            "skip-worktree",
+            "core.filemode=true",
+            "ignored caches stay outside",
+            "nested repositories are unsupported",
+            "single `cat-file --batch`",
+            "exact release receipt",
+            "resume",
+        ):
+            self.assertIn(token, combined)
+        for path, purpose in (
+            (
+                "docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md",
+                "WHAT/WHY",
+            ),
+            (
+                "docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md",
+                "HOW",
+            ),
+        ):
+            self.assertEqual(index.count(f"| `{path}` | `GOVERNING_CORE` |"), 1)
+            row = next(line for line in index.splitlines() if f"| `{path}` |" in line)
+            self.assertIn(purpose, row)
+            self.assertIn("IMPLEMENTED_LOCAL", row)
+        for path in (
+            "skills/control-plane-run/SKILL.md",
+            "skills/control-plane-run/references/stable-pause-v1.md",
+            "plugins/control-plane/skills/control-plane-run/references/stable-pause-v1.md",
+        ):
+            self.assertIn(path, combined)
+        for forbidden_claim in (
+            "stable_pause=RELEASED",
+            "stable_pause=INSTALLED",
+            "stable_pause=CONSUMER_PROVEN",
+            "stable_pause=CANARY_PASS",
+        ):
+            self.assertNotIn(forbidden_claim, combined)
+
+    def test_stable_pause_threats_and_runbook_are_aligned(self) -> None:
+        maintenance = read(MAINTENANCE)
+        security = read(ROOT / "SECURITY.md")
+        threat = read(THREAT_MODEL)
+        combined = "\n".join((maintenance, security, threat))
+
+        _, marker, runbook = maintenance.partition("## Stable Pause v1")
+        self.assertEqual(marker, "## Stable Pause v1")
+        runbook, _, _ = runbook.partition("\n## ")
+        runbook_flat = " ".join(runbook.split())
+        for token in (
+            "scripts/control-plane task checkpoint",
+            "--mode stable-pause",
+            "--task-id EXACT-TASK-ID",
+            "--json",
+            "SAFE_PAUSE_ACTIVE",
+            "SAFE_PAUSE_TERMINAL",
+            "UNSAFE_PAUSE",
+            "UNKNOWN",
+            "exit 0",
+            "exit 1",
+            "exit 2",
+            "native host before and after",
+            "never upgrades",
+            "4096 bytes",
+            "checkpoint_digest",
+            "same task and worktree",
+            "authorizes=false",
+        ):
+            self.assertIn(token, runbook_flat)
+        for exclusion in (
+            "no cleanup",
+            "no lifecycle transition",
+            "no Goal",
+            "no test or gate",
+            "no Git transition",
+            "no remote effect",
+            "no consumer",
+            "no canary",
+        ):
+            self.assertIn(exclusion, runbook_flat)
+        combined_flat = " ".join(combined.split())
+        for attacker_story in (
+            "repository byte substitution",
+            "lock-domain substitution",
+            "malicious Git config or filter",
+            "residue smuggling",
+            "digest-as-authority confusion",
+            "host-visibility uncertainty",
+            "index-hint hiding",
+            "nested repository collapse",
+            "terminal receipt deletion",
+        ):
+            self.assertIn(attacker_story, combined_flat)
+        for residual in (
+            "same-UID/filesystem compromise after the last descriptor check",
+            "non-cooperating external writers",
+        ):
+            self.assertIn(residual, combined_flat)
+
+    def test_stable_pause_skill_join_is_verify_only(self) -> None:
+        skill = read(ROOT / "skills/control-plane-run/SKILL.md")
+        reference = read(
+            ROOT / "skills/control-plane-run/references/stable-pause-v1.md"
+        )
+        self.assertIn("only when", skill)
+        self.assertIn("Do not load", skill)
+        self.assertIn("ordinary Control Plane work", skill)
+        for marker in (
+            "verify-only",
+            "native host",
+            "before",
+            "after",
+            "foreground observer",
+            "active host operation",
+            "host visibility",
+            "UNSAFE_PAUSE",
+            "UNKNOWN",
+            "never upgrades",
+            "same task",
+            "same worktree",
+            "checkpoint_digest",
+            "authorizes=false",
+            "does not kill",
+            "does not interrupt",
+            "does not clean",
+            "does not mutate task or lease state",
+            "does not create a Goal",
+            "does not run tests or gates",
+            "does not perform Git or remote transitions",
+            "transcript",
+            "hidden reasoning",
+            "raw output",
+            "full diff",
+            "secrets",
+            "personal data",
+        ):
+            self.assertIn(marker, reference)
+        self.assertIn(
+            "Only the bounded foreground observer may be present during the invocation",
+            reference,
+        )
+        self.assertIn(
+            "Core `UNSAFE_PAUSE` or `UNKNOWN` is never upgraded by native evidence",
+            reference,
+        )
+        for forbidden in (
+            "create_goal(",
+            "update_goal(",
+            "task transition",
+            "task lease-release",
+            "bash tests/run.sh",
+            "git commit",
+            "git push",
+            "git clean",
+            "rm -rf",
+        ):
+            self.assertNotIn(forbidden, reference)
+
     def test_adoption_enablement_plan_has_closed_requirement_traceability(self) -> None:
         specification = ADOPTION_ENABLEMENT_SPEC.read_text(encoding="utf-8")
         plan = ADOPTION_ENABLEMENT_PLAN.read_text(encoding="utf-8")

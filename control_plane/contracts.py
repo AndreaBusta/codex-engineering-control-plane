@@ -59,6 +59,41 @@ TASK_PHASES = frozenset(
         "operate",
     }
 )
+CORE_STATES = (
+    "framed",
+    "planned",
+    "ready",
+    "implementing",
+    "verifying",
+    "review_ready",
+    "blocked",
+    "closed",
+)
+STABLE_PAUSE_STATUSES = (
+    "SAFE_PAUSE_ACTIVE",
+    "SAFE_PAUSE_TERMINAL",
+    "UNSAFE_PAUSE",
+    "UNKNOWN",
+)
+STABLE_PAUSE_CHECK_VALUES = ("PASS", "FAIL", "UNKNOWN")
+STABLE_PAUSE_MUTEX_VALUES = ("free", "held", "absent", "unknown")
+STABLE_PAUSE_LEASE_VALUES = ("active", "absent", "unknown")
+STABLE_PAUSE_ISSUE_CODES = (
+    "E_STABLE_PAUSE_REPOSITORY",
+    "E_STABLE_PAUSE_SNAPSHOT_DRIFT",
+    "E_STABLE_PAUSE_LIFECYCLE",
+    "E_STABLE_PAUSE_OPERATION_ACTIVE",
+    "E_STABLE_PAUSE_RESIDUE",
+    "E_STABLE_PAUSE_BOUNDS",
+)
+STABLE_PAUSE_ISSUE_DIMENSIONS = (
+    "repository",
+    "snapshot",
+    "lifecycle",
+    "operation",
+    "residue",
+    "bounds",
+)
 TASK_EFFECTS = frozenset(
     {
         "local_read",
@@ -148,6 +183,85 @@ AUTHORIZATION_REQUEST_KEYS = frozenset(
         "scope_paths",
     }
 )
+
+_STABLE_PAUSE_ROOT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "scope",
+        "status",
+        "repository",
+        "lifecycle",
+        "control_plane_state",
+        "checks",
+        "issues",
+        "checkpoint_digest",
+        "authorizes",
+    }
+)
+_STABLE_PAUSE_REPOSITORY_KEYS = frozenset(
+    {
+        "root",
+        "common_git_dir",
+        "branch",
+        "head",
+        "status_digest",
+        "worktree_digest",
+        "staged_count",
+        "unstaged_count",
+        "untracked_count",
+        "diff_check",
+    }
+)
+_STABLE_PAUSE_LIFECYCLE_KEYS = frozenset(
+    {
+        "task_id",
+        "task_state",
+        "task_state_digest",
+        "lease_state",
+        "lease_digest",
+        "owner_runtime_digest",
+    }
+)
+_STABLE_PAUSE_CONTROL_KEYS = frozenset(
+    {
+        "adoption_mutex",
+        "verification_mutex",
+        "task_mutex",
+        "lease_mutex",
+        "residue_count",
+        "residue_digest",
+    }
+)
+_STABLE_PAUSE_CHECK_KEYS = frozenset(
+    {
+        "repository_identity",
+        "snapshot_stability",
+        "lifecycle_binding",
+        "mutex_quiescence",
+        "owned_residue",
+    }
+)
+_STABLE_PAUSE_ISSUE_KEYS = frozenset({"code", "dimension"})
+_STABLE_PAUSE_ISSUE_DIMENSION_BY_CODE = {
+    code: dimension
+    for code, dimension in zip(
+        STABLE_PAUSE_ISSUE_CODES,
+        STABLE_PAUSE_ISSUE_DIMENSIONS,
+        strict=True,
+    )
+}
+_STABLE_PAUSE_MAX_BYTES = 4096
+_STABLE_PAUSE_MAX_DEPTH = 32
+_STABLE_PAUSE_MAX_ITEMS = 4096
+_STABLE_PAUSE_MAX_STRING = 8192
+_STABLE_PAUSE_MAX_ISSUES = 8
+_STABLE_PAUSE_HEAD = re.compile(r"^[0-9a-f]{40}$", re.ASCII)
+_STABLE_PAUSE_BRANCH = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$",
+    re.ASCII,
+)
+_STABLE_PAUSE_CHECKPOINT_DOMAIN = b"control-plane-stable-pause-v1\0"
 
 _ACTIVE_ADOPTION_JOURNAL_KEYS = frozenset(
     {
@@ -527,9 +641,294 @@ def load_active_adoption_journal(payload: bytes) -> dict[str, Any]:
             parse_constant=_active_adoption_reject_constant,
         )
         _active_adoption_bounded(value)
-        return validate_active_adoption_journal(value)
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError("active adoption journal JSON is invalid") from error
+    return validate_active_adoption_journal(value)
+
+
+def _stable_pause_closed_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("stable pause observation has duplicate fields")
+        value[key] = item
+    return value
+
+
+def _stable_pause_reject_constant(_: str) -> None:
+    raise ValueError("stable pause observation contains a non-finite number")
+
+
+def _stable_pause_bounded(value: Any) -> None:
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    observed = 0
+    while stack:
+        item, depth = stack.pop()
+        observed += 1
+        if observed > _STABLE_PAUSE_MAX_ITEMS:
+            raise ValueError("stable pause observation exceeds item bounds")
+        if depth > _STABLE_PAUSE_MAX_DEPTH:
+            raise ValueError("stable pause observation exceeds depth bounds")
+        if isinstance(item, Mapping):
+            for key, child in item.items():
+                if (
+                    not isinstance(key, str)
+                    or len(key.encode("utf-8")) > _STABLE_PAUSE_MAX_STRING
+                ):
+                    raise ValueError("stable pause observation has an invalid key")
+                if key == "authorizes" and child is not False:
+                    raise ValueError("stable pause observation cannot authorize")
+                stack.append((child, depth + 1))
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            if len(item.encode("utf-8")) > _STABLE_PAUSE_MAX_STRING:
+                raise ValueError("stable pause observation has an oversized string")
+        elif item is None or isinstance(item, bool) or type(item) is int:
+            pass
+        else:
+            raise ValueError("stable pause observation has an unsupported value")
+
+
+def _stable_pause_exact(value: Any, keys: frozenset[str]) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise ValueError("stable pause observation fields are not exact")
+    return value
+
+
+def _stable_pause_digest(value: Any, *, nullable: bool = False) -> bool:
+    return (nullable and value is None) or (
+        isinstance(value, str) and SHA256_DIGEST.fullmatch(value) is not None
+    )
+
+
+def _stable_pause_path(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("/")
+        and 1 < len(value.encode("utf-8")) <= 4096
+        and "\0" not in value
+        and "\n" not in value
+        and "\r" not in value
+    )
+
+
+def stable_pause_checkpoint_digest(value: Mapping[str, Any]) -> str:
+    if not isinstance(value, Mapping) or value.get("authorizes") is not False:
+        raise ValueError("stable pause observation cannot authorize")
+    unsigned = dict(value)
+    unsigned.pop("checkpoint_digest", None)
+    _stable_pause_bounded(unsigned)
+    payload = _STABLE_PAUSE_CHECKPOINT_DOMAIN + canonical_json(unsigned).encode(
+        "utf-8"
+    )
+    return f"sha256:{sha256(payload).hexdigest()}"
+
+
+def derive_stable_pause_status(
+    checks: Mapping[str, Any], lifecycle_class: str
+) -> str:
+    closed = _stable_pause_exact(checks, _STABLE_PAUSE_CHECK_KEYS)
+    if any(value not in STABLE_PAUSE_CHECK_VALUES for value in closed.values()):
+        raise ValueError("stable pause checks are invalid")
+    if lifecycle_class not in {"active", "terminal", "contradiction", "unknown"}:
+        raise ValueError("stable pause lifecycle classification is invalid")
+    if "FAIL" in closed.values() or lifecycle_class == "contradiction":
+        return "UNSAFE_PAUSE"
+    if "UNKNOWN" in closed.values() or lifecycle_class == "unknown":
+        return "UNKNOWN"
+    if lifecycle_class == "active":
+        return "SAFE_PAUSE_ACTIVE"
+    return "SAFE_PAUSE_TERMINAL"
+
+
+def validate_stable_pause_observation(value: Any) -> dict[str, Any]:
+    _stable_pause_bounded(value)
+    observation = _stable_pause_exact(value, _STABLE_PAUSE_ROOT_KEYS)
+    if (
+        type(observation.get("schema_version")) is not int
+        or observation.get("schema_version") != 1
+        or observation.get("kind") != "StablePauseObservationV1"
+        or observation.get("scope") != "core-owned-local-state"
+        or observation.get("status") not in STABLE_PAUSE_STATUSES
+        or observation.get("authorizes") is not False
+    ):
+        raise ValueError("stable pause observation envelope is invalid")
+
+    repository = _stable_pause_exact(
+        observation.get("repository"),
+        _STABLE_PAUSE_REPOSITORY_KEYS,
+    )
+    if (
+        not _stable_pause_path(repository.get("root"))
+        or not _stable_pause_path(repository.get("common_git_dir"))
+        or not isinstance(repository.get("branch"), str)
+        or _STABLE_PAUSE_BRANCH.fullmatch(str(repository["branch"])) is None
+        or ".." in str(repository["branch"])
+        or str(repository["branch"]).endswith("/")
+        or not isinstance(repository.get("head"), str)
+        or _STABLE_PAUSE_HEAD.fullmatch(str(repository["head"])) is None
+        or not _stable_pause_digest(repository.get("status_digest"), nullable=True)
+        or not _stable_pause_digest(repository.get("worktree_digest"), nullable=True)
+        or (repository.get("status_digest") is None)
+        != (repository.get("worktree_digest") is None)
+        or any(
+            type(repository.get(key)) is not int
+            or not 0 <= int(repository[key]) <= 20_000
+            for key in ("staged_count", "unstaged_count", "untracked_count")
+        )
+        or repository.get("diff_check") not in STABLE_PAUSE_CHECK_VALUES
+    ):
+        raise ValueError("stable pause repository binding is invalid")
+
+    lifecycle = _stable_pause_exact(
+        observation.get("lifecycle"),
+        _STABLE_PAUSE_LIFECYCLE_KEYS,
+    )
+    task_state = lifecycle.get("task_state")
+    lease_state = lifecycle.get("lease_state")
+    if (
+        not validate_task_id(lifecycle.get("task_id"))
+        or task_state not in (*CORE_STATES, "unknown")
+        or not _stable_pause_digest(
+            lifecycle.get("task_state_digest"), nullable=True
+        )
+        or lease_state not in STABLE_PAUSE_LEASE_VALUES
+        or not _stable_pause_digest(lifecycle.get("lease_digest"), nullable=True)
+        or not _stable_pause_digest(
+            lifecycle.get("owner_runtime_digest"), nullable=True
+        )
+        or (lease_state == "active")
+        != (lifecycle.get("lease_digest") is not None)
+        or (
+            task_state == "unknown"
+            and (
+                lifecycle.get("task_state_digest") is not None
+                or lifecycle.get("owner_runtime_digest") is not None
+            )
+        )
+        or (
+            task_state != "unknown"
+            and (
+                lifecycle.get("task_state_digest") is None
+                or lifecycle.get("owner_runtime_digest") is None
+            )
+        )
+    ):
+        raise ValueError("stable pause lifecycle binding is invalid")
+
+    control = _stable_pause_exact(
+        observation.get("control_plane_state"),
+        _STABLE_PAUSE_CONTROL_KEYS,
+    )
+    if (
+        any(
+            control.get(key) not in STABLE_PAUSE_MUTEX_VALUES
+            for key in (
+                "adoption_mutex",
+                "verification_mutex",
+                "task_mutex",
+                "lease_mutex",
+            )
+        )
+        or type(control.get("residue_count")) is not int
+        or not 0 <= int(control["residue_count"]) <= 4096
+        or not _stable_pause_digest(control.get("residue_digest"), nullable=True)
+    ):
+        raise ValueError("stable pause control-plane state is invalid")
+
+    checks = _stable_pause_exact(observation.get("checks"), _STABLE_PAUSE_CHECK_KEYS)
+    if any(value not in STABLE_PAUSE_CHECK_VALUES for value in checks.values()):
+        raise ValueError("stable pause checks are invalid")
+    if (control.get("residue_digest") is None) != (
+        checks.get("owned_residue") == "UNKNOWN"
+    ):
+        raise ValueError("stable pause residue binding is invalid")
+    if (repository.get("status_digest") is None) and not any(
+        checks.get(key) == "UNKNOWN"
+        for key in ("repository_identity", "snapshot_stability")
+    ):
+        raise ValueError("stable pause snapshot binding is invalid")
+
+    issues = observation.get("issues")
+    if not isinstance(issues, list) or len(issues) > _STABLE_PAUSE_MAX_ISSUES:
+        raise ValueError("stable pause issues are invalid")
+    normalized_issues: list[dict[str, str]] = []
+    for item in issues:
+        issue = _stable_pause_exact(item, _STABLE_PAUSE_ISSUE_KEYS)
+        code = issue.get("code")
+        dimension = issue.get("dimension")
+        if (
+            code not in STABLE_PAUSE_ISSUE_CODES
+            or dimension not in STABLE_PAUSE_ISSUE_DIMENSIONS
+            or _STABLE_PAUSE_ISSUE_DIMENSION_BY_CODE.get(str(code)) != dimension
+        ):
+            raise ValueError("stable pause issue is invalid")
+        normalized_issues.append({"code": str(code), "dimension": str(dimension)})
+    if normalized_issues != sorted(
+        normalized_issues,
+        key=lambda item: (item["code"], item["dimension"]),
+    ) or len({(item["code"], item["dimension"]) for item in normalized_issues}) != len(
+        normalized_issues
+    ):
+        raise ValueError("stable pause issues are not exact")
+
+    status = observation["status"]
+    if status.startswith("SAFE_PAUSE_") and (
+        any(value != "PASS" for value in checks.values()) or normalized_issues
+    ):
+        raise ValueError("stable pause safe status is inconsistent")
+    if status.startswith("SAFE_PAUSE_") and (
+        control.get("adoption_mutex") != "free"
+        or control.get("verification_mutex") not in {"free", "absent"}
+        or control.get("task_mutex") != "free"
+        or control.get("lease_mutex") != "free"
+        or control.get("residue_count") != 0
+    ):
+        raise ValueError("stable pause safe control state is inconsistent")
+    if status == "SAFE_PAUSE_ACTIVE" and (
+        task_state not in CORE_STATES[:-1] or lease_state != "active"
+    ):
+        raise ValueError("stable pause active lifecycle is inconsistent")
+    if status == "SAFE_PAUSE_TERMINAL" and (
+        task_state != "closed" or lease_state != "absent"
+    ):
+        raise ValueError("stable pause terminal lifecycle is inconsistent")
+    if status == "UNSAFE_PAUSE" and (
+        "FAIL" not in checks.values() or not normalized_issues
+    ):
+        raise ValueError("stable pause unsafe status is inconsistent")
+    if status == "UNKNOWN" and (
+        "FAIL" in checks.values()
+        or "UNKNOWN" not in checks.values()
+        or not normalized_issues
+    ):
+        raise ValueError("stable pause unknown status is inconsistent")
+
+    supplied = observation.get("checkpoint_digest")
+    if not _stable_pause_digest(supplied) or supplied != stable_pause_checkpoint_digest(
+        observation
+    ):
+        raise ValueError("stable pause checkpoint digest is invalid")
+    encoded = canonical_json(observation).encode("utf-8")
+    if len(encoded) > _STABLE_PAUSE_MAX_BYTES:
+        raise ValueError("stable pause observation exceeds output bounds")
+    return dict(observation)
+
+
+def load_stable_pause_observation(payload: bytes) -> dict[str, Any]:
+    if not isinstance(payload, bytes) or not 0 <= len(payload) <= _STABLE_PAUSE_MAX_BYTES:
+        raise ValueError("stable pause observation exceeds file bounds")
+    try:
+        value = json.loads(
+            payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=_stable_pause_closed_pairs,
+            parse_constant=_stable_pause_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        raise ValueError("stable pause observation JSON is invalid") from error
+    _stable_pause_bounded(value)
+    return validate_stable_pause_observation(value)
 
 
 @dataclass(frozen=True)

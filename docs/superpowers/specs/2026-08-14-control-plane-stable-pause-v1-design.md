@@ -1,8 +1,8 @@
 # Stable Pause v1 — Verify-only Design
 
-**Status:** `DRAFT_FOR_USER_REVIEW / NOT_IMPLEMENTED`
+**Status:** `IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE`
 
-**Classification:** `DRAFT_NON_GOVERNING`
+**Classification:** `GOVERNING_CORE / IMPLEMENTED_LOCAL`
 
 **Authority:** `authorizes=false`
 
@@ -10,10 +10,13 @@
 
 **Scope:** local Control Plane state only
 
-This document specifies a proposed architecture. It does not claim that Stable
-Pause exists in the runtime, does not modify the current lifecycle, and does
-not authorize implementation, cleanup, task closure, lease release, Git
-transitions, a consumer, a canary, installation, or remote effects.
+This document is the governing WHAT/WHY contract for the locally implemented
+Stable Pause v1 candidate. `CLOSES_ON_FINAL_EVIDENCE` requires final frozen-byte
+evidence for a closure claim; it is not a release, installation, consumer
+proof, canary result, or remote integration.
+Stable Pause does not modify the current lifecycle and does not authorize
+cleanup, task closure, lease release, Git transitions, a consumer, a canary,
+installation, or remote effects. Every result remains `authorizes=false`.
 
 ## 1. Problem
 
@@ -77,9 +80,9 @@ it does not persist a new artifact.
 
 Stable Pause v1 uses a hybrid architecture:
 
-1. **Core observer:** a future dependency-free Control Plane component reads
+1. **Core observer:** a dependency-free Control Plane component reads
    and validates only repository, lifecycle, mutex, and owned-residue facts.
-2. **Future CLI surface:** the observer is exposed as a verify-only task
+2. **CLI surface:** the observer is exposed as a verify-only task
    checkpoint command.
 3. **Progressive skill reference:** the existing canonical
    `control-plane-run` skill loads a small Stable Pause reference only when the
@@ -88,12 +91,12 @@ Stable Pause v1 uses a hybrid architecture:
    whether a tool or test session is still active and the exact semantic
    continuation.
 
-The proposed future command is:
+The implemented local command is:
 
 ```bash
 scripts/control-plane task checkpoint \
   --mode stable-pause \
-  --task-id <exact-task-id> \
+  --task-id EXACT-TASK-ID \
   --json
 ```
 
@@ -161,7 +164,8 @@ The user-facing outcome has one of four statuses:
 
 Core is responsible for:
 
-- canonical repository, worktree, branch, HEAD, and common Git-dir identity;
+- the exact selected repository root, worktree, branch, HEAD, and common
+  Git-dir identity, without accepting a local `core.worktree` redirect;
 - a bounded, content-bound local worktree snapshot and `git diff --check`
   result;
 - exact parsing and digest validation of the named task record;
@@ -196,10 +200,11 @@ test merely to populate them and never fabricates a missing result.
 
 ## 7. Verify-only observation protocol
 
-The future observer performs the following bounded sequence:
+The observer performs the following bounded sequence:
 
-1. Resolve and validate the repository root, worktree Git dir, common Git dir,
-   branch, HEAD, and exact task ID without following unsafe links.
+1. Resolve and validate the exact selected repository root, worktree Git dir,
+   common Git dir, branch, HEAD, and exact task ID without following unsafe
+   links or accepting a local `core.worktree` redirect.
 2. Capture the first canonical Git and lifecycle snapshot.
 3. Open only pre-existing Control Plane mutex paths with no-create,
    no-follow, bounded, owner-safe primitives.
@@ -217,10 +222,10 @@ The future observer performs the following bounded sequence:
    bounded JSON object.
 
 Lock acquisition is an ephemeral kernel observation, not a repository write.
-The implementation must use `create=false` throughout. If the current Core
-lock graph cannot express this sequence without inversion, implementation is
-blocked until the graph is reconciled; Stable Pause must not introduce a
-second lock order.
+The implementation uses `create=false` throughout and the exact order
+`adoption.lifecycle -> verification -> named task -> leases`. Every success
+and failure path is zero mutation. Stable Pause introduces no second lock
+order.
 
 No network or remote-ref refresh participates in v1.
 
@@ -238,8 +243,11 @@ The skill wraps the Core observation with two native checks:
 3. Run the Core command once as a bounded foreground observation.
 4. After it exits, verify again that there is no yielded command, test, tool
    session, or writing worker and that the observer process is gone.
-5. Join those native facts with the Core object. A present operation yields
-   `UNSAFE_PAUSE`; unavailable native visibility yields `UNKNOWN`.
+5. Join those native facts with the Core object. This is the
+   native host before and after join: a present operation yields
+   `UNSAFE_PAUSE`; unavailable
+   native visibility yields `UNKNOWN`; native evidence never upgrades a Core
+   `UNSAFE_PAUSE` or `UNKNOWN`.
 
 The host checks only sessions and workers it can identify natively. They do not
 authorize a global process scan or claim that an unrelated external process
@@ -311,19 +319,30 @@ bounded strict-decoding rules.
 Counts are non-negative bounded integers. Issue entries are closed objects of
 `code` and `dimension`, drawn from fixed enumerations, sorted deterministically,
 and capped before serialization. The complete JSON output must not exceed
-4 KiB. Bounds overflow produces `UNKNOWN`, never truncated safe evidence.
+4096 bytes (4 KiB). Bounds overflow produces `UNKNOWN`, never truncated safe
+evidence.
 
 ### 8.2 Deterministic digests
 
 `status_digest` is computed over canonical bounded local Git-status records
-with individual untracked paths enabled, not human-formatted output.
-`worktree_digest` additionally binds index entries, path types and modes,
-symlink targets, explicit absence markers, and the raw bytes of every present
-staged, modified, renamed, or untracked path represented by that status. It
-uses read-only Git plumbing and descriptor-safe bounded content hashing; it
-must not create Git objects or refresh the index. A dataless, unreadable,
-oversized, unstable, or timed-out path yields `UNKNOWN` rather than a partial
-safe digest.
+with individual untracked paths enabled, not human-formatted output. Git runs
+with the closed configuration including `core.filemode=true`; any
+`assume-unchanged` or `skip-worktree` index hint is rejected instead of being
+allowed to hide drift.
+
+`worktree_digest` additionally binds every indexed path's worktree bytes and
+mode, index entries, path types, symlink targets, explicit absence markers,
+and the raw bytes of every present staged, modified, renamed, or untracked path
+represented by the observation. Index blobs are read through a single
+`cat-file --batch` process with global output bounds. A bounded fixed Git
+ignored-path observation is also included: ignored caches stay outside the
+unsafe-type inventory, while their closed path set is bound to the digest and
+cannot expand through an external excludes file. Gitlinks, nested `.git`
+markers, and bare markers fail closed because nested repositories are
+unsupported. Read-only Git plumbing and descriptor-safe bounded content
+hashing must not create Git objects or refresh the index. A dataless,
+unreadable, oversized, unstable, or timed-out path yields `UNKNOWN` rather
+than a partial safe digest.
 
 `residue_digest` covers only sorted classifications of recognized Control
 Plane-owned residue; it does not hash arbitrary cache or temporary-directory
@@ -350,7 +369,9 @@ Status precedence is closed and deterministic:
 3. Otherwise, a coherent nonterminal named task and its policy-valid owner and
    lease variant produce `SAFE_PAUSE_ACTIVE`.
 4. Otherwise, a coherent terminal named task with no active lease produces
-   `SAFE_PAUSE_TERMINAL`.
+   `SAFE_PAUSE_TERMINAL`; when its lease generation is nonzero, the lifecycle
+   must also contain the exact release receipt for that task, lease, owner,
+   generation, and digest.
 
 Examples of definite contradictions include:
 
@@ -363,12 +384,12 @@ Examples of definite contradictions include:
 - recognized Control Plane recovery residue exists outside its permitted
   lifecycle state.
 
-A dirty worktree, a preserved failing test, or `git diff --check` failure is
+A dirty worktree, a preserved failing RED, or `git diff --check` failure is
 quality evidence, not by itself proof that the state is crash-unsafe. These
 facts remain visible in the observation and capsule. They block whatever later
 gate or completion policy requires them, but Stable Pause marks them unsafe
 only when they also cause snapshot drift, lifecycle inconsistency, or an active
-operation.
+operation: dirty or RED evidence is not automatically unsafe.
 
 ## 10. Owned transient inventory
 
@@ -398,7 +419,7 @@ may not upgrade a Core `UNKNOWN` or `UNSAFE_PAUSE` result.
 ## 11. Continuation capsule
 
 After joining the Core observation with native host facts, the skill emits a
-semantic capsule of at most 4 KiB containing:
+semantic capsule of at most 4096 bytes (4 KiB) containing:
 
 - effective result and checkpoint digest;
 - objective and current unresolved question;
@@ -466,6 +487,9 @@ command or owner action as inert text, but it never executes it.
   traversal, exact ownership/mode/link checks, and named-path revalidation.
 - Subprocesses, if needed for Git, use a closed environment, bounded output,
   fixed arguments, and no shell interpolation.
+- The selected root must equal Git's discovered root; index-hint hiding,
+  external excludes, executable-mode suppression, filter execution, Gitlinks,
+  and nested repository collapse all fail closed.
 - Mutex probes use existing files only and never create a second lock domain.
 - The observer reads no secrets and never prints record payloads wholesale.
 - Issue output uses enumerated dimensions rather than attacker-controlled text.
@@ -488,7 +512,9 @@ Implementation, if separately authorized, begins with failing tests for:
 7. unrelated global temporary files and caches remaining unobserved and
    untouched;
 8. status or byte-level worktree drift between the two bounded captures,
-   including changed bytes whose Git status marker remains the same;
+   including changed bytes whose Git status marker remains the same, local
+   `core.worktree` substitution, `core.filemode=false`, `assume-unchanged`,
+   `skip-worktree`, ignored-cache boundaries, and collapsed untracked trees;
 9. malformed, duplicate-key, non-finite, oversized, deep, or unexpected input;
 10. deterministic issue ordering and digest replay;
 11. native host active-operation and unknown-operation downgrade behavior;
@@ -497,37 +523,38 @@ Implementation, if separately authorized, begins with failing tests for:
     effect authorization;
 14. resume with equal digest and resume with explained/unexplained drift;
 15. canonical and plugin skill-copy parity; and
-16. temporary-repository isolation with no consumer, canary, remote, or real
-    user-state mutation.
+16. nested `.git`, bare, and Gitlink rejection plus one globally bounded blob
+    batch; and
+17. terminal receipt deletion and mismatched lease/receipt filenames, followed
+    by temporary-repository isolation with no consumer, canary, remote, or
+    real user-state mutation.
 
 Tests must snapshot bytes and relevant inode identities before and after all
 failure cases. A passing focused suite is not a full-gate or release claim.
 
-## 16. Proposed future implementation surface
+## 16. Implemented local surface
 
-This list is architectural, not authorization or a changed-path commitment:
+This list records the local implementation; it is not authorization or a
+release claim:
 
-- a dependency-free Core observation module for `StablePauseObservationV1`;
+- `control_plane/stable_pause.py` for `StablePauseObservationV1`;
 - the existing CLI dispatcher and launcher surface for `task checkpoint`;
 - Core contract and focused test modules;
-- the canonical `control-plane-run` progressive reference and its distributed
-  plugin copy;
+- the canonical `skills/control-plane-run/SKILL.md` progressive loader,
+  `skills/control-plane-run/references/stable-pause-v1.md`, and byte-identical
+  `plugins/control-plane/skills/control-plane-run/references/stable-pause-v1.md`;
 - CLI/skill routing and parity tests;
 - the maintenance runbook, security guidance, and threat model; and
 - runtime, entrypoint, plugin, and documentation seals required by the exact
   repository generation.
 
-The implementation plan must discover the current dispatch paths and produce
-an exact file map before any code edit. It must not infer that this draft grants
-authority to touch those files.
+The governing implementation plan records the exact file map, RED/GREEN
+discipline, rollback, and final-evidence closure rule.
 
 ## 17. Documentation impact
 
-While this document remains `DRAFT_NON_GOVERNING`, it is not added to the
-canonical governing index and does not change current operator instructions.
-
-If the design and a later implementation are approved, closure must assess and
-align:
+This document is `GOVERNING_CORE / IMPLEMENTED_LOCAL` and is listed once in the
+canonical index. Closure aligns:
 
 - the canonical documentation index and spec classification;
 - the Control Plane maintenance runbook;
@@ -542,14 +569,10 @@ design.
 
 ## 18. Rollback
 
-There is no runtime rollback for this spec-only draft because nothing is
-implemented. The draft can be removed before governing adoption without
-affecting Control Plane behavior.
-
-For a later implementation, rollback means removing the CLI route, observer,
-tests, and progressive reference together; restoring prior documentation and
-seals; and proving the pre-feature full gate. Persisted Stable Pause state does
-not require migration because v1 creates none.
+Rollback means removing the CLI route, observer, tests, and progressive
+reference together; restoring prior documentation and seals; and proving the
+pre-feature full gate. Persisted Stable Pause state does not require migration
+because v1 creates none.
 
 ## 19. Design decisions closed in v1
 
@@ -565,25 +588,25 @@ not require migration because v1 creates none.
 - host uncertainty downgrades to `UNKNOWN`; and
 - every output remains `authorizes=false`.
 
-## 20. Review and implementation gate
+## 20. Final evidence gate
 
-This draft is ready only for design review. Before implementation:
-
-1. the user must approve or amend this written spec;
-2. a separate implementation plan must map exact current files and TDD steps;
-3. current Control Plane route and write-preflight must pass on sealed bytes;
-4. the plan must state the exact local-write authority it needs; and
-5. implementation must remain separately unauthorized until the user grants
-   that exact scope.
+The local implementation exists and `CLOSES_ON_FINAL_EVIDENCE` requires final
+frozen-byte evidence: the focused suite, one freshly authorized
+`bash tests/run.sh`, post-gates, and two final reviews on identical bytes. A
+closure claim is truthful only with that external native Goal/handoff evidence;
+the classification remains `GOVERNING_CORE / IMPLEMENTED_LOCAL`, never
+installed, consumer-proven, canary-proven, or released. `authorizes=false`.
 
 ## Continuación
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora.
-- **Para continuar:** revisar esta spec y, solo tras aprobación explícita,
-  redactar un plan de implementación TDD sin ejecutar cambios.
-- **Mensaje exacto:** `Apruebo la spec Stable Pause v1; redacta el plan de implementación sin ejecutar.`
-- **Estado de partida:** spec local en borrador, no gobernante, no implementada,
-  sin commit ni efectos remotos; `authorizes=false`.
-- **No hacer todavía:** implementar, resealar, ejecutar gates, limpiar residuos,
-  cambiar tareas o leases, commit, push, PR, merge, deploy, consumer o canary.
+- **Para continuar:** si Task 8 aún carece de evidencia, congelar los bytes y
+  completar el gate/reviews; si ya existe, usar el Goal/handoff nativo sin
+  reescribir este sujeto.
+- **Mensaje exacto:** `Autoriza una única ejecución local de bash tests/run.sh para los bytes finales de Stable Pause v1.`
+- **Estado de partida:** `GOVERNING_CORE / IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE`;
+  la evidencia Task 8 vive fuera de este documento; sin instalación,
+  consumidor, canary ni remoto; `authorizes=false`.
+- **No hacer todavía:** limpiar residuos, inferir autoridad, commit, push, PR,
+  merge, deploy, consumer, canary o release.

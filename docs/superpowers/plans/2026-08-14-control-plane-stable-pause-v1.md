@@ -8,9 +8,9 @@
 
 **Tech Stack:** Python 3.11+ standard library, POSIX `sh`, trusted bounded Git plumbing, strict JSON, `fcntl` locks, `unittest`, Markdown; no new dependency, package installation, network access, consumer, or canary.
 
-**Status:** `DRAFT_FOR_USER_REVIEW / NOT_EXECUTED`
+**Status:** `IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE`
 
-**Classification:** `DRAFT_NON_GOVERNING`
+**Classification:** `GOVERNING_CORE / IMPLEMENTED_LOCAL`
 
 **Authority:** `authorizes=false`
 
@@ -18,15 +18,19 @@
 
 **Workflow:** `verified-workflow / structured`, risk `T3`
 
-**Front classification:** `PROMPT_MULTIFRONT`; Stable Pause is a new sequential front and must not overlap the unfinished AE-09 writer or evidence freeze.
+**Front classification:** `SEQUENTIAL_LOCAL_FRONT`; AE-09 closed before this implementation began. Stable Pause `CLOSES_ON_FINAL_EVIDENCE` and requires final frozen-byte evidence, with no consumer, canary, installation, or remote effect.
 
 ---
 
-## Execution boundary and activation conditions
+## Execution boundary and activation record
 
-This plan is the only authorized write in this turn. It does not authorize its own execution.
+This plan does not authorize its own execution. The following conditions record
+the gate used before implementation and remain the reproducible activation
+contract; the later native grants are descriptive, non-transferable, and
+`authorizes=false`.
 
-Implementation may begin only after all of these conditions are freshly true on the exact implementation bytes:
+Implementation began only after all of these conditions were freshly true on
+the exact implementation bytes:
 
 1. the current Core 3.1 Adoption Enablement AE-09 front has reached a stable, locally recoverable closure;
 2. no writer, test, gate, yielded command, task transition, or lease operation is active;
@@ -35,15 +39,23 @@ Implementation may begin only after all of these conditions are freshly true on 
 5. the user grants fresh local-write authority naming this plan and its exact scope; and
 6. one exact task owner already exists, or separately authorized task/lease provisioning has completed, and at most one writer is established without overlapping the AE-09 owner.
 
-At plan-writing time, conditions 3 and 4 are not satisfied. Both commands fail closed with:
+At plan-writing time, conditions 3 and 4 were not satisfied. Both commands
+failed closed with:
 
 ```text
 E_RUNTIME_BOOTSTRAP: launcher does not match lock
 ```
 
-That failure is recorded evidence of the intentionally unsealed AE-09 working tree. Do not bypass the launcher, import Core directly as a substitute, repair seals under this plan-writing authority, or begin Stable Pause implementation while the failure remains.
+That historical failure recorded the intentionally unsealed AE-09 working tree.
+AE-09 was subsequently closed and resealed before Stable Pause Task 0. A later
+native grant approved Tasks 0-7 and a separate exact task/lease owner; a native
+Goal tracks the remaining local work. Those grants do not replay or transfer
+authority to another task or effect.
 
-The following effects remain excluded throughout this plan unless separately authorized later: task or lease mutation, cleanup of transient state, Goal creation, full-gate execution, commit, push, PR, merge, deploy, release, installation, consumer adoption, canary, secrets, and any remote effect.
+Cleanup of transient state, push, PR, merge, deploy, release, installation,
+consumer adoption, canary, secrets, and any remote effect remain excluded. The
+Task 8 full gate still requires its fresh one-shot grant on frozen bytes; no
+earlier implementation or Goal authority substitutes for it.
 
 ## Closed implementation decisions
 
@@ -66,7 +78,7 @@ The following effects remain excluded throughout this plan unless separately aut
 | `SP-02` | Exact local repository and byte-bound worktree identity without Git mutation. | 2 | clean, dirty, staged, rename, symlink, untracked, dataless/unreadable, drift, and zero-mutation tests |
 | `SP-03` | Create-false mutex observation in lifecycle, verification, named-task, lease order. | 3 | held, absent, substituted, post-flock drift, lock-order, and inode-snapshot tests |
 | `SP-04` | Exact task, owner, lease, adoption, activation, and residue validation. | 1, 3 | active, terminal, forged, mismatch, provisioning, rollback, recovery, and residue tests |
-| `SP-05` | Future CLI `task checkpoint --mode stable-pause --task-id ID --json`. | 4 | parser, exit-code, stdout/stderr, invocation-count, and zero-write tests |
+| `SP-05` | CLI `task checkpoint --mode stable-pause --task-id ID --json`. | 4 | parser, exit-code, stdout/stderr, invocation-count, and zero-write tests |
 | `SP-06` | Native host before/after quiescence joins Core without upgrading its result. | 5 | trigger, active operation, unknown visibility, no cleanup, and resume tests |
 | `SP-07` | Progressive reference inside canonical and packaged `control-plane-run`. | 5, 6 | inventory, parity, bounded-reference, and forbidden-mutation tests |
 | `SP-08` | Documentation, security, seals, and rollback remain coherent. | 6, 7 | lock, manifest, documentation, threat snapshot, Adoption regression, and rollback evidence |
@@ -93,6 +105,10 @@ No row may be declared closed unless its RED failed for the intended reason, its
 - `scripts/control-plane`: stage-0 allowlist/runtime update and unchanged bootstrap guarantees.
 - `.codex/hooks/control_plane_hook.py`: captured runtime allowlist parity.
 - `.codex/control-plane.lock`: resealed Core runtime and entrypoint/hook digests after final runtime bytes freeze.
+- `adoption_enablement/manifest.py`: keep the exact Core source projection in
+  parity with the 26-module Core allowlist.
+- `.codex/adoption-enablement.lock`: reseal only the isolated Adoption runtime
+  digest after that projection allowlist changes; keep tool version `0.1.0`.
 - `tests/run.sh`: exact governing test/helper/module manifests only; no behavioral shortcut.
 - `tests/test_core_cli.py`: CLI grammar, single invocation, output, exit codes, and no mutation.
 - `tests/test_core_contract.py`: strict observation schema, value sets, digest, recursion, and bounds.
@@ -101,6 +117,8 @@ No row may be declared closed unless its RED failed for the intended reason, its
 - `tests/test_core_plugin.py`: canonical/packaged reference parity and exact plugin inventory.
 - `tests/test_core_task_state.py`: prove shared constants preserve all existing transitions and bootstrap semantics.
 - `tests/test_core_documentation.py`: spec/plan/index/runbook/security/dogfood/threat and progressive-reference assertions.
+- `tests/test_adoption_enablement_preview.py`: exact 26-module source projection
+  and `stable_pause.py` inclusion regression.
 - `skills/control-plane-run/SKILL.md`: bounded trigger and progressive reference routing only.
 - `plugins/control-plane/skills/control-plane-run/SKILL.md`: byte-identical packaged skill update.
 - `README.md`: current local capability and verify-only/non-authorizing boundary.
@@ -116,8 +134,15 @@ No row may be declared closed unless its RED failed for the intended reason, its
 
 - `.codex/project-policy.toml` and `.codex/resource-registry.toml`: no new authority, route, dependency, or resource registration is required.
 - `plugins/control-plane/.codex-plugin/plugin.json`: product version remains `3.1.0-core.2`.
-- `adoption_enablement/**` and `.codex/adoption-enablement.lock`: Stable Pause is Core; the separate Adoption runtime remains byte-unchanged, although its regression tests must pass against the new Core projection.
-- real task records, lease records, journals, receipts, mutex files, and Git configuration: tests use temporary repositories only.
+- Adoption transaction, repository, recovery, and CLI behavior remain
+  unchanged. Only the exact source-projection allowlist in
+  `adoption_enablement/manifest.py`, its focused test, and the resulting
+  isolated Adoption lock digest change so a future projection cannot omit the
+  new Core module.
+- Stable Pause behavior never mutates real task records, lease records,
+  journals, receipts, mutex files, or Git configuration. The implementation
+  workflow separately provisioned one exact task/lease owner under the
+  worktree/common Git dirs; product tests still use temporary repositories only.
 - ADRs: the approved verify-only design adds no lifecycle or authority decision requiring a new ADR.
 
 ## Dependency graph and execution discipline
@@ -147,15 +172,15 @@ Use one writer. Read-only review may overlap only after a task's bytes are froze
 - Read: this plan
 - Temporary only: one `TaskEnvelope` outside the repository or under the worktree Git dir
 
-- [ ] **Step 1: Re-anchor the exact repository state.**
+- [x] **Step 1: Re-anchor the exact repository state.**
 
 Run read-only checks for physical cwd, Git top level, worktree list, branch, HEAD, status, and active `tests/run.sh` or `unittest` processes. Require this existing worktree and a non-protected `codex/` branch. Record but do not clean unrelated dirty bytes.
 
-- [ ] **Step 2: Prove AE-09 has stopped safely.**
+- [x] **Step 2: Prove AE-09 has stopped safely.**
 
 Require its task/lease owner to be terminal or otherwise explicitly handed off, no recovery-required lifecycle, no live test/gate process, and current Core/runtime seals to agree. If any fact is unknown, stop; Stable Pause cannot be used to manufacture its own safe starting point.
 
-- [ ] **Step 3: Normalize and route one exact implementation envelope.**
+- [x] **Step 3: Normalize and route one exact implementation envelope.**
 
 The envelope must identify the approved spec and this plan, list only the file map above, request local reads and local writes, and set every external or Git transition to false. Create and later remove the fixed temporary envelope with `apply_patch`, then run:
 
@@ -169,11 +194,11 @@ scripts/control-plane preflight --mode write
 
 Read every required routed resource completely. Do not treat recommendations as authority.
 
-- [ ] **Step 4: Obtain fresh implementation authority.**
+- [x] **Step 4: Obtain fresh implementation authority.**
 
 The required grant is local source/test/documentation editing and focused temporary-repository tests for Tasks 1-7. It must continue to exclude full-gate execution, real task/lease mutation, cleanup, commit, remote, consumer, and canary. If no valid task already owns the work, obtain a separate exact task/lease provisioning grant before starting; neither plan approval nor implementation authority supplies it. If the user grants a narrower set, rewrite the execution scope rather than inferring the remainder.
 
-- [ ] **Step 5: Establish TDD evidence discipline.**
+- [x] **Step 5: Establish TDD evidence discipline.**
 
 For every later task, preserve the exact RED command and failure reason, implement the smallest coherent behavior, run the named GREEN command, and inspect `git diff --check` plus scoped status. Do not advance on a test that passed before the intended production change or failed for fixture/bootstrap noise.
 
@@ -189,7 +214,7 @@ For every later task, preserve the exact RED command and failure reason, impleme
 - Modify: `tests/test_core_task_state.py`
 - Modify: `docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md` only if an ambiguity is found
 
-- [ ] **Step 1: Write strict RED contract tests.**
+- [x] **Step 1: Write strict RED contract tests.**
 
 Add exact tests for:
 
@@ -231,13 +256,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
 
 Expected RED: Stable Pause constants and validator/digest functions do not exist. A parser or import error elsewhere is not the intended failure.
 
-- [ ] **Step 2: Define one shared lifecycle vocabulary.**
+- [x] **Step 2: Define one shared lifecycle vocabulary.**
 
 Move the existing eight task-state strings to an immutable `CORE_STATES` tuple in `control_plane/contracts.py`; import and re-export that tuple from `task_state.py` so existing callers and transition behavior do not change. Do not define terminality from the state string alone: preserve the current exact record semantics in which `closed` is terminal only with `resume_state:null`, and `blocked` is terminal only with `resume_forbidden:true` and `resume_state:null`. Do not add `paused` or change any transition edge.
 
 Add regression tests that compare the previous exact tuple and exercise every current start, transition, block, resume, close, revision, and bootstrap-UNKNOWN path.
 
-- [ ] **Step 3: Implement the pure Stable Pause contract helpers.**
+- [x] **Step 3: Implement the pure Stable Pause contract helpers.**
 
 Add dependency-free functions with these responsibilities:
 
@@ -250,7 +275,7 @@ Add dependency-free functions with these responsibilities:
 
 Reuse the existing canonical JSON and closed-decoder primitives. Do not accept subclasses where exact JSON scalar types are required, do not normalize attacker strings into evidence, and do not truncate oversized safe output.
 
-- [ ] **Step 4: Make the contract GREEN and prove existing lifecycle compatibility.**
+- [x] **Step 4: Make the contract GREEN and prove existing lifecycle compatibility.**
 
 Run:
 
@@ -272,7 +297,7 @@ Require all tests to pass and confirm that the only production behavior added is
 - Modify: `tests/test_core_stable_pause.py`
 - Read/reuse: `control_plane/repository.py`
 
-- [ ] **Step 1: Write repository-observation RED tests.**
+- [x] **Step 1: Write repository-observation RED tests.**
 
 Cover temporary repositories with:
 
@@ -283,8 +308,9 @@ Cover temporary repositories with:
 5. stable dirty bytes and a stable `diff --check` failure that remain observable quality evidence;
 6. a path swapped, chmodded, rewritten through an open descriptor, or renamed between captures;
 7. dataless, unreadable, non-UTF-8 path, FIFO, socket, device, hardlinked regular file, too many paths, too-deep path, oversized file, aggregate-byte overflow, Git timeout, malformed `-z` output, and output overflow;
-8. hostile filters, attributes, aliases, environment variables, config, pager, and replacement-object settings; and
-9. before/after byte and inode snapshots proving every failure path is zero-mutation and creates no Git object, index lock, state file, or receipt.
+8. hostile filters, attributes, aliases, environment variables, config, pager, replacement-object settings, local `core.worktree` substitution, and `core.filemode=false`;
+9. `assume-unchanged` and `skip-worktree` hints; bounded ignored caches versus nonignored unsafe files; nested `.git`, bare, and Gitlink repositories; and collapsed untracked directory content; and
+10. before/after byte and inode snapshots proving every failure path is zero-mutation and creates no Git object, index lock, state file, or receipt.
 
 Run the intended RED:
 
@@ -295,9 +321,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
 
 Expected RED: `observe_repository_snapshot` and the Stable Pause module are absent.
 
-- [ ] **Step 2: Implement exact identity and fixed Git commands.**
+- [x] **Step 2: Implement exact identity and fixed Git commands.**
 
-Resolve and validate physical root, worktree Git dir, common Git dir, branch, and `HEAD^{commit}`. Reuse `trusted_git_executable`, its fixed config, and its closed environment. Run only bounded read-only commands equivalent to:
+Resolve and validate the exact selected repository root, worktree Git dir, common Git dir, branch, and `HEAD^{commit}`; reject a local `core.worktree` redirect. Reuse `trusted_git_executable`, its fixed config including `core.filemode=true` and `core.excludesFile=/dev/null`, and its closed environment. Run only bounded read-only commands equivalent to:
 
 ```text
 status --porcelain=v1 -z --untracked-files=all --no-renames
@@ -311,9 +337,9 @@ diff --cached --check
 
 Do not run `add`, `update-index`, `write-tree`, `hash-object -w`, checkout, reset, clean, fetch, or any command with implicit index refresh. Set `GIT_OPTIONAL_LOCKS=0` and retain the existing hostile-environment exclusions.
 
-- [ ] **Step 3: Bind every relevant path to its actual bytes.**
+- [x] **Step 3: Bind every relevant path to its actual bytes.**
 
-Use descriptor-relative, no-follow reads and stable pre/open/post identity checks. Open regular leaves with `O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC`, then require the full regular/owner/mode/link/identity contract through `fstat` and named `lstat` before and after reading. Read symlink targets through bounded no-follow primitives. Reject FIFO, socket, device, hardlink, dataless, and identity drift without blocking. The digest input must bind sorted status records, sorted index records, path bytes, file type, mode, symlink target, explicit absence, staged blob identity, bounded raw index-blob bytes read by object ID through `cat-file --batch`, and bounded raw worktree bytes for every present staged, modified, renamed, or untracked path represented by the observation. Reject a missing, non-blob, malformed, or oversized batch response; never create an object.
+Use descriptor-relative, no-follow reads and stable pre/open/post identity checks. Open regular leaves with `O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC`, then require the full regular/owner/mode/link/identity contract through `fstat` and named `lstat` before and after reading. Read symlink targets through bounded no-follow primitives. Reject FIFO, socket, device, hardlink, dataless, identity drift, `assume-unchanged`, and `skip-worktree` without blocking. The digest input must bind sorted status records, sorted index records, every indexed path's worktree bytes and mode, path bytes, file type, symlink target, explicit absence, staged blob identity, a bounded ignored-path set, and bounded raw worktree bytes for every present staged, modified, renamed, or untracked path represented by the observation. Read every required index blob through a single `cat-file --batch` process with one aggregate bound. Ignored caches stay outside the global unsafe-type inventory but remain digest-bound; Gitlinks and nested `.git` or bare markers fail closed because nested repositories are unsupported. Reject a missing, non-blob, malformed, or oversized batch response; never create an object.
 
 Use these closed initial limits, changing them only through an explicit spec amendment supported by RED tests:
 
@@ -331,7 +357,7 @@ Any timeout, instability, unavailable content, or overflow returns an `UNKNOWN` 
 
 Domain-separate the canonical status and full worktree inputs as `control-plane-stable-pause-status-v1` and `control-plane-stable-pause-worktree-v1`. The second digest includes the first input rather than treating a porcelain marker as byte evidence.
 
-- [ ] **Step 4: Make repository observation GREEN.**
+- [x] **Step 4: Make repository observation GREEN.**
 
 Run:
 
@@ -354,7 +380,7 @@ Then rerun the same fixture twice without mutation and assert identical `status_
 - Read/reuse: `control_plane/task_state.py`
 - Read/reuse: `control_plane/contracts.py`
 
-- [ ] **Step 1: Write lifecycle and mutex RED tests.**
+- [x] **Step 1: Write lifecycle and mutex RED tests.**
 
 Create a matrix for coherent active and terminal tasks plus every definite contradiction:
 
@@ -362,7 +388,8 @@ Create a matrix for coherent active and terminal tasks plus every definite contr
 - optional legacy lock legitimately absent versus required journal-bound lock absent;
 - file or parent directory replaced before or after `flock`;
 - wrong owner, mode, type, link count, size, identity, journal state, activation marker, runtime digest, task digest, lease digest, task ID, or lease owner;
-- active lease for another task or runtime;
+- active lease for another task or runtime, or terminal generation without its
+  exact release receipt;
 - forged, duplicate-key, non-finite, oversized, resumed-closed, or otherwise invalid task/lease/journal record;
 - provisioning prefixes `P1`, `P2`, `P2Q`, `P3`, `P3Q`, `P4`, and `P4T`;
 - adoption staging, recovery, rollback quarantine, task pending-write artifacts, contradictory receipts, unknown protected-root entries, and full-gate mutex inconsistency;
@@ -379,7 +406,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
   tests.test_core_stable_pause.StablePauseResidueTests
 ```
 
-- [ ] **Step 2: Implement the create-false lock graph.**
+- [x] **Step 2: Implement the create-false lock graph.**
 
 Open only existing private directories and lock files with descriptor-relative no-follow operations. Retain root, common-Git-dir, state-root, lock-directory, and lock-file descriptors through all protected reads and the second snapshot. Acquire exclusive nonblocking locks in this exact order:
 
@@ -389,19 +416,19 @@ adoption.lifecycle -> verification -> named task -> leases
 
 The named task lock is `sha256(task_id) + ".lock"`; the other names are `adoption.lock`, `verification.lock`, and `leases.lock` in their existing canonical roots. Use no `O_CREAT`, revalidate parent and file identities after each `flock` and again before release, and release in reverse order only after the second snapshot. Never call writer helpers that provision a missing mutex. Lifecycle-variant interpretation decides whether absence is valid, unsafe, or unknown.
 
-- [ ] **Step 3: Validate state while all applicable locks are held.**
+- [x] **Step 3: Validate state while all applicable locks are held.**
 
-Use existing strict Core validators and public read-only store surfaces where they preserve descriptor and lock guarantees. Validate the named task, owner/runtime, lease, adoption journal, activation lock, and verification binding as one coherent generation. A journal in anything other than the exact active variant is non-quiescent. A terminal task requires no active lease; a coherent nonterminal task requires its exact policy-valid lease variant.
+Use existing strict Core validators and public read-only store surfaces where they preserve descriptor and lock guarantees. Validate the named task, owner/runtime, lease, adoption journal, activation lock, and verification binding as one coherent generation. A journal in anything other than the exact active variant is non-quiescent. A terminal task requires no active lease and, when `lease_generation > 0`, its exact release receipt; a coherent nonterminal task requires its exact policy-valid lease variant.
 
 Capture the second repository and lifecycle snapshot before releasing any observation lock. If any stable fact differs, derive `E_STABLE_PAUSE_SNAPSHOT_DRIFT` and do not preserve a digest as safe evidence.
 
-- [ ] **Step 4: Implement a closed owned-residue inventory.**
+- [x] **Step 4: Implement a closed owned-residue inventory.**
 
 Enumerate only recognized Control Plane state roots under the worktree Git dir and common Git dir. Classify durable valid records separately from provisioning, staging, recovery, rollback quarantine, pending-write, contradictory receipt, and unknown protected-root entries. Hash only sorted closed classifications. Do not scan global `/tmp`, user caches, browser data, arbitrary ignored files, or a process table.
 
 Domain-separate the canonical residue classification as `control-plane-stable-pause-residue-v1`; an empty inventory still has a deterministic digest and count zero.
 
-- [ ] **Step 5: Make lifecycle and residue behavior GREEN.**
+- [x] **Step 5: Make lifecycle and residue behavior GREEN.**
 
 Run:
 
@@ -425,7 +452,7 @@ Require deterministic issue ordering, exact precedence, and zero mutation in eve
 - Modify: `tests/test_core_stable_pause.py`
 - Modify: `tests/test_core_cli.py`
 
-- [ ] **Step 1: Write CLI RED tests.**
+- [x] **Step 1: Write CLI RED tests.**
 
 Fix the exact accepted grammar:
 
@@ -456,17 +483,17 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
   tests.test_core_stable_pause.StablePauseCliTests
 ```
 
-- [ ] **Step 2: Add the smallest exact dispatcher.**
+- [x] **Step 2: Add the smallest exact dispatcher.**
 
 Add `task checkpoint` alongside the existing task command family. The dispatcher validates `--mode stable-pause`, exact task ID, and `--json`, calls the observer once, validates its returned object again at the serialization boundary, writes canonical UTF-8 JSON plus one newline, and returns the closed exit mapping.
 
 Do not add `task pause`, a default task, a human mode, persisted output, cleanup, retry, wait, remote refresh, or implicit task/lease action.
 
-- [ ] **Step 3: Assemble the final Core object.**
+- [x] **Step 3: Assemble the final Core object.**
 
 `observe_stable_pause(repository, task_id)` must perform the approved eight-step protocol, fill every closed field, derive checks and status, sort issues, compute the checkpoint digest last, validate the full object, enforce 4096 bytes, and only then return it. Error conversion maps only known repository/contract/lock/bounds failures to stable issue dimensions; unknown exception text is not serialized.
 
-- [ ] **Step 4: Make the CLI GREEN.**
+- [x] **Step 4: Make the CLI GREEN.**
 
 Run:
 
@@ -490,7 +517,7 @@ Inspect captured stdout/stderr and prove repeated observation of the same stable
 - Modify: `tests/test_core_plugin.py`
 - Modify: `tests/test_core_documentation.py`
 
-- [ ] **Step 1: Write progressive-loading and host-join RED tests.**
+- [x] **Step 1: Write progressive-loading and host-join RED tests.**
 
 The canonical skill tests must require:
 
@@ -512,7 +539,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
   tests.test_core_documentation.CoreDocumentationTests.test_stable_pause_skill_join_is_verify_only
 ```
 
-- [ ] **Step 2: Write the canonical progressive reference.**
+- [x] **Step 2: Write the canonical progressive reference.**
 
 The reference procedure must:
 
@@ -537,11 +564,11 @@ Use this closed effective-result join:
 
 The capsule must contain objective, unresolved question, exact Git identity, named task/lease facts, compact dirty/residue evidence, explicitly separate last RED and last GREEN, remaining work, pending effects, next exact action, unauthorized transitions, and the repository's `## Continuación` fields. Observation time may be displayed outside the digested Core object.
 
-- [ ] **Step 3: Link the reference from both skill entrypoints.**
+- [x] **Step 3: Link the reference from both skill entrypoints.**
 
 Add only bounded intent routing and one relative reference link. Keep the canonical and packaged `SKILL.md` files byte-identical. Do not duplicate the full procedure into the entrypoint and do not introduce a new skill registration.
 
-- [ ] **Step 4: Make the skill surface GREEN.**
+- [x] **Step 4: Make the skill surface GREEN.**
 
 Run:
 
@@ -565,9 +592,11 @@ Then inspect both skill inventories and exact byte parity. This is documentation
 - Modify: `tests/test_core_lockfile.py`
 - Modify: `tests/test_core_governing_manifest.py`
 - Modify: `tests/test_core_plugin.py`
-- Read/verify unchanged: `.codex/adoption-enablement.lock`
+- Modify after a projection RED only: `adoption_enablement/manifest.py`
+- Modify after that runtime changes: `.codex/adoption-enablement.lock`
+- Modify: `tests/test_adoption_enablement_preview.py`
 
-- [ ] **Step 1: Write manifest and seal RED tests.**
+- [x] **Step 1: Write manifest and seal RED tests.**
 
 Require the exact runtime tuple to contain `stable_pause.py` once, in canonical order, with no missing or extra module. Require the launcher, hook bootstrap, lockfile module list, lockfile validator, and independent lockfile test inventory to agree. Add the new governing test/helper/reference/doc paths to every exact manifest and require `tests/run.sh` to reject omission, duplication, or drift.
 
@@ -575,20 +604,20 @@ Run the intended RED:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
-  tests.test_core_lockfile.CoreLockfileTests.test_runtime_inventory_is_exact \
+  tests.test_core_lockfile.CoreLockfileTests.test_schema_two_declares_independent_exact_core_inventory \
   tests.test_core_governing_manifest \
   tests.test_core_plugin
 ```
 
 Expected RED: the new files are not yet recognized by all exact inventories and the old Core runtime seal does not cover them.
 
-- [ ] **Step 2: Update exact inventories without changing the version.**
+- [x] **Step 2: Update exact inventories without changing the version.**
 
-Change all duplicate stage-0/runtime allowlists together. The Core runtime grows from 25 to 26 modules. Keep `product_version = "3.1.0-core.2"` in the Core lock, launcher, hook, package, and plugin manifest. Do not modify Adoption Enablement code, its tool version, or `.codex/adoption-enablement.lock`.
+Change all duplicate stage-0/runtime allowlists together. The Core runtime grows from 25 to 26 modules. Keep `product_version = "3.1.0-core.2"` in the Core lock, launcher, hook, package, and plugin manifest. The initial implementation expected Adoption Enablement to remain byte-identical; Task 8 calibration later proved that its exact source-projection allowlist must also name `stable_pause.py`. That bounded correction does not change Adoption behavior or tool version.
 
 Recompute active Core LOC and require it to stay within the existing 21,530-line policy ceiling. Do not raise that ceiling as part of Stable Pause; split or simplify the observer if the candidate exceeds it.
 
-- [ ] **Step 3: Freeze runtime and bootstrap bytes, then reseal once.**
+- [x] **Step 3: Freeze runtime and bootstrap bytes, then reseal once.**
 
 After Tasks 1-5 code, tests, launcher, and hook bytes are final:
 
@@ -600,7 +629,7 @@ After Tasks 1-5 code, tests, launcher, and hook bytes are final:
 
 Do not reseal around a failing test, do not edit a digest to satisfy only one implementation, and do not touch the threat-model footer yet.
 
-- [ ] **Step 4: Run the focused bootstrap/manifests GREEN.**
+- [x] **Step 4: Run the focused bootstrap/manifests GREEN.**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
@@ -622,7 +651,11 @@ scripts/control-plane doctor
 scripts/control-plane preflight --mode write
 ```
 
-These checks validate the local implementation front. They do not authorize a real task checkpoint, full gate, commit, or remote effect.
+These checks validate the local implementation front. On the expected
+uncommitted candidate, policy-check, registry-check and doctor pass; write
+preflight fails closed only with `E_GIT_DIRTY`. That result is not a runtime or
+seal failure and does not authorize an implicit commit. These checks do not
+authorize a real task checkpoint, full gate, commit, or remote effect.
 
 ## Task 7: Align governing documentation, security, dogfood, and the normalized snapshot
 
@@ -638,7 +671,7 @@ These checks validate the local implementation front. They do not authorize a re
 - Modify: `docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md`
 - Modify: `tests/test_core_documentation.py`
 
-- [ ] **Step 1: Write documentation RED tests before changing governing prose.**
+- [x] **Step 1: Write documentation RED tests before changing governing prose.**
 
 Segment exact governing sections and require:
 
@@ -661,19 +694,19 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
   tests.test_core_documentation.CoreDocumentationTests.test_stable_pause_threats_and_runbook_are_aligned
 ```
 
-- [ ] **Step 2: Promote the approved design only with implementation evidence.**
+- [x] **Step 2: Promote the approved design only with implementation evidence.**
 
 After Tasks 1-6 pass, change the spec and plan from draft/non-governing to the repository's exact implemented-local classification. Add both to the canonical index once, with purposes that distinguish WHAT/WHY from HOW. Do not describe Stable Pause as released, installed, consumer-proven, or remotely integrated.
 
 If implementation diverges from the approved verify-only architecture, stop and request a spec amendment. Do not silently rewrite the spec to fit code.
 
-- [ ] **Step 3: Write the operator and security contract.**
+- [x] **Step 3: Write the operator and security contract.**
 
 The maintenance runbook must give exact safe invocation, status/exit interpretation, native join, continuation capsule, resume recheck, and fail-closed next actions. README and dogfood must describe it as a local Core capability. SECURITY and the threat model must document inputs, trust boundaries, fixed Git execution, descriptor/lock identity, bounded output, privacy exclusions, non-authority of digests, and residuals.
 
 Mark every prior Core byte-bound gate/review/dogfood digest as superseded by the new 26-module runtime. Preserve historical evidence as history; do not overwrite it as if it had covered Stable Pause.
 
-- [ ] **Step 4: Make governing documentation GREEN.**
+- [x] **Step 4: Make governing documentation GREEN.**
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
@@ -682,7 +715,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v \
   tests.test_core_plugin
 ```
 
-- [ ] **Step 5: Reseal the threat-model footer last.**
+- [x] **Step 5: Reseal the threat-model footer last.**
 
 Only after every tracked and governing untracked byte is frozen, compute the canonical value:
 
@@ -693,6 +726,33 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -c \
 
 Use `apply_patch` to change only the final `Version:` line in the threat model, preserve the `Repository:` line, rerun the helper, and require the value to remain identical. Then rerun the exact threat-model footer test. Any later byte change invalidates this step and requires one new final reseal.
 
+## Pre-freeze implementation evidence
+
+This receipt records Tasks 0-7 before the normalized footer is sealed. It is
+descriptive, never transfers authority, and remains `authorizes=false`.
+
+| Task | Intended RED | Current pre-seal evidence |
+|---|---|---|
+| 1-6 | task-specific contract, observer, lifecycle, CLI, skill, and exact-inventory omissions. | Core non-document focus `175/175`; Stable Pause plus repository regression `44/44`; 26 modules; 18,505/21,530 LOC |
+| 7 | governing-document controls and final snapshot footer absent or stale. | documentation `26/27`; the sole expected RED is the normalized `Version:` mismatch closed by the final footer reseal |
+| Task 8 calibration remediation | 26th Core projection record absent and isolated Adoption runtime lock stale. | intended projection RED `1/1`; projection/lock focal `2/2`; full Adoption regression `89/89` |
+
+The implementation owner `TASK-CONTROL-PLANE-STABLE-PAUSE-V1-R1` reached
+`closed`; its generation-1 lease has zero active records and one immutable
+release receipt. Core runtime seal
+`sha256:4289fd2683336dbdf76108c6644c717ec34b9be480dbc72fd28e813ba35d4dc3`
+matches two independent oracles; its lock file SHA-256 is
+`78c06e750b625fc7cbdfb9787feb5351982676e19af1afc4e26409626fc2e21a`.
+The separately domain-bound Adoption runtime is
+`sha256:6f4cd41b869c9a55b900cdb3c3f1e9acf73c2a2210632b48321486d07ee6f2eb`;
+its lock file SHA-256 is
+`6dffb70c452885b9984c3b23a7ace4d81d0a7c9d19b1366ba8f96e58645c80b3`.
+
+Task 8 checkboxes remain intentionally open in the frozen governing subject.
+Its authoritative gate, post-gates, review verdicts and final acceptance belong
+to the native Goal and final handoff; editing this plan afterward would change
+the bytes those results certify.
+
 ## Task 8: Verify frozen bytes, obtain independent reviews, and record local evidence
 
 **Files:**
@@ -700,6 +760,30 @@ Use `apply_patch` to change only the final `Version:` line in the threat model, 
 - Verify: every path in the exact file responsibility map
 - Modify only if a RED or review finding requires a TDD correction: the narrow owning files and their tests
 - Never modify: a consumer repository, remote, canary, release, or real user data
+
+### Task 8 calibration remediation: exact Adoption projection
+
+The prior unchanged-Adoption assumption was falsified by the first aggregate
+calibration: the Core lock correctly declared 26 modules while
+`adoption_enablement/manifest.py` still accepted and projected only 25. The
+suite therefore failed before Adoption behavior with
+`E_ADOPTION_SOURCE_LOCK`, and the isolated Adoption runtime digest was stale.
+
+The repair followed TDD on the local candidate only:
+
+1. `tests/test_adoption_enablement_preview.py` required exactly 26 projected
+   Core modules and one `control_plane/stable_pause.py` record, then failed with
+   the intended source-lock error;
+2. `adoption_enablement/manifest.py` added that single module to its closed
+   projection allowlist;
+3. the focused projection test passed;
+4. two independent Adoption digest implementations agreed on the new isolated
+   runtime value before `.codex/adoption-enablement.lock` was resealed; and
+5. the projection and lock focal tests passed `2/2`.
+
+This is a descriptive local remediation, remains `authorizes=false`, and does
+not alter Adoption transactions, install in a consumer, run a canary, or grant
+any Git or remote transition.
 
 - [ ] **Step 1: Freeze the candidate and prove no operation is active.**
 
@@ -815,7 +899,10 @@ Use `apply_patch` for rollback edits. Do not use `git reset --hard`, `git checko
 
 ## Implementation authority gate
 
-Approval of this plan authorizes no implementation. A future implementation request must name this exact plan and authorize the bounded local source/test/documentation writes for Tasks 1-7. If no valid pre-existing Control Plane task owns the work, task/lease provisioning requires a separate exact local authorization; neither this plan nor Stable Pause may create that authority. Task 8's `bash tests/run.sh` requires its own fresh one-shot authorization after bytes are frozen.
+Approval of this plan authorized no implementation. The later native grants for
+Tasks 0-7 and exact task/lease provisioning were separately observed and are
+not replayable authority. Task 8's `bash tests/run.sh` still requires its own
+fresh one-shot authorization after bytes are frozen.
 
 Dependencies, secrets, CI/CD, consumer repositories, canaries, and remote systems are outside the implementation scope. Any later need to touch one of them stops execution for a scope amendment.
 
@@ -823,7 +910,13 @@ Dependencies, secrets, CI/CD, consumer repositories, canaries, and remote system
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora.
-- **Para continuar:** revisar este plan y, solo después de cerrar y resealar AE-09, emitir una autorización local nueva y exacta si se desea iniciar Task 0.
-- **Mensaje exacto:** `Apruebo el plan Stable Pause v1 y autorizo únicamente su implementación local TDD conforme a Tasks 0-7, sin full gate, task/lease mutation, commit, remoto, consumidor ni canary.`
-- **Estado de partida:** worktree `control-plane-adoption-enablement-design`, rama `codex/control-plane-adoption-enablement-design`, HEAD `b07418364409f76c900f0595a76c9e3e388ac433`; spec aprobada; plan no ejecutado; AE-09 todavía sin sellar; `route` y `preflight --mode write` fallan con `E_RUNTIME_BOOTSTRAP: launcher does not match lock`; sin commit ni efecto remoto; `authorizes=false`.
-- **No hacer todavía:** implementar, reparar o resealar AE-09 bajo esta aprobación, ejecutar tests o gates, administrar tareas/leases, limpiar residuos, commit, push, PR, merge, deploy, instalar, usar consumidor o canary.
+- **Para continuar:** ejecutar Task 8 solo sobre los bytes congelados y registrar
+  sus resultados en el Goal/handoff nativo sin reescribir el sujeto certificado.
+- **Mensaje exacto:** `Autoriza una sola ejecución local de bash tests/run.sh sobre los bytes finales de Stable Pause v1; si pasa, continúa con post-gates y cierre local, sin consumidor, canary, commit ni remoto.`
+- **Estado de partida:** worktree `control-plane-adoption-enablement-design`, rama
+  `codex/control-plane-adoption-enablement-design`, HEAD
+  `4d5c0e5bfde35978b872f9e6b2eae5a52a759c95`; runtime Core de 26 módulos;
+  implementación task `closed`, cero lease activa; sin consumidor, canary ni
+  efecto remoto; `authorizes=false`.
+- **No hacer todavía:** repetir un full gate sin grant fresco, limpiar evidencia,
+  commit, push, PR, merge, deploy, instalar, usar consumidor o canary.

@@ -35,6 +35,7 @@ ACTIVE_RUNTIME_MODULES = (
     "risk_sentinel.py",
     "routing.py",
     "scopes.py",
+    "stable_pause.py",
     "task_state.py",
     "toolchain.py",
     "verification.py",

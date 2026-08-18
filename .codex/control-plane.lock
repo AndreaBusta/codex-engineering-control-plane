@@ -34,6 +34,7 @@ runtime_modules = [
   "risk_sentinel.py",
   "routing.py",
   "scopes.py",
+  "stable_pause.py",
   "task_state.py",
   "toolchain.py",
   "verification.py",
@@ -43,8 +44,8 @@ runtime_modules = [
 project_policy = "sha256:84ac53ebd751c92be82c8d7ebafa7af15d22ca0ed19f773b27ef0f8496a0f4c3"
 resource_registry = "sha256:9ed8a8b77b2c376b4235446a41ddddfdc089c8393d5ab702c50a6ffa8dabf16f"
 hooks = "sha256:ffa4e6c3a17ab3d6e3ef6d88d1b4e9e42433d3da478bc6a25a744a25e7990faf"
-hook_entrypoint = "sha256:b205e7cf5fe07cdd0f3737c5ed66e162f18a638deba679b3c10ab3597bbadb28"
+hook_entrypoint = "sha256:02756af360d9a59b547d93dbddbfbebe6d1ca57c5a6b5912ec713a7820aa9f38"
 git_pre_commit = "sha256:81defff214f3cf23eb70f2c24ab5130defb2c423992f6d314d18a01fb3a318b9"
 git_pre_push = "sha256:a68952c97fc7148ce1952c10799cd0f3ee1761e7d28455aeb193b8699a42e7bd"
-entrypoint = "sha256:4a87c3ff30a89cc4815def2008c7ed80d5b667d28eb26cb0b1c7cb7abc486a9f"
-runtime = "sha256:8364b6bd7ac6e93dc7896a42c3ee5cbd8a973d3c8a3481f844ece8f29a1fe41a"
+entrypoint = "sha256:7dc54bea42218c16d2c5bcfa889fa009c6153d30b45406946406be8ebca34a75"
+runtime = "sha256:4289fd2683336dbdf76108c6644c717ec34b9be480dbc72fd28e813ba35d4dc3"

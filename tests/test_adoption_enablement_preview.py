@@ -44,7 +44,9 @@ class AdoptionPreviewTests(unittest.TestCase):
                 tuple(record["path"] for record in manifest["records"]),
                 tuple(sorted(MANAGED_SOURCE_PATHS)),
             )
-            self.assertEqual(len(CORE_RUNTIME_MODULES), 25)
+            self.assertEqual(len(CORE_RUNTIME_MODULES), 26)
+            self.assertEqual(CORE_RUNTIME_MODULES.count("stable_pause.py"), 1)
+            self.assertIn("control_plane/stable_pause.py", MANAGED_SOURCE_PATHS)
             self.assertNotIn(".codex/control-plane.lock", MANAGED_SOURCE_PATHS)
             self.assertIs(manifest["authorizes"], False)
 

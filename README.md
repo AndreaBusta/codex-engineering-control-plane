@@ -30,7 +30,8 @@ leases generacionales, verificación proporcional, recuperación exacta de
 instalaciones existentes y checkpoints no autorizantes. Acepta solo `answer` y
 `local_change`. Su máximo estado actual es
 `GREEN_LOCAL / PENDING_STABLE_ADOPTION`, con `self_certified=false` y
-`authorizes=false`.
+`authorizes=false`. Stable Pause v1 está `IMPLEMENTED_LOCAL` dentro del runtime
+de 26 módulos; cada cierre exige evidencia final sobre bytes congelados.
 
 La superficie Advanced está en cuarentena estructural. Los documentos v2.3/v2.4
 se conservan como historia y no gobiernan el runtime actual. Consulta el
@@ -61,7 +62,7 @@ autorización nativa separada.
 
 Los parsers Core `adopt plan`, `adopt apply`, `upgrade plan` y `upgrade apply`
 siguen en cuarentena y responden `E_CAPABILITY_QUARANTINED` sin mutación. El
-tool local no reactiva esa superficie ni entra en la allowlist de 25 módulos
+tool local no reactiva esa superficie ni entra en la allowlist de 26 módulos
 Core. Consulta la
 [especificación](docs/superpowers/specs/2026-08-13-control-plane-core-adoption-enablement-design.md)
 y el [plan de implementación](docs/superpowers/plans/2026-08-13-control-plane-core-adoption-enablement.md)
@@ -157,6 +158,30 @@ responden `E_CAPABILITY_QUARANTINED` sin mutación.
 El contrato completo está en
 [mantenimiento Core](docs/engineering/19-control-plane-core-maintenance.md).
 
+### Stable Pause verify-only
+
+```bash
+scripts/control-plane task checkpoint \
+  --mode stable-pause \
+  --task-id EXACT-TASK-ID \
+  --json
+```
+
+La task exacta es obligatoria. El comando observa dos snapshots locales bajo
+mutexes preexistentes con `create=false`, no crea estado `paused`, no limpia y
+no muta task, lease, Git ni repositorio. Devuelve una única observación cerrada
+de hasta 4096 bytes con `SAFE_PAUSE_ACTIVE`, `SAFE_PAUSE_TERMINAL`,
+`UNSAFE_PAUSE` o `UNKNOWN`, `checkpoint_digest` determinista y
+`authorizes=false`. Un dirty worktree o un RED preservado permanecen visibles;
+no son automáticamente inseguros si el snapshot y el lifecycle son coherentes.
+
+El procedimiento progresivo en `skills/control-plane-run/SKILL.md` carga
+`skills/control-plane-run/references/stable-pause-v1.md` solo para una petición
+de parada/checkpoint. Une la observación con visibilidad del host nativo antes y
+después; nunca mejora un `UNSAFE_PAUSE` o `UNKNOWN`. Al resume, repite la
+observación para la misma task y worktree, compara `checkpoint_digest`, explica
+la deriva y vuelve a los gates ordinarios antes de escribir.
+
 ### Diagnosticar riesgo local
 
 ```bash
@@ -194,6 +219,8 @@ scripts/control-plane git-guard pre-push
 - [Mantenimiento, compatibilidad y rollback Core](docs/engineering/19-control-plane-core-maintenance.md)
 - [Dogfood manual de 10 tareas](docs/engineering/20-control-plane-core-dogfood.md)
 - [Threat model Core](docs/security/2026-08-12-control-plane-core-threat-model.md)
+- [Stable Pause v1: WHAT/WHY](docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md)
+- [Stable Pause v1: HOW y rollback](docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md)
 - [Razonamiento, contexto y agentes](docs/engineering/03-reasoning-context-agents.md)
 - [Política documental](docs/engineering/04-documentation-policy.md)
 - [Configuración global de Codex](docs/engineering/08-global-codex-configuration.md)

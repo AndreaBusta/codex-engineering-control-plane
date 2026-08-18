@@ -16,6 +16,7 @@ import tomllib
 from typing import Any, Iterator, Mapping
 
 from control_plane.contracts import (
+    CORE_STATES,
     SHA256_DIGEST,
     TASK_OUTCOMES,
     contract_digest,
@@ -31,16 +32,6 @@ from control_plane.repository import (
 from control_plane.scopes import normalize_scope
 
 
-CORE_STATES = (
-    "framed",
-    "planned",
-    "ready",
-    "implementing",
-    "verifying",
-    "review_ready",
-    "blocked",
-    "closed",
-)
 _TRANSITIONS = {
     "framed": {"planned", "blocked"},
     "planned": {"ready", "blocked"},

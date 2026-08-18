@@ -9,6 +9,13 @@ reference a canonical, non-authorizing evidence payload below. Every row is
 bound to `3.1.0-core.1` and remains historical; none certifies the current
 `3.1.0-core.2` candidate. Fresh ten-task dogfood is required for core.2.
 
+Stable Pause v1 is `IMPLEMENTED_LOCAL` in the current 26-module Core candidate.
+It is a verify-only local capability, not a dogfood PASS: the command emits
+`SAFE_PAUSE_ACTIVE`, `SAFE_PAUSE_TERMINAL`, `UNSAFE_PAUSE`, or `UNKNOWN` with
+`authorizes=false`, and closure requires final frozen-byte evidence. Adding the
+module invalidates every earlier byte-bound Core gate, review, and local
+observation, including evidence collected before the 26-module runtime seal.
+
 ## Entry gate
 
 - Use the exact `3.1.0-core.2` source candidate and record its runtime digest.
@@ -62,6 +69,8 @@ new `3.1.0-core.2` candidate. A fresh ten-task scorecard and a separate full
 gate are required before core.2 may satisfy the dogfood gate; success would
 still not enable Autopilot or stable adoption.
 Every evidence reference excludes prompts, transcripts, secrets, and authority.
+Stable Pause evidence, when completed, still cannot substitute for the fresh
+ten-task scorecard, consumer proof, canary, installation, or adoption authority.
 
 ## Evidence registry
 
