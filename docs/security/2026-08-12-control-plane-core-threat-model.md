@@ -135,4 +135,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:2ae0c88fe23fc63c8b9cfb824a53718deb9878588cca3a5b5992c18c5d01402d
+Version: codex-security-snapshot/v1:sha256:fec8dfeb5c8efb239a923680aeab08d03a724a69e5c60c34480160388dabde98
