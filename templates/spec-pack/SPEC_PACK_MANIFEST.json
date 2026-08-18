@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "kind": "SpecPackManifestV1",
+  "pack_id": "SPEC-EXAMPLE-001",
+  "title": "Nombre corto y verificable del producto o cambio",
+  "target_repository": "/ruta/absoluta/al/repositorio/destino",
+  "profiles": ["generic"],
+  "tier": "T2",
+  "envelope": "docs/spec-packs/SPEC-EXAMPLE-001/envelope.json",
+  "artifacts": {
+    "prd": "docs/spec-packs/SPEC-EXAMPLE-001/PRD.md",
+    "trd": "docs/spec-packs/SPEC-EXAMPLE-001/TRD.md",
+    "ux": "docs/spec-packs/SPEC-EXAMPLE-001/UX_UI.md",
+    "flow": "docs/spec-packs/SPEC-EXAMPLE-001/APP_FLOW.md",
+    "backend": "docs/spec-packs/SPEC-EXAMPLE-001/BACKEND.md",
+    "plan": "docs/spec-packs/SPEC-EXAMPLE-001/IMPLEMENTATION_PLAN.md"
+  },
+  "status": "draft",
+  "authorizes": false
+}

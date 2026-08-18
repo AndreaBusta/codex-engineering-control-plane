@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "task_id": "SPEC-EXAMPLE-001",
+  "objective": "Redactar un SpecPack completo y trazable para el cambio descrito.",
+  "intent": "plan",
+  "phase": "frame",
+  "requested_outcome": "local_change",
+  "goals": [
+    {
+      "id": "goal-specpack",
+      "summary": "Producir seis artefactos con trazabilidad cerrada.",
+      "domains": ["product", "project"],
+      "depends_on": []
+    }
+  ],
+  "domains": ["product", "project"],
+  "signals": ["multi_file", "cross_system"],
+  "scope_paths": ["docs/spec-packs/"],
+  "risk": {
+    "uncertainty": 3,
+    "blast_radius": 1,
+    "irreversibility": 1,
+    "verification_complexity": 2
+  },
+  "effects": [
+    {"name": "local_read", "source": "model_inference"},
+    {"name": "local_write", "source": "user_explicit"}
+  ],
+  "explicit_resources": [],
+  "excluded_resources": []
+}
