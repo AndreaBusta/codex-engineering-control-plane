@@ -7,6 +7,12 @@ la decisión para cada rama viva. No autoriza ninguna transición. Borrar una
 rama, empujar una etiqueta o cambiar la protección de `main` son efectos
 externos que requieren autorización explícita e independiente.
 
+> **Corrección del 2026-08-18.** La primera versión de este documento concluyó
+> que no existía trabajo pendiente de integrar. Esa conclusión era válida dentro
+> de un único clon y **falsa a nivel de proyecto**: el repositorio está clonado
+> dos veces y la línea más avanzada vivía fuera de la vista del inventario. Ver
+> «Segundo clon» y «Veredicto sobre rebase y merge», ya rectificados.
+
 ## Estado observado
 
 Todos los hechos siguientes proceden de lectura local de Git y de la API de
@@ -45,6 +51,26 @@ Lo observado es Git, GitHub y el sistema de archivos local. Queda fuera:
 
 La inactividad de archivos entre el 2026-08-08 y el 2026-08-11 es evidencia de
 abandono probable, no demostración de que nadie los use.
+
+## Segundo clon
+
+`git worktree list` no muestra los worktrees de otro clon, y las ramas locales
+de ese clon tampoco aparecen. Un inventario hecho desde un solo checkout puede
+ser exhaustivo dentro de su alcance y ciego fuera de él.
+
+| Clon | Ruta | Estado |
+|---|---|---|
+| Canónico | `~/Developer/codex-engineering-control-plane` | Sincronizado con `origin`; cero archivos `dataless` |
+| Secundario | `~/Documents/Develope-IOS` | `main` atrasado en `934a42c`; **715 archivos `dataless`** |
+
+Del clon secundario cuelga
+`~/.config/superpowers/worktrees/Develope-IOS/control-plane-adoption-enablement-design`,
+con la rama `codex/control-plane-adoption-enablement-design`: la línea Adoption
+Enablement y Stable Pause v1, que llegó a acumular cuatro commits y 5 049
+líneas sin comprometer antes de publicarse.
+
+Antes de afirmar nada global sobre el estado del repositorio, comprobar los dos
+clones.
 
 ## Prueba aplicada a cada rama
 
@@ -104,20 +130,48 @@ etiquetada y se retira de la lista de ramas activas.
 
 ## Veredicto sobre rebase y merge
 
-**No hay ningún rebase que hacer y ningún merge que hacer.** No existe trabajo
-pendiente de integrar en este repositorio.
+**Rectificado.** Dentro del clon canónico no hay ningún rebase ni merge que
+hacer: la tabla anterior lo demuestra rama por rama. Pero sí existe trabajo
+pendiente de integrar en el proyecto, y vive en el segundo clon:
+`codex/control-plane-adoption-enablement-design` adelanta a `main` en cuatro
+commits con el paquete `adoption_enablement/`, el CLI
+`scripts/control-plane-adoption` y `control_plane/stable_pause.py`.
 
 | Pregunta | Respuesta observada |
 |---|---|
-| ¿Alguna rama contiene trabajo aprobado sin integrar? | No |
+| ¿Alguna rama **de este clon** contiene trabajo sin integrar? | No |
 | ¿Hay conflicto pendiente de resolver? | No |
 | ¿Hay PR abierto esperando revisión? | No |
-| ¿`main` está por detrás de alguna rama en contenido gobernante? | No |
+| ¿`main` está por detrás de alguna rama de este clon? | No |
+| ¿`main` está por detrás de una rama de otro clon? | **Sí**: Adoption Enablement |
 | ¿La divergencia observada es real? | No: es un artefacto de `squash` |
 
-El trabajo real pendiente no es de integración sino de **higiene y de cierre de
-gates**: retirar ramas muertas, alinear la protección de `main` con la policy
-declarada y cerrar el gate integral del candidato `3.1.0-core.1`.
+El trabajo pendiente es por tanto de tres clases distintas, y conviene no
+mezclarlas: **integrar** la línea Adoption Enablement, **higiene** de ramas
+muertas y worktrees, y **cierre de gates** —protección de `main` y las
+rerevisiones que aún exige `AE-09` sobre el candidato `3.1.0-core.2`.
+
+## Almacenamiento: iCloud rompe el runtime sin ser un defecto
+
+El clon secundario está bajo la sincronización de Escritorio y Documentos de
+iCloud. macOS deja archivos como marcadores `dataless` —flag APFS
+`UF_DATALESS`— y los materializa en la primera lectura. Eso rompe Core por dos
+vías, y ninguna es un fallo del código:
+
+| Síntoma observado | Causa real |
+|---|---|
+| `E_CORE_LEASE_PATH: adoption mutex identity changed` | Materializar cambia el inodo; la guarda TOCTOU compara antes y después y falla cerrada, **correctamente** |
+| `E_SNAPSHOT_GIT_TIMEOUT` | Con 468 de 1 148 objetos Git `dataless`, leer el árbol ancla tardó `139 s` frente a un presupuesto de `5 s` |
+| `E_LEGACY_STATE_UNKNOWN` | Lo mismo, sobre hojas de estado legacy |
+
+Medición del 2026-08-18 sobre el mismo comando y los mismos bytes: `139 s` en
+frío, `0,027 s` una vez materializado. Materializar los archivos hizo pasar el
+gate integral de `395` pruebas con dos errores a `395 OK`.
+
+La lección operativa es que un fallo de almacenamiento puede imitar durante
+días un defecto de producto. Ante cualquiera de esos tres códigos, comprobar
+`st_flags` antes de tocar código. La solución de fondo es mantener los
+repositorios fuera de carpetas sincronizadas.
 
 ## Runbook de limpieza
 
