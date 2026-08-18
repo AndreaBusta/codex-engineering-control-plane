@@ -30,10 +30,13 @@ a quarantined capability or grant authority.
 | `docs/engineering/19-control-plane-core-maintenance.md` | `GOVERNING_CORE` | Core operation, compatibility, recovery, and rollback. |
 | `docs/engineering/20-control-plane-core-dogfood.md` | `GOVERNING_CORE` | Manual adoption gate; currently pending. |
 | `docs/engineering/21-repository-alignment-and-branch-decisions.md` | `GOVERNING_CORE` | Observed repository state, per-branch decisions, and cleanup runbook. |
+| `docs/engineering/22-orientation-and-known-traps.md` | `GOVERNING_CORE` | Cold-start entry point: where to work, what is true now, and environment faults that imitate defects. |
 | `docs/security/2026-08-12-control-plane-core-threat-model.md` | `GOVERNING_CORE` | Repository-scoped threat model. |
 | `docs/superpowers/plans/2026-08-12-control-plane-core-3-1.md` | `GOVERNING_CORE` | Current local implementation plan and checkpoint. |
 | `docs/superpowers/plans/2026-08-18-control-plane-3-2-specpack.md` | `GOVERNING_CORE` | Current phased plan for the SpecPack contract and its gate. |
+| `docs/superpowers/plans/2026-08-18-control-plane-3-3-operator-orientation.md` | `GOVERNING_CORE` | Current plan for operator orientation. |
 | `docs/superpowers/specs/2026-08-18-control-plane-3-2-specpack-design.md` | `GOVERNING_CORE` | Current SpecPack design: PRD, TRD, UX/UI, flow, and backend contracts. |
+| `docs/superpowers/specs/2026-08-18-control-plane-3-3-operator-orientation-design.md` | `GOVERNING_CORE` | Operator orientation design and blind-spot evidence. |
 
 ## Historical non-governing documents
 
