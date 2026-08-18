@@ -57,6 +57,7 @@ tests.test_core_cli
 tests.test_core_contract
 tests.test_core_documentation
 tests.test_core_git_guards
+tests.test_core_git_skill
 tests.test_core_git_state
 tests.test_core_governing_manifest
 tests.test_core_hooks
@@ -115,6 +116,7 @@ tests/test_core_cli.py
 tests/test_core_contract.py
 tests/test_core_documentation.py
 tests/test_core_git_guards.py
+tests/test_core_git_skill.py
 tests/test_core_git_state.py
 tests/test_core_governing_manifest.py
 tests/test_core_hooks.py

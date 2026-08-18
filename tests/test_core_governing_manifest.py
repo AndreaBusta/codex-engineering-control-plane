@@ -88,6 +88,7 @@ GOVERNING_TESTS = frozenset(
         "tests.test_core_contract",
         "tests.test_core_documentation",
         "tests.test_core_git_guards",
+        "tests.test_core_git_skill",
         "tests.test_core_git_state",
         "tests.test_core_governing_manifest",
         "tests.test_core_hooks",

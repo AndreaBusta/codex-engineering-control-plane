@@ -42,7 +42,7 @@ runtime_modules = [
 
 [digests]
 project_policy = "sha256:84ac53ebd751c92be82c8d7ebafa7af15d22ca0ed19f773b27ef0f8496a0f4c3"
-resource_registry = "sha256:9ed8a8b77b2c376b4235446a41ddddfdc089c8393d5ab702c50a6ffa8dabf16f"
+resource_registry = "sha256:5b738e4a21fcd8c70787416fabf37e058f1225f58699b1dedfae23e117bcf1b6"
 hooks = "sha256:ffa4e6c3a17ab3d6e3ef6d88d1b4e9e42433d3da478bc6a25a744a25e7990faf"
 hook_entrypoint = "sha256:f0ea3e4aabfee3b28519038e91d45a5de0df210b55bc7298cc50dd6435f8bacc"
 git_pre_commit = "sha256:81defff214f3cf23eb70f2c24ab5130defb2c423992f6d314d18a01fb3a318b9"
