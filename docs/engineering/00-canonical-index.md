@@ -29,8 +29,11 @@ a quarantined capability or grant authority.
 | `docs/engineering/12-multidominio-y-modos.md` | `GOVERNING_CORE` | Current multidomain and interaction guidance. |
 | `docs/engineering/19-control-plane-core-maintenance.md` | `GOVERNING_CORE` | Core operation, compatibility, recovery, and rollback. |
 | `docs/engineering/20-control-plane-core-dogfood.md` | `GOVERNING_CORE` | Manual adoption gate; currently pending. |
+| `docs/engineering/21-repository-alignment-and-branch-decisions.md` | `GOVERNING_CORE` | Observed repository state, per-branch decisions, and cleanup runbook. |
 | `docs/security/2026-08-12-control-plane-core-threat-model.md` | `GOVERNING_CORE` | Repository-scoped threat model. |
 | `docs/superpowers/plans/2026-08-12-control-plane-core-3-1.md` | `GOVERNING_CORE` | Current local implementation plan and checkpoint. |
+| `docs/superpowers/plans/2026-08-18-control-plane-3-2-specpack.md` | `GOVERNING_CORE` | Current phased plan for the SpecPack contract and its gate. |
+| `docs/superpowers/specs/2026-08-18-control-plane-3-2-specpack-design.md` | `GOVERNING_CORE` | Current SpecPack design: PRD, TRD, UX/UI, flow, and backend contracts. |
 
 ## Historical non-governing documents
 
@@ -80,3 +83,12 @@ authority models do not govern Core.
 
 Release records remain canonical evidence of their own published versions. The
 special status makes explicit that they are not instructions for Core.
+
+## Proposed decisions
+
+A proposed decision records an intent under review. It does not govern Core, does
+not enable a capability, and does not grant authority until it is accepted.
+
+| Path | Status | Purpose |
+|---|---|---|
+| `docs/adr/0007-governed-product-spec-pack.md` | `PROPOSED_NON_GOVERNING` | SpecPack contract and its phased gate; awaiting acceptance. |
