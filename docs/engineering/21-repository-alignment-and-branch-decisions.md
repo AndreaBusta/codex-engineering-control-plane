@@ -31,6 +31,21 @@ La estrategia de integración declarada en `.codex/project-policy.toml` es
 sus commits originales nunca entraron, entró un commit aplastado equivalente.
 El número de commits no es evidencia de trabajo pendiente.
 
+## Límites de esta observación
+
+Lo observado es Git, GitHub y el sistema de archivos local. Queda fuera:
+
+- **Tareas del host.** Este documento no prueba qué tareas Codex existen, cuáles
+  están activas ni si alguna tiene asignado uno de los worktrees listados.
+  `AGENTS.md` fija que esa lectura solo es válida por la vía nativa del host; sin
+  ella el estado es `UNKNOWN`, no «ninguna». Antes de retirar un worktree conviene
+  confirmar por separado que ninguna tarea viva depende de él.
+- **Intención.** Que un artefacto esté superado por contenido no prueba que su
+  autor lo diera por cerrado.
+
+La inactividad de archivos entre el 2026-08-08 y el 2026-08-11 es evidencia de
+abandono probable, no demostración de que nadie los use.
+
 ## Prueba aplicada a cada rama
 
 Comparar commits induce a error bajo `squash`. La prueba usada aquí es de
@@ -127,9 +142,41 @@ git push origin archive/cross-thread-audit-lookup-v1 archive/control-plane-v2-4 
 Con la etiqueta empujada, el borrado de rama deja de ser una pérdida: cualquier
 commit sigue siendo alcanzable por nombre.
 
-### 2. Retirar worktrees inactivos
+### 2. Rescatar trabajo huérfano
+
+Comparar ramas no basta. Dos artefactos viven fuera de todo commit y se
+perderían en una limpieza ingenua. Ambos cuelgan de `codex/control-plane-v2-3`.
+
+| Artefacto | Contenido | Relación con `main` |
+|---|---|---|
+| `stash@{0}` `codex-m0-v2.3-docs-before-runtime` | Dos documentos, 793 líneas | Presentes en `main` como versiones posteriores; el stash conserva borradores anteriores con 315 y 181 líneas de diferencia |
+| `docs/superpowers/plans/2026-08-10-control-plane-taskplaybook-v0.md` sin rastrear en el worktree v2-3 | Plan de 527 líneas | No existe en ningún commit. `main` contiene otro plan distinto para el mismo trabajo, con 581 líneas de diferencia |
+
+Ninguno es trabajo en vuelo: son borradores de planificación de trabajo ya
+entregado en PR #19 y PR #20. Pero el plan sin rastrear no existe en ninguna
+otra parte, y `git worktree remove` fallará por su causa.
+
+```bash
+# Inspeccionar antes de decidir
+git stash show -p stash@{0}
+cat /Users/bustaseo/.config/superpowers/worktrees/codex-engineering-control-plane/control-plane-v2-3/docs/superpowers/plans/2026-08-10-control-plane-taskplaybook-v0.md
+```
+
+Decidir explícitamente entre conservar el plan como historia —moviéndolo al
+repositorio principal o comprometiéndolo en una rama de archivo— o descartarlo
+por superado. El stash sobrevive al borrado de rama porque vive en el Git
+common dir, pero es frágil: si se conserva, conviene materializarlo.
+
+**Nunca usar `--force` para saltarse esta comprobación.** Que Git se niegue a
+retirar un worktree es la señal de que hay bytes que no existen en ningún otro
+sitio.
+
+### 3. Retirar worktrees inactivos
 
 Cuatro worktrees quedaron anclados a ramas muertas y bloquean su borrado.
+Última actividad observada entre el 2026-08-08 y el 2026-08-11, sin procesos
+abiertos sobre ellos. Ausencia de actividad local no prueba por sí sola que
+ninguna tarea del host los tenga asignados; esa comprobación es independiente.
 
 ```bash
 git worktree remove /Users/bustaseo/.config/superpowers/worktrees/codex-engineering-control-plane/control-plane-v2-3
@@ -142,7 +189,7 @@ git worktree prune
 Un worktree con cambios sin comprometer falla de forma segura. Revisar el
 árbol antes de forzar; no usar limpieza destructiva.
 
-### 3. Borrar ramas locales
+### 4. Borrar ramas locales
 
 ```bash
 git branch -D codex/control-plane-v2-3 codex/control-plane-v2-4 codex/control-plane-v3 codex/taskplaybook-v0-impl
@@ -151,7 +198,7 @@ git branch -D codex/control-plane-v2-3 codex/control-plane-v2-4 codex/control-pl
 Se usa `-D` y no `-d` porque `squash` impide que Git reconozca la fusión.
 La equivalencia de contenido ya quedó probada arriba, no la asume Git.
 
-### 4. Borrar ramas remotas
+### 5. Borrar ramas remotas
 
 ```bash
 git push origin --delete codex/control-plane-v2-4
@@ -159,13 +206,15 @@ git push origin --delete codex/taskplaybook-v0-impl
 git push origin --delete codex/cross-thread-audit-lookup-v1
 ```
 
-### 5. Estado esperado al cerrar
+### 6. Estado esperado al cerrar
 
 ```text
-ramas locales   = main + rama de trabajo activa
-ramas remotas   = origin/main
-worktrees       = repositorio principal + worktree activo
-etiquetas       = v2.1.0, v2.1.1, archive/*
+ramas locales    = main + rama de trabajo activa
+ramas remotas    = origin/main
+worktrees        = repositorio principal + worktree activo
+etiquetas        = v2.1.0, v2.1.1, archive/*
+stash            = vacío o materializado de forma explícita
+trabajo huérfano = cero archivos sin rastrear fuera de un commit
 ```
 
 ## Brecha entre policy y plataforma
