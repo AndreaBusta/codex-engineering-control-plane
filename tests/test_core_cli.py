@@ -574,6 +574,33 @@ class CoreCliTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     self.assertEqual(completed.stdout.strip(), "E_JSON_INPUT")
 
+    def test_survey_command_exit_codes_and_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            return_code, payload = run_cli_in_process(
+                "survey", "--repo", str(repo), "--base", "HEAD", "--json"
+            )
+            self.assertEqual(return_code, 0)
+            self.assertEqual(payload["kind"], "RepositorySurveyV1")
+            self.assertEqual(payload["other_clones"], "UNKNOWN")
+            self.assertIs(payload["authorizes"], False)
+            self.assertTrue(payload["clone"]["branch"])
+            self.assertEqual(len(payload["clone"]["head"]), 40)
+
+            (repo / "orphan.md").write_text("only here\n", encoding="utf-8")
+            return_code, payload = run_cli_in_process(
+                "survey", "--repo", str(repo), "--base", "HEAD", "--json"
+            )
+            self.assertEqual(return_code, 1)
+            self.assertEqual(payload["orphan_work"]["untracked_total"], 1)
+
+            return_code, payload = run_cli_in_process(
+                "survey", "--repo", str(repo), "--base", "nope", "--json"
+            )
+            self.assertEqual(return_code, 2)
+            self.assertEqual(payload["error_code"], "E_SURVEY_BASE_UNKNOWN")
+            self.assertIs(payload["authorizes"], False)
+
     def test_doctor_reports_git_state_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = make_repo(Path(directory) / "repo")
