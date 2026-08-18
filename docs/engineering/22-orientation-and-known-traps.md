@@ -51,7 +51,7 @@ los dos clones.
 | Autopilot | `OFF` |
 | Outcomes permitidos por Core | `answer` y `local_change`, nada más |
 | Superficie Advanced | en cuarentena estructural por ADR 0006 |
-| Protección de rama en `main` | **ausente**, pese a que la policy declara `require_pull_request = true` |
+| Protección de rama en `main` | activa: PR obligatorio, check `core-verify`, rama al día, sin force push ni borrado, historia lineal |
 
 ### Líneas de trabajo publicadas
 
@@ -104,8 +104,10 @@ git diff --diff-filter=A --name-only origin/main..<rama>
 
 ### 3.3 Las ramas `codex/*` de la línea v2.3–v3 no se fusionan
 
-Solo aportan los módulos que ADR 0006 puso en cuarentena. Fusionarlas
-revertiría la decisión vigente. Detalle rama por rama en
+Solo aportaban los módulos que ADR 0006 puso en cuarentena. Se retiraron el
+2026-08-18 y siguen alcanzables como etiquetas `archive/*`; si alguien las
+recupera, la regla se mantiene: fusionarlas revertiría la decisión vigente.
+Detalle rama por rama en
 [decisiones de rama](21-repository-alignment-and-branch-decisions.md).
 
 ### 3.4 El threat model se rompe con cualquier cambio de contenido

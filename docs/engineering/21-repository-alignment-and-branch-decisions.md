@@ -30,7 +30,7 @@ GitHub el 2026-08-18.
 | Releases publicadas | `v2.1.0`, `v2.1.1` |
 | Workflow CI | `.github/workflows/control-plane.yml`, job `core-verify` |
 | Suite local sobre `main` | `234` tests, `OK`, `52 s` |
-| Protección de rama en `main` | **ausente** (`HTTP 404 Branch not protected`) |
+| Protección de rama en `main` | **ausente al observar; cerrada el mismo día** (ver «Brecha entre policy y plataforma») |
 
 La estrategia de integración declarada en `.codex/project-policy.toml` es
 `squash`. Por eso toda rama fusionada aparece "adelantada" respecto a `main`:
@@ -175,9 +175,23 @@ repositorios fuera de carpetas sincronizadas.
 
 ## Runbook de limpieza
 
-Estas transiciones son externas y destructivas. No se ejecutan sin
-autorización explícita para cada una. El orden importa: primero se preserva,
-después se borra.
+**Ejecutado el 2026-08-18.** Se conserva porque describe el orden correcto y
+porque el mismo procedimiento sirve para la próxima limpieza. Estas transiciones
+son externas y destructivas: no se ejecutan sin autorización explícita para cada
+una. El orden importa: primero se preserva, después se borra.
+
+Resultado, verificado por `survey`: `PASS`, cero stashes, cero archivos sin
+rastrear, cero worktrees sucios. Ramas remotas reducidas a `main` más las dos
+líneas activas. Todo lo retirado sigue alcanzable por etiqueta:
+
+| Etiqueta | Contenido preservado |
+|---|---|
+| `archive/control-plane-v2-3` | Incluye el plan de 527 líneas que no existía en ningún commit |
+| `archive/control-plane-v2-4` | Rama fusionada por PR #20 |
+| `archive/control-plane-v3` | Ancestro de la línea v2.4 |
+| `archive/taskplaybook-v0-impl` | Rama fusionada por PR #19 |
+| `archive/cross-thread-audit-lookup-v1` | El módulo de 347 líneas de PR #8, cerrado sin fusionar |
+| `archive/stash-codex-m0-v2-3` | El stash `codex-m0-v2.3-docs-before-runtime` |
 
 ### 1. Preservar antes de borrar
 
@@ -295,8 +309,21 @@ gates— y por eso mismo hay que cerrarla. Configuración mínima propuesta para
 - prohibir push directo y force push;
 - permitir únicamente fusión `squash`.
 
-Mientras la protección no exista, ninguna afirmación de este repositorio debe
-presentar el gate de Pull Request como impuesto por la plataforma.
+### Cerrada el 2026-08-18
+
+La protección ya está configurada y la brecha no existe:
+
+| Regla | Estado |
+|---|---|
+| Pull Request obligatorio | activo, con `0` aprobaciones requeridas |
+| Check obligatorio | `core-verify` |
+| Rama al día con la base | exigido |
+| Force push | prohibido |
+| Borrado de rama | prohibido |
+| Historia lineal | exigida |
+
+A partir de aquí, el gate de Pull Request **sí** está impuesto por la
+plataforma, no solo declarado en la policy.
 
 ## Gate integral del candidato
 
