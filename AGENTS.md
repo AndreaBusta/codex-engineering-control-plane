@@ -9,6 +9,9 @@ La prosa no sustituye a los gates, GitHub, CI ni al proveedor de release.
 
 ## Antes de editar
 
+0. Si llegas sin historia, lee primero
+   [orientación y trampas conocidas](docs/engineering/22-orientation-and-known-traps.md):
+   dónde trabajar, qué es verdad hoy y qué fallos del entorno imitan defectos.
 1. Identifica cwd, raíz Git, worktree, rama, HEAD y estado.
 2. Lee `.codex/project-policy.toml`, `.codex/resource-registry.toml` y los
    documentos directamente relevantes.
@@ -120,6 +123,21 @@ Para una referencia exacta `codex://threads/<UUID>`, usa solo la lectura nativa 
   ownership y continuidad, no autorización para otra transición.
 - `external_consumer_adoption=PROHIBITED` mientras el candidato permanezca
   `GREEN_LOCAL / PENDING_STABLE_ADOPTION`.
+
+## Entorno
+
+- Trabaja en `~/Developer/codex-engineering-control-plane` y crea los worktrees
+  bajo `~/Developer/`. `~/Documents/Develope-IOS` es un clon histórico bajo
+  sincronización de iCloud; no trabajes ahí.
+- Antes de interpretar un fallo, comprueba archivos `dataless` (flag APFS
+  `0x40000000`). Materializarlos cambia el inodo y agota los presupuestos de
+  tiempo, así que `E_CORE_LEASE_PATH`, `E_SNAPSHOT_GIT_TIMEOUT`,
+  `E_LEGACY_STATE_UNKNOWN` y un `git` colgado suelen ser almacenamiento, no
+  código. Las guardas fallan cerradas porque funcionan.
+- `git worktree list` solo ve los worktrees de su propio clon. No afirmes nada
+  global sobre el repositorio desde un único checkout.
+- Bajo `squash`, toda rama fusionada parece adelantada. Compara contenido con
+  `git diff --diff-filter=A --name-only origin/main..<rama>`, no commits.
 
 ## Seguridad
 
