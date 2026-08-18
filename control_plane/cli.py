@@ -364,7 +364,10 @@ def command_inventory(arguments: argparse.Namespace) -> int:
 
 def command_doctor(arguments: argparse.Namespace) -> int:
     from control_plane.lockfile import validate_lock
-    from control_plane.materialization import inspect_tracked_materialization
+    from control_plane.materialization import (
+        inspect_git_state_materialization,
+        inspect_tracked_materialization,
+    )
     from control_plane.repository import trusted_git_executable
     from control_plane.resource_registry import (
         load_registry,
@@ -410,6 +413,10 @@ def command_doctor(arguments: argparse.Namespace) -> int:
         "tracked_files_materialized": None,
         "dataless_tracked_files": None,
         "materialization_status": "UNKNOWN",
+        "git_state_materialized": None,
+        "dataless_git_state_files": None,
+        "git_state_materialization_status": "UNKNOWN",
+        "git_state_areas": [],
     }
     if not git_available:
         errors.append({"code": "E_DOCTOR_GIT", "message": "Git is not available."})
@@ -436,6 +443,22 @@ def command_doctor(arguments: argparse.Namespace) -> int:
                         "code": materialization.error_code
                         or "E_MATERIALIZATION_UNKNOWN",
                         "message": "Tracked file materialization is not proven.",
+                    }
+                )
+            git_state = inspect_git_state_materialization(root)
+            facts.update(
+                {
+                    "git_state_materialized": git_state.ok,
+                    "dataless_git_state_files": git_state.dataless_files,
+                    "git_state_materialization_status": git_state.status,
+                    "git_state_areas": list(git_state.areas),
+                }
+            )
+            if not git_state.ok:
+                errors.append(
+                    {
+                        "code": git_state.error_code or "E_MATERIALIZATION_UNKNOWN",
+                        "message": "Git state materialization is not proven.",
                     }
                 )
             registry = load_registry(_registry_path(root, None))
