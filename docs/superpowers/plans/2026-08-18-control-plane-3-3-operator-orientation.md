@@ -96,18 +96,17 @@ class GitStateMaterializationTests(unittest.TestCase):
             core = repository / ".git" / "codex-control-plane-core"
             core.mkdir(parents=True)
             (core / "adoption.lock").write_bytes(b"")
-            real_lstat = Path.lstat
+            real_flags = None
 
-            def fake_lstat(self: Path):
-                metadata = real_lstat(self)
-                if self.name == "adoption.lock":
-                    return os.stat_result(
-                        tuple(metadata)[:10],
-                        {"st_flags": DATALESS_FLAG},
-                    )
-                return metadata
+            def fake_flags(path: Path) -> int:
+                if path.name == "adoption.lock":
+                    return DATALESS_FLAG
+                return real_flags(path)
 
-            with patch.object(Path, "lstat", fake_lstat):
+            from control_plane import materialization
+
+            real_flags = materialization._file_flags
+            with patch.object(materialization, "_file_flags", fake_flags):
                 observed = inspect_git_state_materialization(repository)
             self.assertFalse(observed.ok)
             self.assertEqual(observed.status, "FAIL")
@@ -146,6 +145,25 @@ class GitStateMaterializationTests(unittest.TestCase):
             observed = inspect_git_state_materialization(repository)
             self.assertEqual(observed.status, "PASS")
             self.assertTrue(observed.ok)
+
+    def test_inspection_does_not_mutate_git_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+
+            def snapshot() -> list[tuple[str, int, int]]:
+                return sorted(
+                    (
+                        str(item.relative_to(repository)),
+                        item.lstat().st_size,
+                        item.lstat().st_mtime_ns,
+                    )
+                    for item in (repository / ".git").rglob("*")
+                    if item.is_file()
+                )
+
+            before = snapshot()
+            inspect_git_state_materialization(repository)
+            self.assertEqual(before, snapshot())
 
 
 if __name__ == "__main__":
@@ -282,7 +300,7 @@ Add `import os` to the module imports if absent.
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_core_materialization -v`
-Expected: PASS, 5 tests
+Expected: PASS, 6 tests
 
 - [ ] **Step 5: Check the LOC budget**
 
@@ -900,9 +918,9 @@ git commit -m "feat(control-plane): expose survey through the CLI"
 
 ---
 
-### Task 5: Add the Git and orchestration skill
+### Task 5: Add the Git orientation and bounded-autonomy skill
 
-Cross-thread reading has no runtime here, by decision: `AGENTS.md` requires the host's native read and forbids a Python adapter. PR #8 was closed for attempting one. This task carries that expertise as a skill.
+Cross-thread reading has no runtime here, by decision: `AGENTS.md` requires the host's native read and forbids a Python adapter. PR #8 was closed for attempting one. This task carries that expertise as a skill, together with the three mechanisms that let an agent work unattended without lowering any gate: a scoped mandate, a recoverable stop, and a mandatory independent review.
 
 **Files:**
 - Create: `skills/control-plane-git/SKILL.md`
@@ -947,6 +965,20 @@ class GitSkillContractTests(unittest.TestCase):
         ):
             self.assertIn(token, content)
         for forbidden in ("adapter", "cross_thread_audit"):
+            self.assertNotIn(forbidden, content)
+
+    def test_skill_carries_the_bounded_autonomy_contract(self) -> None:
+        content = SKILL.read_text(encoding="utf-8")
+        for token in (
+            "mandate",
+            "recoverable stop",
+            "independent review",
+            "did not write",
+        ):
+            self.assertIn(token, content)
+        for external in ("commit", "push", "pull request", "merge", "release"):
+            self.assertIn(external, content.lower())
+        for forbidden in ("Autopilot=ON", "daemon", "scheduler", "telemetry"):
             self.assertNotIn(forbidden, content)
 
     def test_skill_is_small_enough_to_always_load(self) -> None:
@@ -1008,6 +1040,28 @@ clone, its worktrees, its branches compared by content, and orphan work.
   `git_state_materialized`. A false value explains mutex identity changes,
   snapshot timeouts and hung Git far better than any code change would.
 
+## Working unattended
+
+Autonomy comes from scope granted once, never from a lowered gate.
+
+- **Mandate.** One authorization fixes paths, effects and budget. Inside it,
+  work to completion without asking again. `local_read` and `local_write`
+  within the declared paths need no further permission.
+- **Recoverable stop.** At the mandate boundary, do not ask — stop at a
+  resumable point and emit an exact checkpoint: repository, worktree, branch,
+  HEAD, changed paths, what was verified, what remains unknown, and the single
+  next action. A stop is not a failure and never claims completion.
+- **Independent review is mandatory.** Never claim closure on your own word.
+  Dispatch a reviewer that did not write the code and cannot edit the tree. In
+  this repository a green suite has repeatedly hidden real defects: five P1
+  after 175/175, seven after 283/283. Removing the human makes fresh eyes more
+  necessary, not less.
+
+External effects — commit, push, pull request, merge, deploy, release,
+installation, adoption — keep their individual gate whatever the mandate says.
+They are a handful of moments; gating them is what makes the rest safe to grant
+at once.
+
 ## Where a task continues
 
 Resolve `codex://threads/<UUID>` only through the host's native read. Never
@@ -1025,6 +1079,9 @@ continues.
 
 Close with repository, worktree, branch, HEAD, what was observed, what remains
 unknown, and `authorizes=false`.
+
+This skill grants nothing. It describes how to work inside a mandate the
+operator already gave.
 ```
 
 Then add to `.codex/resource-registry.toml` a `[[resources]]` block with
@@ -1050,7 +1107,7 @@ Add a `[[routes]]` block with `id = "git-orientation"`, `priority = 720`,
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `python3 -m unittest tests.test_core_git_skill -v`
-Expected: PASS, 4 tests
+Expected: PASS, 5 tests
 
 - [ ] **Step 5: Verify the registry still validates**
 

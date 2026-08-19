@@ -18,14 +18,22 @@ El repositorio está clonado dos veces. **No son equivalentes.**
 | `~/Developer/control-plane-worktrees/` | Worktrees sanos, fuera de carpetas sincronizadas |
 | `~/Documents/Develope-IOS` | **Histórico. No trabajes aquí.** Bajo sincronización de iCloud; su `main` está atrasado |
 
-Comprobación de una línea antes de empezar, desde la raíz que vayas a usar:
+Comprobación antes de empezar:
 
 ```bash
-python3 -c "import pathlib,sys;b=pathlib.Path('.');n=sum(1 for p in b.rglob('*') if p.is_file() and getattr(p.lstat(),'st_flags',0)&0x40000000);print('dataless:',n);sys.exit(1 if n else 0)"
+scripts/control-plane survey --repo . --json
+scripts/control-plane doctor
 ```
 
-Si devuelve algo distinto de `dataless: 0`, **detente y lee la sección 3** antes
-de interpretar cualquier fallo posterior.
+`survey` te da clon, worktrees, ramas por contenido y trabajo huérfano en una
+lectura. `doctor` informa `git_state_materialized`. Además, el gate de escritura
+ya se detiene solo: `preflight --mode write` falla si el estado Git no está
+materializado, así que la trampa de la sección 3.1 dejó de ser evitable por
+disciplina y pasó a ser imposible de pisar en el caso común.
+
+Residuo conocido: si el propio archivo de policy es un marcador, `preflight`
+falla antes con `E_POLICY_PARSE` y sin pista del entorno. `doctor` y `survey`
+sí lo dicen.
 
 `git worktree list` solo muestra los worktrees de **su propio** clon. Un
 inventario hecho desde un checkout puede ser exhaustivo dentro de su alcance y
@@ -43,7 +51,7 @@ los dos clones.
 | Autopilot | `OFF` |
 | Outcomes permitidos por Core | `answer` y `local_change`, nada más |
 | Superficie Advanced | en cuarentena estructural por ADR 0006 |
-| Protección de rama en `main` | **ausente**, pese a que la policy declara `require_pull_request = true` |
+| Protección de rama en `main` | activa: PR obligatorio, check `core-verify`, rama al día, sin force push ni borrado, historia lineal |
 
 ### Líneas de trabajo publicadas
 
@@ -96,8 +104,10 @@ git diff --diff-filter=A --name-only origin/main..<rama>
 
 ### 3.3 Las ramas `codex/*` de la línea v2.3–v3 no se fusionan
 
-Solo aportan los módulos que ADR 0006 puso en cuarentena. Fusionarlas
-revertiría la decisión vigente. Detalle rama por rama en
+Solo aportaban los módulos que ADR 0006 puso en cuarentena. Se retiraron el
+2026-08-18 y siguen alcanzables como etiquetas `archive/*`; si alguien las
+recupera, la regla se mantiene: fusionarlas revertiría la decisión vigente.
+Detalle rama por rama en
 [decisiones de rama](21-repository-alignment-and-branch-decisions.md).
 
 ### 3.4 El threat model se rompe con cualquier cambio de contenido

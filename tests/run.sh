@@ -57,6 +57,7 @@ tests.test_core_cli
 tests.test_core_contract
 tests.test_core_documentation
 tests.test_core_git_guards
+tests.test_core_git_skill
 tests.test_core_git_state
 tests.test_core_governing_manifest
 tests.test_core_hooks
@@ -72,6 +73,7 @@ tests.test_core_repository
 tests.test_core_risk_sentinel
 tests.test_core_routing
 tests.test_core_state_paths
+tests.test_core_survey
 tests.test_core_task_state
 tests.test_core_toolchain
 tests.test_core_types
@@ -99,6 +101,7 @@ control_plane/resource_registry.py
 control_plane/risk_sentinel.py
 control_plane/routing.py
 control_plane/scopes.py
+control_plane/survey.py
 control_plane/task_state.py
 control_plane/toolchain.py
 control_plane/verification.py'
@@ -113,6 +116,7 @@ tests/test_core_cli.py
 tests/test_core_contract.py
 tests/test_core_documentation.py
 tests/test_core_git_guards.py
+tests/test_core_git_skill.py
 tests/test_core_git_state.py
 tests/test_core_governing_manifest.py
 tests/test_core_hooks.py
@@ -128,6 +132,7 @@ tests/test_core_repository.py
 tests/test_core_risk_sentinel.py
 tests/test_core_routing.py
 tests/test_core_state_paths.py
+tests/test_core_survey.py
 tests/test_core_task_state.py
 tests/test_core_toolchain.py
 tests/test_core_types.py

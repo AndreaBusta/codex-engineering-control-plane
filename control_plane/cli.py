@@ -110,8 +110,12 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _render_human(payload: Mapping[str, Any]) -> str:
     command = str(payload.get("command", "control-plane"))
-    if command == "risk-status" and payload.get("status") in {"PASS", "FAIL", "UNKNOWN"}:
-        lines = [f"{payload['status']} risk-status"]
+    if command in {"risk-status", "survey"} and payload.get("status") in {
+        "PASS",
+        "FAIL",
+        "UNKNOWN",
+    }:
+        lines = [f"{payload['status']} {command}"]
     else:
         diagnostic = (
             command == "preflight"
@@ -156,6 +160,8 @@ def _emit(payload: dict[str, Any], as_json: bool) -> int:
     if payload.get("error_code") == _QUARANTINED:
         return 2
     if payload.get("command") == "risk-status" and payload.get("status") == "UNKNOWN":
+        return 2
+    if payload.get("command") == "survey" and payload.get("status") == "UNKNOWN":
         return 2
     return 0 if payload.get("ok") else 1
 
@@ -362,9 +368,42 @@ def command_inventory(arguments: argparse.Namespace) -> int:
     return _emit(payload, arguments.json)
 
 
+
+def command_survey(arguments: argparse.Namespace) -> int:
+    from control_plane.survey import survey_payload, survey_repository
+
+    try:
+        observed = survey_repository(Path(arguments.repo), base=arguments.base)
+    except Exception as error:  # noqa: BLE001 - surfaced as a closed payload
+        return _emit(_failure("survey", error), arguments.json)
+    payload = survey_payload(observed)
+    payload.update(
+        {
+            "command": "survey",
+            "ok": observed.status == "PASS",
+            "facts": {
+                "branch": observed.branch,
+                "worktrees": len(observed.worktrees),
+                "worktrees_dirty": sum(1 for item in observed.worktrees if item.dirty),
+                "branches": len(observed.branches),
+                "branches_content_equivalent": sum(
+                    1 for item in observed.branches if item.content_equivalent_to_base
+                ),
+                "orphan_stashes": observed.stashes,
+                "orphan_untracked": observed.untracked_total,
+                "other_clones": "UNKNOWN",
+            },
+        }
+    )
+    return _emit(payload, arguments.json)
+
+
 def command_doctor(arguments: argparse.Namespace) -> int:
     from control_plane.lockfile import validate_lock
-    from control_plane.materialization import inspect_tracked_materialization
+    from control_plane.materialization import (
+        inspect_git_state_materialization,
+        inspect_tracked_materialization,
+    )
     from control_plane.repository import trusted_git_executable
     from control_plane.resource_registry import (
         load_registry,
@@ -410,6 +449,10 @@ def command_doctor(arguments: argparse.Namespace) -> int:
         "tracked_files_materialized": None,
         "dataless_tracked_files": None,
         "materialization_status": "UNKNOWN",
+        "git_state_materialized": None,
+        "dataless_git_state_files": None,
+        "git_state_materialization_status": "UNKNOWN",
+        "git_state_areas": [],
     }
     if not git_available:
         errors.append({"code": "E_DOCTOR_GIT", "message": "Git is not available."})
@@ -436,6 +479,22 @@ def command_doctor(arguments: argparse.Namespace) -> int:
                         "code": materialization.error_code
                         or "E_MATERIALIZATION_UNKNOWN",
                         "message": "Tracked file materialization is not proven.",
+                    }
+                )
+            git_state = inspect_git_state_materialization(root)
+            facts.update(
+                {
+                    "git_state_materialized": git_state.ok,
+                    "dataless_git_state_files": git_state.dataless_files,
+                    "git_state_materialization_status": git_state.status,
+                    "git_state_areas": list(git_state.areas),
+                }
+            )
+            if not git_state.ok:
+                errors.append(
+                    {
+                        "code": git_state.error_code or "E_MATERIALIZATION_UNKNOWN",
+                        "message": "Git state materialization is not proven.",
                     }
                 )
             registry = load_registry(_registry_path(root, None))
@@ -993,6 +1052,12 @@ def build_parser() -> argparse.ArgumentParser:
     inventory.add_argument("--registry", type=Path)
     _output(inventory)
     inventory.set_defaults(handler=command_inventory)
+
+    survey = commands.add_parser("survey")
+    survey.add_argument("--repo", type=Path, default=Path.cwd())
+    survey.add_argument("--base", default="origin/main")
+    _output(survey)
+    survey.set_defaults(handler=command_survey)
 
     route = commands.add_parser("route")
     route.add_argument("--repo", type=Path, default=Path.cwd())

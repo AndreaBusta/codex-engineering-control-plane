@@ -123,6 +123,30 @@ aliases = []
 output_contract = "verified-workflow-v1"
 
 [[resources]]
+id = "skill.control-plane-git"
+kind = "skill"
+provider = "codex-skill"
+locator = "repo://skills/control-plane-git/SKILL.md"
+capabilities = ["git.orientation"]
+scope = "project"
+authority = "project"
+trust = "trusted_project"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "progressive"
+context_class = "small"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = []
+output_contract = "instructions"
+
+[[resources]]
 id = "document.profile-generic"
 kind = "document"
 provider = "repository"
@@ -662,6 +686,20 @@ signals_all = []
 effects_any = []
 required_capabilities = ["task.framing"]
 recommended_resources = ["document.routing-guide"]
+forbidden_resources = []
+
+[[routes]]
+id = "git-orientation"
+priority = 720
+tiers = ["T1", "T2", "T3"]
+phases = ["frame", "research", "plan", "integrate"]
+intents = ["audit", "plan", "diagnose", "integrate"]
+domains_any = []
+signals_any = []
+signals_all = []
+effects_any = []
+required_capabilities = ["git.orientation"]
+recommended_resources = ["skill.control-plane-git"]
 forbidden_resources = []
 
 [[routes]]

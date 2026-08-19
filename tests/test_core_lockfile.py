@@ -47,6 +47,7 @@ EXPECTED_CORE_MODULES = (
     "risk_sentinel.py",
     "routing.py",
     "scopes.py",
+    "survey.py",
     "task_state.py",
     "toolchain.py",
     "verification.py",

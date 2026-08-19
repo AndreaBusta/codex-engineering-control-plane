@@ -574,6 +574,96 @@ class CoreCliTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     self.assertEqual(completed.stdout.strip(), "E_JSON_INPUT")
 
+    def test_survey_command_exit_codes_and_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            return_code, payload = run_cli_in_process(
+                "survey", "--repo", str(repo), "--base", "HEAD", "--json"
+            )
+            self.assertEqual(return_code, 0)
+            self.assertEqual(payload["kind"], "RepositorySurveyV1")
+            self.assertEqual(payload["other_clones"], "UNKNOWN")
+            self.assertIs(payload["authorizes"], False)
+            self.assertTrue(payload["clone"]["branch"])
+            self.assertEqual(len(payload["clone"]["head"]), 40)
+
+            (repo / "orphan.md").write_text("only here\n", encoding="utf-8")
+            return_code, payload = run_cli_in_process(
+                "survey", "--repo", str(repo), "--base", "HEAD", "--json"
+            )
+            self.assertEqual(return_code, 1)
+            self.assertEqual(payload["orphan_work"]["untracked_total"], 1)
+
+            return_code, payload = run_cli_in_process(
+                "survey", "--repo", str(repo), "--base", "nope", "--json"
+            )
+            self.assertEqual(return_code, 2)
+            self.assertEqual(payload["error_code"], "E_SURVEY_BASE_UNKNOWN")
+            self.assertIs(payload["authorizes"], False)
+
+    def test_doctor_reports_git_state_materialization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            (repo / ".codex" / "project-policy.toml").write_bytes(
+                FIXTURE_POLICY.read_bytes()
+            )
+            return_code, payload = run_cli_in_process(
+                "doctor", "--repo", str(repo), "--json"
+            )
+            facts = payload["facts"]
+            for key in (
+                "git_state_materialized",
+                "dataless_git_state_files",
+                "git_state_materialization_status",
+                "git_state_areas",
+            ):
+                self.assertIn(key, facts)
+            self.assertTrue(facts["git_state_materialized"])
+            self.assertEqual(facts["dataless_git_state_files"], 0)
+            self.assertEqual(facts["git_state_materialization_status"], "PASS")
+            self.assertEqual(facts["git_state_areas"], [])
+            self.assertNotIn(
+                "E_MATERIALIZATION_DATALESS",
+                {error["code"] for error in payload["errors"]},
+            )
+            del return_code
+
+    def test_doctor_fails_closed_on_unproven_git_state(self) -> None:
+        from control_plane.materialization import GitStateMaterialization
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_repo(Path(directory) / "repo")
+            (repo / ".codex" / "project-policy.toml").write_bytes(
+                FIXTURE_POLICY.read_bytes()
+            )
+            observation = GitStateMaterialization(
+                False,
+                "FAIL",
+                12,
+                3,
+                ("core_state", "objects"),
+                False,
+                "E_MATERIALIZATION_DATALESS",
+            )
+            with patch(
+                "control_plane.materialization.inspect_git_state_materialization",
+                return_value=observation,
+            ):
+                return_code, payload = run_cli_in_process(
+                    "doctor", "--repo", str(repo), "--json"
+                )
+            self.assertNotEqual(return_code, 0)
+            self.assertFalse(payload["ok"])
+            self.assertFalse(payload["facts"]["git_state_materialized"])
+            self.assertEqual(payload["facts"]["dataless_git_state_files"], 3)
+            self.assertEqual(
+                payload["facts"]["git_state_areas"], ["core_state", "objects"]
+            )
+            self.assertIn(
+                "E_MATERIALIZATION_DATALESS",
+                {error["code"] for error in payload["errors"]},
+            )
+
     def test_doctor_fails_closed_on_unproven_materialization(self) -> None:
         from control_plane.materialization import MaterializationResult
 

@@ -269,6 +269,39 @@ def evaluate_preflight(
                 f"Divergence from {remote_base} could not be observed safely.",
             )
 
+    from control_plane import materialization
+
+    git_state = materialization.inspect_git_state_materialization(root)
+    facts["git_state_materialized"] = git_state.ok
+    facts["dataless_git_state_files"] = git_state.dataless_files
+    _check(
+        checks,
+        "GIT_STATE_MATERIALIZED",
+        git_state.ok,
+        "Git state is fully materialized.",
+        (
+            (
+                f"{git_state.dataless_files} Git state files are placeholders "
+                f"in {', '.join(git_state.areas) or 'unknown areas'}. "
+                "Materialize them before writing; a placeholder changes inode "
+                "identity on first read and starves time budgets."
+            )
+            if git_state.status == "FAIL"
+            else (
+                "Git state materialization is not proven "
+                f"({git_state.error_code or 'unknown cause'}); "
+                f"{git_state.scanned_files} entries were observed before the "
+                "scan stopped. Treat this as unknown, never as clean."
+            )
+        ),
+    )
+    if mode == "write" and not git_state.ok:
+        _error(
+            errors,
+            git_state.error_code or "E_MATERIALIZATION_UNKNOWN",
+            "Git state materialization is not proven for a write transition.",
+        )
+
     if mode == "read":
         return GateResult(not errors, mode, facts, checks, errors)
 

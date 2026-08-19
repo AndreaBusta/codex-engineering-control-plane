@@ -125,6 +125,22 @@ responden `E_CAPABILITY_QUARANTINED` sin mutación.
 El contrato completo está en
 [mantenimiento Core](docs/engineering/19-control-plane-core-maintenance.md).
 
+### Inventariar el repositorio
+
+```bash
+scripts/control-plane survey --repo /ruta/al/repositorio --json
+```
+
+Informa clon, worktrees, ramas comparadas **por contenido** y trabajo huérfano
+—stashes y archivos sin rastrear—. `other_clones` es siempre `UNKNOWN`: un
+checkout no puede enumerar otros checkouts, y declararlo evita confundir «no lo
+veo» con «no existe». Exit codes `PASS=0`, `FAIL=1`, `UNKNOWN=2`.
+
+`doctor` y `preflight` añaden `git_state_materialized`. Un archivo `dataless`
+cambia su inodo en la primera lectura, así que un fallo de almacenamiento puede
+imitar un defecto de producto; el gate de escritura ahora se detiene antes de
+empezar en vez de después. El modo lectura sigue permitiendo investigar.
+
 ### Diagnosticar riesgo local
 
 ```bash

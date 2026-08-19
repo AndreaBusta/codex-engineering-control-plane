@@ -64,6 +64,7 @@ GOVERNING_TEST_MATRIX = {
     "risk_sentinel.py": ("tests.test_core_risk_sentinel",),
     "routing.py": ("tests.test_core_routing",),
     "scopes.py": ("tests.test_graph",),
+    "survey.py": ("tests.test_core_survey",),
     "task_state.py": (
         "tests.test_core_task_state",
         "tests.test_core_state_paths",
@@ -87,6 +88,7 @@ GOVERNING_TESTS = frozenset(
         "tests.test_core_contract",
         "tests.test_core_documentation",
         "tests.test_core_git_guards",
+        "tests.test_core_git_skill",
         "tests.test_core_git_state",
         "tests.test_core_governing_manifest",
         "tests.test_core_hooks",
@@ -102,6 +104,7 @@ GOVERNING_TESTS = frozenset(
         "tests.test_core_risk_sentinel",
         "tests.test_core_routing",
         "tests.test_core_state_paths",
+        "tests.test_core_survey",
         "tests.test_core_task_state",
         "tests.test_core_toolchain",
         "tests.test_core_types",
