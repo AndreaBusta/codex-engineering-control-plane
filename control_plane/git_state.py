@@ -280,10 +280,19 @@ def evaluate_preflight(
         git_state.ok,
         "Git state is fully materialized.",
         (
-            f"{git_state.dataless_files} Git state files are placeholders "
-            f"in {', '.join(git_state.areas) or 'unknown areas'}. "
-            "Materialize them before writing; a placeholder changes inode "
-            "identity on first read and starves time budgets."
+            (
+                f"{git_state.dataless_files} Git state files are placeholders "
+                f"in {', '.join(git_state.areas) or 'unknown areas'}. "
+                "Materialize them before writing; a placeholder changes inode "
+                "identity on first read and starves time budgets."
+            )
+            if git_state.status == "FAIL"
+            else (
+                "Git state materialization is not proven "
+                f"({git_state.error_code or 'unknown cause'}); "
+                f"{git_state.scanned_files} entries were observed before the "
+                "scan stopped. Treat this as unknown, never as clean."
+            )
         ),
     )
     if mode == "write" and not git_state.ok:

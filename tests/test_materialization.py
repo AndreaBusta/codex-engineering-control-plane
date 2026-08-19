@@ -218,6 +218,56 @@ class GitStateMaterializationTests(unittest.TestCase):
             self.assertEqual(observed.status, "PASS")
             self.assertTrue(observed.ok)
 
+    def test_unreadable_git_subtree_is_unknown_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            blocked = repository / ".git" / "codex-control-plane-core"
+            blocked.mkdir(parents=True)
+            (blocked / "adoption.lock").write_bytes(b"")
+            os.chmod(blocked, 0)
+            try:
+                observed = inspect_git_state_materialization(repository)
+            finally:
+                os.chmod(blocked, 0o755)
+            self.assertEqual(
+                observed.status,
+                "UNKNOWN",
+                "an unreadable subtree must not be reported as a clean scan",
+            )
+            self.assertEqual(observed.error_code, "E_MATERIALIZATION_STAT")
+
+    def test_linked_worktree_is_not_scanned_twice(self) -> None:
+        main = None
+        with tempfile.TemporaryDirectory() as raw:
+            main = _repository(Path(raw))
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(main), "commit", "--quiet",
+                 "--allow-empty", "-m", "first"],
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin",
+                     "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"},
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=True, timeout=10,
+            )
+            linked = Path(raw) / "linked"
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(main), "worktree", "add", "--quiet",
+                 str(linked), "-b", "side"],
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=True, timeout=10,
+            )
+            unique = sum(
+                len(files)
+                for _, _, files in os.walk(main / ".git", followlinks=False)
+            )
+            observed = inspect_git_state_materialization(linked)
+            self.assertEqual(
+                observed.scanned_files,
+                unique,
+                "a nested worktree git dir must not be walked twice",
+            )
+
     def test_inspection_does_not_mutate_git_state(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repository = _repository(Path(raw))

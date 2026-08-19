@@ -69,6 +69,69 @@ class RepositorySurveyTests(unittest.TestCase):
             self.assertEqual(feature.only_in_branch, 0)
             self.assertTrue(feature.content_equivalent_to_base)
 
+    def test_branch_that_only_modifies_is_not_content_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            _git(repository, "checkout", "--quiet", "-b", "only-modifies")
+            (repository / "a.txt").write_text("real unmerged work\n", encoding="utf-8")
+            _git(repository, "commit", "--quiet", "-am", "modify without adding")
+            _git(repository, "checkout", "--quiet", "main")
+            observed = survey_repository(repository, base="main")
+            branch = next(b for b in observed.branches if b.name == "only-modifies")
+            self.assertFalse(
+                branch.content_equivalent_to_base,
+                "a branch with unmerged modifications must never read as equivalent",
+            )
+
+    def test_branch_that_only_deletes_is_not_content_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            _git(repository, "checkout", "--quiet", "-b", "only-deletes")
+            (repository / "a.txt").unlink()
+            _git(repository, "commit", "--quiet", "-am", "delete without adding")
+            _git(repository, "checkout", "--quiet", "main")
+            observed = survey_repository(repository, base="main")
+            branch = next(b for b in observed.branches if b.name == "only-deletes")
+            self.assertFalse(branch.content_equivalent_to_base)
+
+    def test_unobservable_worktree_status_is_unknown_not_clean(self) -> None:
+        from unittest.mock import patch
+
+        from control_plane import survey as survey_module
+
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            real_text = survey_module._text
+
+            def failing_text(repo, arguments):
+                if arguments and arguments[0] == "status":
+                    return None
+                return real_text(repo, arguments)
+
+            with patch.object(survey_module, "_text", failing_text):
+                observed = survey_repository(repository, base="main")
+            self.assertEqual(observed.status, "UNKNOWN")
+            self.assertEqual(observed.error_code, "E_SURVEY_INVENTORY")
+
+    def test_unobservable_stash_list_is_unknown_not_zero(self) -> None:
+        from unittest.mock import patch
+
+        from control_plane import survey as survey_module
+
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            real_text = survey_module._text
+
+            def failing_text(repo, arguments):
+                if arguments and arguments[0] == "stash":
+                    return None
+                return real_text(repo, arguments)
+
+            with patch.object(survey_module, "_text", failing_text):
+                observed = survey_repository(repository, base="main")
+            self.assertEqual(observed.status, "UNKNOWN")
+            self.assertEqual(observed.error_code, "E_SURVEY_INVENTORY")
+
     def test_orphan_work_counts_stashes_and_untracked(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repository = _repository(Path(raw))

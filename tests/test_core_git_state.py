@@ -53,6 +53,33 @@ class CoreGitStateTests(unittest.TestCase):
         self.assertFalse(read.facts["git_state_materialized"])
         self.assertEqual(read.facts["dataless_git_state_files"], 468)
 
+    def test_unknown_git_state_is_not_reported_as_zero_placeholders(self) -> None:
+        from unittest.mock import patch
+
+        from control_plane.git_state import evaluate_preflight
+        from control_plane.materialization import GitStateMaterialization
+
+        policy = self.scenario.policy()
+        self.scenario.checkout_feature()
+        unknown = GitStateMaterialization(
+            False, "UNKNOWN", 50_001, 0, (), True, "E_MATERIALIZATION_LIMIT"
+        )
+        with patch(
+            "control_plane.materialization.inspect_git_state_materialization",
+            return_value=unknown,
+        ):
+            write = evaluate_preflight(self.scenario.repo, policy, "write")
+        message = next(
+            check.message
+            for check in write.checks
+            if check.code == "GIT_STATE_MATERIALIZED"
+        )
+        self.assertNotIn("0 Git state files are placeholders", message)
+        self.assertIn("not proven", message.lower())
+        self.assertIn(
+            "E_MATERIALIZATION_LIMIT", {error.code for error in write.errors}
+        )
+
     def test_write_gate_passes_on_a_materialized_repository(self) -> None:
         from control_plane.git_state import evaluate_preflight
 

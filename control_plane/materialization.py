@@ -160,9 +160,15 @@ def _git_state_roots(repository: Path) -> tuple[Path, ...]:
         if completed.returncode != 0:
             return ()
         candidate = Path(completed.stdout.decode("utf-8", errors="replace").strip())
-        if candidate.is_absolute() and candidate not in roots:
+        if candidate.is_absolute():
             roots.append(candidate)
-    return tuple(roots)
+    maximal: list[Path] = []
+    for candidate in roots:
+        if any(candidate.is_relative_to(other) for other in roots if other != candidate):
+            continue
+        if candidate not in maximal:
+            maximal.append(candidate)
+    return tuple(maximal)
 
 
 def _area_for(root: Path, path: Path) -> str:
@@ -195,9 +201,15 @@ def inspect_git_state_materialization(
     scanned = 0
     areas: set[str] = set()
     dataless = 0
+
+    def _fail_closed(error: OSError) -> None:
+        raise error
+
     try:
         for root in roots:
-            for current, directories, files in os.walk(root, followlinks=False):
+            for current, directories, files in os.walk(
+                root, followlinks=False, onerror=_fail_closed
+            ):
                 directories[:] = [
                     name
                     for name in directories

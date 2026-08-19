@@ -9,6 +9,10 @@ import subprocess
 from control_plane.repository import trusted_git_argv, trusted_git_environment
 
 
+class _SurveyLimit(Exception):
+    """Internal marker: a declared bound was exceeded."""
+
+
 _MAX_OUTPUT_BYTES = 1_048_576
 _TIMEOUT_SECONDS = 10
 
@@ -90,15 +94,16 @@ def _worktrees(root: Path, limit: int) -> tuple[WorktreeObservation, ...] | None
             detached = True
         elif not line and path:
             if len(entries) >= limit:
-                return None
+                raise _SurveyLimit
             dirty = untracked = 0
             status = _text(Path(path), ("status", "--porcelain", "-uall"))
-            if status:
-                for item in status.splitlines():
-                    if item.startswith("??"):
-                        untracked += 1
-                    else:
-                        dirty += 1
+            if status is None:
+                return None
+            for item in status.splitlines():
+                if item.startswith("??"):
+                    untracked += 1
+                elif item:
+                    dirty += 1
             entries.append(
                 WorktreeObservation(path, branch, head, detached, dirty, untracked)
             )
@@ -124,14 +129,16 @@ def _branches(
         if not name or name == base:
             continue
         if len(entries) >= limit:
-            return None
+            raise _SurveyLimit
         added = _text(
             root, ("diff", "--diff-filter=A", "--name-only", f"{base}..{name}")
         )
-        if added is None:
+        whole = _text(root, ("diff", "--name-only", f"{base}..{name}"))
+        if added is None or whole is None:
             return None
         only = len([item for item in added.splitlines() if item])
-        entries.append(BranchObservation(name, head, only, only == 0))
+        equivalent = not [item for item in whole.splitlines() if item]
+        entries.append(BranchObservation(name, head, only, equivalent))
     return tuple(entries)
 
 
@@ -157,14 +164,17 @@ def survey_repository(
     branch = _text(root, ("rev-parse", "--abbrev-ref", "HEAD"))
     if head is None or branch is None:
         return _unknown(root, "E_SURVEY_INVENTORY")
-    worktrees = _worktrees(root, max_worktrees)
-    if worktrees is None:
+    try:
+        worktrees = _worktrees(root, max_worktrees)
+        branches = None if worktrees is None else _branches(root, base, max_branches)
+    except _SurveyLimit:
         return _unknown(root, "E_SURVEY_LIMIT")
-    branches = _branches(root, base, max_branches)
-    if branches is None:
-        return _unknown(root, "E_SURVEY_LIMIT")
+    if worktrees is None or branches is None:
+        return _unknown(root, "E_SURVEY_INVENTORY")
     stash_listing = _text(root, ("stash", "list"))
-    stashes = 0 if not stash_listing else len(stash_listing.splitlines())
+    if stash_listing is None:
+        return _unknown(root, "E_SURVEY_INVENTORY")
+    stashes = len([item for item in stash_listing.splitlines() if item])
     untracked_total = sum(item.untracked for item in worktrees)
     orphan = stashes or untracked_total
     return RepositorySurvey(
