@@ -340,13 +340,15 @@ Observación del 2026-08-18: `bash tests/run.sh` sobre `main` en
 
 Esa ejecución es evidencia local válida, pero no cierra por sí sola el gate
 declarado en el scorecard: aquel gate se define sobre los bytes sellados del
-candidato, con `max_gate_runs=6` ligado a la misma closure lineage. Para la
-lineage R1 reencuadrada el 2026-08-20, `gate_run_count=2` y el siguiente intento
-es `3/6`. Los intentos 1 y 2 permanecen consumidos: sus resultados byte-bound
-quedaron superseded por reparaciones posteriores, pero no se borran ni se
-reclasifican. La última ejecución consumida debe quedar verde sobre los bytes
-finales; reparar o volver a congelar no reinicia el contador, y alcanzar
-`gate_run_count=6` sin ese estado exige Stable Pause. Cerrarlo es una decisión de
+candidato, con `max_gate_runs=6` ligado a la misma closure lineage. El checkpoint
+previo e inmutable del reframe R1 del 2026-08-20 registró `gate_run_count=2` y
+programó el intento `3/6`. Los intentos 1 y 2 permanecen consumidos: sus
+resultados byte-bound quedaron superseded por reparaciones posteriores, pero no
+se borran ni se reclasifican. Los resultados posteriores se registran en el Goal
+y handoff nativos sin reescribir este checkpoint histórico. La última ejecución
+consumida debe quedar verde sobre los bytes finales; reparar o volver a congelar
+no reinicia el contador, y alcanzar `gate_run_count=6` sin ese estado exige
+Stable Pause. Cerrarlo es una decisión de
 la tarea orquestadora, no un efecto derivado de esta lectura. El candidato
 permanece `GREEN_LOCAL / PENDING_STABLE_ADOPTION` y
 `external_consumer_adoption=PROHIBITED`.

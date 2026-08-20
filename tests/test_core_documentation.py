@@ -795,6 +795,8 @@ class CoreDocumentationTests(unittest.TestCase):
         self.assertIn("última ejecución consumida", alignment_flat)
         self.assertIn("gate_run_count=2", alignment)
         self.assertIn("3/6", alignment)
+        self.assertIn("checkpoint previo e inmutable", alignment_flat)
+        self.assertIn("resultados posteriores", alignment_flat)
         for stale_rule in (
             "fresh one-shot",
             "one authorized full gate",
