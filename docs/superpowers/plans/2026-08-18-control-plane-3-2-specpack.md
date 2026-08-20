@@ -1,6 +1,7 @@
 # Plan de implementación — Control Plane 3.2 SpecPack
 
-Fecha: 2026-08-18. Estado: `ready`. `authorizes=false`.
+Fecha: 2026-08-18. Estado:
+`PREPARED / BLOCKED_ON_R1_FINAL_EVIDENCE`. `authorizes=false`.
 
 Diseño de referencia:
 [SpecPack gobernado](../specs/2026-08-18-control-plane-3-2-specpack-design.md).
@@ -17,9 +18,9 @@ declara entrada, salida, prueba y criterio de cierre.
 |---|---|
 | Repositorio | `codex-engineering-control-plane` |
 | Remoto | `https://github.com/AndreaBusta/codex-engineering-control-plane.git` |
-| Base | `main` en `b07418364409f76c900f0595a76c9e3e388ac433` |
-| Versión candidata | `3.1.0-core.1`, `GREEN_LOCAL / PENDING_STABLE_ADOPTION` |
-| Suite | `bash tests/run.sh`, `234` tests en verde el 2026-08-18 |
+| Base | `main`; reobservar su SHA exacto antes de abrir la fase |
+| Versión candidata | reconciliación `3.1.0-core.2`; `R1_OPEN`: reparaciones, prerevisiones frescas y evidencia final pendientes |
+| Suite | la evidencia previa no cierra R1; la última ejecución integral debe quedar verde sobre los bytes finales dentro de `max_gate_runs=3` |
 | Estrategia de integración | `squash` |
 | Superficie Advanced | en cuarentena estructural, no reactivar |
 | Outcomes permitidos | `answer` y `local_change` únicamente |
@@ -35,12 +36,12 @@ scripts/control-plane preflight --mode write
 | Fase | Contenido | Runtime nuevo | Condición de entrada |
 |---|---|---|---|
 | 0 | Higiene de ramas | no | Autorización explícita por transición |
-| 1 | Contrato: plantillas y skill | no | Ninguna, ejecutable ya |
+| 1 | Contrato: plantillas y skill | no | `R1_CLOSED_ON_FINAL_EVIDENCE`; no ejecutar mientras R1 siga abierto |
 | 2 | Validador `spec_pack.py` y CLI | sí | Las tres condiciones de la sección «Puerta de la fase 2» |
 | 3 | Verificación cruzada contra diff | sí | No diseñar todavía |
 
-Las fases 0 y 1 son independientes entre sí y pueden ejecutarse en cualquier
-orden. La fase 2 depende de la 1.
+Las fases 0 y 1 no dependen entre sí, pero la fase 1 permanece bloqueada hasta
+`R1_CLOSED_ON_FINAL_EVIDENCE`. La fase 2 depende de la 1.
 
 ---
 
@@ -51,9 +52,13 @@ independiente. El runbook completo, con comandos exactos y estado esperado,
 está en
 [decisiones de rama](../../engineering/21-repository-alignment-and-branch-decisions.md).
 
-Resumen de la decisión ya tomada: no hay rebase ni merge pendientes. Las cuatro
-ramas `codex/*` de la línea v2.3–v3 solo aportan módulos que ADR 0006 puso en
-cuarentena; fusionarlas revertiría la decisión vigente.
+Resumen de la decisión ya tomada: no hay rebase ni merge pendientes. Las ramas
+históricas `codex/control-plane-v3`, `codex/control-plane-v2-3`,
+`codex/control-plane-v2-4` y `codex/taskplaybook-v0-impl` solo aportan módulos
+que ADR 0006 puso en cuarentena; fusionarlas revertiría la decisión vigente.
+Esta regla no se aplica a todas las ramas `codex/*`: en particular,
+`codex/control-plane-adoption-enablement-design` es el subject aprobado para la
+reconciliación R1 y queda fuera de esa cuarentena.
 `codex/cross-thread-audit-lookup-v1` es un rechazo técnico consciente,
 sustituido por el lookup nativo.
 
@@ -155,8 +160,9 @@ Todo en verde, cero runtime nuevo en `control_plane/`, y el diff limitado a
 La fase 2 **no empieza** hasta que las tres condiciones se cumplan a la vez y
 sean verificables por separado:
 
-1. el candidato `3.1.0-core.1` ha alcanzado adopción estable y el gate integral
-   del scorecard está cerrado como ejecución autoritativa única;
+1. el candidato `3.1.0-core.2` ha alcanzado adopción estable y la última
+   ejecución consumida del gate integral está verde sobre sus bytes finales,
+   dentro de `max_gate_runs=3`;
 2. la fase 1 lleva al menos tres packs redactados en trabajo real, no de prueba;
 3. existe autorización explícita para ampliar la superficie de runtime durante
    la línea 3.x.
@@ -250,8 +256,8 @@ Evaluar impacto documental antes de cerrar cada fase:
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora del plan 3.2.
-- **Para continuar:** ejecutar la fase 1 completa y detenerse antes de la puerta de la fase 2.
-- **Mensaje exacto:** `Ejecuta la fase 1 del plan SpecPack 3.2: skill, registry y tests de contrato. No implementes el validador ni realices efectos remotos.`
-- **Estado de partida:** `main` en `b074183`, plantillas creadas en `templates/spec-pack/`, skill y entradas de registry pendientes, validador no implementado.
+- **Para continuar:** tras cerrar R1, ejecutar la fase 1 completa y detenerse antes de la puerta de la fase 2.
+- **Mensaje exacto:** `Con R1 cerrado y reobservado, ejecuta la fase 1 del plan SpecPack 3.2: skill, registry y tests de contrato. No implementes el validador ni realices efectos remotos.`
+- **Estado de partida:** plantillas creadas en `templates/spec-pack/`; skill y entradas de registry pendientes; validador no implementado; fase bloqueada hasta evidencia final de R1.
 - **No hacer todavía:** implementar `spec_pack.py`, tocar el lock, instalar, adoptar externamente, commit, push, PR, merge o release.
 - **Autoridad:** `authorizes=false`

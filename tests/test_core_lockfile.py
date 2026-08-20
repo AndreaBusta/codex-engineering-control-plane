@@ -47,6 +47,7 @@ EXPECTED_CORE_MODULES = (
     "risk_sentinel.py",
     "routing.py",
     "scopes.py",
+    "stable_pause.py",
     "survey.py",
     "task_state.py",
     "toolchain.py",
@@ -112,7 +113,7 @@ class CoreLockfileTests(unittest.TestCase):
         root: Path,
         *,
         schema: int = 2,
-        product: str = "3.1.0-core.1",
+        product: str = "3.1.0-core.2",
         layout: str = "source",
         package: str = "control_plane",
         modules: tuple[str, ...] = EXPECTED_CORE_MODULES,
@@ -267,6 +268,7 @@ class CoreLockfileTests(unittest.TestCase):
         )
 
         self.assertEqual(ACTIVE_RUNTIME_MODULES, EXPECTED_CORE_MODULES)
+        self.assertEqual(len(EXPECTED_CORE_MODULES), 27)
         self.assertEqual(getattr(lockfile, "LOCK_MAX_BYTES", None), LOCK_MAX_BYTES)
         self.assertEqual(getattr(lockfile, "READ_CHUNK_BYTES", None), READ_CHUNK_BYTES)
         self.assertEqual(
@@ -278,7 +280,7 @@ class CoreLockfileTests(unittest.TestCase):
             RUNTIME_TOTAL_MAX_BYTES,
         )
         self.assertEqual(lock["schema_version"], 2)
-        self.assertEqual(lock["product_version"], "3.1.0-core.1")
+        self.assertEqual(lock["product_version"], "3.1.0-core.2")
         self.assertEqual(lock["runtime_layout"], "source")
         self.assertEqual(lock["runtime_package"], "control_plane")
         self.assertEqual(tuple(lock["runtime_modules"]), EXPECTED_CORE_MODULES)
@@ -340,6 +342,15 @@ class CoreLockfileTests(unittest.TestCase):
         self.assertIn("-X pycache_prefix=/dev/null", launcher)
         self.assertIn("import sys, tomllib", launcher)
         self.assertIn("sys.version_info >= (3, 11)", launcher)
+
+    def test_stage0_launcher_opens_every_runtime_leaf_nonblocking(self) -> None:
+        source = (ROOT / "scripts" / "control-plane").read_text(encoding="utf-8")
+        read_private = source.split("def read_private(path, limit, code):", 1)[1]
+        read_private = read_private.split("\ndef inventory(runtime):", 1)[0]
+
+        self.assertIn('getattr(os, "O_NONBLOCK", 0)', read_private)
+        self.assertLess(read_private.index("flags = ("), read_private.index("os.open(path, flags)"))
+        self.assertLess(read_private.index("os.open(path, flags)"), read_private.index("os.fstat(descriptor)"))
 
     def test_bootstraps_ignore_timestamp_valid_repository_bytecode(self) -> None:
         for kind in ("launcher", "hook"):

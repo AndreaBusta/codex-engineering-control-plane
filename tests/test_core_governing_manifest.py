@@ -37,6 +37,8 @@ GOVERNING_TEST_MATRIX = {
     "contracts.py": (
         "tests.test_contracts_v2",
         "tests.test_core_contract",
+        "tests.test_core_task_state",
+        "tests.test_core_verification",
     ),
     "core_types.py": ("tests.test_core_types",),
     "git_guards.py": ("tests.test_core_git_guards",),
@@ -47,6 +49,7 @@ GOVERNING_TEST_MATRIX = {
     "leases.py": (
         "tests.test_core_leases",
         "tests.test_core_state_paths",
+        "tests.test_core_task_state",
     ),
     "lockfile.py": ("tests.test_core_lockfile",),
     "maintenance.py": (
@@ -64,6 +67,7 @@ GOVERNING_TEST_MATRIX = {
     "risk_sentinel.py": ("tests.test_core_risk_sentinel",),
     "routing.py": ("tests.test_core_routing",),
     "scopes.py": ("tests.test_graph",),
+    "stable_pause.py": ("tests.test_core_stable_pause",),
     "survey.py": ("tests.test_core_survey",),
     "task_state.py": (
         "tests.test_core_task_state",
@@ -104,6 +108,7 @@ GOVERNING_TESTS = frozenset(
         "tests.test_core_risk_sentinel",
         "tests.test_core_routing",
         "tests.test_core_state_paths",
+        "tests.test_core_stable_pause",
         "tests.test_core_survey",
         "tests.test_core_task_state",
         "tests.test_core_toolchain",
@@ -115,7 +120,38 @@ GOVERNING_HELPERS = frozenset(
     {
         "tests.core_gate",
         "tests.core_router_test_support",
+        "tests.core_stable_pause_test_support",
         "tests.git_test_support",
+    }
+)
+ADOPTION_MODULE_FILES = frozenset(
+    {
+        "adoption_enablement/__init__.py",
+        "adoption_enablement/cli.py",
+        "adoption_enablement/contracts.py",
+        "adoption_enablement/lockfile.py",
+        "adoption_enablement/manifest.py",
+        "adoption_enablement/repository.py",
+        "adoption_enablement/safe_io.py",
+        "adoption_enablement/transaction.py",
+    }
+)
+ADOPTION_TESTS = frozenset(
+    {
+        "tests.test_adoption_enablement_contracts",
+        "tests.test_adoption_enablement_repository",
+        "tests.test_adoption_enablement_preview",
+        "tests.test_adoption_enablement_transaction",
+        "tests.test_adoption_enablement_recovery",
+        "tests.test_adoption_enablement_bootstrap",
+        "tests.test_adoption_enablement_e2e",
+    }
+)
+ADOPTION_HELPERS = frozenset({"tests.adoption_enablement_test_support"})
+ADOPTION_GATE_FILES = frozenset(
+    {
+        "scripts/control-plane-adoption",
+        ".codex/adoption-enablement.lock",
     }
 )
 
@@ -248,6 +284,14 @@ def _imported_modules(tree: ast.AST) -> tuple[set[str], tuple[str, ...]]:
 
 
 class CoreGoverningManifestTests(unittest.TestCase):
+    def test_survey_module_stays_within_its_governing_line_budget(self) -> None:
+        survey = ROOT / "control_plane" / "survey.py"
+        self.assertLessEqual(
+            len(survey.read_text(encoding="utf-8").splitlines()),
+            450,
+            "control_plane/survey.py exceeds its 450-line governing budget",
+        )
+
     def test_ast_scanner_closes_alias_and_from_import_bypasses(self) -> None:
         tree = ast.parse(
             "import importlib as loader\n"
@@ -323,6 +367,11 @@ class CoreGoverningManifestTests(unittest.TestCase):
         declared_helpers = frozenset(_shell_words("CORE_TEST_HELPERS"))
         declared_package = tuple(_shell_words("CORE_TEST_PACKAGE"))
         declared_gate_files = frozenset(_shell_words("CORE_GATE_FILES"))
+        adoption_modules = frozenset(_shell_words("ADOPTION_MODULES"))
+        adoption_tests = frozenset(_shell_words("ADOPTION_TESTS"))
+        adoption_test_files = frozenset(_shell_words("ADOPTION_TEST_FILES"))
+        adoption_helpers = frozenset(_shell_words("ADOPTION_TEST_HELPERS"))
+        adoption_gate_files = frozenset(_shell_words("ADOPTION_GATE_FILES"))
 
         self.assertEqual(declared_tests, GOVERNING_TESTS)
         self.assertEqual(
@@ -350,6 +399,60 @@ class CoreGoverningManifestTests(unittest.TestCase):
                 }
             ),
         )
+        self.assertEqual(adoption_modules, ADOPTION_MODULE_FILES)
+        self.assertEqual(adoption_tests, ADOPTION_TESTS)
+        self.assertEqual(
+            adoption_test_files,
+            frozenset(
+                str(_module_path(module).relative_to(ROOT))
+                for module in ADOPTION_TESTS
+            ),
+        )
+        self.assertEqual(
+            adoption_helpers,
+            frozenset(
+                str(_module_path(module).relative_to(ROOT))
+                for module in ADOPTION_HELPERS
+            ),
+        )
+        self.assertEqual(adoption_gate_files, ADOPTION_GATE_FILES)
+
+        observed_adoption_sources = frozenset(
+            str(path.relative_to(ROOT))
+            for path in (ROOT / "adoption_enablement").iterdir()
+            if path.is_file()
+        )
+        observed_adoption_tests = frozenset(
+            str(path.relative_to(ROOT))
+            for path in (ROOT / "tests").glob("test_adoption_enablement_*.py")
+        )
+        self.assertEqual(observed_adoption_sources, ADOPTION_MODULE_FILES)
+        self.assertEqual(observed_adoption_tests, adoption_test_files)
+
+    def test_core_and_adoption_runtime_import_boundaries_are_bidirectionally_closed(self) -> None:
+        for relative in sorted(ADOPTION_MODULE_FILES):
+            tree = ast.parse((ROOT / relative).read_bytes(), filename=relative)
+            imported, dynamic_targets = _imported_modules(tree)
+            self.assertFalse(
+                any(name == "control_plane" or name.startswith("control_plane.") for name in imported),
+                relative,
+            )
+            self.assertFalse(
+                any(target == "control_plane" or target.startswith("control_plane.") for target in dynamic_targets),
+                relative,
+            )
+        for name in ACTIVE_RUNTIME_MODULES:
+            relative = ROOT / "control_plane" / name
+            tree = ast.parse(relative.read_bytes(), filename=str(relative))
+            imported, dynamic_targets = _imported_modules(tree)
+            self.assertFalse(
+                any(name == "adoption_enablement" or name.startswith("adoption_enablement.") for name in imported),
+                str(relative),
+            )
+            self.assertFalse(
+                any(target == "adoption_enablement" or target.startswith("adoption_enablement.") for target in dynamic_targets),
+                str(relative),
+            )
 
     def test_governing_tests_and_helpers_have_no_advanced_import_path(self) -> None:
         sources = GOVERNING_TESTS | GOVERNING_HELPERS
@@ -364,6 +467,9 @@ class CoreGoverningManifestTests(unittest.TestCase):
                     for name in imported
                     if _forbidden_runtime_import(name)
                     or name in FORBIDDEN_TEST_HELPERS
+                    or name == "adoption_enablement"
+                    or name.startswith("adoption_enablement.")
+                    or name.startswith("tests.test_adoption_enablement_")
                 }
                 self.assertEqual(forbidden, set())
                 forbidden_dynamic = tuple(

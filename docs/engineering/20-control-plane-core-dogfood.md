@@ -1,20 +1,29 @@
 # Control Plane Core manual dogfood
 
-Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`.
+Status: `HISTORICAL_PASS_10_TASK_CORE_1 / CORE_2_DOGFOOD_PENDING`. `Autopilot=OFF`.
 
 This is a manual evidence gate, not an execution log or an authorization store.
 No prompts, transcripts, or telemetry are persisted. A task counts only after
 its observable result and bounded evidence have been reviewed. Completed rows
-reference a canonical, non-authorizing evidence payload below; the candidate
-remains pending until all ten rows satisfy the exit gate together.
+reference a canonical, non-authorizing evidence payload below. Every row is
+bound to `3.1.0-core.1` and remains historical; none certifies the current
+`3.1.0-core.2` candidate. Fresh ten-task dogfood is required for core.2.
+
+Stable Pause v1 is `IMPLEMENTED_LOCAL` in the current 27-module Core candidate.
+It is a verify-only local capability, not a dogfood PASS: the command emits
+`SAFE_PAUSE_ACTIVE`, `SAFE_PAUSE_TERMINAL`, `UNSAFE_PAUSE`, or `UNKNOWN` with
+`authorizes=false`, and closure requires final frozen-byte evidence. Adding the
+module invalidates every earlier byte-bound Core gate, review, and local
+observation, including evidence collected before the 27-module runtime seal.
 
 ## Entry gate
 
-- Use the exact `3.1.0-core.1` source candidate and record its runtime digest.
+- Use the exact `3.1.0-core.2` source candidate and record its runtime digest.
 - Keep one root coordinator, at most two workers, and no overlapping writers.
 - Permit only `answer` or `local_change`; defer every external effect.
-- Run focal verification while iterating and at most one authoritative full
-  suite for the final subject of each task.
+- Run focal verification while iterating. Do not run a full suite per dogfood
+  task; the frozen candidate and completed scorecard share the separate final
+  budget `max_gate_runs=3` from the Core maintenance runbook.
 - Mark uncertainty `UNKNOWN`; never translate missing evidence into success.
 
 ## Scorecard
@@ -55,10 +64,14 @@ duplicated_full_suites=0
 authoritative_full_gate=PENDING
 ```
 
-The ten rows satisfy these dogfood invariants. The authoritative full gate is a
-separate, single execution over the sealed final bytes. Failure leaves the
-candidate blocked; success still does not enable Autopilot or stable adoption.
+The ten rows satisfied these dogfood invariants for `3.1.0-core.1`. Their
+authoritative full gate and every version-bound result were invalidated for the
+new `3.1.0-core.2` candidate. A fresh ten-task scorecard and a separate full
+gate are required before core.2 may satisfy the dogfood gate; success would
+still not enable Autopilot or stable adoption.
 Every evidence reference excludes prompts, transcripts, secrets, and authority.
+Stable Pause evidence, when completed, still cannot substitute for the fresh
+ten-task scorecard, consumer proof, canary, installation, or adoption authority.
 
 ## Evidence registry
 
@@ -146,8 +159,8 @@ Evidence digest: `sha256:ec29389f6afb3492d85f21f4e92ca20e699a2605f66a97c466e1229
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora del candidato Core y scorecard manual.
-- **Para continuar:** ejecutar una única vez `bash tests/run.sh` sobre estos bytes finales y detenerse si no es `PASS`.
-- **Mensaje exacto:** `Ejecuta el único gate integral de Control Plane Core 3.1; no edites ni realices efectos remotos después.`
-- **Estado de partida:** `3.1.0-core.1`, diez filas `PASS`, gate dogfood satisfecho, gate integral aún no observado y adopción estable no autorizada.
+- **Para continuar:** ejecutar un nuevo dogfood manual de diez tareas ligado al digest final de `3.1.0-core.2` en una tarea separada.
+- **Mensaje exacto:** `Prepara el dogfood manual local de 3.1.0-core.2; no instales, no uses consumidor ni habilites Autopilot.`
+- **Estado de partida:** `3.1.0-core.2` pendiente de dogfood; las diez filas `PASS` de `3.1.0-core.1` son evidencia histórica y la adopción estable no está autorizada.
 - **No hacer todavía:** instalar, adoptar externamente, commit, push, PR, merge, deploy, publicación o release.
 - **Autoridad:** `authorizes=false`

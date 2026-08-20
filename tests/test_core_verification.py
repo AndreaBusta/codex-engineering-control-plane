@@ -8,6 +8,7 @@ from pathlib import Path
 import py_compile
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,8 +17,15 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from control_plane.contracts import contract_digest
 from control_plane.verification import VerificationMutex, run_serialized_verification
-from tests.test_core_task_state import git, make_repo
+from tests.test_core_task_state import (
+    git,
+    install_active_adoption_journal,
+    install_provisioning_prefix,
+    make_repo,
+    private_state_identity_snapshot,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,10 +40,30 @@ def runner_fixture(root: Path) -> Path:
         repository / "control_plane",
         ignore=ignored,
     )
+    shutil.copytree(
+        ROOT / "adoption_enablement",
+        repository / "adoption_enablement",
+        ignore=ignored,
+    )
+    shutil.copytree(
+        ROOT / "skills" / "control-plane-git",
+        repository / "skills" / "control-plane-git",
+        ignore=ignored,
+    )
+    shutil.copytree(
+        ROOT / "templates" / "spec-pack",
+        repository / "templates" / "spec-pack",
+        ignore=ignored,
+    )
     shutil.copytree(ROOT / "tests", repository / "tests", ignore=ignored)
     (repository / "scripts").mkdir()
-    for name in ("control-plane", "build-release-candidate"):
+    for name in ("control-plane", "build-release-candidate", "control-plane-adoption"):
         shutil.copy2(ROOT / "scripts" / name, repository / "scripts" / name)
+    (repository / ".codex").mkdir()
+    shutil.copy2(
+        ROOT / ".codex" / "adoption-enablement.lock",
+        repository / ".codex" / "adoption-enablement.lock",
+    )
     initialized = subprocess.run(
         ["/usr/bin/git", "init", "--quiet", str(repository)],
         env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
@@ -109,7 +137,293 @@ def hold_mutex(repo: str, ready: multiprocessing.Queue) -> None:
         time.sleep(1.0)
 
 
+def install_active_adoption_verification_binding(repository: Path) -> Path:
+    lock_path, _ = install_active_adoption_journal(repository)
+    return lock_path
+
+
+def replace_bound_verification_mutex(lock_path: Path, case: str) -> int:
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+    )
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if case == "missing_file":
+        lock_path.unlink()
+    elif case == "replaced_file":
+        lock_path.rename(lock_path.with_name("verification.displaced"))
+    else:
+        locks = lock_path.parent
+        locks.rename(locks.with_name("locks.displaced"))
+        locks.mkdir(mode=0o700)
+    if case != "missing_file":
+        replacement = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.close(replacement)
+    return descriptor
+
+
+def mutate_adoption_journal(repository: Path, case: str) -> None:
+    path = (
+        repository
+        / ".git"
+        / "codex-control-plane-core"
+        / "adoption"
+        / "journal.json"
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if case == "duplicate":
+        payload = path.read_text(encoding="utf-8").replace(
+            '"schema_version":1',
+            '"schema_version":1,"schema_version":1',
+            1,
+        )
+        path.write_text(payload, encoding="utf-8")
+        return
+    if case == "extra":
+        value["unexpected"] = False
+    elif case == "schema":
+        value["schema_version"] = 2
+    elif case == "target_binding_extra":
+        value["target_binding"]["unexpected"] = False
+    elif case == "parent_mode":
+        value["managed_parent_directories"][0]["mode"] = 0o777
+    elif case == "parent_order":
+        value["managed_parent_directories"][1:3] = reversed(
+            value["managed_parent_directories"][1:3]
+        )
+    elif case == "repository_scan":
+        value["managed_repository_scan"]["gitlinks_absent"] = False
+    elif case == "created_path":
+        value["created_directories"].append(
+            {"path": "../escape", "mode": 0o755, "identity": None}
+        )
+    elif case == "published_record":
+        value["published_records"].append({"path": "scripts/control-plane"})
+    elif case == "target_lock_path":
+        value["target_lock_record"]["path"] = ".codex/other.lock"
+    elif case == "prior_git_config":
+        value["prior_git_config"] = {"core.hooksPath": "hooks"}
+    elif case == "rollback_before":
+        value["rollback_records"][0]["before"] = "present"
+    elif case == "nested_authorizes":
+        value["target_binding"]["authorizes"] = True
+    elif case == "digest_syntax":
+        value["plan_digest"] = "invalid"
+    else:
+        raise AssertionError(f"unknown journal mutation: {case}")
+    unsigned = {key: item for key, item in value.items() if key != "state_digest"}
+    value["state_digest"] = contract_digest(unsigned)
+    path.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+
 class CoreVerificationTests(unittest.TestCase):
+    def test_runner_fixture_carries_every_reconciled_governing_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = runner_fixture(Path(directory))
+
+            for relative in (
+                "adoption_enablement/manifest.py",
+                "control_plane/stable_pause.py",
+                "control_plane/survey.py",
+                "skills/control-plane-git/SKILL.md",
+                "templates/spec-pack/SPEC_PACK_MANIFEST.json",
+            ):
+                with self.subTest(relative=relative):
+                    self.assertTrue((repository / relative).is_file(), relative)
+
+    def test_transitional_provisioning_blocks_core_verifier_without_mutation(self) -> None:
+        for prefix in ("P2", "P2Q", "P3", "P3Q", "P4", "P4T"):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                repository = runner_fixture(Path(directory))
+                install_provisioning_prefix(repository, prefix)
+                before = private_state_identity_snapshot(repository)
+
+                with self.assertRaisesRegex(ValueError, "^E_VERIFICATION_LOCK:"):
+                    with VerificationMutex(repository):
+                        self.fail("Core verifier accepted transitional provisioning")
+                self.assertEqual(private_state_identity_snapshot(repository), before)
+
+    def test_transitional_provisioning_blocks_runner_without_mutation(self) -> None:
+        for prefix in ("P2", "P2Q", "P3", "P3Q", "P4", "P4T"):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                repository = runner_fixture(Path(directory))
+                install_gate_sentinel(repository)
+                install_provisioning_prefix(repository, prefix)
+                before = private_state_identity_snapshot(repository)
+
+                completed = run_fixture_gate(repository)
+
+                self.assert_stable_gate_error(completed, "E_TEST_MUTEX")
+                self.assertEqual(private_state_identity_snapshot(repository), before)
+
+    def test_core_and_runner_require_a_closed_active_adoption_journal(self) -> None:
+        for case in (
+            "duplicate",
+            "extra",
+            "schema",
+            "target_binding_extra",
+            "parent_mode",
+            "parent_order",
+            "repository_scan",
+            "created_path",
+            "published_record",
+            "target_lock_path",
+            "prior_git_config",
+            "rollback_before",
+            "nested_authorizes",
+            "digest_syntax",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                repository = runner_fixture(Path(directory))
+                install_gate_sentinel(repository)
+                install_active_adoption_verification_binding(repository)
+                mutate_adoption_journal(repository, case)
+
+                with self.assertRaisesRegex(ValueError, "^E_VERIFICATION_LOCK:"):
+                    with VerificationMutex(repository):
+                        self.fail("Core accepted a non-closed adoption journal")
+                completed = run_fixture_gate(repository)
+                self.assert_stable_gate_error(completed, "E_TEST_MUTEX")
+
+    def test_core_verifier_retains_the_locked_directory_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = make_repo(Path(directory) / "repo")
+            with VerificationMutex(repository) as acquired:
+                self.assertTrue(acquired)
+            state = repository / ".git" / "codex-control-plane-core"
+            locks = state / "locks"
+            lock_path = locks / "verification.lock"
+            displaced = state / "locks.displaced"
+            real_flock = fcntl.flock
+            replaced = False
+
+            def replace_directory_after_flock(descriptor: int, operation: int) -> None:
+                nonlocal replaced
+                real_flock(descriptor, operation)
+                if operation == (fcntl.LOCK_EX | fcntl.LOCK_NB) and not replaced:
+                    locks.rename(displaced)
+                    locks.mkdir(mode=0o700)
+                    (displaced / "verification.lock").rename(lock_path)
+                    replaced = True
+
+            with patch(
+                "control_plane.verification.fcntl.flock",
+                side_effect=replace_directory_after_flock,
+            ), self.assertRaisesRegex(ValueError, "^E_VERIFICATION_LOCK:"):
+                with VerificationMutex(repository):
+                    self.fail("Core accepted a substituted lock directory")
+
+    def test_runner_retains_the_locked_directory_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = runner_fixture(root)
+            install_gate_sentinel(repository)
+            ready = root / "runner-ready"
+            resume = root / "runner-resume"
+            runner = repository / "tests" / "run.sh"
+            source = runner.read_text(encoding="utf-8")
+            marker = "lock_held = True\nvalidate_lifecycle_after_flock("
+            replacement = (
+                "lock_held = True\n"
+                "import time as _mutex_test_time\n"
+                f"Path({str(ready)!r}).write_text('ready', encoding='utf-8')\n"
+                "for _mutex_test_index in range(500):\n"
+                f"    if Path({str(resume)!r}).exists():\n"
+                "        break\n"
+                "    _mutex_test_time.sleep(0.01)\n"
+                "else:\n"
+                "    fail('E_TEST_MUTEX', 'test rendezvous timed out')\n"
+                "validate_lifecycle_after_flock("
+            )
+            self.assertIn(marker, source)
+            runner.write_text(source.replace(marker, replacement, 1), encoding="utf-8")
+            process = subprocess.Popen(
+                ["/bin/sh", str(runner)],
+                cwd=repository,
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                stdin=subprocess.DEVNULL,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _ in range(200):
+                if ready.exists():
+                    break
+                time.sleep(0.01)
+            self.assertTrue(ready.exists())
+            state = repository / ".git" / "codex-control-plane-core"
+            locks = state / "locks"
+            displaced = state / "locks.displaced"
+            locks.rename(displaced)
+            locks.mkdir(mode=0o700)
+            (displaced / "verification.lock").rename(
+                locks / "verification.lock"
+            )
+            resume.write_text("resume", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=10)
+            completed = subprocess.CompletedProcess(
+                process.args,
+                process.returncode,
+                stdout,
+                stderr,
+            )
+            self.assert_stable_gate_error(completed, "E_TEST_MUTEX")
+
+    def test_runner_rejects_a_symlinked_adoption_binding_ancestor(self) -> None:
+        for case in ("marker", "journal"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                repository = runner_fixture(Path(directory))
+                install_gate_sentinel(repository)
+                install_active_adoption_verification_binding(repository)
+                if case == "marker":
+                    original = repository / ".codex"
+                    displaced = repository / ".codex.displaced"
+                else:
+                    state = repository / ".git" / "codex-control-plane-core"
+                    original = state / "adoption"
+                    displaced = state / "adoption.displaced"
+                original.rename(displaced)
+                original.symlink_to(displaced.name, target_is_directory=True)
+
+                completed = run_fixture_gate(repository)
+
+                self.assert_stable_gate_error(completed, "E_TEST_MUTEX")
+
+    def test_bound_core_verifier_rejects_a_second_mutex_domain(self) -> None:
+        for case in ("missing_file", "replaced_file", "replaced_directory"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                repository = make_repo(Path(directory) / "repo")
+                lock_path = install_active_adoption_verification_binding(repository)
+                descriptor = replace_bound_verification_mutex(lock_path, case)
+                try:
+                    with self.assertRaisesRegex(ValueError, "^E_VERIFICATION_LOCK:"):
+                        with VerificationMutex(repository) as acquired:
+                            self.assertFalse(acquired)
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+
+    def test_bound_runner_rejects_a_second_mutex_domain_before_execution(self) -> None:
+        for case in ("missing_file", "replaced_file", "replaced_directory"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                repository = runner_fixture(Path(directory))
+                install_gate_sentinel(repository)
+                lock_path = install_active_adoption_verification_binding(repository)
+                descriptor = replace_bound_verification_mutex(lock_path, case)
+                try:
+                    completed = run_fixture_gate(repository)
+                finally:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    os.close(descriptor)
+                self.assert_stable_gate_error(completed, "E_TEST_MUTEX")
+
     def test_core_gate_rejects_local_clean_filter_before_git_sink(self) -> None:
         from tests import core_gate
 

@@ -27,6 +27,24 @@ _CORE_STATES = (
 )
 _QUARANTINED = "E_CAPABILITY_QUARANTINED"
 _JSON_INPUT_MAX_BYTES = 1_048_576
+_SURVEY_OUTPUT_MAX_BYTES = 4_096
+
+
+class _StoreOnce(argparse.Action):
+    """Reject repeated Stable Pause flags instead of accepting last-value wins."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        marker = f"_seen_{self.dest}"
+        if getattr(namespace, marker, False):
+            parser.error(f"argument {option_string} may be supplied exactly once")
+        setattr(namespace, marker, True)
+        setattr(namespace, self.dest, self.const if self.nargs == 0 else values)
 
 
 def _error_code(error: BaseException) -> str:
@@ -151,12 +169,41 @@ def _render_human(payload: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _emit(payload: dict[str, Any], as_json: bool) -> int:
-    print(
-        json.dumps(payload, indent=2, sort_keys=True)
+def _emit(
+    payload: dict[str, Any],
+    as_json: bool,
+    *,
+    output_limit: int | None = None,
+    overflow_payload: dict[str, Any] | None = None,
+    compact_json: bool = False,
+) -> int:
+    rendered = (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":") if compact_json else None,
+            indent=None if compact_json else 2,
+        )
         if as_json
         else _render_human(payload)
     )
+    if output_limit is not None and len((rendered + "\n").encode("utf-8")) > output_limit:
+        if overflow_payload is None:
+            raise ValueError("E_OUTPUT_LIMIT: rendered output exceeds its bound")
+        payload = overflow_payload
+        rendered = (
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":") if compact_json else None,
+                indent=None if compact_json else 2,
+            )
+            if as_json
+            else _render_human(payload)
+        )
+        if len((rendered + "\n").encode("utf-8")) > output_limit:
+            raise ValueError("E_OUTPUT_LIMIT: fallback output exceeds its bound")
+    print(rendered)
     if payload.get("error_code") == _QUARANTINED:
         return 2
     if payload.get("command") == "risk-status" and payload.get("status") == "UNKNOWN":
@@ -182,6 +229,33 @@ def _quarantined(command: str) -> dict[str, Any]:
         "command": command,
         "ok": False,
         "error_code": _QUARANTINED,
+        "authorizes": False,
+    }
+
+
+def _closed_survey_payload(error_code: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "RepositorySurveyV1",
+        "command": "survey",
+        "ok": False,
+        "clone": {"root": "", "common_git_dir": "", "branch": "", "head": ""},
+        "worktrees": [],
+        "branches": [],
+        "orphan_work": {"stashes": 0, "untracked_total": 0},
+        "other_clones": "UNKNOWN",
+        "status": "UNKNOWN",
+        "error_code": error_code,
+        "facts": {
+            "branch": "",
+            "worktrees": 0,
+            "worktrees_dirty": 0,
+            "branches": 0,
+            "branches_content_equivalent": 0,
+            "orphan_stashes": 0,
+            "orphan_untracked": 0,
+            "other_clones": "UNKNOWN",
+        },
         "authorizes": False,
     }
 
@@ -374,8 +448,14 @@ def command_survey(arguments: argparse.Namespace) -> int:
 
     try:
         observed = survey_repository(Path(arguments.repo), base=arguments.base)
-    except Exception as error:  # noqa: BLE001 - surfaced as a closed payload
-        return _emit(_failure("survey", error), arguments.json)
+    except Exception:  # noqa: BLE001 - converted to a stable closed payload
+        return _emit(
+            _closed_survey_payload("E_SURVEY_INVENTORY"),
+            arguments.json,
+            output_limit=_SURVEY_OUTPUT_MAX_BYTES,
+            overflow_payload=_closed_survey_payload("E_SURVEY_OUTPUT_LIMIT"),
+            compact_json=True,
+        )
     payload = survey_payload(observed)
     payload.update(
         {
@@ -395,7 +475,13 @@ def command_survey(arguments: argparse.Namespace) -> int:
             },
         }
     )
-    return _emit(payload, arguments.json)
+    return _emit(
+        payload,
+        arguments.json,
+        output_limit=_SURVEY_OUTPUT_MAX_BYTES,
+        overflow_payload=_closed_survey_payload("E_SURVEY_OUTPUT_LIMIT"),
+        compact_json=True,
+    )
 
 
 def command_doctor(arguments: argparse.Namespace) -> int:
@@ -874,6 +960,34 @@ def command_task(arguments: argparse.Namespace) -> int:
     return _emit(payload, arguments.json)
 
 
+def command_task_checkpoint(arguments: argparse.Namespace) -> int:
+    """Emit exactly one canonical verify-only Stable Pause JSON object."""
+
+    from control_plane.contracts import canonical_json, validate_stable_pause_observation
+    from control_plane.stable_pause import (
+        observe_stable_pause,
+        unknown_stable_pause_observation,
+    )
+
+    try:
+        value = observe_stable_pause(Path.cwd(), arguments.task_id)
+        value = validate_stable_pause_observation(value)
+        if value["lifecycle"]["task_id"] != arguments.task_id:
+            raise ValueError("stable pause task binding differs")
+    except Exception:
+        value = unknown_stable_pause_observation(
+            Path.cwd(),
+            arguments.task_id,
+            issue_code="E_STABLE_PAUSE_BOUNDS",
+        )
+    print(canonical_json(value))
+    if value["status"] == "UNKNOWN":
+        return 2
+    if value["status"] == "UNSAFE_PAUSE":
+        return 1
+    return 0
+
+
 def command_safe_read(arguments: argparse.Namespace) -> int:
     from control_plane.core_types import observe_current_worktree
     from control_plane.hooks import _safe_read_repository_identity, execute_safe_read
@@ -1151,6 +1265,24 @@ def build_parser() -> argparse.ArgumentParser:
             action_parser.add_argument("--lease-digest", required=True)
         _output(action_parser)
         action_parser.set_defaults(handler=command_task)
+
+    checkpoint = task_actions.add_parser("checkpoint")
+    checkpoint.add_argument(
+        "--mode",
+        choices=("stable-pause",),
+        required=True,
+        action=_StoreOnce,
+    )
+    checkpoint.add_argument("--task-id", required=True, action=_StoreOnce)
+    checkpoint.add_argument(
+        "--json",
+        nargs=0,
+        const=True,
+        default=False,
+        required=True,
+        action=_StoreOnce,
+    )
+    checkpoint.set_defaults(handler=command_task_checkpoint)
 
     run = commands.add_parser("run")
     run_actions = run.add_subparsers(dest="run_action", required=True)

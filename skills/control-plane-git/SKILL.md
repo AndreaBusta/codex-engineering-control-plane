@@ -17,7 +17,9 @@ clone, its worktrees, its branches compared by content, and orphan work.
   and another clone's local branches never appear. `survey` reports
   `other_clones=UNKNOWN`. Treat that as unknown, never as none.
 - **`squash` makes merged branches look ahead.** Commit counts prove nothing.
-  Compare content: `git diff --diff-filter=A --name-only <base>..<branch>`.
+  Compare the whole content delta with
+  `git diff --name-status --no-ext-diff --no-textconv <base>..<branch> --`;
+  only empty output proves equivalence. An added-path inventory is auxiliary.
 - **Orphan work hides outside commits.** Stashes and untracked files exist
   nowhere else. A refused `git worktree remove` is the signal; never force it.
 - **`dataless` files imitate defects.** A placeholder changes inode identity on

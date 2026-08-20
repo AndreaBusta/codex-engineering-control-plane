@@ -196,6 +196,93 @@ def task_start_arguments(repo: Path, task_id: str, policy: Path) -> tuple[str, .
 
 
 class CoreCliTests(unittest.TestCase):
+    def test_task_checkpoint_stable_pause_has_closed_grammar(self) -> None:
+        from contextlib import redirect_stderr
+
+        from control_plane.cli import build_parser
+
+        exact = (
+            "task",
+            "checkpoint",
+            "--mode",
+            "stable-pause",
+            "--task-id",
+            "TASK-STABLE-PAUSE-V1",
+            "--json",
+        )
+        parsed = build_parser().parse_args(exact)
+        self.assertEqual(parsed.task_action, "checkpoint")
+        self.assertEqual(parsed.mode, "stable-pause")
+        self.assertEqual(parsed.task_id, "TASK-STABLE-PAUSE-V1")
+        self.assertTrue(parsed.json)
+        invalid = (
+            exact[:-1],
+            ("task", "checkpoint", "--task-id", "TASK-STABLE-PAUSE-V1", "--json"),
+            ("task", "checkpoint", "--mode", "stable-pause", "--json"),
+            exact + ("--mode", "stable-pause"),
+            exact + ("--task-id", "TASK-SECOND"),
+            exact + ("--json",),
+            (
+                "task",
+                "checkpoint",
+                "--mode",
+                "cleanup",
+                "--task-id",
+                "TASK-STABLE-PAUSE-V1",
+                "--json",
+            ),
+            exact + ("--remote",),
+            exact + ("TASK-POSITIONAL",),
+        )
+        for argv in invalid:
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                build_parser().parse_args(argv)
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_task_checkpoint_maps_closed_results_to_exit_codes(self) -> None:
+        from control_plane.cli import main
+        from tests.core_stable_pause_test_support import (
+            resigned,
+            stable_pause_observation,
+        )
+
+        active = stable_pause_observation()
+        terminal = stable_pause_observation(
+            status="SAFE_PAUSE_TERMINAL",
+            task_state="closed",
+            lease_state="absent",
+        )
+        unsafe = stable_pause_observation(status="UNSAFE_PAUSE")
+        unsafe["checks"]["owned_residue"] = "FAIL"
+        unsafe["issues"] = [
+            {"code": "E_STABLE_PAUSE_RESIDUE", "dimension": "residue"}
+        ]
+        unsafe = resigned(unsafe)
+        unknown = stable_pause_observation(status="UNKNOWN")
+        unknown["checks"]["repository_identity"] = "UNKNOWN"
+        unknown["issues"] = [
+            {"code": "E_STABLE_PAUSE_REPOSITORY", "dimension": "repository"}
+        ]
+        unknown = resigned(unknown)
+        argv = (
+            "task",
+            "checkpoint",
+            "--mode",
+            "stable-pause",
+            "--task-id",
+            "TASK-STABLE-PAUSE-V1",
+            "--json",
+        )
+        for value, expected in ((active, 0), (terminal, 0), (unsafe, 1), (unknown, 2)):
+            output = io.StringIO()
+            with self.subTest(status=value["status"]), patch(
+                "control_plane.stable_pause.observe_stable_pause",
+                return_value=value,
+            ) as observer, redirect_stdout(output):
+                self.assertEqual(main(argv), expected)
+            observer.assert_called_once_with(Path.cwd(), "TASK-STABLE-PAUSE-V1")
+            self.assertEqual(json.loads(output.getvalue()), value)
+
     def test_explicit_policy_cannot_substitute_for_governing_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = make_repo(Path(directory) / "repo")
@@ -576,7 +663,7 @@ class CoreCliTests(unittest.TestCase):
 
     def test_survey_command_exit_codes_and_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = make_repo(Path(directory) / "repo")
+            repo = make_repo(Path(directory) / "repo").resolve()
             return_code, payload = run_cli_in_process(
                 "survey", "--repo", str(repo), "--base", "HEAD", "--json"
             )
@@ -600,6 +687,57 @@ class CoreCliTests(unittest.TestCase):
             self.assertEqual(return_code, 2)
             self.assertEqual(payload["error_code"], "E_SURVEY_BASE_UNKNOWN")
             self.assertIs(payload["authorizes"], False)
+
+    def test_survey_output_over_budget_is_bounded_unknown(self) -> None:
+        from control_plane.cli import main
+        from control_plane.survey import RepositorySurvey
+
+        oversized = RepositorySurvey(
+            root="x" * 8_192,
+            common_git_dir="/git",
+            branch="main",
+            head="0" * 40,
+            worktrees=(),
+            branches=(),
+            stashes=0,
+            untracked_total=0,
+            status="PASS",
+            error_code=None,
+        )
+        output = io.StringIO()
+        with patch(
+            "control_plane.survey.survey_repository", return_value=oversized
+        ), redirect_stdout(output):
+            return_code = main(
+                ("survey", "--repo", "/repo", "--base", "HEAD", "--json")
+            )
+        rendered = output.getvalue()
+        payload = json.loads(rendered)
+
+        self.assertLessEqual(len(rendered.encode("utf-8")), 4_096)
+        self.assertEqual(return_code, 2)
+        self.assertEqual(payload["status"], "UNKNOWN")
+        self.assertEqual(payload["error_code"], "E_SURVEY_OUTPUT_LIMIT")
+        self.assertIs(payload["authorizes"], False)
+
+    def test_survey_exception_is_deterministic_unknown_without_error_text(self) -> None:
+        payloads: list[dict] = []
+        for detail in ("first private detail", "second private detail"):
+            with patch(
+                "control_plane.survey.survey_repository",
+                side_effect=RuntimeError(detail),
+            ):
+                return_code, payload = run_cli_in_process(
+                    "survey", "--repo", "/repo", "--base", "HEAD", "--json"
+                )
+            self.assertEqual(return_code, 2)
+            self.assertEqual(payload["status"], "UNKNOWN")
+            self.assertEqual(payload["error_code"], "E_SURVEY_INVENTORY")
+            self.assertNotIn(detail, json.dumps(payload, sort_keys=True))
+            self.assertIs(payload["authorizes"], False)
+            payloads.append(payload)
+
+        self.assertEqual(payloads[0], payloads[1])
 
     def test_doctor_reports_git_state_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

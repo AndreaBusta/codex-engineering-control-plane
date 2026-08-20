@@ -1,0 +1,18 @@
+schema_version = 1
+tool_version = "0.1.0"
+runtime_package = "adoption_enablement"
+runtime_layout = "source"
+runtime_modules = [
+  "__init__.py",
+  "cli.py",
+  "contracts.py",
+  "lockfile.py",
+  "manifest.py",
+  "repository.py",
+  "safe_io.py",
+  "transaction.py",
+]
+
+[digests]
+entrypoint = "sha256:8d079a27ab94fce929bb9b5b5ed15892b268f1531bb84791f13846e9360e1256"
+runtime = "sha256:3ca092f0d71942dff84076fae03d3cdaa45bc97df7189ae1978c7b3b36e3ffe5"

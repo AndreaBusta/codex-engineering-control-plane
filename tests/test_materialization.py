@@ -25,7 +25,7 @@ class MaterializationTests(unittest.TestCase):
             ["git", "-C", str(repo), "add", "--", "materialized.txt", "placeholder.txt"],
             check=True,
         )
-        return repo
+        return repo.resolve()
 
     def test_dataless_tracked_file_is_reported_without_reading_contents(self) -> None:
         from control_plane.materialization import (
@@ -133,6 +133,24 @@ class MaterializationTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.tracked_files, 2)
 
+    def test_tracked_inventory_never_uses_unbounded_subprocess_run(self) -> None:
+        from control_plane.materialization import inspect_tracked_materialization
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repository(Path(temporary))
+            with patch.object(
+                subprocess,
+                "run",
+                side_effect=AssertionError("unbounded subprocess.run was used"),
+            ), patch(
+                "control_plane.materialization._file_flags", return_value=0
+            ):
+                result = inspect_tracked_materialization(repo)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "PASS")
+        self.assertEqual(result.tracked_files, 2)
+
 
 def _repository(root: Path) -> Path:
     repository = root / "repo"
@@ -146,10 +164,46 @@ def _repository(root: Path) -> Path:
         check=True,
         timeout=10,
     )
-    return repository
+    return repository.resolve()
 
 
 class GitStateMaterializationTests(unittest.TestCase):
+    def test_clean_git_state_is_proven_without_spawning_git(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            with patch.object(
+                subprocess,
+                "run",
+                side_effect=AssertionError("git was spawned before materialization"),
+            ):
+                observed = inspect_git_state_materialization(repository)
+
+        self.assertEqual(observed.status, "PASS")
+        self.assertTrue(observed.ok)
+
+    def test_symlinked_repository_root_is_unknown_without_following_it(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            alias = Path(raw) / "repo-alias"
+            alias.symlink_to(repository, target_is_directory=True)
+            observed = inspect_git_state_materialization(alias)
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_INVENTORY")
+
+    def test_git_state_flags_come_from_descriptor_bound_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            with patch(
+                "control_plane.materialization._file_flags",
+                side_effect=AssertionError("absolute path flags were consulted"),
+            ):
+                observed = inspect_git_state_materialization(repository)
+
+        self.assertEqual(observed.status, "PASS")
+        self.assertTrue(observed.ok)
+
     def test_clean_git_state_passes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repository = _repository(Path(raw))
@@ -170,15 +224,15 @@ class GitStateMaterializationTests(unittest.TestCase):
             (core / "adoption.lock").write_bytes(b"")
             real_flags = None
 
-            def fake_flags(path: Path) -> int:
+            def fake_flags(metadata, path: Path) -> int:
                 if path.name == "adoption.lock":
                     return DATALESS_FLAG
-                return real_flags(path)
+                return real_flags(metadata, path)
 
             from control_plane import materialization
 
-            real_flags = materialization._file_flags
-            with patch.object(materialization, "_file_flags", fake_flags):
+            real_flags = materialization._metadata_flags
+            with patch.object(materialization, "_metadata_flags", fake_flags):
                 observed = inspect_git_state_materialization(repository)
             self.assertFalse(observed.ok)
             self.assertEqual(observed.status, "FAIL")
@@ -207,7 +261,13 @@ class GitStateMaterializationTests(unittest.TestCase):
                     inspect_git_state_materialization(repository, max_files=invalid)
                 self.assertIn("E_MATERIALIZATION_LIMIT", str(observed.exception))
 
-    def test_symlinked_git_entry_is_not_followed(self) -> None:
+    def test_git_state_limit_above_governing_cap_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            with self.assertRaisesRegex(ValueError, "^E_MATERIALIZATION_LIMIT"):
+                inspect_git_state_materialization(repository, max_files=50_001)
+
+    def test_symlinked_git_entry_is_unknown_not_silently_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repository = _repository(Path(raw))
             outside = Path(raw) / "outside"
@@ -215,8 +275,204 @@ class GitStateMaterializationTests(unittest.TestCase):
             (outside / "secret.txt").write_text("x", encoding="utf-8")
             os.symlink(outside, repository / ".git" / "linked")
             observed = inspect_git_state_materialization(repository)
-            self.assertEqual(observed.status, "PASS")
-            self.assertTrue(observed.ok)
+            self.assertEqual(observed.status, "UNKNOWN")
+            self.assertFalse(observed.ok)
+            self.assertEqual(observed.error_code, "E_MATERIALIZATION_STAT")
+
+    def test_fifo_git_entry_is_unknown_not_silently_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            os.mkfifo(repository / ".git" / "hostile.fifo")
+            observed = inspect_git_state_materialization(repository)
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_STAT")
+
+    def test_inventory_limit_counts_directories_as_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            for name in ("empty-a", "empty-b", "empty-c"):
+                (repository / ".git" / name).mkdir()
+            file_count = sum(
+                1 for item in (repository / ".git").rglob("*") if item.is_file()
+            )
+            observed = inspect_git_state_materialization(
+                repository, max_files=file_count
+            )
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertTrue(observed.truncated)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_LIMIT")
+
+    def test_directory_depth_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            current = repository / ".git" / "deep"
+            for index in range(70):
+                current = current / f"d{index}"
+                current.mkdir(parents=True)
+            observed = inspect_git_state_materialization(repository)
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertTrue(observed.truncated)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_LIMIT")
+
+    def test_git_state_scan_deadline_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            with patch("time.monotonic", side_effect=(0.0, 11.0)):
+                observed = inspect_git_state_materialization(repository)
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertTrue(observed.truncated)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_LIMIT")
+
+    def test_git_state_deadline_is_passed_into_topology_discovery(self) -> None:
+        from control_plane import materialization
+
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            real_discovery = materialization._git_state_roots
+            with patch.object(
+                materialization,
+                "_git_state_roots",
+                wraps=real_discovery,
+            ) as discovery:
+                observed = inspect_git_state_materialization(repository)
+
+        self.assertEqual(observed.status, "PASS")
+        self.assertIn("deadline", discovery.call_args.kwargs)
+
+    def test_object_alternates_are_unknown_before_any_git_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            alternate = Path(raw) / "alternate-objects"
+            alternate.mkdir()
+            (repository / ".git" / "objects" / "info" / "alternates").write_text(
+                f"{alternate}\n", encoding="utf-8"
+            )
+            observed = inspect_git_state_materialization(repository)
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_STAT")
+
+    def test_case_variant_object_alternates_is_also_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            (repository / ".git" / "objects" / "info" / "Alternates").write_text(
+                "/unobserved/object-store\n", encoding="utf-8"
+            )
+            observed = inspect_git_state_materialization(repository)
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_STAT")
+
+    def test_git_state_root_identity_is_bound_from_discovery_to_walk(self) -> None:
+        from control_plane import materialization
+
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            original_git = repository / ".git"
+            displaced = repository / ".git.displaced"
+            real_discovery = materialization._git_state_roots
+
+            def substitute(*args, **kwargs):
+                roots = real_discovery(*args, **kwargs)
+                original_git.rename(displaced)
+                original_git.mkdir()
+                return roots
+
+            try:
+                with patch.object(
+                    materialization,
+                    "_git_state_roots",
+                    side_effect=substitute,
+                ):
+                    observed = inspect_git_state_materialization(repository)
+            finally:
+                if original_git.is_dir():
+                    original_git.rmdir()
+                if displaced.exists():
+                    displaced.rename(original_git)
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_STAT")
+
+    def test_dataless_linked_worktree_control_file_stops_before_git_spawn(self) -> None:
+        from control_plane import materialization
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            main = _repository(root)
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(main),
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    "first",
+                ],
+                env={
+                    "LC_ALL": "C",
+                    "PATH": "/usr/bin:/bin",
+                    "GIT_AUTHOR_NAME": "t",
+                    "GIT_AUTHOR_EMAIL": "t@e",
+                    "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@e",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=10,
+            )
+            linked = root / "linked"
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(main),
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    str(linked),
+                    "-b",
+                    "side",
+                ],
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=10,
+            )
+            real_flags = materialization._metadata_flags
+
+            def flags(metadata, path: Path) -> int:
+                if path == (linked / ".git").resolve(strict=False):
+                    return DATALESS_FLAG
+                return real_flags(metadata, path)
+
+            with patch.object(materialization, "_metadata_flags", side_effect=flags), patch.object(
+                subprocess,
+                "run",
+                side_effect=AssertionError("git spawned before control-file proof"),
+            ):
+                observed = inspect_git_state_materialization(linked)
+
+        self.assertEqual(observed.status, "UNKNOWN")
+        self.assertFalse(observed.ok)
+        self.assertEqual(observed.error_code, "E_MATERIALIZATION_INVENTORY")
 
     def test_unreadable_git_subtree_is_unknown_not_pass(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -257,6 +513,7 @@ class GitStateMaterializationTests(unittest.TestCase):
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, check=True, timeout=10,
             )
+            linked = linked.resolve()
             unique = sum(
                 len(files)
                 for _, _, files in os.walk(main / ".git", followlinks=False)

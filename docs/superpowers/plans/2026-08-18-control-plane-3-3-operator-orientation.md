@@ -1,5 +1,9 @@
 # Control Plane 3.3 Operator Orientation Implementation Plan
 
+Estado: `HISTORICAL_NON_GOVERNING / IMPLEMENTED_LOCAL`. Este plan conserva la
+traza TDD original; sus snippets y continuaciones no gobiernan la operación
+actual. El diseño 3.3, el runtime sellado y los runbooks actuales son la verdad.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the four proven blind spots that make the Control Plane unreliable as a Git guide and unusable as an orchestrator, without adding governance surface or any cross-thread runtime.

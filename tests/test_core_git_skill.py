@@ -7,6 +7,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "skills" / "control-plane-git" / "SKILL.md"
+CONTENT_EQUIVALENCE_GUIDANCE = (
+    ROOT / "AGENTS.md",
+    SKILL,
+    ROOT / "docs" / "engineering" / "21-repository-alignment-and-branch-decisions.md",
+    ROOT / "docs" / "engineering" / "22-orientation-and-known-traps.md",
+)
 
 
 class GitSkillContractTests(unittest.TestCase):
@@ -45,6 +51,16 @@ class GitSkillContractTests(unittest.TestCase):
 
     def test_skill_is_small_enough_to_always_load(self) -> None:
         self.assertLessEqual(len(SKILL.read_bytes()), 4_096)
+
+    def test_content_equivalence_guidance_uses_the_whole_diff(self) -> None:
+        for path in CONTENT_EQUIVALENCE_GUIDANCE:
+            with self.subTest(path=str(path.relative_to(ROOT))):
+                content = path.read_text(encoding="utf-8")
+                if "git diff --diff-filter=A --name-only" in content:
+                    self.fail(
+                        "an add-only diff omits modified and deleted branch content"
+                    )
+                self.assertRegex(content, r"git diff --name-(?:only|status)")
 
     def test_registry_routes_the_git_capability(self) -> None:
         registry = tomllib.loads(

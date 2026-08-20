@@ -23,6 +23,57 @@ CANONICAL_INDEX = ROOT / "docs" / "engineering" / "00-canonical-index.md"
 ADR = ROOT / "docs" / "adr" / "0006-control-plane-core-and-quarantine.md"
 MAINTENANCE = ROOT / "docs" / "engineering" / "19-control-plane-core-maintenance.md"
 DOGFOOD = ROOT / "docs" / "engineering" / "20-control-plane-core-dogfood.md"
+ADOPTION_ENABLEMENT_SPEC = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-13-control-plane-core-adoption-enablement-design.md"
+)
+ADOPTION_ENABLEMENT_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-13-control-plane-core-adoption-enablement.md"
+)
+STABLE_PAUSE_SPEC = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-14-control-plane-stable-pause-v1-design.md"
+)
+STABLE_PAUSE_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-14-control-plane-stable-pause-v1.md"
+)
+ALIGNMENT = ROOT / "docs" / "engineering" / "21-repository-alignment-and-branch-decisions.md"
+ORIENTATION = ROOT / "docs" / "engineering" / "22-orientation-and-known-traps.md"
+SPECPACK_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-18-control-plane-3-2-specpack.md"
+)
+ORIENTATION_DESIGN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-18-control-plane-3-3-operator-orientation-design.md"
+)
+ORIENTATION_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-18-control-plane-3-3-operator-orientation.md"
+)
 THREAT_PATH = Path("docs/security/2026-08-12-control-plane-core-threat-model.md")
 THREAT_MODEL = ROOT / THREAT_PATH
 REPOSITORY_ID = "sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959"
@@ -37,7 +88,7 @@ _MAX_SNAPSHOT_FILE_BYTES = 2 * 1_048_576
 _MAX_SNAPSHOT_TOTAL_BYTES = 8 * 1_048_576
 _MAX_DOCUMENT_BYTES = 1_048_576
 _FILE_PROVIDER_DATALESS = 0x40000000
-_GIT_TIMEOUT_SECONDS = 5.0
+_GIT_TIMEOUT_SECONDS = 15.0
 _PROCESS_CLEANUP_SECONDS = 0.25
 _GIT_ENVIRONMENT = {
     "PATH": "/usr/bin:/bin",
@@ -124,6 +175,8 @@ HISTORICAL_DOCUMENTS = (
     "docs/superpowers/specs/2026-08-08-control-plane-v2-3-outcome-bridge-design.md",
     "docs/superpowers/plans/2026-08-10-control-plane-v2-4-native-governor.md",
     "docs/superpowers/plans/2026-08-11-control-plane-taskplaybook-v0-progressive-disclosure.md",
+    "docs/superpowers/plans/2026-08-12-control-plane-core-3-1.md",
+    "docs/superpowers/plans/2026-08-18-control-plane-3-3-operator-orientation.md",
     "docs/superpowers/specs/2026-07-28-codex-engineering-control-plane-design.md",
     "docs/superpowers/specs/2026-07-29-clarification-gate-risk-sentinel-design.md",
     "docs/superpowers/specs/2026-08-10-control-plane-taskplaybook-v0-design.md",
@@ -150,7 +203,13 @@ GOVERNING_DOCUMENTS = (
     "docs/engineering/19-control-plane-core-maintenance.md",
     "docs/engineering/20-control-plane-core-dogfood.md",
     "docs/security/2026-08-12-control-plane-core-threat-model.md",
-    "docs/superpowers/plans/2026-08-12-control-plane-core-3-1.md",
+    "docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md",
+    "docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md",
+)
+
+LOCAL_ENABLEMENT_DOCUMENTS = (
+    "docs/superpowers/specs/2026-08-13-control-plane-core-adoption-enablement-design.md",
+    "docs/superpowers/plans/2026-08-13-control-plane-core-adoption-enablement.md",
 )
 
 ADVANCED_OPERATION_PATTERN = re.compile(
@@ -165,7 +224,8 @@ ADVANCED_OPERATION_PATTERN = re.compile(
 )
 ADVANCED_MARKER_CORE_ALLOWLIST = {
     "docs/engineering/19-control-plane-core-maintenance.md",
-    "docs/superpowers/plans/2026-08-12-control-plane-core-3-1.md",
+    "docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md",
+    "docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md",
 }
 
 
@@ -687,12 +747,546 @@ def normalized_snapshot_version() -> str:
 
 
 class CoreDocumentationTests(unittest.TestCase):
+    def test_final_verification_budget_and_reconciliation_review_are_bounded(self) -> None:
+        maintenance = read(MAINTENANCE)
+        stable_pause_plan = read(STABLE_PAUSE_PLAN)
+        adoption_plan = read(ADOPTION_ENABLEMENT_PLAN)
+
+        _, marker, verification = maintenance.partition("## Final verification budget")
+        self.assertEqual(marker, "## Final verification budget")
+        verification, _, _ = verification.partition("\n## ")
+        verification_flat = " ".join(verification.split())
+        for token in (
+            "max_gate_runs=3",
+            "gate_run_count",
+            "same closure lineage",
+            "does not reset",
+            "verification mutex",
+            "exact final bytes",
+            "last consumed run",
+            "Stable Pause",
+            "fresh disposable executor",
+            "waits internally",
+            "periodic empty polls",
+            "does not grant commit, push, PR, merge, deploy, or release authority",
+            "both exact merge parents",
+            "semantic reconciliation delta",
+            "Inherited-parent bytes",
+            "0 Critical / 0 Important",
+        ):
+            self.assertIn(token, verification_flat)
+
+        alignment = read(ALIGNMENT)
+        alignment_flat = " ".join(alignment.split())
+        stable_pause_spec = read(STABLE_PAUSE_SPEC)
+        for governing_gate_document in (
+            stable_pause_plan,
+            adoption_plan,
+            stable_pause_spec,
+            alignment,
+        ):
+            self.assertIn("max_gate_runs=3", governing_gate_document)
+        for governing_gate_document in (
+            stable_pause_plan,
+            adoption_plan,
+            stable_pause_spec,
+        ):
+            self.assertIn("last consumed run", governing_gate_document)
+        self.assertIn("última ejecución consumida", alignment_flat)
+        for stale_rule in (
+            "fresh one-shot",
+            "one authorized full gate",
+            "fresh one-shot authority",
+            "one-shot authorization",
+            "grant fresco",
+            "una sola ejecución local",
+            "una sola vez el gate integral",
+        ):
+            for governing_gate_document in (
+                stable_pause_plan,
+                adoption_plan,
+                stable_pause_spec,
+                alignment,
+            ):
+                self.assertNotIn(stale_rule, governing_gate_document)
+
+        dogfood = read(DOGFOOD)
+        dogfood_flat = " ".join(dogfood.split())
+        self.assertIn("Do not run a full suite per dogfood task", dogfood_flat)
+        self.assertIn("max_gate_runs=3", dogfood_flat)
+        self.assertNotIn("at most one authoritative full", dogfood_flat)
+
+        for document in (read(ALIGNMENT), read(ORIENTATION), read(SPECPACK_PLAN)):
+            document_flat = " ".join(document.split())
+            for branch in (
+                "`codex/control-plane-v3`",
+                "`codex/control-plane-v2-3`",
+                "`codex/control-plane-v2-4`",
+                "`codex/taskplaybook-v0-impl`",
+            ):
+                self.assertIn(branch, document_flat)
+            self.assertIn("no se aplica a todas las ramas `codex/*`", document_flat)
+            self.assertIn(
+                "`codex/control-plane-adoption-enablement-design`",
+                document_flat,
+            )
+            self.assertNotIn("ramas `codex/*` de la línea v2.3–v3", document_flat)
+
+    def test_stable_pause_governing_contract(self) -> None:
+        specification = read(STABLE_PAUSE_SPEC)
+        plan = read(STABLE_PAUSE_PLAN)
+        readme = read(ROOT / "README.md")
+        dogfood = read(DOGFOOD)
+        index = read(CANONICAL_INDEX)
+        combined = "\n".join((specification, plan, readme, dogfood))
+
+        for document in (specification, plan):
+            document_flat = " ".join(document.split())
+            self.assertIn("GOVERNING_CORE / IMPLEMENTED_LOCAL", document_flat)
+            self.assertIn("CLOSES_ON_FINAL_EVIDENCE", document_flat)
+            self.assertIn("final frozen-byte evidence", document_flat)
+            self.assertIn("authorizes=false", document_flat)
+        self.assertIn("## Pre-freeze implementation evidence", plan)
+        self.assertIn("E_GIT_DIRTY", plan)
+        self.assertIn("Task 8 checkboxes remain intentionally open", plan)
+        self.assertIn("native Goal and final handoff", plan)
+        self.assertIn(
+            "### Task 8 calibration remediation: exact Adoption projection",
+            plan,
+        )
+        self.assertIn(
+            "The prior unchanged-Adoption assumption was falsified",
+            plan,
+        )
+        for status in (
+            "SAFE_PAUSE_ACTIVE",
+            "SAFE_PAUSE_TERMINAL",
+            "UNSAFE_PAUSE",
+            "UNKNOWN",
+        ):
+            self.assertIn(status, combined)
+        for token in (
+            "scripts/control-plane task checkpoint",
+            "--mode stable-pause",
+            "--task-id EXACT-TASK-ID",
+            "--json",
+            "exact task ID",
+            "create=false",
+            "adoption.lifecycle -> verification -> named task -> leases",
+            "zero mutation",
+            "dirty worktree",
+            "failing RED",
+            "not automatically unsafe",
+            "native host before and after",
+            "never upgrades",
+            "4096 bytes",
+            "checkpoint_digest",
+            "exact selected repository root",
+            "assume-unchanged",
+            "skip-worktree",
+            "core.filemode=true",
+            "ignored caches stay outside",
+            "nested repositories are unsupported",
+            "single `cat-file --batch`",
+            "exact release receipt",
+            "resume",
+        ):
+            self.assertIn(token, combined)
+        for path, purpose in (
+            (
+                "docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md",
+                "WHAT/WHY",
+            ),
+            (
+                "docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md",
+                "HOW",
+            ),
+        ):
+            self.assertEqual(index.count(f"| `{path}` | `GOVERNING_CORE` |"), 1)
+            row = next(line for line in index.splitlines() if f"| `{path}` |" in line)
+            self.assertIn(purpose, row)
+            self.assertIn("IMPLEMENTED_LOCAL", row)
+        for path in (
+            "skills/control-plane-run/SKILL.md",
+            "skills/control-plane-run/references/stable-pause-v1.md",
+            "plugins/control-plane/skills/control-plane-run/references/stable-pause-v1.md",
+        ):
+            self.assertIn(path, combined)
+        for forbidden_claim in (
+            "stable_pause=RELEASED",
+            "stable_pause=INSTALLED",
+            "stable_pause=CONSUMER_PROVEN",
+            "stable_pause=CANARY_PASS",
+        ):
+            self.assertNotIn(forbidden_claim, combined)
+
+    def test_stable_pause_threats_and_runbook_are_aligned(self) -> None:
+        maintenance = read(MAINTENANCE)
+        security = read(ROOT / "SECURITY.md")
+        threat = read(THREAT_MODEL)
+        combined = "\n".join((maintenance, security, threat))
+
+        _, marker, runbook = maintenance.partition("## Stable Pause v1")
+        self.assertEqual(marker, "## Stable Pause v1")
+        runbook, _, _ = runbook.partition("\n## ")
+        runbook_flat = " ".join(runbook.split())
+        for token in (
+            "scripts/control-plane task checkpoint",
+            "--mode stable-pause",
+            "--task-id EXACT-TASK-ID",
+            "--json",
+            "SAFE_PAUSE_ACTIVE",
+            "SAFE_PAUSE_TERMINAL",
+            "UNSAFE_PAUSE",
+            "UNKNOWN",
+            "exit 0",
+            "exit 1",
+            "exit 2",
+            "native host before and after",
+            "never upgrades",
+            "4096 bytes",
+            "checkpoint_digest",
+            "same task and worktree",
+            "authorizes=false",
+        ):
+            self.assertIn(token, runbook_flat)
+        for exclusion in (
+            "no cleanup",
+            "no lifecycle transition",
+            "no Goal",
+            "no test or gate",
+            "no Git transition",
+            "no remote effect",
+            "no consumer",
+            "no canary",
+        ):
+            self.assertIn(exclusion, runbook_flat)
+        combined_flat = " ".join(combined.split())
+        for attacker_story in (
+            "repository byte substitution",
+            "lock-domain substitution",
+            "malicious Git config or filter",
+            "residue smuggling",
+            "digest-as-authority confusion",
+            "host-visibility uncertainty",
+            "index-hint hiding",
+            "nested repository collapse",
+            "terminal receipt deletion",
+        ):
+            self.assertIn(attacker_story, combined_flat)
+        for residual in (
+            "same-UID/filesystem compromise after the last descriptor check",
+            "non-cooperating external writers",
+        ):
+            self.assertIn(residual, combined_flat)
+
+    def test_stable_pause_skill_join_is_verify_only(self) -> None:
+        skill = read(ROOT / "skills/control-plane-run/SKILL.md")
+        reference = read(
+            ROOT / "skills/control-plane-run/references/stable-pause-v1.md"
+        )
+        self.assertIn("only when", skill)
+        self.assertIn("Do not load", skill)
+        self.assertIn("ordinary Control Plane work", skill)
+        for marker in (
+            "verify-only",
+            "native host",
+            "before",
+            "after",
+            "foreground observer",
+            "active host operation",
+            "host visibility",
+            "UNSAFE_PAUSE",
+            "UNKNOWN",
+            "never upgrades",
+            "same task",
+            "same worktree",
+            "checkpoint_digest",
+            "authorizes=false",
+            "does not kill",
+            "does not interrupt",
+            "does not clean",
+            "does not mutate task or lease state",
+            "does not create a Goal",
+            "does not run tests or gates",
+            "does not perform Git or remote transitions",
+            "transcript",
+            "hidden reasoning",
+            "raw output",
+            "full diff",
+            "secrets",
+            "personal data",
+        ):
+            self.assertIn(marker, reference)
+        self.assertIn(
+            "Only the bounded foreground observer may be present during the invocation",
+            reference,
+        )
+        self.assertIn(
+            "Core `UNSAFE_PAUSE` or `UNKNOWN` is never upgraded by native evidence",
+            reference,
+        )
+        for forbidden in (
+            "create_goal(",
+            "update_goal(",
+            "task transition",
+            "task lease-release",
+            "bash tests/run.sh",
+            "git commit",
+            "git push",
+            "git clean",
+            "rm -rf",
+        ):
+            self.assertNotIn(forbidden, reference)
+
+    def test_adoption_enablement_plan_has_closed_requirement_traceability(self) -> None:
+        specification = ADOPTION_ENABLEMENT_SPEC.read_text(encoding="utf-8")
+        plan = ADOPTION_ENABLEMENT_PLAN.read_text(encoding="utf-8")
+
+        self.assertIn("Status: accepted for local implementation.", specification)
+        self.assertIn(
+            "Preparation state: `IMPLEMENTED_LOCAL / CANARY_PROHIBITED`.",
+            specification,
+        )
+        self.assertIn("external_consumer_adoption=PROHIBITED", specification)
+        self.assertIn("The Spec Kit CLI is not installed", plan)
+        for document in (specification, plan):
+            for token in (
+                "managed_parent_directories",
+                "managed_repository_scan",
+                "managed-repositories-v1",
+                "journal-bound-v1",
+                "lifecycle_lock",
+                "verification_lock",
+                "`create=false`",
+                "reuse-only",
+                "`scripts/control-plane` from the selected source",
+                "ROOT_EMPTY",
+                "`P2Q`",
+                "`P3Q`",
+                "durable quarantine",
+                "nonblocking",
+                "exact-value",
+                "lifecycle inode before the task lock",
+            ):
+                self.assertIn(token, document)
+        _, marker, evidence = plan.partition("## Implementation evidence")
+        self.assertEqual(marker, "## Implementation evidence")
+        evidence, _, _ = evidence.partition("\n## ")
+        for index in range(1, 10):
+            requirement = f"AE-{index:02d}"
+            self.assertGreaterEqual(plan.count(requirement), 2, requirement)
+            resolution = "CLOSES_ON_FINAL_EVIDENCE" if index == 9 else "CLOSED"
+            self.assertRegex(
+                evidence,
+                rf"(?m)^\| `{requirement}` \| RED: [^|]+ \| GREEN: [^|]+ \| "
+                rf"ROLLBACK: [^|]+ \| `{resolution}` \|$",
+            )
+        self.assertIn(
+            "one passing final-byte focal set, a full gate whose last consumed "
+            "run is green within `max_gate_runs=3`, all post-gates and both "
+            "independent rereviews on identical bytes",
+            evidence,
+        )
+        for test_name in (
+            "test_git_markers_inside_managed_scope_are_rejected_without_mutation",
+            "test_gitlink_inside_managed_scope_is_rejected_without_mutation",
+            "test_managed_repository_scan_depth_and_count_are_bounded_without_mutation",
+            "test_nested_repository_drift_after_apply_blocks_verify_and_rollback_before_mutation",
+            "test_target_authority_uses_the_exact_selected_source_entrypoint",
+            "test_source_head_drift_after_locked_preview_fails_before_journal",
+            "test_unjournaled_mutex_provisioning_is_exactly_recoverable",
+            "test_core_owned_verification_mutex_is_not_adoption_provisioning",
+            "test_provisioning_recovery_validates_plan_before_cleanup",
+            "test_fresh_verification_provisioning_is_exclusive",
+            "test_verification_guard_revalidates_common_and_state_after_flock",
+            "test_rollback_rejects_a_missing_or_replaced_bound_verification_mutex",
+            "test_core_and_runner_require_a_closed_active_adoption_journal",
+            "test_invalid_active_adoption_journal_blocks_task_and_lease_mutation",
+            "test_invalid_active_adoption_journal_blocks_new_lease_claim",
+            "test_core_verifier_retains_the_locked_directory_identity",
+            "test_runner_retains_the_locked_directory_identity",
+            "test_runner_rejects_a_symlinked_adoption_binding_ancestor",
+            "test_active_adoption_journal_counts_the_root_toward_the_item_bound",
+            "test_invalid_active_journal_blocks_new_task_before_creating_its_lock",
+            "test_each_partial_journalless_provisioning_prefix_is_recoverable",
+            "test_each_provisioning_cleanup_boundary_remains_retryable",
+            "test_post_cleanup_validation_failure_leaves_a_retryable_prefix",
+            "test_core_only_verification_prefixes_are_preserved",
+            "test_forged_closed_task_blocks_rollback_without_mutation",
+            "test_rollback_preserves_a_record_substituted_after_preflight",
+            "test_confined_read_opens_the_leaf_nonblocking",
+            "test_root_empty_core_prefix_race_removes_only_the_created_lifecycle_lock",
+            "test_p2_p3_cleanup_never_removes_a_substituted_directory",
+            "test_p4t_cleanup_opens_and_revalidates_the_observed_temporary",
+            "test_new_task_holds_a_lifecycle_domain_even_when_adoption_was_absent",
+            "test_rollback_conditionally_removes_only_its_exact_hooks_path",
+            "test_rollback_retains_open_managed_and_activation_inodes_in_quarantine",
+            "test_rollback_rechecks_managed_quarantine_after_an_open_descriptor_write",
+            "test_rollback_rechecks_activation_quarantine_after_an_open_descriptor_write",
+        ):
+            self.assertIn(test_name, evidence)
+        _, addendum_marker, addendum = plan.partition(
+            "### Subsequent AE-09 verification-lock remediation"
+        )
+        self.assertEqual(
+            addendum_marker,
+            "### Subsequent AE-09 verification-lock remediation",
+        )
+        addendum, _, _ = addendum.partition("Run focused tests first:")
+        for token in (
+            "control_plane/contracts.py",
+            "control_plane/verification.py",
+            "tests/test_core_task_state.py",
+            "tests/test_core_verification.py",
+            "tests/run.sh",
+            ".codex/control-plane.lock",
+            ".codex/adoption-enablement.lock",
+            "verification_lock",
+            "does not grant, replay, or transfer authority",
+            "authorizes=false",
+        ):
+            self.assertIn(token, addendum)
+        _, final_addendum_marker, final_addendum = plan.partition(
+            "### Subsequent AE-09 final concurrency and quarantine remediation"
+        )
+        self.assertEqual(
+            final_addendum_marker,
+            "### Subsequent AE-09 final concurrency and quarantine remediation",
+        )
+        final_addendum, _, _ = final_addendum.partition("Run focused tests first:")
+        for token in (
+            "control_plane/leases.py",
+            "adoption_enablement/safe_io.py",
+            "adoption_enablement/repository.py",
+            "adoption_enablement/transaction.py",
+            "tests/test_core_task_state.py",
+            "tests/test_core_leases.py",
+            "tests/test_adoption_enablement_repository.py",
+            "tests/test_adoption_enablement_transaction.py",
+            "tests/test_adoption_enablement_recovery.py",
+            "verification_lock",
+            "`P2Q`",
+            "`P3Q`",
+            "durable quarantine",
+            "does not grant, replay, or transfer authority",
+            "authorizes=false",
+        ):
+            self.assertIn(token, final_addendum)
+        self.assertNotIn(
+            "that bounded closure requires only the `task_state.py` revalidation "
+            "and `leases.py` shared adoption barrier",
+            plan,
+        )
+        for token in (
+            "O_CREAT|O_EXCL",
+            "pre-existing Core-owned verification mutex",
+            "validates the reviewed plan before cleanup",
+            "closed active journal",
+            "common/state/locks/file",
+        ):
+            self.assertIn(token, specification)
+        for boundary in (
+            "atomic no-replace rename",
+            "verification=UNKNOWN",
+            "fixture teardown",
+            "bound to `3.1.0-core.2`",
+        ):
+            self.assertIn(boundary, specification)
+        self.assertIn(
+            "product rollback must never delete Core-owned task evidence",
+            plan,
+        )
+        self.assertIn("authorized bump to `3.1.0-core.2`", plan)
+        self.assertIn(
+            "evidence bound to `3.1.0-core.1` remains historical",
+            plan,
+        )
+        for task in range(1, 9):
+            self.assertEqual(
+                len(re.findall(rf"^## Task {task}:", plan, re.MULTILINE)),
+                1,
+            )
+        self.assertIn("IMPLEMENTED_LOCAL / CANARY_PROHIBITED", plan)
+        self.assertNotIn("Decision: `GO_STABLE_ADOPTION`", plan)
+        self.assertNotIn("Autopilot = ON", plan)
+
+    def test_adoption_enablement_is_local_only_and_non_authorizing(self) -> None:
+        documents = {
+            "readme": read(ROOT / "README.md"),
+            "security": read(ROOT / "SECURITY.md"),
+            "adr": read(ADR),
+            "index": read(CANONICAL_INDEX),
+            "maintenance": read(MAINTENANCE),
+            "threat": read(THREAT_MODEL),
+        }
+        combined = "\n".join(documents.values())
+        for token in (
+            "adoption_tool=IMPLEMENTED_LOCAL",
+            "temporary_repository_e2e=PASS",
+            "external_consumer_adoption=PROHIBITED",
+            "canary=NOT_PREPARED",
+            "stable_adoption=NOT_DECIDED",
+            "Autopilot OFF",
+            "authorizes=false",
+        ):
+            self.assertIn(token, combined)
+        for surface in ("readme", "security", "maintenance"):
+            self.assertIn("E_CAPABILITY_QUARANTINED", documents[surface])
+        for surface in ("security", "threat"):
+            for token in (
+                "managed-repositories-v1",
+                "journal-bound-v1",
+                "lifecycle_lock",
+                "verification.lock",
+                "verification_lock",
+                "reuse-only",
+                "pre-existing Core-owned verification mutex",
+                "closed active journal",
+                "P2Q",
+                "P3Q",
+                "durable quarantine",
+                "exact-value",
+                "nonblocking",
+            ):
+                self.assertIn(token, documents[surface])
+        self.assertIn("does not supersede the adoption prohibition", documents["adr"])
+        self.assertIn("later independently accepted ADR", documents["adr"])
+        self.assertIn(
+            "before even preparing one disposable canary",
+            documents["adr"],
+        )
+        for path in LOCAL_ENABLEMENT_DOCUMENTS:
+            self.assertRegex(
+                documents["index"],
+                rf"(?m)^\| `{re.escape(path)}` \| `GOVERNING_LOCAL_ENABLEMENT` \|",
+            )
+        for threat in (
+            "source substitution",
+            "wrong-target selection",
+            "partial publication",
+            "journal tampering",
+            "rollback deletion",
+            "filter execution",
+            "hostile environment",
+            "lock replay",
+            "serialized-authority confusion",
+            "nested-repository smuggling",
+            "selected-source authority substitution",
+            "lifecycle-lock substitution",
+            "verification-mutex substitution",
+        ):
+            self.assertIn(threat, documents["threat"])
+        self.assertNotIn("canary=PASS", combined)
+        self.assertNotIn("stable_adoption=APPROVED", combined)
+
     def test_required_core_documents_and_headings_exist(self) -> None:
         contracts = {
             ADR: (
                 "# ADR 0006: Control Plane Core and structural quarantine",
                 "## Context",
                 "## Decision",
+                "## Local adoption enablement",
                 "## Alternatives",
                 "## Consequences",
                 "## Compatibility and rollback",
@@ -705,6 +1299,7 @@ class CoreDocumentationTests(unittest.TestCase):
                 "## Maintenance circuit breaker",
                 "## Compatibility window",
                 "## Rollback",
+                "## Local adoption enablement",
                 "## External adoption",
             ),
             DOGFOOD: (
@@ -725,6 +1320,7 @@ class CoreDocumentationTests(unittest.TestCase):
                 "# Canonical documentation index",
                 "## Version truth",
                 "## Governing Core documents",
+                "## Governing local enablement documents",
                 "## Historical non-governing documents",
             ),
         }
@@ -739,7 +1335,9 @@ class CoreDocumentationTests(unittest.TestCase):
         for truth in (
             "2.1.1 — last official release",
             "3.0.0 — unpublished plugin candidate; not a product release",
-            "3.1.0-core.1 — local prerelease candidate",
+            "3.1.0-core.1 — superseded local prerelease candidate",
+            "3.1.0-core.2 — current local prerelease candidate",
+            "Fresh ten-task dogfood is required for `3.1.0-core.2`",
             "GREEN_LOCAL / PENDING_STABLE_ADOPTION",
         ):
             self.assertIn(truth, index)
@@ -784,6 +1382,36 @@ class CoreDocumentationTests(unittest.TestCase):
         self.assertIn(THREAT_PATH.as_posix(), security)
         self.assertNotIn("`PR LISTA` es el default", security)
         self.assertNotIn("outcome bridge v2.3 permanece", security)
+
+    def test_completed_orientation_and_pending_specpack_have_current_statuses(self) -> None:
+        statuses = index_statuses()
+        orientation_path = ORIENTATION_PLAN.relative_to(ROOT).as_posix()
+        specpack = read(SPECPACK_PLAN)
+        orientation = read(ORIENTATION)
+        self.assertEqual(
+            statuses.get(orientation_path),
+            "HISTORICAL_NON_GOVERNING",
+        )
+        self.assertIn("IMPLEMENTED_LOCAL", read(ORIENTATION_DESIGN))
+        self.assertNotIn("sin implementación", read(ORIENTATION_DESIGN))
+        self.assertIn("BLOCKED_ON_R1_FINAL_EVIDENCE", specpack)
+        self.assertNotIn("3.1.0-core.1", specpack)
+        self.assertIn("3.1.0-core.2", specpack)
+        self.assertIn("R1_CLOSED_ON_FINAL_EVIDENCE", specpack)
+        self.assertIn(
+            "reparaciones, prerevisiones frescas y evidencia final pendientes",
+            specpack,
+        )
+        self.assertNotIn(
+            "| 1 | Contrato: plantillas y skill | no | Ninguna, ejecutable ya |",
+            specpack,
+        )
+        self.assertIn("BLOCKED_ON_R1_FINAL_EVIDENCE", orientation)
+        self.assertIn("codex/reconcile-core-3-1-core-2", orientation)
+        self.assertIn("R1_OPEN / FINAL_EVIDENCE_PENDING", orientation)
+        self.assertNotIn("Gate integral `395 OK`", orientation)
+        self.assertNotIn("AE-09 pendiente", orientation)
+        self.assertNotIn("protección de rama ausente", read(ALIGNMENT))
 
     def test_readme_recommends_only_governing_core_documents_and_local_preflight(self) -> None:
         readme = read(ROOT / "README.md")
@@ -893,7 +1521,7 @@ class CoreDocumentationTests(unittest.TestCase):
             "self_certified=false",
             "external_consumer_adoption=PROHIBITED",
             "GREEN_LOCAL / PENDING_STABLE_ADOPTION",
-            "origin/main@929d3f8a0656fed190bb65ceb3a29deef8de07d6",
+            "origin/main@b07418364409f76c900f0595a76c9e3e388ac433",
         ):
             self.assertIn(token, content)
         for command in (
@@ -912,6 +1540,40 @@ class CoreDocumentationTests(unittest.TestCase):
                 content,
                 rf"(?m)^\| `{re.escape(command)}` \| `E_CAPABILITY_QUARANTINED` \| `2` \|",
             )
+        _, marker, mutex = content.partition("## Verification mutex")
+        self.assertEqual(marker, "## Verification mutex")
+        mutex, _, _ = mutex.partition("## Maintenance circuit breaker")
+        for token in (
+            "locks/verification.lock",
+            "verification_lock",
+            "persistent",
+            "create=false",
+            "reuse-only",
+            "never unlink",
+            "E_VERIFICATION_LOCK",
+            "E_TEST_MUTEX",
+            "Fresh Adoption apply",
+            "pre-existing Core-owned verification mutex",
+            "closed active journal",
+            "authorizes=false",
+        ):
+            self.assertIn(token, mutex)
+        _, marker, quarantine = content.partition("## Adoption rollback quarantine")
+        self.assertEqual(marker, "## Adoption rollback quarantine")
+        quarantine, _, _ = quarantine.partition("## Maintenance circuit breaker")
+        for token in (
+            "adoption.lock",
+            "lifecycle inode before the task lock",
+            "ROOT_EMPTY",
+            "P2Q",
+            "P3Q",
+            "nonblocking",
+            "exact-value",
+            "durable quarantine",
+            "separate GC",
+            "authorizes=false",
+        ):
+            self.assertIn(token, quarantine)
 
     def test_core_task_and_lease_state_locations_match_runtime(self) -> None:
         agents = read(ROOT / "AGENTS.md")
@@ -931,8 +1593,23 @@ class CoreDocumentationTests(unittest.TestCase):
         content = read(DOGFOOD)
         self.assertEqual(
             [line for line in content.splitlines() if line.startswith("Status:")],
-            ["Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`."],
+            [
+                "Status: `HISTORICAL_PASS_10_TASK_CORE_1 / "
+                "CORE_2_DOGFOOD_PENDING`. `Autopilot=OFF`."
+            ],
         )
+        entry_marker = "## Entry gate\n\n"
+        scorecard_marker = "\n## Scorecard\n"
+        _, entry_separator, entry_tail = content.partition(entry_marker)
+        entry_gate, scorecard_separator, _ = entry_tail.partition(scorecard_marker)
+        self.assertEqual(entry_separator, entry_marker)
+        self.assertEqual(scorecard_separator, scorecard_marker)
+        self.assertIn(
+            "- Use the exact `3.1.0-core.2` source candidate and record its "
+            "runtime digest.",
+            entry_gate,
+        )
+        self.assertNotIn("3.1.0-core.1", entry_gate)
         self.assertIsNone(
             re.search(r"(?i)\bAutopilot\s*=\s*ON\b", content),
             "Autopilot must remain OFF everywhere in the scorecard",
@@ -971,7 +1648,8 @@ class CoreDocumentationTests(unittest.TestCase):
                 self.assertEqual(row[3:6], ["answer", "local_read", "0"])
         for token in (
             "Autopilot=OFF",
-            "PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE",
+            "HISTORICAL_PASS_10_TASK_CORE_1 / CORE_2_DOGFOOD_PENDING",
+            "Fresh ten-task dogfood is required for core.2",
             "tasks_completed=10",
             "facts_only_total=3",
             "duplicated_effects=0",
@@ -1140,13 +1818,15 @@ class CoreDocumentationTests(unittest.TestCase):
                 (
                     "- **Escribe en:** este hilo.",
                     "- **Rol:** orquestadora del candidato Core y scorecard manual.",
-                    "- **Para continuar:** ejecutar una única vez `bash tests/run.sh` "
-                    "sobre estos bytes finales y detenerse si no es `PASS`.",
-                    "- **Mensaje exacto:** `Ejecuta el único gate integral de Control "
-                    "Plane Core 3.1; no edites ni realices efectos remotos después.`",
-                    "- **Estado de partida:** `3.1.0-core.1`, diez filas `PASS`, gate "
-                    "dogfood satisfecho, gate integral aún no observado y adopción "
-                    "estable no autorizada.",
+                    "- **Para continuar:** ejecutar un nuevo dogfood manual de diez "
+                    "tareas ligado al digest final de `3.1.0-core.2` en una tarea "
+                    "separada.",
+                    "- **Mensaje exacto:** `Prepara el dogfood manual local de "
+                    "3.1.0-core.2; no instales, no uses consumidor ni habilites "
+                    "Autopilot.`",
+                    "- **Estado de partida:** `3.1.0-core.2` pendiente de dogfood; "
+                    "las diez filas `PASS` de `3.1.0-core.1` son evidencia histórica "
+                    "y la adopción estable no está autorizada.",
                     "- **No hacer todavía:** instalar, adoptar externamente, "
                     "commit, push, PR, merge, deploy, publicación o release.",
                     "- **Autoridad:** `authorizes=false`",
@@ -1219,31 +1899,38 @@ class CoreDocumentationTests(unittest.TestCase):
                 lambda payload: payload.__setitem__("prompt_text", "synthetic")
             ),
             "contradictory_autopilot": content.replace(
-                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`.",
-                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=ON`.\n\n"
+                "Status: `HISTORICAL_PASS_10_TASK_CORE_1 / "
+                "CORE_2_DOGFOOD_PENDING`. `Autopilot=OFF`.",
+                "Status: `HISTORICAL_PASS_10_TASK_CORE_1 / "
+                "CORE_2_DOGFOOD_PENDING`. `Autopilot=ON`.\n\n"
                 "<!-- stale marker: Autopilot=OFF -->",
                 1,
             ),
             "wrong_continuation": content.replace(
-                "ejecutar una única vez `bash tests/run.sh`",
-                "ejecutar dos veces `bash tests/run.sh`",
+                "ejecutar un nuevo dogfood manual de diez tareas",
+                "reutilizar el dogfood histórico",
                 1,
             ).replace(
-                "Ejecuta el único gate integral",
-                "Ejecuta dos gates integrales",
+                "Prepara el dogfood manual local",
+                "Reutiliza el dogfood histórico",
                 1,
             ),
             "duplicate_status": content.replace(
-                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`.",
-                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=OFF`.\n"
-                "Status: `PASS_10_TASK_DOGFOOD_PENDING_FINAL_GATE`. `Autopilot=ON`.",
+                "Status: `HISTORICAL_PASS_10_TASK_CORE_1 / "
+                "CORE_2_DOGFOOD_PENDING`. `Autopilot=OFF`.",
+                "Status: `HISTORICAL_PASS_10_TASK_CORE_1 / "
+                "CORE_2_DOGFOOD_PENDING`. `Autopilot=OFF`.\n"
+                "Status: `HISTORICAL_PASS_10_TASK_CORE_1 / "
+                "CORE_2_DOGFOOD_PENDING`. `Autopilot=ON`.",
                 1,
             ),
             "duplicate_continuation": content.replace(
-                "- **Para continuar:** ejecutar una única vez `bash tests/run.sh` "
-                "sobre estos bytes finales y detenerse si no es `PASS`.",
-                "- **Para continuar:** ejecutar una única vez `bash tests/run.sh` "
-                "sobre estos bytes finales y detenerse si no es `PASS`.\n"
+                "- **Para continuar:** ejecutar un nuevo dogfood manual de diez "
+                "tareas ligado al digest final de `3.1.0-core.2` en una tarea "
+                "separada.",
+                "- **Para continuar:** ejecutar un nuevo dogfood manual de diez "
+                "tareas ligado al digest final de `3.1.0-core.2` en una tarea "
+                "separada.\n"
                 "- **Para continuar:** ejecutar un segundo gate.",
                 1,
             ),

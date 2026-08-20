@@ -62,12 +62,13 @@ ACTIVE_RUNTIME_MODULES = (
     "risk_sentinel.py",
     "routing.py",
     "scopes.py",
+    "stable_pause.py",
     "survey.py",
     "task_state.py",
     "toolchain.py",
     "verification.py",
 )
-PRODUCT_VERSION = "3.1.0-core.1"
+PRODUCT_VERSION = "3.1.0-core.2"
 LOCK_MAX_BYTES = 64 * 1024
 BOOTSTRAP_MAX_BYTES = 1024 * 1024
 RUNTIME_MODULE_MAX_BYTES = 1024 * 1024

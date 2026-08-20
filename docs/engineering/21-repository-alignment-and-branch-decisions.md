@@ -75,16 +75,21 @@ clones.
 ## Prueba aplicada a cada rama
 
 Comparar commits induce a error bajo `squash`. La prueba usada aquí es de
-contenido: qué archivos existen en la rama y no existen en `origin/main`.
+contenido completo: altas, modificaciones, borrados, renombres y modos entre la
+rama y `origin/main`.
 
 ```bash
-git diff --diff-filter=A --name-only origin/main..<rama>
+git diff --name-status --no-ext-diff --no-textconv origin/main..<rama> --
 ```
+
+Solo una salida vacía prueba equivalencia. Un inventario limitado a altas es
+auxiliar y nunca decide por sí solo que una rama carezca de trabajo pendiente.
 
 ## Hallazgo determinante
 
-Las cuatro ramas `codex/*` de la línea v2.3–v3 aportan exactamente el mismo
-conjunto de archivos ausentes en `main`:
+Las ramas históricas `codex/control-plane-v3`, `codex/control-plane-v2-3`,
+`codex/control-plane-v2-4` y `codex/taskplaybook-v0-impl` aportan exactamente el
+mismo conjunto de archivos ausentes en `main`:
 
 ```text
 control_plane/adoption.py
@@ -104,6 +109,10 @@ La consecuencia es directa y es el eje de este documento:
 
 > Rebasar o fusionar cualquiera de esas ramas reintroduciría el runtime en
 > cuarentena y revertiría la decisión que gobierna hoy el repositorio.
+
+Esta regla no se aplica a todas las ramas `codex/*`. En particular,
+`codex/control-plane-adoption-enablement-design` contiene el subject aprobado
+para reconciliación y no forma parte de este conjunto histórico en cuarentena.
 
 ## Decisión por rama
 
@@ -335,17 +344,19 @@ Observación del 2026-08-18: `bash tests/run.sh` sobre `main` en
 
 Esa ejecución es evidencia local válida, pero no cierra por sí sola el gate
 declarado en el scorecard: aquel gate se define sobre los bytes sellados del
-candidato y como una única ejecución autoritativa registrada como tal. Cerrarlo
-es una decisión de la tarea orquestadora, no un efecto derivado de esta lectura.
-El candidato permanece `GREEN_LOCAL / PENDING_STABLE_ADOPTION` y
+candidato, con `max_gate_runs=3` ligado a la misma closure lineage. La última
+ejecución consumida debe quedar verde sobre los bytes finales; reparar no
+reinicia el contador y agotarlo exige Stable Pause. Cerrarlo es una decisión de
+la tarea orquestadora, no un efecto derivado de esta lectura. El candidato
+permanece `GREEN_LOCAL / PENDING_STABLE_ADOPTION` y
 `external_consumer_adoption=PROHIBITED`.
 
 ## Continuación
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora de la alineación del repositorio.
-- **Para continuar:** autorizar por separado etiquetado, borrado de ramas y protección de `main`.
-- **Mensaje exacto:** `Autoriza el paso 1 del runbook de limpieza: crear y empujar las etiquetas archive/*.`
-- **Estado de partida:** `main` en `b074183`, limpio, sin PR abiertos, suite local `234 OK`, protección de rama ausente.
-- **No hacer todavía:** borrar ramas, empujar etiquetas, cambiar protección, instalar o adoptar el candidato.
+- **Para continuar:** cerrar la reconciliación R1 sin reabrir la higiene histórica ya terminada.
+- **Mensaje exacto:** `Continúa R1 sobre su worktree exacto; compara el delta completo contra ambos padres y conserva las ramas históricas concretas en cuarentena.`
+- **Estado de partida:** protección de `main` activa con `core-verify`; la reconciliación local `3.1.0-core.2` mantiene su evidencia final pendiente.
+- **No hacer todavía:** commit, push, PR, merge, instalar o adoptar el candidato sin la autoridad exacta de esa transición.
 - **Autoridad:** `authorizes=false`
