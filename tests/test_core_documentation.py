@@ -1416,9 +1416,18 @@ class CoreDocumentationTests(unittest.TestCase):
         self.assertIn("este documento no registra estado vivo", orientation)
         self.assertNotIn("R1_OPEN / FINAL_EVIDENCE_PENDING", orientation)
         self.assertNotIn("recorte por procedencia y evidencia final pendientes", orientation)
+        alignment = read(ALIGNMENT)
+        orientation_design = read(ORIENTATION_DESIGN)
+        self.assertIn("no registra estado vivo ni autoridad", alignment)
+        self.assertIn("no registra estado vivo ni autoridad", orientation)
+        self.assertIn("no registra el estado vivo de cierre de R1", orientation_design)
+        for governing_document in (alignment, orientation, orientation_design):
+            self.assertNotIn("evidencia final de R1 pendiente", governing_document)
+            self.assertNotIn("commits locales de R1 sí están autorizados", governing_document)
+            self.assertNotIn("commits locales de R1 están autorizados", governing_document)
         self.assertNotIn("Gate integral `395 OK`", orientation)
         self.assertNotIn("AE-09 pendiente", orientation)
-        self.assertNotIn("protección de rama ausente", read(ALIGNMENT))
+        self.assertNotIn("protección de rama ausente", alignment)
 
     def test_readme_recommends_only_governing_core_documents_and_local_preflight(self) -> None:
         readme = read(ROOT / "README.md")

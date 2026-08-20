@@ -240,6 +240,6 @@ entrada de CLI, la skill y las filas de registry. Sin migración de datos.
 - **Rol:** orquestadora del diseño 3.3.
 - **Para continuar:** cerrar la evidencia final de R1 sobre los bytes reparados y sellados.
 - **Mensaje exacto:** `Verifica los focales 3.3, reseña el candidato y conserva el último gate integral para los bytes finales.`
-- **Estado de partida:** `IMPLEMENTED_LOCAL`; la materialización Git y Survey heredados forman parte del candidato `3.1.0-core.2`; su hardening de descubrimiento y recorrido permanece diferido, con evidencia final de R1 pendiente.
+- **Estado de partida:** `IMPLEMENTED_LOCAL`; la materialización Git y Survey heredados forman parte del candidato `3.1.0-core.2` y su hardening de descubrimiento y recorrido permanece diferido; este diseño no registra el estado vivo de cierre de R1.
 - **No hacer todavía:** push, PR, merge, instalación, adopción externa o release.
 - **Autoridad:** `authorizes=false`

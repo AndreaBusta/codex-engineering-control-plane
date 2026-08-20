@@ -174,6 +174,6 @@ git status --short --branch
 - **Rol:** relevo que llega sin historia.
 - **Para continuar:** consultar el contador vigente en el Goal o handoff nativos y ejecutar solo el siguiente intento disponible sobre el snapshot final.
 - **Mensaje exacto:** `Continúa R1 sobre codex/reconcile-core-3-1-core-2; verifica el delta recortado y usa el siguiente intento disponible registrado fuera de los bytes.`
-- **Estado de partida:** candidato `3.1.0-core.2`; este documento no registra estado vivo; consultar el Goal o handoff nativos antes de continuar. El commit local de preservación es `d901bb6` y los commits locales de R1 están autorizados.
+- **Estado de partida:** candidato `3.1.0-core.2`; este documento no registra estado vivo ni autoridad. `d901bb6` es solo el ancla histórica de preservación; consultar el Goal o handoff nativos antes de continuar.
 - **No hacer todavía:** instalar, adoptar externamente, push, PR, merge, deploy o release sin autorización exacta.
 - **Autoridad:** `authorizes=false`

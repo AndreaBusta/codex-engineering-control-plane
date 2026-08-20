@@ -348,10 +348,11 @@ se borran ni se reclasifican. Los resultados posteriores se registran en el Goal
 y handoff nativos sin reescribir este checkpoint histórico. La última ejecución
 consumida debe quedar verde sobre los bytes finales; reparar o volver a congelar
 no reinicia el contador, y alcanzar `gate_run_count=6` sin ese estado exige
-Stable Pause. Cerrarlo es una decisión de
-la tarea orquestadora, no un efecto derivado de esta lectura. El candidato
-permanece `GREEN_LOCAL / PENDING_STABLE_ADOPTION` y
-`external_consumer_adoption=PROHIBITED`.
+Stable Pause. Cerrarlo es una decisión de la tarea orquestadora, no un efecto
+derivado de esta lectura. Este documento no registra el estado vivo de cierre;
+debe reobservarse en el Goal o handoff nativos y en el remoto. La precondición
+fail-closed `external_consumer_adoption=PROHIBITED` permanece hasta que un
+artefacto gobernante la cambie explícitamente.
 
 ## Continuación
 
@@ -359,6 +360,6 @@ permanece `GREEN_LOCAL / PENDING_STABLE_ADOPTION` y
 - **Rol:** orquestadora de la alineación del repositorio.
 - **Para continuar:** cerrar la reconciliación R1 sin reabrir la higiene histórica ya terminada.
 - **Mensaje exacto:** `Continúa R1 sobre su worktree exacto; compara el delta completo contra ambos padres y conserva las ramas históricas concretas en cuarentena.`
-- **Estado de partida:** protección de `main` activa con `core-verify`; la reconciliación local `3.1.0-core.2` está preservada en `d901bb6` y mantiene su evidencia final pendiente.
-- **No hacer todavía:** push, PR, merge, instalar o adoptar el candidato sin la autoridad exacta de esa transición; los commits locales de R1 sí están autorizados.
+- **Estado de partida:** este documento no registra estado vivo ni autoridad; `d901bb6` es solo el ancla histórica de preservación. Reobservar rama, HEAD, remoto, protección y autoridad nativa antes de continuar.
+- **No hacer todavía:** push, PR, merge, instalar o adoptar el candidato sin la autoridad exacta de esa transición; ninguna autoridad se infiere de este documento.
 - **Autoridad:** `authorizes=false`
