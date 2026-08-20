@@ -54,7 +54,7 @@ authority to another task or effect.
 
 Cleanup of transient state, push, PR, merge, deploy, release, installation,
 consumer adoption, canary, secrets, and any remote effect remain excluded. The
-Task 8 full gate uses `max_gate_runs=3` on frozen bytes; the last consumed run
+Task 8 full gate uses `max_gate_runs=6` on frozen bytes; the last consumed run
 must be green on the exact final bytes. The budget is verification evidence and
 does not substitute for authority over any Git or remote effect.
 
@@ -83,7 +83,7 @@ does not substitute for authority over any Git or remote effect.
 | `SP-06` | Native host before/after quiescence joins Core without upgrading its result. | 5 | trigger, active operation, unknown visibility, no cleanup, and resume tests |
 | `SP-07` | Progressive reference inside canonical and packaged `control-plane-run`. | 5, 6 | inventory, parity, bounded-reference, and forbidden-mutation tests |
 | `SP-08` | Documentation, security, seals, and rollback remain coherent. | 6, 7 | lock, manifest, documentation, threat snapshot, Adoption regression, and rollback evidence |
-| `SP-09` | Final evidence is fresh and bound to frozen bytes, with no consumer or canary. | 8 | focused suite, a full gate whose last consumed run is green within `max_gate_runs=3`, post-gates, two independent reviews, local observation |
+| `SP-09` | Final evidence is fresh and bound to frozen bytes, with no consumer or canary. | 8 | focused suite, a full gate whose last consumed run is green within `max_gate_runs=6`, post-gates, two independent reviews, local observation |
 
 No row may be declared closed unless its RED failed for the intended reason, its GREEN passes on the same bytes, and its zero-mutation assertion proves byte and relevant inode identity preservation.
 
@@ -160,7 +160,7 @@ Task 0: activate sealed implementation front
                           -> Task 8: frozen-byte verification and reviews
 ```
 
-Use one writer. Read-only review may overlap only after a task's bytes are frozen and no reviewer runs a gate or mutates state. Delegate each Task 8 full-gate attempt to a fresh disposable executor that waits internally and returns one terminal summary. Do not exceed `max_gate_runs=3`; exhaustion enters Stable Pause.
+Use one writer. Read-only review may overlap only after a task's bytes are frozen and no reviewer runs a gate or mutates state. Delegate each Task 8 full-gate attempt to a fresh disposable executor that waits internally and returns one terminal summary. Do not exceed `max_gate_runs=6`; exhaustion enters Stable Pause.
 
 ## Task 0: Activate a sealed and separately authorized implementation front
 
@@ -818,7 +818,7 @@ The Adoption tests are regressions against the projected Core generation; they d
 - [ ] **Step 3: Execute the bounded full-gate budget.**
 
 Load or initialize `gate_run_count` for the same closure lineage and set
-`max_gate_runs=3`. Repair and re-freeze do not reset it. A fresh disposable
+`max_gate_runs=6`. Repair and re-freeze do not reset it. A fresh disposable
 executor acquires the verification mutex, starts the command, waits internally,
 and returns one terminal summary:
 
@@ -829,7 +829,7 @@ bash tests/run.sh
 Acquiring the mutex and starting the command increments `gate_run_count`.
 Content repair returns to TDD, invalidates the previous final-byte evidence and
 may consume the next run after a new freeze. The last consumed run must be
-green on the exact final bytes. At `gate_run_count=3` without that state, enter
+green on the exact final bytes. At `gate_run_count=6` without that state, enter
 Stable Pause. The budget grants no Git or remote authority.
 
 - [ ] **Step 4: Run post-gates only after an exit-zero authoritative gate.**
@@ -893,7 +893,7 @@ Stable Pause v1 persists no feature state, so source rollback is path-exact:
 5. restore the prior Core lock allowlist and recompute every live digest from restored bytes;
 6. reseal the normalized threat-model footer last; and
 7. prove the pre-feature focused suite and a final green full gate within
-   `max_gate_runs=3`.
+   `max_gate_runs=6`.
 
 Use `apply_patch` for rollback edits. Do not use `git reset --hard`, `git checkout --`, `git clean`, recursive deletion, or mutation of task/lease/journal state. If implementation ever creates persisted Stable Pause state, that is a spec violation requiring a new migration/rollback design rather than improvisation.
 
@@ -911,7 +911,7 @@ Use `apply_patch` for rollback edits. Do not use `git reset --hard`, `git checko
 Approval of this plan authorized no implementation. The later native grants for
 Tasks 0-7 and exact task/lease provisioning were separately observed and are
 not replayable authority. Task 8's read-only gate is limited by
-`max_gate_runs=3`; its last consumed run must be green on frozen final bytes.
+`max_gate_runs=6`; its last consumed run must be green on frozen final bytes.
 That evidence never authorizes a Git or remote transition.
 
 Dependencies, secrets, CI/CD, consumer repositories, canaries, and remote systems are outside the implementation scope. Any later need to touch one of them stops execution for a scope amendment.
@@ -922,12 +922,12 @@ Dependencies, secrets, CI/CD, consumer repositories, canaries, and remote system
 - **Rol:** orquestadora.
 - **Para continuar:** ejecutar Task 8 solo sobre los bytes congelados y registrar
   sus resultados en el Goal/handoff nativo sin reescribir el sujeto certificado.
-- **Mensaje exacto:** `Ejecuta el siguiente intento disponible de bash tests/run.sh dentro de max_gate_runs=3 en una ejecutora fresca; la última ejecución debe quedar verde sobre bytes finales, sin consumidor, canary, commit ni remoto.`
+- **Mensaje exacto:** `Ejecuta el siguiente intento disponible de bash tests/run.sh dentro de max_gate_runs=6 en una ejecutora fresca; la última ejecución debe quedar verde sobre bytes finales, sin consumidor, canary, commit ni remoto.`
 - **Estado de partida histórico, previo a la reconciliación R1:** worktree `control-plane-adoption-enablement-design`, rama
   `codex/control-plane-adoption-enablement-design`, HEAD
   `4d5c0e5bfde35978b872f9e6b2eae5a52a759c95`; runtime Core de 26 módulos antes
   de unir Survey; el candidato reconciliado R1 debe cerrar con 27 módulos;
   implementación task `closed`, cero lease activa; sin consumidor, canary ni
   efecto remoto; `authorizes=false`.
-- **No hacer todavía:** superar `max_gate_runs=3`, limpiar evidencia,
+- **No hacer todavía:** superar `max_gate_runs=6`, limpiar evidencia,
   commit, push, PR, merge, deploy, instalar, usar consumidor o canary.

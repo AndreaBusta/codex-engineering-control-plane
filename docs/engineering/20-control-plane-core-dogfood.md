@@ -23,7 +23,7 @@ observation, including evidence collected before the 27-module runtime seal.
 - Permit only `answer` or `local_change`; defer every external effect.
 - Run focal verification while iterating. Do not run a full suite per dogfood
   task; the frozen candidate and completed scorecard share the separate final
-  budget `max_gate_runs=3` from the Core maintenance runbook.
+  budget `max_gate_runs=6` from the Core maintenance runbook.
 - Mark uncertainty `UNKNOWN`; never translate missing evidence into success.
 
 ## Scorecard

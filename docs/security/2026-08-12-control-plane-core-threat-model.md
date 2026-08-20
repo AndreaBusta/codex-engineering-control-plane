@@ -75,9 +75,6 @@ Repository invariants:
    schemas, exact source and target bindings and `authorizes=false`. Target
    policy and registry are evaluated only by `scripts/control-plane` from the
    selected source, and the full source manifest is compared before journaling.
-   Source and installed Core locks additionally require the exact canonical
-   key set, all schema selectors, audit hook mode, pending hook trust, ordered
-   27-module inventory and exact digest-key set; a subset cannot verify.
    `adoption_tool=IMPLEMENTED_LOCAL` and `temporary_repository_e2e=PASS` do not
    change `external_consumer_adoption=PROHIBITED`, `canary=NOT_PREPARED`,
    `stable_adoption=NOT_DECIDED` or `Autopilot OFF`.
@@ -96,13 +93,9 @@ Repository invariants:
     pre-existing Core-owned verification mutex is not crash provenance and
     remains untouched.
 11. Rollback conditionally removes only the exact-value Adoption hooks setting.
-    It requires the same single-worktree topology observed by preview, moves
-    activation and managed leaves into linked durable quarantine, revalidates
-    them before the receipt, and leaves reclamation to a separate GC that this
-    implementation neither provides nor authorizes. Local Git config mutation
-    rejects a symlinked/non-regular leaf before lifecycle state, prepares the
-    fixed change off-path, atomically exchanges names and verifies the displaced
-    inode and original bytes through a retained descriptor.
+    It moves activation and managed leaves into linked durable quarantine,
+    revalidates them before the receipt, and leaves reclamation to a separate GC
+    that this implementation neither provides nor authorizes.
 12. Stable Pause requires one exact task ID and the exact selected repository
     root. Before any Git snapshot it inspects Git-state inode materialization;
     dataless or unobservable Git state returns fail-closed
@@ -136,10 +129,7 @@ Repository invariants:
 | source substitution changes managed bytes after preview | A different runtime is published under a reviewed plan | Apply repeats the immutable source observation, manifest and plan binding; any drift is `E_ADOPTION_SOURCE_DRIFT` with zero target mutation. |
 | selected-source authority substitution makes the host checkout decide target validity | A different parser approves policy or registry than the Core bytes being installed | Execute only `scripts/control-plane` from the selected source and compare its full source manifest, including HEAD and tree, before journal creation. |
 | wrong-target selection redirects a valid plan | A fresh but unintended repository is mutated | Canonical repo, common-dir, worktree, branch, HEAD, policy and registry bindings are re-observed before journal creation. |
-| nested-repository smuggling hides `.git`, bare markers or a Gitlink under managed scope | Publication or rollback crosses repository semantics that preview did not bind | The bounded, descriptor-relative `managed-repositories-v1` scan case-folds every reserved marker and rejects markers/Gitlinks in preview/apply/verify/rollback; drift stops before deactivation. |
-| a source or installed lock changes a canonical field Adoption did not enumerate | Adoption reports PASS for a generation Core rejects | Exact top-level fields, schemas, hook values, module order and digest-key set are shared by source projection and installed verification; mismatch fails before activation. |
-| `.git/config` is a symlink or its leaf is substituted | `git config --local` writes outside the selected repository | No-follow private regular-leaf checks happen before lifecycle mutation; fixed Git edits a private off-path copy, atomic exchange exposes the displaced inode, and descriptor/byte mismatch restores the original and fails. |
-| a linked worktree is added after apply | rollback overlooks worktree-local task state and deactivates early | Rollback repeats the NUL-delimited single-worktree inventory before any journal transition; topology drift preserves active state. |
+| nested-repository smuggling hides `.git`, bare markers or a Gitlink under managed scope | Publication or rollback crosses repository semantics that preview did not bind | The bounded, descriptor-relative `managed-repositories-v1` scan rejects markers and Gitlinks in preview/apply/verify/rollback; drift stops before deactivation. |
 | partial publication leaves launchable files | Incomplete managed bytes execute | All managed bytes are published inactive; launcher and hooks fail closed until the target lock is atomically published last. |
 | journal tampering changes recovery intent | Rollback overwrites or deletes unrelated state | Closed schema, separate expected digests, private no-follow storage and exact record revalidation stop before compensation. |
 | rollback deletion removes user data | A created-path record is stale or substituted | Deactivate first; remove only exact journal-owned bytes and empty directories with unchanged descriptor identity, otherwise preserve and fail closed. |
@@ -154,9 +144,7 @@ Repository invariants:
 | a regular state leaf becomes a FIFO after `stat` | Apply, verify or rollback blocks indefinitely while holding exclusion | Every bounded read/cleanup open is nonblocking, then checks regular type, owner, mode, links, bounds and opened/named identity. |
 | `core.hooksPath` changes after rollback preflight | Unconditional unset deletes a consumer's new value | exact-value conditional unset targets only `.codex/git-hooks`; a concurrent value is preserved and rollback reports drift. |
 | rollback unlinks a managed inode while another descriptor remains open | Later writes evade final path verification and receipt evidence | Activation and managed leaves remain linked in durable quarantine and are revalidated after the move and before PASS; separate GC is outside scope. |
-| filter execution is triggered by Git observation | Target-controlled clean, smudge, textconv or external diff code executes | Exact read-only Git forms disable hooks, textconv and external diff and execute only after descriptor-bound `fchdir`; Survey interleaves three independent attribute guards with two byte-identical `status` observations in every registered worktree. Any unsafe, drifting or incomplete inventory is `UNKNOWN`. |
-| a gitlink or object alternate escapes the observed repository | `status` executes a nested repository filter or object lookup reads unproved storage | Survey runs the filesystem-first Git-state guard before any Git command, rejects case-insensitive `objects/info/alternates`, and binds an index with no mode `160000` before and after status. |
-| a registered worktree path is replaced by another checkout from the same clone | Survey attaches the registry branch/head to different bytes and reports a false clean result | Every canonical worktree binds its worktree-specific Git-dir and backlink, common-dir, exact HEAD/branch, directory identities and index digest before and after status. Branch comparisons use captured OIDs, while root, worktree list, refs and stash are re-observed before return. |
+| filter execution is triggered by Git observation | Target-controlled clean, smudge, textconv or external diff code executes | Closed Git argv disables hooks, filters, textconv and external diff; unsafe attributes fail before content observation. |
 | hostile environment redirects Python, Git or startup code | Unverified code executes before lock validation | POSIX `env -i`, absolute tool candidates, `-I -S -B`, disabled bytecode cache and verified captured-byte loaders. |
 | lock replay reuses another source, target or plan | A prior local result is treated as current | Adoption and target locks bind exact schema, runtime, source, target and manifest digests; non-exact replay is `E_ADOPTION_REPLAY`. |
 | serialized-authority confusion treats a receipt as permission | A plan or receipt is replayed as canary approval | Every nested artifact requires boolean `authorizes=false`; the host must obtain a later ADR and separate native authorization. |
@@ -224,6 +212,16 @@ authority, project bytes, or external state.
   tests. It has not been run against a consumer, and no canary has been
   prepared. A later independently accepted ADR and separate native
   authorization remain mandatory boundaries.
+- Proven inherited Survey and Adoption hardening gaps that were not introduced
+  by the R1 reconciliation are deferred to `codex/survey-hardening-wip` at
+  preservation commit `d901bb6c95377074a7fb2fb23762476547335969`: filter
+  execution and output/resource bounds, submodule/Gitlink and object-alternate
+  handling, detached-worktree substitution, discovery-to-walk TOCTOU,
+  newline-bearing paths, APFS case-equivalent Git markers, canonical lock
+  completeness, redirected `.git/config` writes, linked-worktree rollback
+  inventory and add-only branch-equivalence guidance. They remain
+  non-authorizing local risks; external consumer adoption stays prohibited
+  until a later bounded front closes or explicitly accepts them.
 - The snapshot binds immutable anchor
   `929d3f8a0656fed190bb65ceb3a29deef8de07d6`, its canonical final tracked
   overlay, non-ignored untracked regular files excluding this threat-model
@@ -237,4 +235,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:53132a4741850f97563ccdfab6757e37ddd4aa0eb38cf8be6ab6018e9d05e68a
+Version: codex-security-snapshot/v1:sha256:2657c7ded31c122b45e31aa534a5ec49274ec442c5a52ef47e4331c307542c8b

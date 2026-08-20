@@ -757,7 +757,7 @@ class CoreDocumentationTests(unittest.TestCase):
         verification, _, _ = verification.partition("\n## ")
         verification_flat = " ".join(verification.split())
         for token in (
-            "max_gate_runs=3",
+            "max_gate_runs=6",
             "gate_run_count",
             "same closure lineage",
             "does not reset",
@@ -785,7 +785,7 @@ class CoreDocumentationTests(unittest.TestCase):
             stable_pause_spec,
             alignment,
         ):
-            self.assertIn("max_gate_runs=3", governing_gate_document)
+            self.assertIn("max_gate_runs=6", governing_gate_document)
         for governing_gate_document in (
             stable_pause_plan,
             adoption_plan,
@@ -793,6 +793,8 @@ class CoreDocumentationTests(unittest.TestCase):
         ):
             self.assertIn("last consumed run", governing_gate_document)
         self.assertIn("última ejecución consumida", alignment_flat)
+        self.assertIn("gate_run_count=2", alignment)
+        self.assertIn("3/6", alignment)
         for stale_rule in (
             "fresh one-shot",
             "one authorized full gate",
@@ -813,7 +815,7 @@ class CoreDocumentationTests(unittest.TestCase):
         dogfood = read(DOGFOOD)
         dogfood_flat = " ".join(dogfood.split())
         self.assertIn("Do not run a full suite per dogfood task", dogfood_flat)
-        self.assertIn("max_gate_runs=3", dogfood_flat)
+        self.assertIn("max_gate_runs=6", dogfood_flat)
         self.assertNotIn("at most one authoritative full", dogfood_flat)
 
         for document in (read(ALIGNMENT), read(ORIENTATION), read(SPECPACK_PLAN)):
@@ -1084,7 +1086,7 @@ class CoreDocumentationTests(unittest.TestCase):
             )
         self.assertIn(
             "one passing final-byte focal set, a full gate whose last consumed "
-            "run is green within `max_gate_runs=3`, all post-gates and both "
+            "run is green within `max_gate_runs=6`, all post-gates and both "
             "independent rereviews on identical bytes",
             evidence,
         )

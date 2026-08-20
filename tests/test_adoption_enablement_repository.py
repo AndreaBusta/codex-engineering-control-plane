@@ -257,38 +257,6 @@ class AdoptionRepositoryTests(unittest.TestCase):
 
                 self.assertEqual(before, metadata_snapshot(target))
 
-    def test_casefolded_git_markers_inside_managed_scope_are_rejected(self) -> None:
-        cases = ("git-directory", "bare-markers")
-        for case in cases:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                container = Path(directory).resolve(strict=True)
-                source = initialize_full_source(container / "source", self.ROOT)
-                target = initialize_fresh_target(container / "target")
-                write_file(
-                    target,
-                    ".gitignore",
-                    "scripts/work/\nscripts/nested.git/\n",
-                )
-                git(target, "add", ".gitignore")
-                git(target, "commit", "-m", "ignore hostile nested repositories")
-                if case == "git-directory":
-                    (target / "scripts" / "work" / ".GIT").mkdir(parents=True)
-                else:
-                    nested = target / "scripts" / "nested.git"
-                    nested.mkdir(parents=True)
-                    write_file(nested, "head", b"ref: refs/heads/main\n")
-                    write_file(nested, "CONFIG", b"[core]\n\tbare = true\n")
-                    (nested / "Objects").mkdir()
-                    (nested / "REFS").mkdir()
-
-                from adoption_enablement.manifest import preview
-
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "^E_ADOPTION_NESTED_REPOSITORY",
-                ):
-                    preview(source, target)
-
     def test_gitlink_inside_managed_scope_is_rejected_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             container = Path(directory).resolve(strict=True)

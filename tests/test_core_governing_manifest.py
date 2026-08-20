@@ -284,14 +284,6 @@ def _imported_modules(tree: ast.AST) -> tuple[set[str], tuple[str, ...]]:
 
 
 class CoreGoverningManifestTests(unittest.TestCase):
-    def test_survey_module_stays_within_its_governing_line_budget(self) -> None:
-        survey = ROOT / "control_plane" / "survey.py"
-        self.assertLessEqual(
-            len(survey.read_text(encoding="utf-8").splitlines()),
-            450,
-            "control_plane/survey.py exceeds its 450-line governing budget",
-        )
-
     def test_ast_scanner_closes_alias_and_from_import_bypasses(self) -> None:
         tree = ast.parse(
             "import importlib as loader\n"

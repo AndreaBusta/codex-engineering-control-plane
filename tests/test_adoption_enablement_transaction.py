@@ -212,77 +212,6 @@ class AdoptionTransactionTests(unittest.TestCase):
             self.assertFalse((target / "scripts" / "control-plane").exists())
             self.assertFalse((target / "control_plane").exists())
 
-    def test_apply_and_rollback_reject_a_symlinked_local_git_config(self) -> None:
-        for operation in ("apply", "rollback"):
-            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
-                container = Path(directory).resolve(strict=True)
-                source = initialize_full_source(container / "source", ROOT)
-                target = initialize_fresh_target(container / "target")
-                plan = preview(source, target)
-                receipt: dict[str, object] | None = None
-                if operation == "rollback":
-                    receipt = apply_plan(
-                        source,
-                        target,
-                        plan,
-                        expected_plan_digest=plan["plan_digest"],
-                    )
-
-                config = target / ".git" / "config"
-                external = container / f"{operation}-external-config"
-                external.write_bytes(config.read_bytes())
-                external.chmod(stat.S_IMODE(config.lstat().st_mode))
-                config.unlink()
-                config.symlink_to(os.path.relpath(external, config.parent))
-                external_before = external.read_bytes()
-                activation = target / ".codex" / "control-plane.lock"
-                activation_before = activation.read_bytes() if activation.exists() else None
-
-                observed_error: ValueError | None = None
-                try:
-                    if operation == "apply":
-                        apply_plan(
-                            source,
-                            target,
-                            plan,
-                            expected_plan_digest=plan["plan_digest"],
-                        )
-                    else:
-                        assert receipt is not None
-                        rollback(
-                            target,
-                            install_digest=str(receipt["install_digest"]),
-                        )
-                except ValueError as error:
-                    observed_error = error
-
-                with self.subTest(assertion="rejected"):
-                    self.assertIsNotNone(observed_error)
-                    assert observed_error is not None
-                    self.assertRegex(
-                        str(observed_error),
-                        "^E_ADOPTION_(?:GIT_CONFIG|TARGET_DRIFT|ROLLBACK_DRIFT)",
-                    )
-
-                with self.subTest(assertion="external-byte-identity"):
-                    self.assertEqual(external.read_bytes(), external_before)
-                self.assertTrue(config.is_symlink())
-                if operation == "apply":
-                    with self.subTest(assertion="zero-target-mutation"):
-                        self.assertFalse(activation.exists())
-                        self.assertFalse(
-                            (target / ".git" / transaction.STATE_ROOT).exists()
-                        )
-                else:
-                    with self.subTest(assertion="activation-preserved"):
-                        self.assertTrue(activation.is_file())
-                        if activation.is_file():
-                            self.assertEqual(activation.read_bytes(), activation_before)
-                    with self.subTest(assertion="journal-remains-active"):
-                        self.assertTrue(_journal_path(target).is_file())
-                        if _journal_path(target).is_file():
-                            self.assertEqual(_journal(target)["state"], "active")
-
     def test_parent_identity_drift_fails_before_adoption_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             container = Path(directory).resolve(strict=True)
@@ -407,42 +336,6 @@ class AdoptionTransactionTests(unittest.TestCase):
             self.assertEqual(_hooks_path(target), hooks_before)
             self.assertTrue((target / "scripts/control-plane").exists())
             self.assertEqual(_journal(target)["state"], "active")
-
-    def test_rollback_rejects_a_linked_worktree_added_after_apply(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            container = Path(directory).resolve(strict=True)
-            source = initialize_full_source(container / "source", ROOT)
-            target = initialize_fresh_target(container / "target")
-            plan = preview(source, target)
-            receipt = apply_plan(
-                source,
-                target,
-                plan,
-                expected_plan_digest=plan["plan_digest"],
-            )
-            linked = container / "linked"
-            git(
-                target,
-                "worktree",
-                "add",
-                str(linked),
-                "-b",
-                "codex/late-linked",
-            )
-            activation = target / ".codex" / "control-plane.lock"
-            activation_before = activation.read_bytes()
-            hooks_before = _hooks_path(target)
-
-            with self.assertRaisesRegex(
-                ValueError,
-                "^E_ADOPTION_(?:TARGET_WORKTREES|ROLLBACK_DRIFT)",
-            ):
-                rollback(target, install_digest=str(receipt["install_digest"]))
-
-            self.assertEqual(activation.read_bytes(), activation_before)
-            self.assertEqual(_hooks_path(target), hooks_before)
-            self.assertEqual(_journal(target)["state"], "active")
-            self.assertTrue(linked.is_dir())
 
     def test_missing_or_replaced_lifecycle_lock_blocks_core_and_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -69,41 +69,6 @@ _ROLES = {
     ".codex/git-hooks/pre-push": "git_pre_push",
     "scripts/control-plane": "entrypoint",
 }
-_LOCK_SCHEMA_FIELDS = (
-    "policy_schema",
-    "registry_schema",
-    "task_schema",
-    "route_schema",
-    "receipt_schema",
-    "clarification_schema",
-    "risk_schema",
-)
-_LOCK_DIGEST_FIELDS = frozenset(
-    {
-        "project_policy",
-        "resource_registry",
-        "hooks",
-        "hook_entrypoint",
-        "git_pre_commit",
-        "git_pre_push",
-        "entrypoint",
-        "runtime",
-    }
-)
-_LOCK_FIELDS = frozenset(
-    {
-        "schema_version",
-        "product_version",
-        *_LOCK_SCHEMA_FIELDS,
-        "hook_mode",
-        "hook_trust",
-        "runtime_package",
-        "runtime_layout",
-        "runtime_modules",
-        "digests",
-    }
-)
-_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$", re.ASCII)
 
 
 @dataclass(frozen=True)
@@ -112,39 +77,6 @@ class TargetProjection:
     records: tuple[Mapping[str, object], ...]
     payloads: Mapping[str, bytes]
     target_lock: bytes
-
-
-def _canonical_lock_contract(
-    value: object,
-    *,
-    adopted: bool,
-) -> bool:
-    if not isinstance(value, dict):
-        return False
-    expected_fields = _LOCK_FIELDS | ({"adoption_lifecycle"} if adopted else set())
-    digests = value.get("digests")
-    return (
-        set(value) == expected_fields
-        and value.get("schema_version") == 2
-        and value.get("product_version") == "3.1.0-core.2"
-        and all(value.get(name) == 1 for name in _LOCK_SCHEMA_FIELDS)
-        and value.get("hook_mode") == "audit"
-        and value.get("hook_trust") == "pending_hook_trust"
-        and value.get("runtime_package") == "control_plane"
-        and value.get("runtime_layout") == "source"
-        and value.get("runtime_modules") == list(CORE_RUNTIME_MODULES)
-        and isinstance(digests, dict)
-        and set(digests) == _LOCK_DIGEST_FIELDS
-        and all(
-            isinstance(digest, str) and _SHA256.fullmatch(digest) is not None
-            for digest in digests.values()
-        )
-        and (
-            value.get("adoption_lifecycle") == ADOPTION_LIFECYCLE
-            if adopted
-            else "adoption_lifecycle" not in value
-        )
-    )
 
 
 def _source_lock(source: Path) -> tuple[bytes, dict[str, Any]]:
@@ -157,7 +89,16 @@ def _source_lock(source: Path) -> tuple[bytes, dict[str, Any]]:
         value = tomllib.loads(payload.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise ValueError("E_ADOPTION_SOURCE_LOCK: source lock is invalid") from error
-    if not _canonical_lock_contract(value, adopted=False):
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 2
+        or value.get("product_version") != "3.1.0-core.2"
+        or value.get("runtime_package") != "control_plane"
+        or value.get("runtime_layout") != "source"
+        or value.get("runtime_modules") != list(CORE_RUNTIME_MODULES)
+        or not isinstance(value.get("digests"), dict)
+        or "adoption_lifecycle" in value
+    ):
         raise ValueError("E_ADOPTION_SOURCE_LOCK: source lock contract is unsupported")
     return payload, value
 
@@ -297,9 +238,9 @@ def render_target_lock(
     except tomllib.TOMLDecodeError as error:
         raise ValueError("E_ADOPTION_SOURCE_LOCK: rendered target lock is invalid") from error
     if (
-        not _canonical_lock_contract(value, adopted=True)
-        or value.get("digests", {}).get("project_policy") != target.policy_digest
+        value.get("digests", {}).get("project_policy") != target.policy_digest
         or value.get("digests", {}).get("resource_registry") != target.registry_digest
+        or value.get("adoption_lifecycle") != ADOPTION_LIFECYCLE
     ):
         raise ValueError("E_ADOPTION_SOURCE_LOCK: rendered target lock binding drifted")
     return rendered

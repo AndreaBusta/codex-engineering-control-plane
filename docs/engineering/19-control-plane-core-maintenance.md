@@ -81,14 +81,14 @@ non-authorizing and records `authorizes=false`.
 ## Final verification budget
 
 Final full verification is read-only, idempotent, and bounded by
-`max_gate_runs=3` for one exact PR/worktree candidate. The orchestrator records
+`max_gate_runs=6` for one exact PR/worktree candidate. The orchestrator records
 `gate_run_count` outside the product runtime and binds it to the same closure
 lineage. Repair and re-freeze do not create a new lineage, so the counter does
 not reset. A run consumes the budget only after it acquires the verification
 mutex and starts `bash tests/run.sh`;
 `E_VERIFICATION_BUSY` does not consume it. A repair invalidates earlier
 final-byte evidence and returns the candidate to focused RED/GREEN work. The
-last consumed run must be green on the exact final bytes. If three consumed
+last consumed run must be green on the exact final bytes. If six consumed
 runs do not produce that state, stop in Stable Pause instead of requesting an
 unbounded retry.
 

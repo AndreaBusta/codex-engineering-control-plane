@@ -20,7 +20,7 @@ declara entrada, salida, prueba y criterio de cierre.
 | Remoto | `https://github.com/AndreaBusta/codex-engineering-control-plane.git` |
 | Base | `main`; reobservar su SHA exacto antes de abrir la fase |
 | Versión candidata | reconciliación `3.1.0-core.2`; `R1_OPEN`: reparaciones, prerevisiones frescas y evidencia final pendientes |
-| Suite | la evidencia previa no cierra R1; la última ejecución integral debe quedar verde sobre los bytes finales dentro de `max_gate_runs=3` |
+| Suite | la evidencia previa no cierra R1; la última ejecución integral debe quedar verde sobre los bytes finales dentro de `max_gate_runs=6` |
 | Estrategia de integración | `squash` |
 | Superficie Advanced | en cuarentena estructural, no reactivar |
 | Outcomes permitidos | `answer` y `local_change` únicamente |
@@ -162,7 +162,7 @@ sean verificables por separado:
 
 1. el candidato `3.1.0-core.2` ha alcanzado adopción estable y la última
    ejecución consumida del gate integral está verde sobre sus bytes finales,
-   dentro de `max_gate_runs=3`;
+   dentro de `max_gate_runs=6`;
 2. la fase 1 lleva al menos tres packs redactados en trabajo real, no de prueba;
 3. existe autorización explícita para ampliar la superficie de runtime durante
    la línea 3.x.

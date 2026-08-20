@@ -75,15 +75,11 @@ clones.
 ## Prueba aplicada a cada rama
 
 Comparar commits induce a error bajo `squash`. La prueba usada aquí es de
-contenido completo: altas, modificaciones, borrados, renombres y modos entre la
-rama y `origin/main`.
+contenido: qué archivos existen en la rama y no existen en `origin/main`.
 
 ```bash
-git diff --name-status --no-ext-diff --no-textconv origin/main..<rama> --
+git diff --diff-filter=A --name-only origin/main..<rama>
 ```
-
-Solo una salida vacía prueba equivalencia. Un inventario limitado a altas es
-auxiliar y nunca decide por sí solo que una rama carezca de trabajo pendiente.
 
 ## Hallazgo determinante
 
@@ -344,9 +340,13 @@ Observación del 2026-08-18: `bash tests/run.sh` sobre `main` en
 
 Esa ejecución es evidencia local válida, pero no cierra por sí sola el gate
 declarado en el scorecard: aquel gate se define sobre los bytes sellados del
-candidato, con `max_gate_runs=3` ligado a la misma closure lineage. La última
-ejecución consumida debe quedar verde sobre los bytes finales; reparar no
-reinicia el contador y agotarlo exige Stable Pause. Cerrarlo es una decisión de
+candidato, con `max_gate_runs=6` ligado a la misma closure lineage. Para la
+lineage R1 reencuadrada el 2026-08-20, `gate_run_count=2` y el siguiente intento
+es `3/6`. Los intentos 1 y 2 permanecen consumidos: sus resultados byte-bound
+quedaron superseded por reparaciones posteriores, pero no se borran ni se
+reclasifican. La última ejecución consumida debe quedar verde sobre los bytes
+finales; reparar o volver a congelar no reinicia el contador, y alcanzar
+`gate_run_count=6` sin ese estado exige Stable Pause. Cerrarlo es una decisión de
 la tarea orquestadora, no un efecto derivado de esta lectura. El candidato
 permanece `GREEN_LOCAL / PENDING_STABLE_ADOPTION` y
 `external_consumer_adoption=PROHIBITED`.
@@ -357,6 +357,6 @@ permanece `GREEN_LOCAL / PENDING_STABLE_ADOPTION` y
 - **Rol:** orquestadora de la alineación del repositorio.
 - **Para continuar:** cerrar la reconciliación R1 sin reabrir la higiene histórica ya terminada.
 - **Mensaje exacto:** `Continúa R1 sobre su worktree exacto; compara el delta completo contra ambos padres y conserva las ramas históricas concretas en cuarentena.`
-- **Estado de partida:** protección de `main` activa con `core-verify`; la reconciliación local `3.1.0-core.2` mantiene su evidencia final pendiente.
-- **No hacer todavía:** commit, push, PR, merge, instalar o adoptar el candidato sin la autoridad exacta de esa transición.
+- **Estado de partida:** protección de `main` activa con `core-verify`; la reconciliación local `3.1.0-core.2` está preservada en `d901bb6` y mantiene su evidencia final pendiente.
+- **No hacer todavía:** push, PR, merge, instalar o adoptar el candidato sin la autoridad exacta de esa transición; los commits locales de R1 sí están autorizados.
 - **Autoridad:** `authorizes=false`

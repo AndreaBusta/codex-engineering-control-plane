@@ -68,22 +68,6 @@ class AdoptionPreviewTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "^E_ADOPTION_SOURCE_(?:MODULES|RUNTIME)"):
                     build_source_manifest(source)
 
-    def test_source_manifest_rejects_noncanonical_hook_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            source = initialize_full_source(Path(directory) / "source", ROOT)
-            lock = source / ".codex" / "control-plane.lock"
-            payload = lock.read_text(encoding="utf-8")
-            self.assertEqual(payload.count('hook_mode = "audit"'), 1)
-            lock.write_text(
-                payload.replace('hook_mode = "audit"', 'hook_mode = "enforce"'),
-                encoding="utf-8",
-            )
-            git(source, "add", ".codex/control-plane.lock")
-            git(source, "commit", "-m", "invalid source hook mode")
-
-            with self.assertRaisesRegex(ValueError, "^E_ADOPTION_SOURCE_LOCK"):
-                build_source_manifest(source)
-
     def test_target_lock_is_generated_in_memory_for_target_authority_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             container = Path(directory).resolve(strict=True)

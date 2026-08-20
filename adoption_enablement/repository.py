@@ -189,7 +189,7 @@ def _assert_no_nested_repositories(repository: Path) -> dict[str, object]:
                         raise ValueError(
                             "E_ADOPTION_TARGET_BOUNDS: managed scan path is too long"
                         )
-                    if name.casefold() == ".git":
+                    if name == ".git":
                         raise ValueError(
                             "E_ADOPTION_NESTED_REPOSITORY: nested Git marker is unsupported"
                         )
@@ -202,8 +202,8 @@ def _assert_no_nested_repositories(repository: Path) -> dict[str, object]:
                 "E_ADOPTION_TARGET_DRIFT: managed scan is unavailable"
             ) from error
 
-        names = {name.casefold() for name, _ in entries}
-        if {"head", "config", "objects"}.issubset(names) and (
+        names = {name for name, _ in entries}
+        if {"HEAD", "config", "objects"}.issubset(names) and (
             "refs" in names or "packed-refs" in names
         ):
             raise ValueError(
@@ -637,39 +637,6 @@ def _canonical_git_directory(root: Path, *arguments: str) -> Path:
     return canonical_root(candidate)
 
 
-def _local_git_config_identity(root: Path) -> tuple[int, ...]:
-    """Bind the exact private regular config leaf used by local Git writes."""
-
-    git_directory = _canonical_git_directory(
-        root,
-        "rev-parse",
-        "--absolute-git-dir",
-    )
-    metadata = confined_lstat(git_directory, "config")
-    if (
-        metadata is None
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) & 0o022
-        or not 0 <= metadata.st_size <= AUTHORITY_FILE_MAX
-        or int(getattr(metadata, "st_flags", 0)) != 0
-    ):
-        raise ValueError("E_ADOPTION_GIT_CONFIG: local Git config is unsafe")
-    return metadata_identity(metadata)
-
-
-def _assert_single_worktree(root: Path) -> None:
-    listing = _run_git(root, "worktree", "list", "--porcelain", "-z")
-    fields = listing.split(b"\0")
-    if (
-        not fields
-        or fields[-1] != b""
-        or sum(field.startswith(b"worktree ") for field in fields) != 1
-    ):
-        raise ValueError("E_ADOPTION_TARGET_WORKTREES: target must have one worktree")
-
-
 def _reject_existing(root: Path, relatives: Sequence[str]) -> None:
     for relative in relatives:
         if confined_lstat(root, relative) is not None:
@@ -847,7 +814,6 @@ def observe_target(
     )
     _reject_existing(root, MANAGED_PATHS)
     managed_repository_scan = _assert_no_nested_repositories(root)
-    config_identity = _local_git_config_identity(root)
     hooks = _run_git(
         root,
         "config",
@@ -859,7 +825,9 @@ def observe_target(
     if hooks:
         raise ValueError("E_ADOPTION_NOT_FRESH: target already configures core.hooksPath")
 
-    _assert_single_worktree(root)
+    worktrees = _run_git(root, "worktree", "list", "--porcelain")
+    if sum(line.startswith(b"worktree ") for line in worktrees.splitlines()) != 1:
+        raise ValueError("E_ADOPTION_TARGET_WORKTREES: target must have one worktree")
     if _run_git(root, "submodule", "status", "--recursive"):
         raise ValueError("E_ADOPTION_NOT_FRESH: submodules are unsupported")
 
@@ -925,7 +893,6 @@ def observe_target(
         metadata_identity(root.lstat()) != root_before
         or _repo_identity(git_directory) != worktree_id
         or _repo_identity(common_directory) != common_dir_id
-        or _local_git_config_identity(root) != config_identity
         or _assert_no_nested_repositories(root) != managed_repository_scan
     ):
         raise ValueError("E_ADOPTION_TARGET_DRIFT: target identity changed")

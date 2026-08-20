@@ -31,7 +31,6 @@ from .contracts import (
 from .manifest import (
     CORE_RUNTIME_MODULES,
     TargetProjection,
-    _canonical_lock_contract,
     build_target_projection,
     preview,
 )
@@ -39,11 +38,9 @@ from .repository import (
     MANAGED_PATHS,
     PROVISIONING_PREFIXES,
     _assert_no_nested_repositories,
-    _assert_single_worktree,
     _managed_parent_directories,
     _canonical_git_directory,
     _clean,
-    _local_git_config_identity,
     _reject_content_filters,
     _run_git,
     _provisioning_state,
@@ -217,49 +214,6 @@ def _rename_noreplace(
     raise ValueError(
         f"E_ADOPTION_PUBLISH: atomic no-replace rename failed ({error_number})"
     )
-
-
-def _rename_exchange(first_name: str, second_name: str, *, directory: int) -> None:
-    """Atomically exchange two leaves so the displaced inode can be verified."""
-
-    for value in (first_name, second_name):
-        if not value or PurePosixPath(value).name != value or "\x00" in value:
-            raise ValueError("E_ADOPTION_GIT_CONFIG: config exchange name is unsafe")
-    library = ctypes.CDLL(None, use_errno=True)
-    first = os.fsencode(first_name)
-    second = os.fsencode(second_name)
-    ctypes.set_errno(0)
-    if hasattr(library, "renameatx_np"):
-        operation = library.renameatx_np
-        operation.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        operation.restype = ctypes.c_int
-        result = operation(directory, first, directory, second, 0x00000002)
-    elif hasattr(library, "renameat2"):
-        operation = library.renameat2
-        operation.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        operation.restype = ctypes.c_int
-        result = operation(directory, first, directory, second, 0x00000002)
-    else:
-        raise ValueError(
-            "E_ADOPTION_FILESYSTEM: atomic config exchange is unavailable"
-        )
-    if result != 0:
-        raise ValueError(
-            "E_ADOPTION_GIT_CONFIG: atomic config exchange failed "
-            f"({ctypes.get_errno()})"
-        )
 
 
 @dataclass
@@ -1068,232 +1022,7 @@ def _transition_journal(
     return _sealed_journal(unsigned)
 
 
-def _private_git_config(metadata: os.stat_result) -> bool:
-    return (
-        stat.S_ISREG(metadata.st_mode)
-        and metadata.st_uid == os.geteuid()
-        and metadata.st_nlink == 1
-        and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
-        and 0 <= metadata.st_size <= FILE_MAX
-        and int(getattr(metadata, "st_flags", 0)) == 0
-    )
-
-
-def _git_config_binding_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
-        int(metadata.st_dev),
-        int(metadata.st_ino),
-        int(metadata.st_mode),
-        int(metadata.st_nlink),
-        int(metadata.st_uid),
-        int(metadata.st_gid),
-        int(metadata.st_size),
-        int(getattr(metadata, "st_flags", 0)),
-    )
-
-
-def _read_config_descriptor(descriptor: int) -> bytes:
-    try:
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        before = os.fstat(descriptor)
-        if not _private_git_config(before):
-            raise OSError("unsafe config descriptor")
-        payload = bytearray()
-        while len(payload) <= FILE_MAX:
-            chunk = os.read(
-                descriptor,
-                min(65_536, FILE_MAX + 1 - len(payload)),
-            )
-            if not chunk:
-                break
-            payload.extend(chunk)
-        after = os.fstat(descriptor)
-    except OSError as error:
-        raise ValueError("E_ADOPTION_GIT_CONFIG: local Git config is unreadable") from error
-    if (
-        metadata_identity(before) != metadata_identity(after)
-        or len(payload) > FILE_MAX
-        or len(payload) != after.st_size
-    ):
-        raise ValueError("E_ADOPTION_GIT_CONFIG: local Git config changed during read")
-    return bytes(payload)
-
-
-def _write_all(descriptor: int, payload: bytes) -> None:
-    offset = 0
-    try:
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("short config write")
-            offset += written
-        os.fsync(descriptor)
-    except OSError as error:
-        raise ValueError("E_ADOPTION_GIT_CONFIG: config staging failed") from error
-
-
-def _config_file_value(target: Path, config: Path) -> bytes:
-    return _run_git(
-        target,
-        "config",
-        "--file",
-        str(config),
-        "--get-all",
-        "core.hooksPath",
-        allowed_returncodes=(0, 1),
-    )
-
-
-def _remove_config_temp(directory: int, name: str) -> None:
-    try:
-        metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        if not _private_git_config(metadata):
-            raise OSError("unsafe config temporary")
-        os.unlink(name, dir_fd=directory)
-        os.fsync(directory)
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise ValueError("E_ADOPTION_GIT_CONFIG: config staging cleanup failed") from error
-
-
-def _replace_local_git_config(
-    target: Path,
-    *,
-    expected_before: bytes,
-    expected_after: bytes,
-    mutation: tuple[str, ...],
-) -> None:
-    """Prepare with Git off-path, then atomically exchange one bound config leaf."""
-
-    _local_git_config_identity(target)
-    git_directory = _canonical_git_directory(
-        target,
-        "rev-parse",
-        "--absolute-git-dir",
-    )
-    directory = _open_private_directory(git_directory)
-    original = -1
-    temporary = f".codex-control-plane-config.{uuid.uuid4().hex}.tmp"
-    temporary_owned = False
-    exchanged = False
-    try:
-        directory_identity = _directory_identity(os.fstat(directory))
-        before = os.stat("config", dir_fd=directory, follow_symlinks=False)
-        if not _private_git_config(before):
-            raise ValueError("E_ADOPTION_GIT_CONFIG: local Git config is unsafe")
-        original = os.open(
-            "config",
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0),
-            dir_fd=directory,
-        )
-        opened = os.fstat(original)
-        named = os.stat("config", dir_fd=directory, follow_symlinks=False)
-        if (
-            metadata_identity(before) != metadata_identity(opened)
-            or metadata_identity(before) != metadata_identity(named)
-        ):
-            raise ValueError("E_ADOPTION_GIT_CONFIG: local Git config changed")
-        original_payload = _read_config_descriptor(original)
-        mode = stat.S_IMODE(before.st_mode)
-        staged = os.open(
-            temporary,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            mode,
-            dir_fd=directory,
-        )
-        temporary_owned = True
-        try:
-            os.fchmod(staged, mode)
-            _write_all(staged, original_payload)
-        finally:
-            os.close(staged)
-        os.fsync(directory)
-        temporary_path = git_directory / temporary
-        if _config_file_value(target, temporary_path) != expected_before:
-            raise ValueError("E_ADOPTION_GIT_CONFIG: local Git config precondition drifted")
-        _run_git(
-            target,
-            "config",
-            "--file",
-            str(temporary_path),
-            *mutation,
-        )
-        prepared = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
-        if (
-            not _private_git_config(prepared)
-            or _config_file_value(target, temporary_path) != expected_after
-            or _directory_identity(os.fstat(directory)) != directory_identity
-        ):
-            raise ValueError("E_ADOPTION_GIT_CONFIG: prepared config is unsafe")
-        opened_after = os.fstat(original)
-        named_before_exchange = os.stat(
-            "config",
-            dir_fd=directory,
-            follow_symlinks=False,
-        )
-        if (
-            metadata_identity(opened) != metadata_identity(opened_after)
-            or metadata_identity(before) != metadata_identity(named_before_exchange)
-            or _read_config_descriptor(original) != original_payload
-        ):
-            raise ValueError("E_ADOPTION_GIT_CONFIG: local Git config changed")
-        prepared_identity = _git_config_binding_identity(prepared)
-        _rename_exchange("config", temporary, directory=directory)
-        exchanged = True
-        temporary_owned = False
-        try:
-            displaced = os.stat(
-                temporary,
-                dir_fd=directory,
-                follow_symlinks=False,
-            )
-            active = os.stat("config", dir_fd=directory, follow_symlinks=False)
-            if (
-                _git_config_binding_identity(displaced)
-                != _git_config_binding_identity(before)
-                or _git_config_binding_identity(active) != prepared_identity
-                or _read_config_descriptor(original) != original_payload
-                or _hooks_path(target) != expected_after
-            ):
-                raise ValueError("E_ADOPTION_GIT_CONFIG: config exchange drifted")
-            os.unlink(temporary, dir_fd=directory)
-            os.fsync(directory)
-        except (OSError, ValueError):
-            _rename_exchange("config", temporary, directory=directory)
-            exchanged = False
-            temporary_owned = True
-            os.fsync(directory)
-            raise
-        exchanged = False
-    except ValueError:
-        raise
-    except OSError as error:
-        raise ValueError("E_ADOPTION_GIT_CONFIG: local Git config update failed") from error
-    finally:
-        if exchanged:
-            try:
-                _rename_exchange("config", temporary, directory=directory)
-                temporary_owned = True
-                os.fsync(directory)
-            except ValueError:
-                pass
-        if temporary_owned:
-            _remove_config_temp(directory, temporary)
-        if original >= 0:
-            os.close(original)
-        os.close(directory)
-
-
 def _set_hooks_path(target: Path) -> None:
-    _local_git_config_identity(target)
     before = _run_git(
         target,
         "config",
@@ -1304,12 +1033,7 @@ def _set_hooks_path(target: Path) -> None:
     )
     if before:
         raise ValueError("E_ADOPTION_TARGET_DRIFT: core.hooksPath appeared")
-    _replace_local_git_config(
-        target,
-        expected_before=b"",
-        expected_after=f"{HOOKS_PATH}\n".encode("utf-8"),
-        mutation=("--add", "core.hooksPath", HOOKS_PATH),
-    )
+    _run_git(target, "config", "--local", "--add", "core.hooksPath", HOOKS_PATH)
     after = _run_git(
         target,
         "config",
@@ -1738,7 +1462,6 @@ def apply_plan(
         raise ValueError(f"E_ADOPTION_PLAN: reviewed plan is invalid ({issues[0].code})")
     source_root = canonical_root(source)
     target_root = canonical_root(target)
-    _local_git_config_identity(target_root)
     common = _canonical_git_directory(target_root, "rev-parse", "--git-common-dir")
     initial_provisioning_state = _provisioning_state(common)
     state_exists = initial_provisioning_state != "ABSENT"
@@ -2096,7 +1819,6 @@ def _target_identity(target: Path, journal: Mapping[str, object]) -> tuple[Path,
     if not isinstance(binding, Mapping):
         raise ValueError("E_ADOPTION_TARGET_DRIFT: target binding is absent")
     root = canonical_root(target)
-    _assert_single_worktree(root)
     git_directory = _canonical_git_directory(root, "rev-parse", "--absolute-git-dir")
     common = _canonical_git_directory(root, "rev-parse", "--git-common-dir")
     branch = _text(
@@ -2195,7 +1917,15 @@ def _target_lock_contract(
         lock = tomllib.loads(payload.decode("utf-8", errors="strict"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise ValueError("E_ADOPTION_VERIFY_DRIFT: target lock is invalid") from error
-    if not _canonical_lock_contract(lock, adopted=True):
+    if (
+        lock.get("schema_version") != 2
+        or lock.get("product_version") != PRODUCT_VERSION
+        or lock.get("adoption_lifecycle") != ADOPTION_LIFECYCLE
+        or lock.get("runtime_package") != "control_plane"
+        or lock.get("runtime_layout") != "source"
+        or lock.get("runtime_modules") != list(CORE_RUNTIME_MODULES)
+        or not isinstance(lock.get("digests"), dict)
+    ):
         raise ValueError("E_ADOPTION_VERIFY_DRIFT: target lock contract drifted")
     digests = lock["digests"]
     by_path = _record_map(records)
@@ -2913,22 +2643,19 @@ def _move_activation_to_recovery(
 
 
 def _unset_hooks_path(target: Path) -> None:
-    _local_git_config_identity(target)
     current = _hooks_path(target)
     if not current:
         return
     if current != f"{HOOKS_PATH}\n".encode("utf-8"):
         raise ValueError("E_ADOPTION_ROLLBACK_DRIFT: core.hooksPath drifted")
     try:
-        _replace_local_git_config(
+        _run_git(
             target,
-            expected_before=f"{HOOKS_PATH}\n".encode("utf-8"),
-            expected_after=b"",
-            mutation=(
-                "--unset-all",
-                "core.hooksPath",
-                r"^\.codex/git-hooks$",
-            ),
+            "config",
+            "--local",
+            "--unset-all",
+            "core.hooksPath",
+            r"^\.codex/git-hooks$",
         )
     except ValueError as error:
         if _hooks_path(target) != f"{HOOKS_PATH}\n".encode("utf-8"):
@@ -3299,7 +3026,6 @@ def rollback(
     if not isinstance(install_digest, str) or _DIGEST.fullmatch(install_digest) is None:
         raise ValueError("E_ADOPTION_REPLAY: install digest is invalid")
     target_root = canonical_root(target)
-    _local_git_config_identity(target_root)
     common = _canonical_git_directory(target_root, "rev-parse", "--git-common-dir")
     if confined_lstat(common, STATE_ROOT) is None:
         raise ValueError("E_ADOPTION_NOT_FOUND: adoption state is absent")

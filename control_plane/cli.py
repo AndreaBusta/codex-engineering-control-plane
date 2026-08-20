@@ -27,7 +27,6 @@ _CORE_STATES = (
 )
 _QUARANTINED = "E_CAPABILITY_QUARANTINED"
 _JSON_INPUT_MAX_BYTES = 1_048_576
-_SURVEY_OUTPUT_MAX_BYTES = 4_096
 
 
 class _StoreOnce(argparse.Action):
@@ -169,41 +168,12 @@ def _render_human(payload: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _emit(
-    payload: dict[str, Any],
-    as_json: bool,
-    *,
-    output_limit: int | None = None,
-    overflow_payload: dict[str, Any] | None = None,
-    compact_json: bool = False,
-) -> int:
-    rendered = (
-        json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":") if compact_json else None,
-            indent=None if compact_json else 2,
-        )
+def _emit(payload: dict[str, Any], as_json: bool) -> int:
+    print(
+        json.dumps(payload, indent=2, sort_keys=True)
         if as_json
         else _render_human(payload)
     )
-    if output_limit is not None and len((rendered + "\n").encode("utf-8")) > output_limit:
-        if overflow_payload is None:
-            raise ValueError("E_OUTPUT_LIMIT: rendered output exceeds its bound")
-        payload = overflow_payload
-        rendered = (
-            json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":") if compact_json else None,
-                indent=None if compact_json else 2,
-            )
-            if as_json
-            else _render_human(payload)
-        )
-        if len((rendered + "\n").encode("utf-8")) > output_limit:
-            raise ValueError("E_OUTPUT_LIMIT: fallback output exceeds its bound")
-    print(rendered)
     if payload.get("error_code") == _QUARANTINED:
         return 2
     if payload.get("command") == "risk-status" and payload.get("status") == "UNKNOWN":
@@ -229,33 +199,6 @@ def _quarantined(command: str) -> dict[str, Any]:
         "command": command,
         "ok": False,
         "error_code": _QUARANTINED,
-        "authorizes": False,
-    }
-
-
-def _closed_survey_payload(error_code: str) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "kind": "RepositorySurveyV1",
-        "command": "survey",
-        "ok": False,
-        "clone": {"root": "", "common_git_dir": "", "branch": "", "head": ""},
-        "worktrees": [],
-        "branches": [],
-        "orphan_work": {"stashes": 0, "untracked_total": 0},
-        "other_clones": "UNKNOWN",
-        "status": "UNKNOWN",
-        "error_code": error_code,
-        "facts": {
-            "branch": "",
-            "worktrees": 0,
-            "worktrees_dirty": 0,
-            "branches": 0,
-            "branches_content_equivalent": 0,
-            "orphan_stashes": 0,
-            "orphan_untracked": 0,
-            "other_clones": "UNKNOWN",
-        },
         "authorizes": False,
     }
 
@@ -448,14 +391,8 @@ def command_survey(arguments: argparse.Namespace) -> int:
 
     try:
         observed = survey_repository(Path(arguments.repo), base=arguments.base)
-    except Exception:  # noqa: BLE001 - converted to a stable closed payload
-        return _emit(
-            _closed_survey_payload("E_SURVEY_INVENTORY"),
-            arguments.json,
-            output_limit=_SURVEY_OUTPUT_MAX_BYTES,
-            overflow_payload=_closed_survey_payload("E_SURVEY_OUTPUT_LIMIT"),
-            compact_json=True,
-        )
+    except Exception as error:  # noqa: BLE001 - surfaced as a closed payload
+        return _emit(_failure("survey", error), arguments.json)
     payload = survey_payload(observed)
     payload.update(
         {
@@ -475,13 +412,7 @@ def command_survey(arguments: argparse.Namespace) -> int:
             },
         }
     )
-    return _emit(
-        payload,
-        arguments.json,
-        output_limit=_SURVEY_OUTPUT_MAX_BYTES,
-        overflow_payload=_closed_survey_payload("E_SURVEY_OUTPUT_LIMIT"),
-        compact_json=True,
-    )
+    return _emit(payload, arguments.json)
 
 
 def command_doctor(arguments: argparse.Namespace) -> int:

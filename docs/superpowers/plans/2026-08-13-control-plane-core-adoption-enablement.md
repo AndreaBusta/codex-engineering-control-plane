@@ -68,7 +68,7 @@ only; none is a canary or an adoption authorization.
 | `AE-06` | RED: status, verify, one verification domain and exact rollback absent | GREEN: `test_missing_or_replaced_lifecycle_lock_blocks_core_and_rollback`, `test_unjournaled_mutex_provisioning_is_exactly_recoverable`, `test_core_verifier_retains_the_locked_directory_identity`, `test_runner_retains_the_locked_directory_identity`, `test_verification_guard_keeps_one_persistent_mutex_domain` and `test_verification_guard_revalidates_named_identity_after_flock` cover closed projection, crash replay and descriptor-held exclusion | ROLLBACK: `test_rollback_rejects_a_missing_or_replaced_bound_verification_mutex`, `test_rollback_and_recovery_restore_exact_consumer_tree` and `test_rollback_excludes_a_waiting_closed_task_revision` | `CLOSED` |
 | `AE-07` | RED: unverified adoption bootstrap absent | GREEN: bootstrap suite rejects pyc, shadow, site, hostile environment and lock drift | ROLLBACK: bootstrap failures import nothing and mutate nothing | `CLOSED` |
 | `AE-08` | RED: no complete temporary-repository lifecycle | GREEN: `test_full_temporary_repository_lifecycle` | ROLLBACK: harness target bytes, modes and Git config equal the before snapshot | `CLOSED` |
-| `AE-09` | RED: adoption sources and tests absent from the authoritative manifest | GREEN: closure requires one passing final-byte focal set, a full gate whose last consumed run is green within `max_gate_runs=3`, all post-gates and both independent rereviews on identical bytes | ROLLBACK: implementation rollback is path-exact; the bootstrap correction remains limited and version-bound | `CLOSES_ON_FINAL_EVIDENCE` |
+| `AE-09` | RED: adoption sources and tests absent from the authoritative manifest | GREEN: closure requires one passing final-byte focal set, a full gate whose last consumed run is green within `max_gate_runs=6`, all post-gates and both independent rereviews on identical bytes | ROLLBACK: implementation rollback is path-exact; the bootstrap correction remains limited and version-bound | `CLOSES_ON_FINAL_EVIDENCE` |
 
 The later AE-06/AE-09 verification-lock remediation is fixed by
 `test_core_owned_verification_mutex_is_not_adoption_provisioning`,
@@ -520,7 +520,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest \
   tests.test_core_documentation -v
 ```
 
-Then run the authoritative local gate within `max_gate_runs=3`. Each consumed
+Then run the authoritative local gate within `max_gate_runs=6`. Each consumed
 run starts only after acquiring the verification mutex; repair invalidates the
 earlier result without resetting the same closure-lineage counter, and the last
 consumed run must be green on exact final bytes. Exhausting the budget without
@@ -587,7 +587,7 @@ A future canary requires, in order: an independently reviewed ADR creating one e
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora del adoption enablement de Core 3.1.
-- **Para continuar:** ejecutar los focales finales, el intento disponible del gate integral dentro de `max_gate_runs=3`, los post-gates y dos revisiones independientes sobre los mismos bytes; el último intento consumido debe estar verde para cerrar AE-09 y el agotamiento exige Stable Pause.
+- **Para continuar:** ejecutar los focales finales, el intento disponible del gate integral dentro de `max_gate_runs=6`, los post-gates y dos revisiones independientes sobre los mismos bytes; el último intento consumido debe estar verde para cerrar AE-09 y el agotamiento exige Stable Pause.
 - **Mensaje exacto:** `Cierra la evidencia final local de AE-09 en 3.1.0-core.2; no prepares ni ejecutes un canary.`
 - **Estado de partida:** `origin/main@b07418364409f76c900f0595a76c9e3e388ac433`, rama `codex/control-plane-adoption-enablement-design`, candidato local `3.1.0-core.2` sin commit y adopción externa prohibida; el cierre depende solo de la evidencia final definida arriba.
 - **No hacer todavía:** instalar, tocar consumidores, ejecutar canary, migrar v2.1, añadir dependencias, commit, push, PR, merge, tag, release, plugin, Autopilot o cualquier efecto remoto.

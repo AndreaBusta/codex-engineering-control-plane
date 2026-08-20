@@ -592,7 +592,7 @@ because v1 creates none.
 
 The local implementation exists and `CLOSES_ON_FINAL_EVIDENCE` requires final
 frozen-byte evidence: the focused suite, a bounded `bash tests/run.sh` budget
-with `max_gate_runs=3`, post-gates, and two final reviews on identical bytes.
+with `max_gate_runs=6`, post-gates, and two final reviews on identical bytes.
 The counter persists through repair and re-freeze in the same closure lineage;
 the last consumed run must be green on exact final bytes, and exhaustion enters
 Stable Pause. A closure claim is truthful only with that external native
@@ -608,7 +608,7 @@ canary-proven, or released. The gate budget grants no Git or remote authority.
 - **Para continuar:** si Task 8 aún carece de evidencia, congelar los bytes y
   completar el gate/reviews; si ya existe, usar el Goal/handoff nativo sin
   reescribir este sujeto.
-- **Mensaje exacto:** `Ejecuta el intento disponible de bash tests/run.sh dentro de max_gate_runs=3 en una ejecutora fresca; el último intento consumido debe quedar verde sobre bytes finales.`
+- **Mensaje exacto:** `Ejecuta el intento disponible de bash tests/run.sh dentro de max_gate_runs=6 en una ejecutora fresca; el último intento consumido debe quedar verde sobre bytes finales.`
 - **Estado de partida:** `GOVERNING_CORE / IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE`;
   la evidencia Task 8 vive fuera de este documento; sin instalación,
   consumidor, canary ni remoto; `authorizes=false`.

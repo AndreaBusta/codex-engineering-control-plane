@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
-from hashlib import sha256
 import os
 from pathlib import Path, PurePosixPath
 import selectors
@@ -56,33 +54,6 @@ _GIT_FILTER_POLL_SECONDS = 0.05
 _GIT_FILTER_REAP_SECONDS = 0.25
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
-_DATALESS_FLAG = 0x40000000
-_TRUSTED_PYTHON = Path("/usr/bin/python3")
-_FCHDIR_GIT_WRAPPER = (
-    "import os,sys;"
-    "descriptor=int(sys.argv[1]);"
-    "arguments=sys.argv[2:];"
-    "os.fchdir(descriptor);"
-    "os.execv(arguments[0],arguments)"
-)
-_BOUNDED_GIT_STATIC_ARGUMENTS = frozenset(
-    {
-        ("check-attr", "--stdin", "-z", "filter", "diff"),
-        ("for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads"),
-        ("ls-files", "-z"),
-        ("ls-files", "--deleted", "-z"),
-        ("ls-files", "--stage", "-z"),
-        ("rev-parse", "--absolute-git-dir"),
-        ("rev-parse", "--abbrev-ref", "HEAD"),
-        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
-        ("rev-parse", "--show-toplevel"),
-        ("rev-parse", "HEAD"),
-        ("stash", "list"),
-        ("status", "--porcelain", "-uno"),
-        ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
-        ("worktree", "list", "--porcelain", "-z"),
-    }
-)
 
 
 class RepositoryError(Exception):
@@ -127,219 +98,6 @@ def _validate_state_directory(
         or unsafe_mode
     ):
         raise _state_error(code, "state directory ownership or mode is unsafe")
-
-
-def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_uid,
-        metadata.st_gid,
-        metadata.st_nlink,
-        metadata.st_size,
-        metadata.st_mtime_ns,
-        metadata.st_ctime_ns,
-        int(getattr(metadata, "st_flags", 0)),
-    )
-
-
-def _directory_binding_identity(metadata: os.stat_result) -> tuple[int, ...]:
-    """Bind a path component without treating unrelated child churn as replacement."""
-
-    return (
-        metadata.st_dev,
-        metadata.st_ino,
-        metadata.st_mode,
-        metadata.st_uid,
-        metadata.st_gid,
-        int(getattr(metadata, "st_flags", 0)),
-    )
-
-
-def _directory_deadline(deadline: float | None) -> None:
-    if deadline is not None and time.monotonic() > deadline:
-        raise TimeoutError("directory observation deadline expired")
-
-
-def _open_canonical_directory(
-    path: Path | str,
-    *,
-    deadline: float | None,
-) -> tuple[Path, int, os.stat_result]:
-    candidate = Path(path)
-    normalized = Path(os.path.normpath(os.fspath(candidate)))
-    if not candidate.is_absolute() or normalized != candidate:
-        raise OSError("directory path is not canonical")
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
-    descriptor = os.open(os.sep, flags)
-    metadata = os.fstat(descriptor)
-    try:
-        for component in candidate.parts[1:]:
-            _directory_deadline(deadline)
-            before = os.stat(
-                component,
-                dir_fd=descriptor,
-                follow_symlinks=False,
-            )
-            mode = stat.S_IMODE(before.st_mode)
-            root_owned_sticky = (
-                before.st_uid == 0 and bool(mode & stat.S_ISVTX)
-            )
-            if (
-                not stat.S_ISDIR(before.st_mode)
-                or before.st_uid not in {0, os.geteuid()}
-                or before.st_nlink < 1
-                or (mode & 0o022 and not root_owned_sticky)
-                or int(getattr(before, "st_flags", 0)) & _DATALESS_FLAG
-            ):
-                raise OSError("directory component is unsafe")
-            child = os.open(component, flags, dir_fd=descriptor)
-            try:
-                opened = os.fstat(child)
-                named = os.stat(
-                    component,
-                    dir_fd=descriptor,
-                    follow_symlinks=False,
-                )
-                if (
-                    _directory_binding_identity(before)
-                    != _directory_binding_identity(opened)
-                    or _directory_binding_identity(before)
-                    != _directory_binding_identity(named)
-                ):
-                    raise OSError("directory component changed during open")
-            except Exception:
-                os.close(child)
-                raise
-            os.close(descriptor)
-            descriptor = child
-            metadata = opened
-        if metadata.st_uid != os.geteuid():
-            raise OSError("final directory is not owned by the operator")
-        return candidate, descriptor, metadata
-    except Exception:
-        os.close(descriptor)
-        raise
-
-
-@contextmanager
-def observed_directory(
-    path: Path | str,
-    *,
-    deadline: float | None = None,
-) -> Iterator[tuple[Path, int, os.stat_result]]:
-    """Retain one canonical owned directory opened without following links."""
-
-    try:
-        candidate, descriptor, opened = _open_canonical_directory(
-            path,
-            deadline=deadline,
-        )
-    except (OSError, TimeoutError, ValueError) as error:
-        raise ValueError(
-            "E_DIRECTORY_OBSERVATION: directory is not safely observable"
-        ) from error
-    try:
-        yield candidate, descriptor, opened
-    except BaseException:
-        raise
-    else:
-        fresh_descriptor = -1
-        try:
-            _directory_deadline(deadline)
-            after = os.fstat(descriptor)
-            _, fresh_descriptor, named = _open_canonical_directory(
-                candidate,
-                deadline=deadline,
-            )
-            if (
-                _directory_identity(opened) != _directory_identity(after)
-                or _directory_identity(opened) != _directory_identity(named)
-            ):
-                raise OSError("directory changed during observation")
-        except (OSError, TimeoutError, ValueError) as error:
-            raise ValueError(
-                "E_DIRECTORY_OBSERVATION: directory changed during observation"
-            ) from error
-        finally:
-            if fresh_descriptor >= 0:
-                os.close(fresh_descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def read_bounded_regular_file(
-    path: Path | str,
-    *,
-    output_limit: int = 4_096,
-) -> bytes:
-    """Read one owned regular file without links, blocking, or an unbounded buffer."""
-
-    if (
-        not isinstance(output_limit, int)
-        or isinstance(output_limit, bool)
-        or not 1 <= output_limit <= 1_048_576
-    ):
-        raise ValueError("E_BOUNDED_FILE: invalid output limit")
-    candidate = Path(os.path.abspath(path))
-    name = candidate.name
-    descriptor = -1
-    payload = bytearray()
-    try:
-        if name in {"", ".", ".."} or "/" in name or "\0" in name:
-            raise OSError("unsafe file name")
-        with observed_directory(candidate.parent) as parent_observation:
-            _, parent, _ = parent_observation
-            before = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or before.st_uid != os.geteuid()
-                or before.st_nlink != 1
-                or stat.S_IMODE(before.st_mode) & 0o022
-                or before.st_size > output_limit
-                or int(getattr(before, "st_flags", 0)) & _DATALESS_FLAG
-            ):
-                raise OSError("unsafe regular file")
-            descriptor = os.open(
-                name,
-                os.O_RDONLY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
-                | getattr(os, "O_NONBLOCK", 0),
-                dir_fd=parent,
-            )
-            opened = os.fstat(descriptor)
-            while len(payload) <= output_limit:
-                chunk = os.read(
-                    descriptor,
-                    min(65_536, output_limit + 1 - len(payload)),
-                )
-                if not chunk:
-                    break
-                payload.extend(chunk)
-            after = os.fstat(descriptor)
-            named = os.stat(name, dir_fd=parent, follow_symlinks=False)
-            if (
-                _directory_identity(before) != _directory_identity(opened)
-                or _directory_identity(before) != _directory_identity(after)
-                or _directory_identity(before) != _directory_identity(named)
-                or len(payload) > output_limit
-                or len(payload) != opened.st_size
-            ):
-                raise OSError("regular file changed during read")
-    except (OSError, TimeoutError, ValueError) as error:
-        raise ValueError("E_BOUNDED_FILE: regular file is not safely readable") from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    return bytes(payload)
 
 
 @contextmanager
@@ -621,7 +379,6 @@ def _bounded_filter_probe(
     input_data: bytes | None,
     output_limit: int,
     timeout: float,
-    pass_fds: Sequence[int] = (),
 ) -> subprocess.CompletedProcess[bytes]:
     """Run one closed probe without ever retaining output beyond its cap."""
 
@@ -633,14 +390,6 @@ def _bounded_filter_probe(
     stderr = bytearray()
     returncode: int | None = None
     try:
-        inherited_descriptors = tuple(pass_fds)
-        if any(
-            not isinstance(descriptor, int)
-            or isinstance(descriptor, bool)
-            or descriptor < 0
-            for descriptor in inherited_descriptors
-        ):
-            raise ValueError("invalid inherited descriptor")
         process = subprocess.Popen(
             list(argv),
             cwd=cwd,
@@ -650,7 +399,6 @@ def _bounded_filter_probe(
             stderr=subprocess.PIPE,
             shell=False,
             close_fds=True,
-            pass_fds=inherited_descriptors,
             start_new_session=True,
         )
         if process.stdout is None or process.stderr is None:
@@ -722,365 +470,6 @@ def _bounded_filter_probe(
     )
 
 
-def _safe_bounded_git_revision(value: str, *, require_range: bool) -> bool:
-    try:
-        encoded = value.encode("utf-8", errors="strict")
-    except UnicodeEncodeError:
-        return False
-    return (
-        bool(encoded)
-        and len(encoded) <= 4_096
-        and not value.startswith("-")
-        and all(byte >= 0x20 and byte != 0x7F for byte in encoded)
-        and (not require_range or ".." in value)
-    )
-
-
-def _bounded_git_arguments_are_read_only(arguments: tuple[str, ...]) -> bool:
-    if arguments in _BOUNDED_GIT_STATIC_ARGUMENTS:
-        return True
-    if (
-        len(arguments) == 4
-        and arguments[:3] == ("rev-parse", "--verify", "--quiet")
-    ):
-        return _safe_bounded_git_revision(arguments[3], require_range=False)
-    revision: str | None = None
-    tail: tuple[str, ...] = ()
-    if len(arguments) in {3, 4} and arguments[:2] == ("diff", "--name-only"):
-        revision = arguments[2]
-        tail = arguments[3:]
-    elif (
-        len(arguments) in {4, 5}
-        and arguments[:3] == ("diff", "--diff-filter=A", "--name-only")
-    ):
-        revision = arguments[3]
-        tail = arguments[4:]
-    return (
-        revision is not None
-        and tail in {(), ("--",)}
-        and _safe_bounded_git_revision(revision, require_range=True)
-    )
-
-
-def _bounded_git_observation(
-    repository: Path | str,
-    arguments: Sequence[str],
-    *,
-    environment: dict[str, str],
-    input_data: bytes | None,
-    output_limit: int,
-    timeout: float,
-) -> subprocess.CompletedProcess[bytes]:
-    normalized = tuple(arguments)
-    if (
-        not normalized
-        or any(not isinstance(item, str) or "\0" in item for item in normalized)
-        or not _bounded_git_arguments_are_read_only(normalized)
-    ):
-        raise ValueError("E_GIT_OBSERVATION: Git command is not read-only")
-    root = Path(os.path.abspath(repository))
-    try:
-        with observed_directory(root) as root_observation:
-            _, descriptor, _ = root_observation
-            git_arguments = trusted_git_argv(Path("."), normalized)
-            wrapper = [
-                str(_TRUSTED_PYTHON),
-                "-I",
-                "-S",
-                "-B",
-                "-c",
-                _FCHDIR_GIT_WRAPPER,
-                str(descriptor),
-                *git_arguments,
-            ]
-            return _bounded_filter_probe(
-                wrapper,
-                cwd=Path("/"),
-                environment=environment,
-                input_data=input_data,
-                output_limit=output_limit,
-                timeout=timeout,
-                pass_fds=(descriptor,),
-            )
-    except (OSError, RuntimeError, ValueError) as error:
-        raise ValueError(
-            "E_GIT_OBSERVATION: bounded Git observation failed"
-        ) from error
-
-
-def run_bounded_git(
-    repository: Path | str,
-    arguments: Sequence[str],
-    *,
-    input_data: bytes | None = None,
-    output_limit: int,
-    timeout: float,
-) -> subprocess.CompletedProcess[bytes]:
-    """Run one exact read-only Git form, bound to an observed directory descriptor."""
-
-    return _bounded_git_observation(
-        repository,
-        arguments,
-        environment=trusted_git_environment(),
-        input_data=input_data,
-        output_limit=output_limit,
-        timeout=timeout,
-    )
-
-
-@dataclass(frozen=True)
-class DirectoryObservation:
-    path: Path
-    identity: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class GitDirectoryBinding:
-    path: str
-    identity: tuple[int, ...]
-    marker_digest: str
-    backlink_digest: str | None
-
-
-@dataclass(frozen=True)
-class WorktreeFingerprint:
-    top: str
-    top_identity: tuple[int, ...]
-    common: str
-    common_identity: tuple[int, ...]
-    git_directory: GitDirectoryBinding
-    head: str
-    branch: str
-    index_digest: str
-    has_gitlink: bool
-
-
-def _bounded_git_bytes(
-    repository: Path,
-    arguments: tuple[str, ...],
-) -> bytes | None:
-    try:
-        completed = run_bounded_git(
-            repository,
-            arguments,
-            output_limit=1_048_576,
-            timeout=10.0,
-        )
-    except (OSError, RuntimeError, ValueError):
-        return None
-    return completed.stdout if completed.returncode == 0 else None
-
-
-def _bounded_git_text(
-    repository: Path,
-    arguments: tuple[str, ...],
-) -> str | None:
-    raw = _bounded_git_bytes(repository, arguments)
-    if raw is None:
-        return None
-    try:
-        value = raw.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return None
-    return value[:-1] if value.endswith("\n") else value
-
-
-def canonical_directory_observation(value: str) -> DirectoryObservation | None:
-    candidate = Path(value)
-    try:
-        with observed_directory(candidate) as opened:
-            canonical, _, metadata = opened
-    except (OSError, RuntimeError, ValueError):
-        return None
-    return DirectoryObservation(canonical, _directory_identity(metadata))
-
-
-def canonical_directory(value: str) -> Path | None:
-    observation = canonical_directory_observation(value)
-    return None if observation is None else observation.path
-
-
-def _strict_control_line(payload: bytes, *, prefix: str = "") -> str | None:
-    try:
-        value = payload.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return None
-    if value.endswith("\n"):
-        value = value[:-1]
-    if not value or "\0" in value:
-        return None
-    if prefix:
-        if not value.startswith(prefix) or len(value) == len(prefix):
-            return None
-        value = value.removeprefix(prefix)
-    return value
-
-
-def _absolute_control_path(value: str, *, relative_to: Path) -> Path:
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = relative_to / candidate
-    return Path(os.path.abspath(candidate))
-
-
-def _git_directory_binding(
-    candidate: Path,
-    common: Path,
-) -> GitDirectoryBinding | None:
-    marker = candidate / ".git"
-    try:
-        with observed_directory(candidate) as root_observation:
-            _, root_descriptor, _ = root_observation
-            marker_metadata = os.stat(
-                ".git",
-                dir_fd=root_descriptor,
-                follow_symlinks=False,
-            )
-    except (OSError, RuntimeError, ValueError):
-        return None
-    if stat.S_ISDIR(marker_metadata.st_mode):
-        marker_observation = canonical_directory_observation(str(marker))
-        common_observation = canonical_directory_observation(str(common))
-        if (
-            marker_observation is None
-            or common_observation is None
-            or marker_observation != common_observation
-        ):
-            return None
-        return GitDirectoryBinding(
-            str(marker_observation.path),
-            marker_observation.identity,
-            sha256(b"directory").hexdigest(),
-            None,
-        )
-    if not stat.S_ISREG(marker_metadata.st_mode):
-        return None
-    try:
-        marker_payload = read_bounded_regular_file(marker)
-    except ValueError:
-        return None
-    pointer = _strict_control_line(marker_payload, prefix="gitdir: ")
-    if pointer is None:
-        return None
-    git_directory = canonical_directory_observation(
-        str(_absolute_control_path(pointer, relative_to=candidate))
-    )
-    if (
-        git_directory is None
-        or git_directory.path.parent.name != "worktrees"
-        or git_directory.path.parent.parent != common
-    ):
-        return None
-    try:
-        backlink_payload = read_bounded_regular_file(git_directory.path / "gitdir")
-    except ValueError:
-        return None
-    backlink = _strict_control_line(backlink_payload)
-    if backlink is None:
-        return None
-    backlink_path = _absolute_control_path(backlink, relative_to=git_directory.path)
-    if (
-        backlink_path.name != ".git"
-        or canonical_directory(str(backlink_path.parent)) != candidate
-    ):
-        return None
-    return GitDirectoryBinding(
-        str(git_directory.path),
-        git_directory.identity,
-        sha256(marker_payload).hexdigest(),
-        sha256(backlink_payload).hexdigest(),
-    )
-
-
-def _index_observation(root: Path) -> tuple[bool, str] | None:
-    raw = _bounded_git_bytes(root, ("ls-files", "--stage", "-z"))
-    if raw is None:
-        return None
-    fields = raw.split(b"\0")
-    if fields[-1] != b"":
-        return None
-    fields.pop()
-    has_gitlink = False
-    for field in fields:
-        header, separator, path = field.partition(b"\t")
-        parts = header.split(b" ")
-        if separator != b"\t" or not path or len(parts) != 3:
-            return None
-        mode, object_name, stage = parts
-        if (
-            len(mode) != 6
-            or any(value not in b"01234567" for value in mode)
-            or len(object_name) not in {40, 64}
-            or stage not in {b"0", b"1", b"2", b"3"}
-        ):
-            return None
-        if mode == b"160000":
-            has_gitlink = True
-    return has_gitlink, sha256(raw).hexdigest()
-
-
-def is_oid(value: str) -> bool:
-    if len(value) not in {40, 64}:
-        return False
-    try:
-        int(value, 16)
-    except ValueError:
-        return False
-    return value == value.lower()
-
-
-def worktree_fingerprint(
-    candidate: Path,
-    common: Path,
-) -> WorktreeFingerprint | None:
-    binding = _git_directory_binding(candidate, common)
-    if binding is None:
-        return None
-    top = _bounded_git_text(candidate, ("rev-parse", "--show-toplevel"))
-    common_value = _bounded_git_text(
-        candidate,
-        ("rev-parse", "--path-format=absolute", "--git-common-dir"),
-    )
-    git_directory_value = _bounded_git_text(
-        candidate,
-        ("rev-parse", "--absolute-git-dir"),
-    )
-    head = _bounded_git_text(candidate, ("rev-parse", "HEAD"))
-    branch = _bounded_git_text(candidate, ("rev-parse", "--abbrev-ref", "HEAD"))
-    if None in {top, common_value, git_directory_value, head, branch}:
-        return None
-    assert top is not None and common_value is not None
-    assert git_directory_value is not None and head is not None and branch is not None
-    top_observation = canonical_directory_observation(top)
-    common_observation = canonical_directory_observation(common_value)
-    git_directory_observation = canonical_directory_observation(git_directory_value)
-    index = _index_observation(candidate)
-    if (
-        top_observation is None
-        or common_observation is None
-        or git_directory_observation is None
-        or index is None
-        or top_observation.path != candidate
-        or common_observation.path != common
-        or git_directory_observation.path != Path(binding.path)
-        or git_directory_observation.identity != binding.identity
-        or not is_oid(head)
-    ):
-        return None
-    has_gitlink, index_digest = index
-    return WorktreeFingerprint(
-        str(top_observation.path),
-        top_observation.identity,
-        str(common_observation.path),
-        common_observation.identity,
-        binding,
-        head,
-        branch,
-        index_digest,
-        has_gitlink,
-    )
-
-
 def assert_no_external_git_filters(
     repository: Path | str,
     paths: Sequence[str] | None = None,
@@ -1092,9 +481,9 @@ def assert_no_external_git_filters(
     environment = trusted_git_environment(index_file=index_file)
     if paths is None:
         try:
-            inventory = _bounded_git_observation(
-                repository,
-                ("ls-files", "-z"),
+            inventory = _bounded_filter_probe(
+                trusted_git_argv(repository, ("ls-files", "-z")),
+                cwd=Path(repository),
                 environment=environment,
                 input_data=None,
                 output_limit=_MAX_GIT_FILTER_PATH_BYTES,
@@ -1152,9 +541,12 @@ def assert_no_external_git_filters(
             "E_GIT_FILTER: clean-filter inventory is incomplete"
         )
     try:
-        completed = _bounded_git_observation(
-            repository,
-            ("check-attr", "--stdin", "-z", "filter", "diff"),
+        completed = _bounded_filter_probe(
+            trusted_git_argv(
+                repository,
+                ("check-attr", "--stdin", "-z", "filter", "diff"),
+            ),
+            cwd=Path(repository),
             environment=environment,
             input_data=payload,
             output_limit=_MAX_GIT_FILTER_OUTPUT_BYTES,

@@ -46,7 +46,7 @@ los dos clones.
 |---|---|
 | Rama base | `main` |
 | Última release oficial | `v2.1.1` |
-| Candidato activo | `3.1.0-core.2`; `R1_OPEN / FINAL_EVIDENCE_PENDING`: reparaciones, prerevisiones frescas y evidencia final pendientes |
+| Candidato activo | `3.1.0-core.2`; `R1_OPEN / FINAL_EVIDENCE_PENDING`: recorte por procedencia, reseal y evidencia final pendientes |
 | `external_consumer_adoption` | `PROHIBITED` |
 | Autopilot | `OFF` |
 | Outcomes permitidos por Core | `answer` y `local_change`, nada más |
@@ -57,7 +57,19 @@ los dos clones.
 
 | Rama | Contenido | Estado |
 |---|---|---|
-| `codex/reconcile-core-3-1-core-2` | Reconciliación Core 3.1, Adoption Enablement y Stable Pause | `R1_OPEN`: reparaciones, prerevisiones frescas y evidencia final pendientes; sin commit, push ni PR |
+| `codex/reconcile-core-3-1-core-2` | Reconciliación Core 3.1, Adoption Enablement y Stable Pause | `R1_OPEN`: WIP preservado en commit local `d901bb6c95377074a7fb2fb23762476547335969`; recorte por procedencia y evidencia final pendientes; sin push ni PR |
+
+### Hardening diferido por procedencia
+
+`codex/survey-hardening-wip` apunta al commit de preservación
+`d901bb6c95377074a7fb2fb23762476547335969`. Allí siguen recuperables los
+hallazgos heredados que no bloquean R1: ejecución de filtros y límites de
+Survey, submódulos/Gitlinks y alternates, sustitución de worktrees,
+discovery-to-walk TOCTOU, paths con salto de línea, colisiones case-fold de
+APFS, validación canónica completa del lock de Adoption, escritura desviada
+por `.git/config` enlazado, inventario de rollback entre linked worktrees y la
+guía add-only para equivalencia de ramas. Este frente solo se decide después de
+que R1 aterrice y se use; la adopción externa continúa prohibida.
 
 ### Contrato SpecPack
 
@@ -98,14 +110,11 @@ Confundirlos lleva a «arreglar» guardas que funcionan bien.
 La policy declara `integration_strategy = "squash"`. Los commits originales de
 una rama fusionada nunca entran en `main`; entra un commit aplastado
 equivalente. **El número de commits no es evidencia de trabajo pendiente.** La
-prueba válida cubre todo el contenido:
+prueba válida es de contenido:
 
 ```bash
-git diff --name-status --no-ext-diff --no-textconv origin/main..<rama> --
+git diff --diff-filter=A --name-only origin/main..<rama>
 ```
-
-Solo una salida vacía prueba equivalencia; un listado limitado a ficheros
-añadidos no cubre modificaciones, borrados, renombres ni cambios de modo.
 
 ### 3.3 Cuatro ramas históricas concretas no se fusionan
 
@@ -163,8 +172,8 @@ git status --short --branch
 
 - **Escribe en:** este hilo.
 - **Rol:** relevo que llega sin historia.
-- **Para continuar:** cerrar las reparaciones y prerevisiones R1 antes de consumir la evidencia integral final.
-- **Mensaje exacto:** `Continúa R1 sobre codex/reconcile-core-3-1-core-2; completa reparaciones y prerevisiones antes del último gate integral.`
-- **Estado de partida:** `R1_OPEN` sobre `3.1.0-core.2`; reparaciones, prerevisiones frescas y evidencia final pendientes.
-- **No hacer todavía:** instalar, adoptar externamente, commit, push, PR, merge, deploy o release sin autorización exacta.
+- **Para continuar:** terminar el recorte por procedencia, resealar y ejecutar focales antes del intento `3/6`.
+- **Mensaje exacto:** `Continúa R1 sobre codex/reconcile-core-3-1-core-2; verifica el delta de decisión recortado antes del intento 3/6.`
+- **Estado de partida:** `R1_OPEN` sobre `3.1.0-core.2`; commit local de preservación `d901bb6`, commits locales autorizados y evidencia final pendiente.
+- **No hacer todavía:** instalar, adoptar externamente, push, PR, merge, deploy o release sin autorización exacta.
 - **Autoridad:** `authorizes=false`

@@ -192,12 +192,11 @@ exactamente el error que produjo B2.
 | Límite | Valor | Motivo |
 |---|---|---|
 | LOC de `control_plane/survey.py` | `≤ 450` | Presupuesto propio |
-| LOC totales de `control_plane/materialization.py` | `≤ 650` | Incluye descubrimiento filesystem-first y recorrido descriptor-relative; el antiguo delta de 120 no cubría estas invariantes |
-| Entradas de estado Git inspeccionadas | `≤ 50 000` | Cuenta directorios y ficheros; evita bombas de directorios vacíos |
-| Profundidad de estado Git | `≤ 64` | Un árbol profundo degrada a `UNKNOWN` |
+| LOC añadidas a `control_plane/materialization.py` | `≤ 120` | Extensión, no reescritura |
+| Archivos de estado Git inspeccionados | `≤ 50 000` | Cota superior con margen sobre los 1 741 observados |
 | Worktrees inventariados | `≤ 64` | Cota generosa sobre los 7 observados |
 | Ramas comparadas por contenido | `≤ 64` | Igual |
-| Tiempo por invocación de Git o recorrido filesystem | `≤ 10 s` | Deadline cooperativo; un syscall bloqueado por el kernel queda como residual |
+| Tiempo por invocación de Git | `≤ 10 s` | Coherente con la materialización actual |
 | Bytes de salida en contexto | `≤ 4 096` | `max_context_output_bytes` del registry |
 
 Una cota superada devuelve `UNKNOWN` con su código, nunca un resultado parcial
@@ -208,22 +207,8 @@ presentado como completo.
 - Solo lectura. Ninguna ruta de código muta el repositorio, escribe estado ni
   ejecuta hooks.
 - Sin red por ninguna vía.
-- Antes de ejecutar Git, la materialización valida por filesystem `.git` y
-  `commondir` con lectura bounded, no-follow, identidad antes/abierto/después y
-  rechazo de placeholders `dataless`.
-- El recorrido es descriptor-relative y acota entradas, profundidad y tiempo.
-  Symlinks, FIFOs, tipos especiales, carreras o subárboles inseguros devuelven
-  `UNKNOWN`; nunca se omiten para producir un falso `PASS`.
-- No se abre contenido de archivos de producto: solo metadatos de inodo e
-  inventarios Git cuya salida se limita antes de almacenarla.
-- `survey` parsea el inventario de worktrees delimitado por NUL, liga cada path
-  canónico al mismo Git common dir, reobserva `HEAD` y branch exactos, rechaza
-  gitlinks/submódulos no soportados y valida filtros externos inmediatamente
-  antes del `status` de cada worktree.
-- Los object alternates quedan no soportados: `objects/info/alternates` degrada
-  la materialización a `UNKNOWN` antes de cualquier observación Git posterior.
-- La salida final de `survey`, incluido el salto final, no supera 4 096 bytes;
-  exceso o excepción producen una cápsula `UNKNOWN` estable y no filtrante.
+- No se sigue ningún enlace simbólico ni se abre contenido de archivos de
+  producto: solo metadatos de inodo e inventarios de Git acotados.
 - Las rutas sensibles se excluyen antes de abrir, reutilizando el patrón ya
   presente en la suite.
 - `survey` describe; no propone borrar nada. Un inventario no es una decisión.
@@ -248,10 +233,6 @@ entrada de CLI, la skill y las filas de registry. Sin migración de datos.
   suprimir revisión es exactamente cómo la autonomía se vuelve cara.
 - Que detectar `dataless` arregle iCloud. La solución de fondo es no guardar
   repositorios en carpetas sincronizadas.
-- Que el límite de 10 s por comando sea un deadline global de Survey. Los topes
-  de 64 worktrees y 64 ramas limitan el número de invocaciones, pero un repo
-  hostil todavía puede consumir varios timeouts secuenciales; queda como
-  residual de denegación local hasta un slice con presupuesto wall-clock común.
 
 ## Continuación
 

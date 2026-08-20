@@ -663,7 +663,7 @@ class CoreCliTests(unittest.TestCase):
 
     def test_survey_command_exit_codes_and_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = make_repo(Path(directory) / "repo").resolve()
+            repo = make_repo(Path(directory) / "repo")
             return_code, payload = run_cli_in_process(
                 "survey", "--repo", str(repo), "--base", "HEAD", "--json"
             )
@@ -687,57 +687,6 @@ class CoreCliTests(unittest.TestCase):
             self.assertEqual(return_code, 2)
             self.assertEqual(payload["error_code"], "E_SURVEY_BASE_UNKNOWN")
             self.assertIs(payload["authorizes"], False)
-
-    def test_survey_output_over_budget_is_bounded_unknown(self) -> None:
-        from control_plane.cli import main
-        from control_plane.survey import RepositorySurvey
-
-        oversized = RepositorySurvey(
-            root="x" * 8_192,
-            common_git_dir="/git",
-            branch="main",
-            head="0" * 40,
-            worktrees=(),
-            branches=(),
-            stashes=0,
-            untracked_total=0,
-            status="PASS",
-            error_code=None,
-        )
-        output = io.StringIO()
-        with patch(
-            "control_plane.survey.survey_repository", return_value=oversized
-        ), redirect_stdout(output):
-            return_code = main(
-                ("survey", "--repo", "/repo", "--base", "HEAD", "--json")
-            )
-        rendered = output.getvalue()
-        payload = json.loads(rendered)
-
-        self.assertLessEqual(len(rendered.encode("utf-8")), 4_096)
-        self.assertEqual(return_code, 2)
-        self.assertEqual(payload["status"], "UNKNOWN")
-        self.assertEqual(payload["error_code"], "E_SURVEY_OUTPUT_LIMIT")
-        self.assertIs(payload["authorizes"], False)
-
-    def test_survey_exception_is_deterministic_unknown_without_error_text(self) -> None:
-        payloads: list[dict] = []
-        for detail in ("first private detail", "second private detail"):
-            with patch(
-                "control_plane.survey.survey_repository",
-                side_effect=RuntimeError(detail),
-            ):
-                return_code, payload = run_cli_in_process(
-                    "survey", "--repo", "/repo", "--base", "HEAD", "--json"
-                )
-            self.assertEqual(return_code, 2)
-            self.assertEqual(payload["status"], "UNKNOWN")
-            self.assertEqual(payload["error_code"], "E_SURVEY_INVENTORY")
-            self.assertNotIn(detail, json.dumps(payload, sort_keys=True))
-            self.assertIs(payload["authorizes"], False)
-            payloads.append(payload)
-
-        self.assertEqual(payloads[0], payloads[1])
 
     def test_doctor_reports_git_state_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

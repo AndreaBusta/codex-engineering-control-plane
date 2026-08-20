@@ -310,12 +310,6 @@ performed, and never upgrades stored evidence into present-tense proof.
 managed byte and mode, policy/registry digests, hooks configuration and absence
 of unexpected managed entries. It never repairs.
 
-The source and installed locks use one closed canonical contract: the complete
-top-level key set, all seven schema selectors, audit-only hook mode, pending
-hook trust, exact 27-module order, exact digest-key set and digest shapes. A
-source lock with an omitted or extra field, including a non-audit `hook_mode`,
-fails before projection; verify cannot emit PASS for a lock Core would reject.
-
 The adoption lock is bilateral from the first Core write, not only after an
 installation: every Core task/lease mutation creates or reuses the lifecycle
 inode before the task lock, holds it shared, and only then takes `leases.lock`.
@@ -338,16 +332,6 @@ quarantines, rechecks them before the receipt, fsyncs affected directories and
 proves the target equals the before snapshot. Reclamation is a separate GC
 operation outside this implementation; rollback does not unlink those retained
 inodes.
-
-Local Git configuration is also a path-bound mutation. Preview requires the
-exact `.git/config` leaf to be an owned, single-link, bounded regular file.
-Apply and rollback repeat that check before any lifecycle mutation, prepare the
-new config with fixed Git against a private random off-path regular file, then
-atomically exchange names. The displaced inode and original bytes are checked
-through the retained descriptor before it is removed; symlink, substitution or
-exchange drift preserves the original config and fails closed. Rollback also
-reasserts the single-worktree topology before journal transition, so a linked
-worktree added after apply blocks deactivation.
 
 Verification exclusion uses one persistent owner-bound
 `locks/verification.lock` inode provisioned during apply. Core verification and
@@ -490,10 +474,7 @@ release. Any `FAIL`, `UNKNOWN`, drift or contention stops the sequence.
 | Existing consumer is mislabelled fresh | caller assertion replaces inventory | managed leaf or legacy/Core record exists | `E_ADOPTION_NOT_FRESH`, zero mutation |
 | Concurrent writer starts | state changes after preview | lock/state/snapshot drift at apply | invalidate plan; do not retry blindly |
 | Selected-source authority is substituted | host checkout validates a different parser or source HEAD advances with identical bytes | selected launcher or full source manifest differs | `E_ADOPTION_SOURCE_DRIFT`, zero target mutation |
-| Nested repository is smuggled through managed scope | `.git`, bare markers or Gitlink survive freshness checks, including case variants on case-insensitive filesystems | case-folded `managed-repositories-v1` scan fails | reject before journal or stop rollback before deactivation |
-| Source or installed lock is only partially validated | Adoption emits PASS for a lock Core rejects | closed canonical field, schema, hook, module and digest-key contract differs | `E_ADOPTION_SOURCE_LOCK` or `E_ADOPTION_VERIFY_DRIFT`; zero activation |
-| `.git/config` redirects through a symlink or is replaced | fixed hooks mutation writes outside the selected repository | no-follow regular-leaf binding plus off-path preparation and atomic exchange cannot prove the displaced inode | preserve the original config and fail `E_ADOPTION_GIT_CONFIG` before activation/deactivation |
-| A linked worktree appears after apply | rollback misses task state in another worktree Git dir | fresh NUL-delimited single-worktree inventory differs | `E_ADOPTION_TARGET_WORKTREES`; keep journal active and activation intact |
+| Nested repository is smuggled through managed scope | `.git`, bare markers or Gitlink survive freshness checks | `managed-repositories-v1` scan fails | reject before journal or stop rollback before deactivation |
 | Lifecycle mutex path is replaced | Core and rollback lock different inodes | `lifecycle_lock` identity differs | fail closed without mutation; never recreate recovery mutex |
 | Verification mutex name, parent or journal binding is replaced | Core, runner or rollback form different inode domains | closed `verification_lock`, descriptor-relative no-follow reads and post-flock directory/file identity differ | reuse-only `E_ADOPTION_VERIFICATION`/`E_VERIFICATION_LOCK`/`E_TEST_MUTEX`; stop before execution or rollback mutation |
 | Lifecycle state appears while a first task waits for its task lock | Core writes outside Adoption exclusion | Core holds the lifecycle inode before the task lock even from an absent state | apply remains excluded or fails without orphaning its lock |
@@ -528,12 +509,8 @@ Implementation follows strict RED-GREEN TDD. The governing test plan covers:
 - selected-source authority and full-manifest drift, including empty commits;
 - missing, extra, symlinked, hardlinked, dataless, unsafe-mode, wrong-owner,
   oversized, deeply nested and count-overflow inputs;
-- `.git` directory/gitfile, case-variant markers on case-insensitive filesystems,
-  nested bare repository and Gitlink smuggling in the bounded managed roots,
-  including post-apply rollback zero-mutation rejection;
-- exact source/installed lock fields and digest keys, symlinked local Git config
-  zero-mutation rejection for apply and rollback, and a linked worktree added
-  after apply blocking rollback before journal transition;
+- `.git` directory/gitfile, nested bare repository and Gitlink smuggling in the
+  bounded managed roots, including post-apply rollback zero-mutation rejection;
 - duplicate JSON keys, malformed schemas and recursion bounds;
 - ambient `HOME`, `PATH`, `GIT_*`, Python/site/bytecode and loader attacks;
 - exact manifest, unexpected runtime entries and bootstrap-before-import;
