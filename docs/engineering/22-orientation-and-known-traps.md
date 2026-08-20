@@ -1,6 +1,6 @@
 # Orientación y trampas conocidas
 
-Estado: `GOVERNING_CORE`. Actualizado el 2026-08-18. `authorizes=false`.
+Estado: `GOVERNING_CORE`. Actualizado el 2026-08-20. `authorizes=false`.
 
 Punto de entrada para una tarea que llega sin historia. Responde tres preguntas
 antes de que cuesten tiempo: **dónde trabajar**, **qué es verdad ahora mismo** y
@@ -46,27 +46,41 @@ los dos clones.
 |---|---|
 | Rama base | `main` |
 | Última release oficial | `v2.1.1` |
-| Candidato activo | `3.1.0-core.2`, `GREEN_LOCAL / PENDING_STABLE_ADOPTION` |
+| Candidato activo | `3.1.0-core.2`; este documento no registra estado vivo: el cierre exige `R1_CLOSED_ON_FINAL_EVIDENCE` observado externamente en `origin/main` con CI verde |
 | `external_consumer_adoption` | `PROHIBITED` |
 | Autopilot | `OFF` |
 | Outcomes permitidos por Core | `answer` y `local_change`, nada más |
 | Superficie Advanced | en cuarentena estructural por ADR 0006 |
 | Protección de rama en `main` | activa: PR obligatorio, check `core-verify`, rama al día, sin force push ni borrado, historia lineal |
 
-### Líneas de trabajo publicadas
+### Línea de trabajo local actual
 
 | Rama | Contenido | Estado |
 |---|---|---|
-| `codex/control-plane-adoption-enablement-design` | Paquete `adoption_enablement/`, `scripts/control-plane-adoption`, `control_plane/stable_pause.py` | Publicada. Gate integral `395 OK`. **`AE-09` pendiente de dos rerevisiones independientes en `0 Critical / 0 Important`** |
+| `codex/reconcile-core-3-1-core-2` | Reconciliación Core 3.1, Adoption Enablement y Stable Pause | WIP preservado en commit local `d901bb6c95377074a7fb2fb23762476547335969`; el recorte por procedencia y el reseal forman parte del snapshot candidato; el estado remoto se observa fuera de este documento |
+
+### Hardening diferido por procedencia
+
+`codex/survey-hardening-wip` apunta al commit de preservación
+`d901bb6c95377074a7fb2fb23762476547335969`. Allí siguen recuperables los
+hallazgos heredados que no bloquean R1: ejecución de filtros y límites de
+Survey, submódulos/Gitlinks y alternates, sustitución de worktrees,
+discovery-to-walk TOCTOU, paths con salto de línea, colisiones case-fold de
+APFS, validación canónica completa del lock de Adoption, escritura desviada
+por `.git/config` enlazado, inventario de rollback entre linked worktrees y la
+guía add-only para equivalencia de ramas. Este frente solo se decide después de
+que R1 aterrice y se use; la adopción externa continúa prohibida.
 
 ### Contrato SpecPack
 
 `templates/spec-pack/` contiene el contrato cerrado de seis artefactos —PRD,
 TRD, UX/UI, flujo, backend y plan— bajo una frontera única: **el modelo redacta,
-el plano verifica**. Diseño y plan por fases en
+el plano verifica**. El plan 3.2 está
+`PREPARED / BLOCKED_ON_R1_FINAL_EVIDENCE`: la fase 1 no es ejecutable hasta
+cerrar R1 sobre sus bytes finales. Diseño y plan por fases en
 [el diseño 3.2](../superpowers/specs/2026-08-18-control-plane-3-2-specpack-design.md).
-La fase 2, el validador determinista, está **bloqueada tras una puerta
-explícita**; no la implementes sin comprobar sus tres condiciones.
+La fase 2, el validador determinista, conserva además una puerta explícita de
+tres condiciones; no la implementes sin comprobarlas.
 
 ## 3. Trampas conocidas
 
@@ -102,11 +116,15 @@ prueba válida es de contenido:
 git diff --diff-filter=A --name-only origin/main..<rama>
 ```
 
-### 3.3 Las ramas `codex/*` de la línea v2.3–v3 no se fusionan
+### 3.3 Cuatro ramas históricas concretas no se fusionan
 
-Solo aportaban los módulos que ADR 0006 puso en cuarentena. Se retiraron el
-2026-08-18 y siguen alcanzables como etiquetas `archive/*`; si alguien las
-recupera, la regla se mantiene: fusionarlas revertiría la decisión vigente.
+Las ramas históricas `codex/control-plane-v3`, `codex/control-plane-v2-3`,
+`codex/control-plane-v2-4` y `codex/taskplaybook-v0-impl` solo aportaban los
+módulos que ADR 0006 puso en cuarentena. Se retiraron el 2026-08-18 y siguen
+alcanzables como etiquetas `archive/*`; si alguien las recupera, la regla se
+mantiene: fusionarlas revertiría la decisión vigente. Esta regla no se aplica a
+todas las ramas `codex/*` y, en particular, no prohíbe reconciliar
+`codex/control-plane-adoption-enablement-design` por su contrato aprobado.
 Detalle rama por rama en
 [decisiones de rama](21-repository-alignment-and-branch-decisions.md).
 
@@ -154,8 +172,8 @@ git status --short --branch
 
 - **Escribe en:** este hilo.
 - **Rol:** relevo que llega sin historia.
-- **Para continuar:** comprobar `dataless`, leer el índice canónico y normalizar la petición como `TaskEnvelope`.
-- **Mensaje exacto:** `Comprueba dataless en la raíz de trabajo, resuelve el route y dime el tier antes de escribir nada.`
-- **Estado de partida:** `main` publicado, candidato `3.1.0-core.2`, `AE-09` pendiente de rerevisiones.
-- **No hacer todavía:** instalar, adoptar externamente, commit, push, PR, merge, deploy o release sin autorización exacta.
+- **Para continuar:** consultar el contador vigente en el Goal o handoff nativos y ejecutar solo el siguiente intento disponible sobre el snapshot final.
+- **Mensaje exacto:** `Continúa R1 sobre codex/reconcile-core-3-1-core-2; verifica el delta recortado y usa el siguiente intento disponible registrado fuera de los bytes.`
+- **Estado de partida:** candidato `3.1.0-core.2`; este documento no registra estado vivo ni autoridad. `d901bb6` es solo el ancla histórica de preservación; consultar el Goal o handoff nativos antes de continuar.
+- **No hacer todavía:** instalar, adoptar externamente, push, PR, merge, deploy o release sin autorización exacta.
 - **Autoridad:** `authorizes=false`

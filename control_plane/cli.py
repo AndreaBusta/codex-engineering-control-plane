@@ -29,6 +29,23 @@ _QUARANTINED = "E_CAPABILITY_QUARANTINED"
 _JSON_INPUT_MAX_BYTES = 1_048_576
 
 
+class _StoreOnce(argparse.Action):
+    """Reject repeated Stable Pause flags instead of accepting last-value wins."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: str | None = None,
+    ) -> None:
+        marker = f"_seen_{self.dest}"
+        if getattr(namespace, marker, False):
+            parser.error(f"argument {option_string} may be supplied exactly once")
+        setattr(namespace, marker, True)
+        setattr(namespace, self.dest, self.const if self.nargs == 0 else values)
+
+
 def _error_code(error: BaseException) -> str:
     return str(getattr(error, "code", str(error).split(":", 1)[0]))
 
@@ -874,6 +891,34 @@ def command_task(arguments: argparse.Namespace) -> int:
     return _emit(payload, arguments.json)
 
 
+def command_task_checkpoint(arguments: argparse.Namespace) -> int:
+    """Emit exactly one canonical verify-only Stable Pause JSON object."""
+
+    from control_plane.contracts import canonical_json, validate_stable_pause_observation
+    from control_plane.stable_pause import (
+        observe_stable_pause,
+        unknown_stable_pause_observation,
+    )
+
+    try:
+        value = observe_stable_pause(Path.cwd(), arguments.task_id)
+        value = validate_stable_pause_observation(value)
+        if value["lifecycle"]["task_id"] != arguments.task_id:
+            raise ValueError("stable pause task binding differs")
+    except Exception:
+        value = unknown_stable_pause_observation(
+            Path.cwd(),
+            arguments.task_id,
+            issue_code="E_STABLE_PAUSE_BOUNDS",
+        )
+    print(canonical_json(value))
+    if value["status"] == "UNKNOWN":
+        return 2
+    if value["status"] == "UNSAFE_PAUSE":
+        return 1
+    return 0
+
+
 def command_safe_read(arguments: argparse.Namespace) -> int:
     from control_plane.core_types import observe_current_worktree
     from control_plane.hooks import _safe_read_repository_identity, execute_safe_read
@@ -1151,6 +1196,24 @@ def build_parser() -> argparse.ArgumentParser:
             action_parser.add_argument("--lease-digest", required=True)
         _output(action_parser)
         action_parser.set_defaults(handler=command_task)
+
+    checkpoint = task_actions.add_parser("checkpoint")
+    checkpoint.add_argument(
+        "--mode",
+        choices=("stable-pause",),
+        required=True,
+        action=_StoreOnce,
+    )
+    checkpoint.add_argument("--task-id", required=True, action=_StoreOnce)
+    checkpoint.add_argument(
+        "--json",
+        nargs=0,
+        const=True,
+        default=False,
+        required=True,
+        action=_StoreOnce,
+    )
+    checkpoint.set_defaults(handler=command_task_checkpoint)
 
     run = commands.add_parser("run")
     run_actions = run.add_subparsers(dest="run_action", required=True)

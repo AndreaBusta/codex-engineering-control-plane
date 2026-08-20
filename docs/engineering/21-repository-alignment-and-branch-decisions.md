@@ -83,8 +83,9 @@ git diff --diff-filter=A --name-only origin/main..<rama>
 
 ## Hallazgo determinante
 
-Las cuatro ramas `codex/*` de la línea v2.3–v3 aportan exactamente el mismo
-conjunto de archivos ausentes en `main`:
+Las ramas históricas `codex/control-plane-v3`, `codex/control-plane-v2-3`,
+`codex/control-plane-v2-4` y `codex/taskplaybook-v0-impl` aportan exactamente el
+mismo conjunto de archivos ausentes en `main`:
 
 ```text
 control_plane/adoption.py
@@ -104,6 +105,10 @@ La consecuencia es directa y es el eje de este documento:
 
 > Rebasar o fusionar cualquiera de esas ramas reintroduciría el runtime en
 > cuarentena y revertiría la decisión que gobierna hoy el repositorio.
+
+Esta regla no se aplica a todas las ramas `codex/*`. En particular,
+`codex/control-plane-adoption-enablement-design` contiene el subject aprobado
+para reconciliación y no forma parte de este conjunto histórico en cuarentena.
 
 ## Decisión por rama
 
@@ -335,17 +340,26 @@ Observación del 2026-08-18: `bash tests/run.sh` sobre `main` en
 
 Esa ejecución es evidencia local válida, pero no cierra por sí sola el gate
 declarado en el scorecard: aquel gate se define sobre los bytes sellados del
-candidato y como una única ejecución autoritativa registrada como tal. Cerrarlo
-es una decisión de la tarea orquestadora, no un efecto derivado de esta lectura.
-El candidato permanece `GREEN_LOCAL / PENDING_STABLE_ADOPTION` y
-`external_consumer_adoption=PROHIBITED`.
+candidato, con `max_gate_runs=6` ligado a la misma closure lineage. El checkpoint
+previo e inmutable del reframe R1 del 2026-08-20 registró `gate_run_count=2` y
+programó el intento `3/6`. Los intentos 1 y 2 permanecen consumidos: sus
+resultados byte-bound quedaron superseded por reparaciones posteriores, pero no
+se borran ni se reclasifican. Los resultados posteriores se registran en el Goal
+y handoff nativos sin reescribir este checkpoint histórico. La última ejecución
+consumida debe quedar verde sobre los bytes finales; reparar o volver a congelar
+no reinicia el contador, y alcanzar `gate_run_count=6` sin ese estado exige
+Stable Pause. Cerrarlo es una decisión de la tarea orquestadora, no un efecto
+derivado de esta lectura. Este documento no registra el estado vivo de cierre;
+debe reobservarse en el Goal o handoff nativos y en el remoto. La precondición
+fail-closed `external_consumer_adoption=PROHIBITED` permanece hasta que un
+artefacto gobernante la cambie explícitamente.
 
 ## Continuación
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora de la alineación del repositorio.
-- **Para continuar:** autorizar por separado etiquetado, borrado de ramas y protección de `main`.
-- **Mensaje exacto:** `Autoriza el paso 1 del runbook de limpieza: crear y empujar las etiquetas archive/*.`
-- **Estado de partida:** `main` en `b074183`, limpio, sin PR abiertos, suite local `234 OK`, protección de rama ausente.
-- **No hacer todavía:** borrar ramas, empujar etiquetas, cambiar protección, instalar o adoptar el candidato.
+- **Para continuar:** cerrar la reconciliación R1 sin reabrir la higiene histórica ya terminada.
+- **Mensaje exacto:** `Continúa R1 sobre su worktree exacto; compara el delta completo contra ambos padres y conserva las ramas históricas concretas en cuarentena.`
+- **Estado de partida:** este documento no registra estado vivo ni autoridad; `d901bb6` es solo el ancla histórica de preservación. Reobservar rama, HEAD, remoto, protección y autoridad nativa antes de continuar.
+- **No hacer todavía:** push, PR, merge, instalar o adoptar el candidato sin la autoridad exacta de esa transición; ninguna autoridad se infiere de este documento.
 - **Autoridad:** `authorizes=false`

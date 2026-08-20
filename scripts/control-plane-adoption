@@ -1,0 +1,297 @@
+#!/bin/sh
+case ${CONTROL_PLANE_ADOPTION_CLEAN_SHELL-} in
+  1) ;;
+  *)
+    exec /usr/bin/env -i CONTROL_PLANE_ADOPTION_CLEAN_SHELL=1 LC_ALL=C PATH=/usr/bin:/bin \
+      /bin/sh "$0" "$@"
+    ;;
+esac
+set -eu
+
+unset BASH_ENV ENV CDPATH LD_PRELOAD DYLD_INSERT_LIBRARIES PYTHONHOME PYTHONPATH || :
+
+SCRIPT_DIR=$(/usr/bin/dirname "$0")
+SCRIPT_DIR=$(CDPATH= cd -P "$SCRIPT_DIR" && /bin/pwd -P)
+PROJECT_ROOT=$(CDPATH= cd -P "$SCRIPT_DIR/.." && /bin/pwd -P)
+BOOTSTRAP_PATH="$SCRIPT_DIR/control-plane-adoption"
+
+PYTHON_BIN=
+for candidate in \
+  /usr/local/bin/python3 \
+  /opt/homebrew/bin/python3 \
+  /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 \
+  /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \
+  /Library/Frameworks/Python.framework/Versions/3.11/bin/python3 \
+  /usr/bin/python3
+do
+  if [ -x "$candidate" ] && \
+    /usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin \
+      "$candidate" -I -S -B -X pycache_prefix=/dev/null \
+      -c 'import sys, tomllib; raise SystemExit(0 if sys.version_info >= (3, 11) and sys.flags.no_site else 1)' \
+      </dev/null >/dev/null 2>&1
+  then
+    PYTHON_BIN=$candidate
+    break
+  fi
+done
+
+if [ -z "$PYTHON_BIN" ]; then
+  echo 'E_ADOPTION_BOOTSTRAP: compatible Python 3.11+ is unavailable' >&2
+  exit 1
+fi
+
+exec /usr/bin/env -i LC_ALL=C PATH=/usr/bin:/bin \
+  "$PYTHON_BIN" -I -S -B -X pycache_prefix=/dev/null -c '
+import os
+import sys
+
+if (
+    not sys.flags.isolated
+    or not sys.flags.safe_path
+    or not sys.flags.no_site
+    or not sys.flags.dont_write_bytecode
+    or sys.pycache_prefix != os.devnull
+    or sys.version_info < (3, 11)
+    or any(name == "adoption_enablement" or name.startswith("adoption_enablement.") for name in sys.modules)
+):
+    raise SystemExit("E_ADOPTION_BOOTSTRAP: Python isolation contract failed")
+sys.dont_write_bytecode = True
+sys.pycache_prefix = os.devnull
+
+import importlib
+import importlib.abc
+import importlib.util
+from hashlib import sha256
+from pathlib import Path
+import stat
+import tomllib
+
+ADOPTION_MODULES = (
+    "__init__.py",
+    "cli.py",
+    "contracts.py",
+    "lockfile.py",
+    "manifest.py",
+    "repository.py",
+    "safe_io.py",
+    "transaction.py",
+)
+TOOL_VERSION = "0.1.0"
+LOCK_MAX = 64 * 1024
+MODULE_MAX = 1024 * 1024
+TOTAL_MAX = 8 * 1024 * 1024
+ENTRYPOINT_MAX = 1024 * 1024
+ENTRY_MAX = 64
+DATALESS_FLAG = 0x40000000
+READ_CHUNK = 64 * 1024
+
+
+def fail(code, message):
+    raise SystemExit(f"{code}: {message}")
+
+
+def dataless(metadata):
+    return bool(int(getattr(metadata, "st_flags", 0)) & DATALESS_FLAG)
+
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def private_regular(metadata, maximum):
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+        and 0 <= metadata.st_size <= maximum
+        and not dataless(metadata)
+    )
+
+
+def private_directory(path):
+    try:
+        before = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError:
+        fail("E_ADOPTION_MODULE_SET", "runtime directory is unavailable")
+    if (
+        resolved != path
+        or not stat.S_ISDIR(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or stat.S_IMODE(before.st_mode) & 0o022
+        or dataless(before)
+    ):
+        fail("E_ADOPTION_MODULE_SET", "runtime directory is unsafe")
+    return before
+
+
+def read_private(path, maximum, code):
+    try:
+        before = path.lstat()
+    except OSError:
+        fail(code, "runtime path is unavailable")
+    if not private_regular(before, maximum):
+        fail(code, "runtime path is not bounded regular private content")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        fail(code, "runtime path cannot be opened safely")
+    try:
+        opened = os.fstat(descriptor)
+        if not private_regular(opened, maximum) or identity(opened) != identity(before):
+            fail(code, "runtime path identity changed before read")
+        chunks = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(READ_CHUNK, maximum + 1 - observed))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > maximum:
+                fail(code, "runtime path exceeds its byte limit")
+        after_open = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        after_path = path.lstat()
+    except OSError:
+        fail(code, "runtime path disappeared during read")
+    if (
+        not private_regular(after_open, maximum)
+        or not private_regular(after_path, maximum)
+        or identity(before) != identity(after_open)
+        or identity(before) != identity(after_path)
+    ):
+        fail(code, "runtime path changed during read")
+    return b"".join(chunks)
+
+
+def inventory(package):
+    before = private_directory(package)
+    names = []
+    try:
+        with os.scandir(package) as entries:
+            for index, entry in enumerate(entries, start=1):
+                if index > ENTRY_MAX or not entry.is_file(follow_symlinks=False):
+                    fail("E_ADOPTION_MODULE_SET", "runtime inventory is unsafe")
+                names.append(entry.name)
+    except OSError:
+        fail("E_ADOPTION_MODULE_SET", "runtime inventory is unavailable")
+    after = private_directory(package)
+    if identity(before) != identity(after):
+        fail("E_ADOPTION_MODULE_SET", "runtime inventory changed")
+    return tuple(sorted(names))
+
+
+root = Path(sys.argv[1]).resolve(strict=True)
+bootstrap = Path(sys.argv[2]).resolve(strict=True)
+if root != Path(sys.argv[1]) or bootstrap != Path(sys.argv[2]):
+    fail("E_ADOPTION_BOOTSTRAP", "bootstrap path is not canonical")
+package = root / "adoption_enablement"
+expected = tuple(sorted(ADOPTION_MODULES))
+if inventory(package) != expected:
+    fail("E_ADOPTION_MODULE_SET", "lock does not match exact adoption modules")
+
+lock_bytes = read_private(root / ".codex" / "adoption-enablement.lock", LOCK_MAX, "E_ADOPTION_TOOL_LOCK")
+try:
+    lock = tomllib.loads(lock_bytes.decode("utf-8"))
+except (UnicodeError, tomllib.TOMLDecodeError):
+    fail("E_ADOPTION_TOOL_LOCK", "tool lock is invalid")
+if set(lock) != {"schema_version", "tool_version", "runtime_package", "runtime_layout", "runtime_modules", "digests"}:
+    fail("E_ADOPTION_TOOL_LOCK", "tool lock fields are not exact")
+if (
+    lock.get("schema_version") != 1
+    or lock.get("tool_version") != TOOL_VERSION
+    or lock.get("runtime_package") != "adoption_enablement"
+    or lock.get("runtime_layout") != "source"
+    or tuple(lock.get("runtime_modules", ())) != ADOPTION_MODULES
+    or not isinstance(lock.get("digests"), dict)
+    or set(lock["digests"]) != {"entrypoint", "runtime"}
+):
+    fail("E_ADOPTION_TOOL_LOCK", "tool lock contract is unsupported")
+bootstrap_bytes = read_private(bootstrap, ENTRYPOINT_MAX, "E_ADOPTION_BOOTSTRAP")
+if lock["digests"].get("entrypoint") != f"sha256:{sha256(bootstrap_bytes).hexdigest()}":
+    fail("E_ADOPTION_BOOTSTRAP", "entrypoint digest drifted")
+
+sources = {}
+hasher = sha256(b"control-plane-adoption-enablement-v1\0")
+total = 0
+for name in ADOPTION_MODULES:
+    payload = read_private(package / name, MODULE_MAX, "E_ADOPTION_MODULE_SET")
+    sources[name] = payload
+    total += len(payload)
+    if total > TOTAL_MAX:
+        fail("E_ADOPTION_MODULE_SET", "runtime exceeds its total byte limit")
+    hasher.update(name.encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(payload)
+    hasher.update(b"\0")
+if inventory(package) != expected:
+    fail("E_ADOPTION_MODULE_SET", "runtime inventory changed during capture")
+if lock["digests"].get("runtime") != f"sha256:{hasher.hexdigest()}":
+    fail("E_ADOPTION_RUNTIME_DIGEST", "runtime digest drifted")
+
+
+class VerifiedAdoptionLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    def selection(self, fullname):
+        if fullname == "adoption_enablement":
+            return "__init__.py", True
+        if fullname.startswith("adoption_enablement."):
+            suffix = fullname.removeprefix("adoption_enablement.")
+            if "." not in suffix:
+                name = f"{suffix}.py"
+                if name in sources:
+                    return name, False
+            raise ImportError("E_ADOPTION_MODULE_SET: unapproved adoption import")
+        return None
+
+    def find_spec(self, fullname, path=None, target=None):
+        del path, target
+        selected = self.selection(fullname)
+        if selected is None:
+            return None
+        name, is_package = selected
+        return importlib.util.spec_from_loader(
+            fullname,
+            self,
+            origin=str(package / name),
+            is_package=is_package,
+        )
+
+    def create_module(self, spec):
+        del spec
+        return None
+
+    def exec_module(self, module):
+        selected = self.selection(module.__name__)
+        if selected is None:
+            raise ImportError("E_ADOPTION_MODULE_SET: unapproved adoption import")
+        name, _ = selected
+        filename = str(package / name)
+        module.__file__ = filename
+        code = compile(sources[name], filename, "exec", dont_inherit=True)
+        exec(code, module.__dict__)
+
+
+sys.meta_path.insert(0, VerifiedAdoptionLoader())
+cli = importlib.import_module("adoption_enablement.cli")
+raise SystemExit(cli.main(sys.argv[3:]))
+' "$PROJECT_ROOT" "$BOOTSTRAP_PATH" "$@"

@@ -1,6 +1,6 @@
 {
   "name": "control-plane",
-  "version": "3.1.0-core.1",
+  "version": "3.1.0-core.2",
   "description": "Local-first, non-authorizing Control Plane Core workflows for Codex.",
   "author": {
     "name": "Codex Engineering Control Plane"

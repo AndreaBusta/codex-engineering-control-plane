@@ -1,6 +1,6 @@
 # Control Plane Core maintenance
 
-This is the governing runbook for the local `3.1.0-core.1` candidate. It does
+This is the governing runbook for the local `3.1.0-core.2` candidate. It does
 not grant an effect: every status, receipt, checkpoint, and recovery result is
 `authorizes=false`.
 
@@ -63,6 +63,115 @@ the repository Git common dir. A second verifier receives
 `consumes_reframe=false`; it executes no Git or test command. Verification is
 serial even when task analysis can otherwise be parallel.
 
+The mutex is the persistent `locks/verification.lock` inode. Fresh Adoption apply
+is the only path that provisions and seals its `verification_lock` for a
+journal-bound generation. Active Core, the full-gate runner, replay, verify and
+rollback are `create=false` and reuse-only: they retain common/state/locks/file
+descriptors through flock, revalidate every named identity, validate the same
+closed active journal, and never unlink the mutex on release. Missing or
+substituted state fails with `E_VERIFICATION_LOCK` or `E_TEST_MUTEX` instead of
+recreating or repairing it.
+
+A pre-existing Core-owned verification mutex is not evidence of an interrupted
+Adoption apply. Fresh apply leaves it unchanged and fails eligibility. Only the
+exact journal-less provisioning inventory created by that same interrupted
+apply may be cleaned after the reviewed plan is revalidated. This behavior is
+non-authorizing and records `authorizes=false`.
+
+## Final verification budget
+
+Final full verification is read-only, idempotent, and bounded by
+`max_gate_runs=6` for one exact PR/worktree candidate. The orchestrator records
+`gate_run_count` outside the product runtime and binds it to the same closure
+lineage. Repair and re-freeze do not create a new lineage, so the counter does
+not reset. A run consumes the budget only after it acquires the verification
+mutex and starts `bash tests/run.sh`;
+`E_VERIFICATION_BUSY` does not consume it. A repair invalidates earlier
+final-byte evidence and returns the candidate to focused RED/GREEN work. The
+last consumed run must be green on the exact final bytes. If six consumed
+runs do not produce that state, stop in Stable Pause instead of requesting an
+unbounded retry.
+
+Each full gate runs in a fresh disposable executor scoped to the exact
+PR/worktree. That executor waits internally and returns one terminal summary;
+the orchestrator does not issue periodic empty polls against the running
+process. This execution budget does not grant commit, push, PR, merge, deploy,
+or release authority.
+
+For a reconciliation merge, both independent reviews classify the final tree
+against both exact merge parents. Reviewers concentrate line-level analysis on
+the semantic reconciliation delta: conflict resolutions and bytes that are not
+identical to either parent. Inherited-parent bytes require provenance and
+tree-identity checks rather than a ritual line-by-line rereview, while every
+security-sensitive boundary crossed by the integration remains in scope. Both
+reviews must still report `0 Critical / 0 Important` on the same frozen bytes.
+
+## Stable Pause v1
+
+Stable Pause is a verify-only local checkpoint for one exact task ID:
+
+```bash
+scripts/control-plane task checkpoint \
+  --mode stable-pause \
+  --task-id EXACT-TASK-ID \
+  --json
+```
+
+The output is one canonical `StablePauseObservationV1` line of at most
+4096 bytes. `SAFE_PAUSE_ACTIVE` and `SAFE_PAUSE_TERMINAL` return exit 0;
+`UNSAFE_PAUSE` returns exit 1; `UNKNOWN` returns exit 2. Every variant contains
+`checkpoint_digest` and `authorizes=false`. A dirty worktree, failing RED, or
+`git diff --check` failure stays visible as quality evidence but is not
+automatically unsafe unless it also proves drift, lifecycle contradiction, or
+an active operation.
+
+The progressive `control-plane-run` reference performs the
+native host before and after quiescence check around the single foreground observer. Native facts
+may downgrade the effective result but never upgrades a Core `UNSAFE_PAUSE` or
+`UNKNOWN`. Render the bounded continuation capsule only after that join. On
+resume, rerun the command for the same task and worktree, compare
+`checkpoint_digest`, explain any drift, and repeat normal route, preflight,
+authority, and lifecycle gates before a write.
+
+This procedure is zero mutation: no cleanup, no lifecycle transition, no Goal,
+no test or gate, no Git transition, no remote effect, no consumer, and no
+canary. It never creates or repairs a mutex or checkpoint artifact. A held or
+missing required mutex, lifecycle/residue contradiction, bounds failure, or
+unknown host visibility is a fail-closed result, not a reason to clean or infer
+authority.
+
+Repository evidence is tied to the exact selected repository root. The closed
+Git context forces `core.filemode=true` and `/dev/null` external excludes,
+rejects `assume-unchanged` and `skip-worktree`, and reads all required blobs
+through a single `cat-file --batch`. Ignored caches stay outside the global
+unsafe-type scan but their bounded path set remains digest-bound. Gitlinks,
+`.git` markers, and bare markers are rejected because nested repositories are
+unsupported. For a terminal task with a nonzero lease generation, safe output
+also requires the exact release receipt. These checks are observational and
+remain `authorizes=false`.
+
+## Adoption rollback quarantine
+
+Core creates or reuses `adoption.lock` and retains the lifecycle inode before the task lock
+even when no journal or activation marker exists. Fresh Adoption
+apply and rollback acquire that same inode exclusively, so an absence-to-write
+race cannot form a second lifecycle domain. An exact raced `ROOT_EMPTY`
+bootstrap removes only the lock created by the failed apply; it never removes a
+Core writer's inode.
+
+Journal-less recovery accepts only `ROOT_EMPTY`, `P1`, `P2`, `P2Q`, `P3`,
+`P3Q`, `P4` and `P4T`. It uses nonblocking opens, complete descriptor/name
+revalidation, and no-replace moves into durable quarantine before removing an
+empty provisioning directory. Any other inventory or substitution is
+`E_ADOPTION_RECOVERY_REQUIRED` and remains untouched.
+
+Product rollback conditionally removes only the exact-value
+`core.hooksPath=.codex/git-hooks` entry. It moves the activation and every
+managed leaf into linked durable quarantine, revalidates them after the move
+and again before the receipt, and does not unlink them during the certifying
+rollback. A separate GC is outside this implementation and would need its own
+contract and authority. This operational record remains `authorizes=false`.
+
 ## Maintenance circuit breaker
 
 `MaintenanceLineageV1` binds one stable runtime digest to one different
@@ -101,9 +210,11 @@ supersedes ADR 0006.
 
 ## Rollback
 
-The candidate is isolated and uncommitted. Before stable adoption, rollback is
-to stop using this worktree; the stable source remains
-`origin/main@929d3f8a0656fed190bb65ceb3a29deef8de07d6`. Do not delete or rewrite
+Before rollback, require one exact candidate worktree and prove its isolation.
+This runbook does not record live Git state or authority: reobserve worktree,
+branch, HEAD, base and native authorization before any rollback. Before stable
+adoption, the only local rollback is to stop using the exact candidate
+worktree. Do not delete or rewrite
 legacy JSON, installed runtimes, external repositories, or Git history to make
 the candidate appear clean.
 
@@ -111,6 +222,34 @@ If an existing installation needs rollback, use the owning stable runtime or a
 future recovery runtime that implements a mechanically shared barrier. Core
 3.1 only verifies the exact journal and then fails closed; it does not reverse
 a commit, remote write, Pull Request, merge, deploy, or release.
+
+## Local adoption enablement
+
+The separate `scripts/control-plane-adoption` entrypoint is implemented for
+closed local verification only. It is not part of `scripts/control-plane`, the
+27-module Core allowlist or the compatibility parser surface.
+
+```text
+adoption_tool=IMPLEMENTED_LOCAL
+temporary_repository_e2e=PASS
+external_consumer_adoption=PROHIBITED
+canary=NOT_PREPARED
+stable_adoption=NOT_DECIDED
+Autopilot OFF
+authorizes=false
+```
+
+Only harness-owned temporary repositories may exercise `preview`, `apply`,
+`status`, `verify` and `rollback` under this implementation decision. Do not
+run the tool against a consumer or prepare a canary. The Core parsers `adopt
+plan`, `adopt apply`, `upgrade plan` and `upgrade apply` remain zero-mutation
+`E_CAPABILITY_QUARANTINED` stubs.
+
+Local implementation rollback removes only the adoption package, entrypoint,
+lock, tests and documentation enumerated by its plan, then proves the Core
+runtime digest unchanged. Transaction rollback inside a harness-owned target
+deactivates the target lock first and removes only exact journal-owned records;
+any identity or digest drift is preserved and fails closed.
 
 ## External adoption
 

@@ -9,8 +9,14 @@ a quarantined capability or grant authority.
 
 - 2.1.1 — last official release, published as tag and GitHub Release.
 - 3.0.0 — unpublished plugin candidate; not a product release.
-- 3.1.0-core.1 — local prerelease candidate; its maximum truthful status is
-  `GREEN_LOCAL / PENDING_STABLE_ADOPTION` until separate stable adoption.
+- 3.1.0-core.1 — superseded local prerelease candidate; its ten-task dogfood and
+  other version-bound evidence remain historical only.
+- 3.1.0-core.2 — current local prerelease candidate; its maximum truthful status
+  is `GREEN_LOCAL / PENDING_STABLE_ADOPTION`. Stable Pause v1 is
+  `IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE` in the exact 27-module candidate;
+  this invalidates earlier Core byte-bound evidence without creating a new
+  product version. Fresh ten-task dogfood is required for `3.1.0-core.2`
+  before any separate stable-adoption decision.
 
 ## Governing Core documents
 
@@ -28,15 +34,25 @@ a quarantined capability or grant authority.
 | `docs/engineering/10-resource-routing.md` | `GOVERNING_CORE` | Current resource selection contract. |
 | `docs/engineering/12-multidominio-y-modos.md` | `GOVERNING_CORE` | Current multidomain and interaction guidance. |
 | `docs/engineering/19-control-plane-core-maintenance.md` | `GOVERNING_CORE` | Core operation, compatibility, recovery, and rollback. |
-| `docs/engineering/20-control-plane-core-dogfood.md` | `GOVERNING_CORE` | Manual adoption gate; currently pending. |
+| `docs/engineering/20-control-plane-core-dogfood.md` | `GOVERNING_CORE` | Historical core.1 evidence plus the fresh core.2 dogfood gate. |
 | `docs/engineering/21-repository-alignment-and-branch-decisions.md` | `GOVERNING_CORE` | Observed repository state, per-branch decisions, and cleanup runbook. |
 | `docs/engineering/22-orientation-and-known-traps.md` | `GOVERNING_CORE` | Cold-start entry point: where to work, what is true now, and environment faults that imitate defects. |
 | `docs/security/2026-08-12-control-plane-core-threat-model.md` | `GOVERNING_CORE` | Repository-scoped threat model. |
-| `docs/superpowers/plans/2026-08-12-control-plane-core-3-1.md` | `GOVERNING_CORE` | Current local implementation plan and checkpoint. |
+| `docs/superpowers/specs/2026-08-14-control-plane-stable-pause-v1-design.md` | `GOVERNING_CORE` | Stable Pause v1 WHAT/WHY verify-only contract; `IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE`. |
+| `docs/superpowers/plans/2026-08-14-control-plane-stable-pause-v1.md` | `GOVERNING_CORE` | Stable Pause v1 HOW, TDD traceability and rollback; `IMPLEMENTED_LOCAL / CLOSES_ON_FINAL_EVIDENCE`. |
 | `docs/superpowers/plans/2026-08-18-control-plane-3-2-specpack.md` | `GOVERNING_CORE` | Current phased plan for the SpecPack contract and its gate. |
-| `docs/superpowers/plans/2026-08-18-control-plane-3-3-operator-orientation.md` | `GOVERNING_CORE` | Current plan for operator orientation. |
 | `docs/superpowers/specs/2026-08-18-control-plane-3-2-specpack-design.md` | `GOVERNING_CORE` | Current SpecPack design: PRD, TRD, UX/UI, flow, and backend contracts. |
-| `docs/superpowers/specs/2026-08-18-control-plane-3-3-operator-orientation-design.md` | `GOVERNING_CORE` | Operator orientation design and blind-spot evidence. |
+| `docs/superpowers/specs/2026-08-18-control-plane-3-3-operator-orientation-design.md` | `GOVERNING_CORE` | Implemented operator-orientation contract and blind-spot evidence. |
+
+## Governing local enablement documents
+
+These artifacts govern only the separately locked local adoption tool. Their
+status does not add modules to Core or grant consumer adoption.
+
+| Path | Status | Purpose |
+|---|---|---|
+| `docs/superpowers/specs/2026-08-13-control-plane-core-adoption-enablement-design.md` | `GOVERNING_LOCAL_ENABLEMENT` | Accepted transaction and rollback design; canary remains prohibited. |
+| `docs/superpowers/plans/2026-08-13-control-plane-core-adoption-enablement.md` | `GOVERNING_LOCAL_ENABLEMENT` | Local implementation, TDD, temporary-repository evidence and exact rollback. |
 
 ## Historical non-governing documents
 
@@ -76,6 +92,8 @@ authority models do not govern Core.
 | `docs/superpowers/plans/2026-08-08-personal-control-plane-v3.md` | `HISTORICAL_NON_GOVERNING` | Personal v3 candidate plan. |
 | `docs/superpowers/plans/2026-08-10-control-plane-v2-4-native-governor.md` | `HISTORICAL_NON_GOVERNING` | v2.4 implementation plan. |
 | `docs/superpowers/plans/2026-08-11-control-plane-taskplaybook-v0-progressive-disclosure.md` | `HISTORICAL_NON_GOVERNING` | Pre-Core taskplaybook plan. |
+| `docs/superpowers/plans/2026-08-12-control-plane-core-3-1.md` | `HISTORICAL_NON_GOVERNING` | Original 3.1.0-core.1 implementation plan and checkpoint; superseded by the 3.1.0-core.2 local candidate. |
+| `docs/superpowers/plans/2026-08-18-control-plane-3-3-operator-orientation.md` | `HISTORICAL_NON_GOVERNING` | Executed 3.3 implementation transcript; the design and current runtime govern. |
 | `docs/superpowers/specs/2026-07-28-codex-engineering-control-plane-design.md` | `HISTORICAL_NON_GOVERNING` | Initial design specification. |
 | `docs/superpowers/specs/2026-07-29-clarification-gate-risk-sentinel-design.md` | `HISTORICAL_NON_GOVERNING` | v2.1 risk design specification. |
 | `docs/superpowers/specs/2026-08-08-control-plane-v2-3-outcome-bridge-design.md` | `HISTORICAL_NON_GOVERNING` | v2.3 design specification. |
