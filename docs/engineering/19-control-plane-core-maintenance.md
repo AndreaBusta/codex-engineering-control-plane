@@ -210,9 +210,10 @@ supersedes ADR 0006.
 
 ## Rollback
 
-The candidate is isolated and uncommitted. Before stable adoption, rollback is
-to stop using this worktree; the stable source remains
-`origin/main@b07418364409f76c900f0595a76c9e3e388ac433`. Do not delete or rewrite
+The candidate remains isolated in its own worktree. This runbook does not record
+live Git state or authority: reobserve worktree, branch, HEAD, base and native
+authorization before any rollback. Before stable adoption, the only local
+rollback is to stop using the exact candidate worktree. Do not delete or rewrite
 legacy JSON, installed runtimes, external repositories, or Git history to make
 the candidate appear clean.
 

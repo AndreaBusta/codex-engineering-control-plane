@@ -1418,13 +1418,41 @@ class CoreDocumentationTests(unittest.TestCase):
         self.assertNotIn("recorte por procedencia y evidencia final pendientes", orientation)
         alignment = read(ALIGNMENT)
         orientation_design = read(ORIENTATION_DESIGN)
+        adoption_plan = read(ADOPTION_ENABLEMENT_PLAN)
+        maintenance = read(MAINTENANCE)
+        maintenance_flat = " ".join(maintenance.split())
         self.assertIn("no registra estado vivo ni autoridad", alignment)
         self.assertIn("no registra estado vivo ni autoridad", orientation)
         self.assertIn("no registra el estado vivo de cierre de R1", orientation_design)
+        self.assertIn("outside the 27-module Core runtime", adoption_plan)
+        self.assertIn("no registra estado Git vivo ni autoridad", adoption_plan)
+        self.assertIn("does not record live Git state or authority", maintenance_flat)
         for governing_document in (alignment, orientation, orientation_design):
             self.assertNotIn("evidencia final de R1 pendiente", governing_document)
             self.assertNotIn("commits locales de R1 sí están autorizados", governing_document)
             self.assertNotIn("commits locales de R1 están autorizados", governing_document)
+        r1_decision_governing_documents = (
+            ROOT / "README.md",
+            CANONICAL_INDEX,
+            MAINTENANCE,
+            DOGFOOD,
+            ALIGNMENT,
+            ORIENTATION,
+            THREAT_MODEL,
+            ADOPTION_ENABLEMENT_PLAN,
+            STABLE_PAUSE_PLAN,
+            SPECPACK_PLAN,
+            STABLE_PAUSE_SPEC,
+            ORIENTATION_DESIGN,
+        )
+        for governing_path in r1_decision_governing_documents:
+            governing_document = read(governing_path)
+            for stale_contract in (
+                "outside the 25-module Core runtime",
+                "origin/main@b07418364409f76c900f0595a76c9e3e388ac433",
+                "candidato local `3.1.0-core.2` sin commit",
+            ):
+                self.assertNotIn(stale_contract, governing_document, governing_path)
         self.assertNotIn("Gate integral `395 OK`", orientation)
         self.assertNotIn("AE-09 pendiente", orientation)
         self.assertNotIn("protección de rama ausente", alignment)
@@ -1537,7 +1565,7 @@ class CoreDocumentationTests(unittest.TestCase):
             "self_certified=false",
             "external_consumer_adoption=PROHIBITED",
             "GREEN_LOCAL / PENDING_STABLE_ADOPTION",
-            "origin/main@b07418364409f76c900f0595a76c9e3e388ac433",
+            "reobserve worktree, branch, HEAD, base and native",
         ):
             self.assertIn(token, content)
         for command in (

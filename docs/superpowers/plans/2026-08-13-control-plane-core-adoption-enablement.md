@@ -4,7 +4,7 @@
 
 **Goal:** Implement a separately locked, local-only adoption tool that can preview, apply, verify, and exactly roll back Control Plane Core 3.1 in fresh temporary repositories while keeping consumer adoption prohibited.
 
-**Architecture:** A new stdlib-only `adoption_enablement` package and `scripts/control-plane-adoption` entrypoint remain outside the 25-module Core runtime and outside `scripts/control-plane`. The tool observes immutable source bytes and an eligible fresh target, publishes all managed bytes inactive, atomically publishes the target `.codex/control-plane.lock` last, verifies the exact installed generation, and deactivates before exact rollback. Its plans, journals, locks, and receipts are closed, bounded, digest-bound, and always `authorizes=false`.
+**Architecture:** A new stdlib-only `adoption_enablement` package and `scripts/control-plane-adoption` entrypoint remain outside the 27-module Core runtime and outside `scripts/control-plane`. The tool observes immutable source bytes and an eligible fresh target, publishes all managed bytes inactive, atomically publishes the target `.codex/control-plane.lock` last, verifies the exact installed generation, and deactivates before exact rollback. Its plans, journals, locks, and receipts are closed, bounded, digest-bound, and always `authorizes=false`.
 
 **Tech Stack:** Python 3.11+ standard library, POSIX `sh`, Git plumbing, TOML/JSON contracts, `unittest`; no new dependency, package installation, plugin installation, or network access.
 
@@ -587,8 +587,8 @@ A future canary requires, in order: an independently reviewed ADR creating one e
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora del adoption enablement de Core 3.1.
-- **Para continuar:** ejecutar los focales finales, el intento disponible del gate integral dentro de `max_gate_runs=6`, los post-gates y dos revisiones independientes sobre los mismos bytes; el último intento consumido debe estar verde para cerrar AE-09 y el agotamiento exige Stable Pause.
-- **Mensaje exacto:** `Cierra la evidencia final local de AE-09 en 3.1.0-core.2; no prepares ni ejecutes un canary.`
-- **Estado de partida:** `origin/main@b07418364409f76c900f0595a76c9e3e388ac433`, rama `codex/control-plane-adoption-enablement-design`, candidato local `3.1.0-core.2` sin commit y adopción externa prohibida; el cierre depende solo de la evidencia final definida arriba.
-- **No hacer todavía:** instalar, tocar consumidores, ejecutar canary, migrar v2.1, añadir dependencias, commit, push, PR, merge, tag, release, plugin, Autopilot o cualquier efecto remoto.
+- **Para continuar:** consultar el Goal o handoff nativos; si AE-09 sigue abierta, ejecutar solo la evidencia que falte dentro de `max_gate_runs=6`, sin repetir una última ejecución ya verde sobre bytes finales.
+- **Mensaje exacto:** `Reobserva AE-09 para 3.1.0-core.2 y completa solo la evidencia aún ausente; no prepares ni ejecutes un canary.`
+- **Estado de partida:** este plan no registra estado Git vivo ni autoridad; reobservar worktree, rama, HEAD, base, Goal o handoff y autorización nativa antes de continuar. La adopción externa permanece prohibida por la policy gobernante.
+- **No hacer todavía:** inferir de este plan autoridad para instalar, tocar consumidores, ejecutar canary, migrar v2.1, añadir dependencias, commit, push, PR, merge, tag, release, plugin, Autopilot o cualquier efecto remoto.
 - **Autoridad:** `authorizes=false`.
