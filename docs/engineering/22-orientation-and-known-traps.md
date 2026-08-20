@@ -172,8 +172,8 @@ git status --short --branch
 
 - **Escribe en:** este hilo.
 - **Rol:** relevo que llega sin historia.
-- **Para continuar:** terminar el recorte por procedencia, resealar y ejecutar focales antes del intento `3/6`.
-- **Mensaje exacto:** `Continúa R1 sobre codex/reconcile-core-3-1-core-2; verifica el delta de decisión recortado antes del intento 3/6.`
+- **Para continuar:** consultar el contador vigente en el Goal o handoff nativos y ejecutar solo el siguiente intento disponible sobre el snapshot final.
+- **Mensaje exacto:** `Continúa R1 sobre codex/reconcile-core-3-1-core-2; verifica el delta recortado y usa el siguiente intento disponible registrado fuera de los bytes.`
 - **Estado de partida:** `R1_OPEN` sobre `3.1.0-core.2`; commit local de preservación `d901bb6`, commits locales autorizados y evidencia final pendiente.
 - **No hacer todavía:** instalar, adoptar externamente, push, PR, merge, deploy o release sin autorización exacta.
 - **Autoridad:** `authorizes=false`
