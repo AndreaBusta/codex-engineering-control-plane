@@ -46,7 +46,7 @@ los dos clones.
 |---|---|
 | Rama base | `main` |
 | Última release oficial | `v2.1.1` |
-| Candidato activo | `3.1.0-core.2`; `R1_OPEN / FINAL_EVIDENCE_PENDING`: recorte por procedencia, reseal y evidencia final pendientes |
+| Candidato activo | `3.1.0-core.2`; este documento no registra estado vivo: el cierre exige `R1_CLOSED_ON_FINAL_EVIDENCE` observado externamente en `origin/main` con CI verde |
 | `external_consumer_adoption` | `PROHIBITED` |
 | Autopilot | `OFF` |
 | Outcomes permitidos por Core | `answer` y `local_change`, nada más |
@@ -57,7 +57,7 @@ los dos clones.
 
 | Rama | Contenido | Estado |
 |---|---|---|
-| `codex/reconcile-core-3-1-core-2` | Reconciliación Core 3.1, Adoption Enablement y Stable Pause | `R1_OPEN`: WIP preservado en commit local `d901bb6c95377074a7fb2fb23762476547335969`; recorte por procedencia y evidencia final pendientes; sin push ni PR |
+| `codex/reconcile-core-3-1-core-2` | Reconciliación Core 3.1, Adoption Enablement y Stable Pause | WIP preservado en commit local `d901bb6c95377074a7fb2fb23762476547335969`; el recorte por procedencia y el reseal forman parte del snapshot candidato; el estado remoto se observa fuera de este documento |
 
 ### Hardening diferido por procedencia
 
@@ -174,6 +174,6 @@ git status --short --branch
 - **Rol:** relevo que llega sin historia.
 - **Para continuar:** consultar el contador vigente en el Goal o handoff nativos y ejecutar solo el siguiente intento disponible sobre el snapshot final.
 - **Mensaje exacto:** `Continúa R1 sobre codex/reconcile-core-3-1-core-2; verifica el delta recortado y usa el siguiente intento disponible registrado fuera de los bytes.`
-- **Estado de partida:** `R1_OPEN` sobre `3.1.0-core.2`; commit local de preservación `d901bb6`, commits locales autorizados y evidencia final pendiente.
+- **Estado de partida:** candidato `3.1.0-core.2`; este documento no registra estado vivo; consultar el Goal o handoff nativos antes de continuar. El commit local de preservación es `d901bb6` y los commits locales de R1 están autorizados.
 - **No hacer todavía:** instalar, adoptar externamente, push, PR, merge, deploy o release sin autorización exacta.
 - **Autoridad:** `authorizes=false`

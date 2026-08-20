@@ -19,7 +19,7 @@ declara entrada, salida, prueba y criterio de cierre.
 | Repositorio | `codex-engineering-control-plane` |
 | Remoto | `https://github.com/AndreaBusta/codex-engineering-control-plane.git` |
 | Base | `main`; reobservar su SHA exacto antes de abrir la fase |
-| Versión candidata | reconciliación `3.1.0-core.2`; `R1_OPEN`: reparaciones, prerevisiones frescas y evidencia final pendientes |
+| Versión candidata | reconciliación `3.1.0-core.2`; este plan no registra estado vivo: la fase permanece bloqueada hasta observar `R1_CLOSED_ON_FINAL_EVIDENCE` en `origin/main` con CI verde |
 | Suite | la evidencia previa no cierra R1; la última ejecución integral debe quedar verde sobre los bytes finales dentro de `max_gate_runs=6` |
 | Estrategia de integración | `squash` |
 | Superficie Advanced | en cuarentena estructural, no reactivar |

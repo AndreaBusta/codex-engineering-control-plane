@@ -1402,7 +1402,8 @@ class CoreDocumentationTests(unittest.TestCase):
         self.assertNotIn("3.1.0-core.1", specpack)
         self.assertIn("3.1.0-core.2", specpack)
         self.assertIn("R1_CLOSED_ON_FINAL_EVIDENCE", specpack)
-        self.assertIn(
+        self.assertIn("este plan no registra estado vivo", specpack)
+        self.assertNotIn(
             "reparaciones, prerevisiones frescas y evidencia final pendientes",
             specpack,
         )
@@ -1412,7 +1413,9 @@ class CoreDocumentationTests(unittest.TestCase):
         )
         self.assertIn("BLOCKED_ON_R1_FINAL_EVIDENCE", orientation)
         self.assertIn("codex/reconcile-core-3-1-core-2", orientation)
-        self.assertIn("R1_OPEN / FINAL_EVIDENCE_PENDING", orientation)
+        self.assertIn("este documento no registra estado vivo", orientation)
+        self.assertNotIn("R1_OPEN / FINAL_EVIDENCE_PENDING", orientation)
+        self.assertNotIn("recorte por procedencia y evidencia final pendientes", orientation)
         self.assertNotIn("Gate integral `395 OK`", orientation)
         self.assertNotIn("AE-09 pendiente", orientation)
         self.assertNotIn("protección de rama ausente", read(ALIGNMENT))
