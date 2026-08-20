@@ -210,10 +210,11 @@ supersedes ADR 0006.
 
 ## Rollback
 
-The candidate remains isolated in its own worktree. This runbook does not record
-live Git state or authority: reobserve worktree, branch, HEAD, base and native
-authorization before any rollback. Before stable adoption, the only local
-rollback is to stop using the exact candidate worktree. Do not delete or rewrite
+Before rollback, require one exact candidate worktree and prove its isolation.
+This runbook does not record live Git state or authority: reobserve worktree,
+branch, HEAD, base and native authorization before any rollback. Before stable
+adoption, the only local rollback is to stop using the exact candidate
+worktree. Do not delete or rewrite
 legacy JSON, installed runtimes, external repositories, or Git history to make
 the candidate appear clean.
 

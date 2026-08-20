@@ -1451,6 +1451,7 @@ class CoreDocumentationTests(unittest.TestCase):
                 "outside the 25-module Core runtime",
                 "origin/main@b07418364409f76c900f0595a76c9e3e388ac433",
                 "candidato local `3.1.0-core.2` sin commit",
+                "The candidate remains isolated in its own worktree",
             ):
                 self.assertNotIn(stale_contract, governing_document, governing_path)
         self.assertNotIn("Gate integral `395 OK`", orientation)
@@ -1542,6 +1543,7 @@ class CoreDocumentationTests(unittest.TestCase):
 
     def test_maintenance_runbook_is_fail_closed_and_time_bounded(self) -> None:
         content = read(MAINTENANCE)
+        content_flat = " ".join(content.split())
         for token in (
             "CoreTaskStateV1",
             "`answer`",
@@ -1567,7 +1569,7 @@ class CoreDocumentationTests(unittest.TestCase):
             "GREEN_LOCAL / PENDING_STABLE_ADOPTION",
             "reobserve worktree, branch, HEAD, base and native",
         ):
-            self.assertIn(token, content)
+            self.assertIn(token, content_flat)
         for command in (
             "run prepare",
             "run verify",
