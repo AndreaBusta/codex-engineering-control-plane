@@ -67,8 +67,13 @@ La prosa no sustituye a los gates, GitHub, CI ni al proveedor de release.
   merge están autorizados de forma permanente cuando los gates y CI estén en verde.
   A estos efectos, commit, push a una ref remota de trabajo no protegida y apertura o
   actualización del PR requieren los gates locales aplicables sobre los bytes actuales.
-  El merge exige reobservar base, target y HEAD exactos y que la CI requerida de ese SHA
-  esté verde, no ausente, omitida ni obsoleta.
+  Antes de push, apertura o actualización del PR o merge, reobserva mediante el host o
+  proveedor exactos el repositorio, las refs source y target, su protección y, cuando
+  exista, el estado y los checks del PR. Ausencia de evidencia, deriva o `UNKNOWN` detienen
+  la transición. La inexistencia confirmada de una ref remota de trabajo no protegida
+  permite solo crear esa ref exacta en el primer push; no prueba PR, checks ni merge.
+  El merge exige además que la CI requerida del HEAD exacto esté verde, no ausente,
+  omitida ni obsoleta.
   Esta autorización nace únicamente de la versión de `AGENTS.md` integrada en la base
   protegida; una edición no integrada no amplía la autoridad de su propia rama.
 - Deploy, release, publicación, instalación de dependencias, cambios de CI y manejo de
