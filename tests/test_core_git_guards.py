@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from control_plane import survey as survey_module
 from control_plane.git_guards import (
     _consume_validated_installed_policy,
     _protected_is_live,
@@ -204,21 +205,25 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
             updates=updates,
         )
 
-    def _survey_branch(self):
+    def _survey_branch(self, name: str | None = None):
+        branch_name = name or self.BRANCH
         survey = survey_repository(self.repo, base="origin/main")
         branches = {branch.name: branch for branch in survey.branches}
-        self.assertIn(self.BRANCH, branches)
-        return survey, branches[self.BRANCH]
+        self.assertIn(branch_name, branches)
+        return survey, branches[branch_name]
 
-    def test_pre_push_blocks_unique_unpublished_branch_on_passing_survey(
+    def test_pre_push_blocks_unique_unpublished_branch_on_failing_survey(
         self,
     ) -> None:
         self._create_unpublished_branch()
 
         survey, branch = self._survey_branch()
-        self.assertEqual(survey.status, "PASS")
-        self.assertEqual(branch.only_in_branch, 0)
+        self.assertEqual(survey.status, "FAIL")
+        self.assertEqual(branch.added_paths, 0)
         self.assertFalse(branch.content_equivalent_to_base)
+        self.assertTrue(branch.has_unique_commits)
+        self.assertFalse(branch.remote_tracking_ref_present)
+        self.assertTrue(branch.unpublished_unique)
 
         payload = self._guard([self._unrelated_update()])
 
@@ -238,8 +243,13 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
             common = self.repo / common
         (common / "shallow").write_text(f"{base}\n", encoding="ascii")
 
+        survey = survey_repository(self.repo, base="origin/main")
+        self.assertEqual(survey.status, "UNKNOWN")
+        self.assertEqual(survey.error_code, "E_SURVEY_INVENTORY")
+
         payload = self._guard([self._unrelated_update()])
 
+        self.assertFalse(payload["ok"])
         self.assertEqual(
             [error["code"] for error in payload["errors"]],
             ["GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN"],
@@ -285,6 +295,13 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
             base,
         )
         self.assertNotEqual(head, base)
+
+        survey, branch = self._survey_branch()
+        self.assertEqual(survey.status, "PASS")
+        self.assertFalse(branch.content_equivalent_to_base)
+        self.assertTrue(branch.has_unique_commits)
+        self.assertTrue(branch.remote_tracking_ref_present)
+        self.assertFalse(branch.unpublished_unique)
 
         payload = self._guard([self._unrelated_update()])
 
@@ -366,25 +383,27 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
             ["refs/remotes/origin/main"],
         )
 
-    def test_pre_push_allows_ahead_branch_with_base_equivalent_content(
+    def test_pre_push_allows_tree_equivalent_branch_after_squash(
         self,
     ) -> None:
         self._create_unpublished_branch()
-        (self.repo / "baseline.txt").write_text("baseline\n", encoding="utf-8")
-        git(self.repo, "add", "baseline.txt")
-        git(self.repo, "commit", "-m", "test: restore base content")
+        git(self.repo, "switch", "main")
+        git(self.repo, "merge", "--squash", self.BRANCH)
+        git(self.repo, "commit", "-m", "test: squash feature")
+        git(
+            self.repo,
+            "update-ref",
+            "refs/remotes/origin/main",
+            git(self.repo, "rev-parse", "HEAD"),
+        )
 
         survey, branch = self._survey_branch()
-        self.assertEqual(
-            git(
-                self.repo,
-                "rev-list",
-                "--count",
-                f"refs/remotes/origin/main..refs/heads/{self.BRANCH}",
-            ),
-            "2",
-        )
+        self.assertEqual(survey.status, "PASS")
+        self.assertEqual(branch.added_paths, 0)
         self.assertTrue(branch.content_equivalent_to_base)
+        self.assertTrue(branch.has_unique_commits)
+        self.assertFalse(branch.remote_tracking_ref_present)
+        self.assertFalse(branch.unpublished_unique)
 
         payload = self._guard([self._unrelated_update()])
 
@@ -608,6 +627,12 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
             "refs/heads/feature/contained",
             contained,
         )
+        survey, branch = self._survey_branch("feature/contained")
+        self.assertEqual(survey.status, "PASS")
+        self.assertFalse(branch.content_equivalent_to_base)
+        self.assertFalse(branch.has_unique_commits)
+        self.assertFalse(branch.remote_tracking_ref_present)
+        self.assertFalse(branch.unpublished_unique)
         commands: list[list[str]] = []
         real_run = subprocess.run
 
@@ -629,6 +654,29 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
 
     def test_pre_push_fails_closed_on_ambiguous_rev_list_output(self) -> None:
         self._create_unpublished_branch()
+        real_survey_text = survey_module._text
+
+        def ambiguous_survey_inventory(repo, arguments, *args, **kwargs):
+            if (
+                arguments
+                and arguments[0] == "for-each-ref"
+                and any(
+                    argument.startswith("--merged=")
+                    for argument in arguments
+                )
+            ):
+                return "ambiguous\noutput"
+            return real_survey_text(repo, arguments, *args, **kwargs)
+
+        with patch.object(
+            survey_module,
+            "_text",
+            side_effect=ambiguous_survey_inventory,
+        ):
+            survey = survey_repository(self.repo, base="origin/main")
+
+        self.assertEqual(survey.status, "UNKNOWN")
+        self.assertEqual(survey.error_code, "E_SURVEY_INVENTORY")
         real_run = subprocess.run
 
         def ambiguous_rev_list(*args, **kwargs):

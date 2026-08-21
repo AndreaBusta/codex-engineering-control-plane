@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 import subprocess
 import tempfile
@@ -251,6 +252,43 @@ def _remote_row(ref: str, head: str, kind: str = "commit") -> str:
 
 
 class RepositorySurveyTests(unittest.TestCase):
+    def test_survey_and_git_guards_do_not_import_each_other(self) -> None:
+        runtime = Path(__file__).parents[1] / "control_plane"
+        checks = (
+            (runtime / "survey.py", "git_guards"),
+            (runtime / "git_guards.py", "survey"),
+        )
+
+        for path, forbidden in checks:
+            with self.subTest(source=path.name, forbidden=forbidden):
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+                imports: set[str] = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        imports.update(alias.name for alias in node.names)
+                    elif isinstance(node, ast.ImportFrom):
+                        prefix = "." * node.level + (node.module or "")
+                        imports.add(prefix)
+                        separator = "" if prefix.endswith(".") else "."
+                        imports.update(
+                            f"{prefix}{separator}{alias.name}"
+                            for alias in node.names
+                        )
+                forbidden_imports = (
+                    forbidden,
+                    f".{forbidden}",
+                    f"control_plane.{forbidden}",
+                )
+                self.assertFalse(
+                    any(
+                        imported == target
+                        or imported.startswith(f"{target}.")
+                        for imported in imports
+                        for target in forbidden_imports
+                    ),
+                    f"{path.name} imports {forbidden}",
+                )
+
     def test_reports_clone_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             repository = _repository(Path(raw))
