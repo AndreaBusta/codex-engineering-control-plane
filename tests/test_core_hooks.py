@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import shlex
 import tempfile
 import unittest
 from unittest import mock
@@ -107,6 +109,152 @@ class CoreHookTests(unittest.TestCase):
                 separators=(",", ":"),
             ).encode()
         )
+
+        self.assertEqual(rendered, "")
+
+    def _assert_branch_deletion_commands_are_denied_by_default(
+        self, commands: tuple[str, ...]
+    ) -> None:
+        from control_plane.hooks import run_hook
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CODEX_CONTROL_PLANE_HOOK_MODE", None)
+                for command in commands:
+                    with self.subTest(command=command):
+                        rendered = run_hook(
+                            json.dumps(
+                                {
+                                    "hook_event_name": "PreToolUse",
+                                    "cwd": str(repo),
+                                    "tool_name": "Bash",
+                                    "tool_input": {"command": command},
+                                },
+                                separators=(",", ":"),
+                            ).encode(),
+                            expected_root=repo,
+                        )
+                        output = json.loads(rendered)["hookSpecificOutput"]
+
+                        self.assertEqual(
+                            output.get("permissionDecision"), "deny"
+                        )
+                        self.assertEqual(
+                            output.get("permissionDecisionReason"),
+                            "CONTROL_PLANE_SOFT_ENFORCE: "
+                            "destructive_command_requires_explicit_authority",
+                        )
+
+    def test_branch_deletion_commands_are_denied_by_default(self) -> None:
+        self._assert_branch_deletion_commands_are_denied_by_default(
+            (
+                "git branch -d feature/old",
+                "git branch -D feature/old",
+                "git push --delete origin feature/old",
+                "git push origin :refs/heads/feature/old",
+            )
+        )
+
+    def test_quoted_branch_deletion_commands_are_denied_by_default(self) -> None:
+        self._assert_branch_deletion_commands_are_denied_by_default(
+            (
+                "git branch -d 'feature/old'",
+                'git branch -D "feature/old"',
+                "git push --delete origin 'feature/old'",
+                "git push origin ':refs/heads/feature/old'",
+            )
+        )
+
+    def test_explicit_audit_keeps_branch_deletion_advisory(self) -> None:
+        from control_plane.hooks import run_hook
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_CONTROL_PLANE_HOOK_MODE": "audit"},
+                clear=False,
+            ):
+                rendered = run_hook(
+                    json.dumps(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "cwd": str(repo),
+                            "tool_name": "Bash",
+                            "tool_input": {
+                                "command": "git branch -D feature/old"
+                            },
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                    expected_root=repo,
+                )
+
+        output = json.loads(rendered)["hookSpecificOutput"]
+        self.assertIn("CONTROL PLANE RISK", output["additionalContext"])
+        self.assertNotIn("permissionDecision", output)
+
+    def test_invalid_hook_modes_fail_closed_to_soft_enforce(self) -> None:
+        from control_plane.hooks import run_hook
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            payload = json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "cwd": str(repo),
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "git branch -D feature/old"
+                    },
+                },
+                separators=(",", ":"),
+            ).encode()
+            for mode in ("", "typo", "SOFT-ENFORCE"):
+                with self.subTest(mode=mode), mock.patch.dict(
+                    os.environ,
+                    {"CODEX_CONTROL_PLANE_HOOK_MODE": mode},
+                    clear=False,
+                ):
+                    output = json.loads(
+                        run_hook(payload, expected_root=repo)
+                    )["hookSpecificOutput"]
+
+                    self.assertEqual(
+                        output.get("permissionDecision"), "deny"
+                    )
+                    self.assertEqual(
+                        output.get("permissionDecisionReason"),
+                        "CONTROL_PLANE_SOFT_ENFORCE: "
+                        "destructive_command_requires_explicit_authority",
+                    )
+
+    def test_closed_safe_read_rg_pattern_is_not_destructive(self) -> None:
+        from control_plane.hooks import run_hook
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            pattern = "needle git branch -D feature/old marker"
+            command = (
+                "scripts/control-plane safe-read --repo "
+                f"{shlex.quote(str(repo))} -- rg --no-config --quiet -e "
+                f"{shlex.quote(pattern)} -- README.md"
+            )
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CODEX_CONTROL_PLANE_HOOK_MODE", None)
+                rendered = run_hook(
+                    json.dumps(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "cwd": str(repo),
+                            "tool_name": "Bash",
+                            "tool_input": {"command": command},
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                    expected_root=repo,
+                )
 
         self.assertEqual(rendered, "")
 

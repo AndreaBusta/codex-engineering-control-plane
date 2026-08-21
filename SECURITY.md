@@ -62,6 +62,8 @@ un gate ni modifica la precedencia.
 | Oversharing tras compactación | `SessionStart(compact)` y manifiesto menor de 4 KiB sin prompt | test de presupuesto | otros hooks pueden añadir contexto |
 | Evidencia ausente parece éxito | `risk-status` separa `PASS`, `FAIL` y `UNKNOWN` | exit codes 0/1/2 + checks locales | observaciones externas pendientes |
 | Guard Git usa policy candidata mutable | snapshot content-addressed bajo Git common dir | manifest y digests instalados | operación fuera de los hooks instalados |
+| Un borrado de rama vuelve inalcanzable trabajo local | el hook distribuido parte en `soft-enforce` y deniega las formas reconocidas de `git branch -d/-D`, `git push --delete` y refspec de borrado | `destructive_command_requires_explicit_authority` | el hook sigue siendo cooperativo, pendiente de trust y no cubre clientes que lo omitan |
+| Un push ajeno deja trabajo único en una rama local sin ref remota propia | el pre-push inventaría como máximo 64 ramas, compara árboles, refs remotas locales exactas y reachability en tres procesos Git bajo un deadline agregado de cinco segundos | `GG_UNPUBLISHED_UNIQUE_BRANCH`; evidencia ambigua produce `GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN` | la existencia por nombre de `refs/remotes/...` exime aunque esté detrás y puede estar obsoleta respecto del servidor; contenido y frescura remotos requieren otra observación |
 | Perfil técnico mal clasificado | evidencia acotada, híbridos y fallback genérico | `project_profile` + tests por stack | estructura atípica sin marcadores |
 | Supply chain CI | stdlib, acciones por SHA y permisos read-only | contrato CI | runner o acción fijada comprometida |
 | Candidato local se presenta como estable | adopción externa prohibida y no self-certification | `GREEN_LOCAL / PENDING_STABLE_ADOPTION` | promoción humana incorrecta |
@@ -89,12 +91,15 @@ un gate ni modifica la precedencia.
 
 ## Hooks
 
-Los hooks se entregan en `audit`. Codex exige revisar y confiar su hash con
-`/hooks`; hasta entonces su estado es `pending_hook_trust` y pueden omitirse.
-Los hooks que pasan no imprimen nada, usan timeout de tres segundos, emiten como
-máximo 4 KiB y nunca persisten el prompt ni telemetría dogfood. Un hook no cubre
-hosted tools ni todos los caminos especializados, por lo que no es una frontera
-de seguridad. Cambiar una variable de entorno no promueve enforcement.
+El launcher distribuido de hooks parte en `soft-enforce`. Codex exige revisar y
+confiar su hash con `/hooks`; hasta entonces su estado es
+`pending_hook_trust` y puede omitirse. La API directa conserva un override
+exacto `audit` para callers controlados, pero el launcher cerrado limpia el
+entorno y una variable ambiental del host no puede degradarlo. Los hooks que
+pasan no imprimen nada, usan timeout de tres segundos, emiten como máximo 4 KiB
+y nunca persisten el prompt ni telemetría dogfood. Un hook no cubre hosted tools
+ni todos los caminos especializados, no autoriza efectos y no sustituye branch
+protection ni evidencia remota fresca.
 
 ## Credenciales y datos
 

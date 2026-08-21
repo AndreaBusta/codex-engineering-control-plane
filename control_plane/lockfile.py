@@ -350,8 +350,14 @@ def validate_lock(root: Path) -> list[LockIssue]:
         )
     if digests.get("runtime") != observed_runtime:
         issues.append(_issue("L_DIGEST", "runtime", "Locked runtime digest does not match."))
-    if lock.get("hook_mode") != "audit":
-        issues.append(_issue("L_HOOK_MODE", "hook_mode", "Core hooks must remain in audit mode."))
+    if lock.get("hook_mode") != "soft-enforce":
+        issues.append(
+            _issue(
+                "L_HOOK_MODE",
+                "hook_mode",
+                "Core hooks must default to soft-enforce mode.",
+            )
+        )
     if lock.get("hook_trust") != "pending_hook_trust":
         issues.append(
             _issue(

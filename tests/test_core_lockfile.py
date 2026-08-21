@@ -284,6 +284,8 @@ class CoreLockfileTests(unittest.TestCase):
         self.assertEqual(lock["runtime_layout"], "source")
         self.assertEqual(lock["runtime_package"], "control_plane")
         self.assertEqual(tuple(lock["runtime_modules"]), EXPECTED_CORE_MODULES)
+        self.assertEqual(lock["hook_mode"], "soft-enforce")
+        self.assertEqual(lock["hook_trust"], "pending_hook_trust")
 
     def test_repository_lock_matches_independent_digest_oracles(self) -> None:
         lock = tomllib.loads(

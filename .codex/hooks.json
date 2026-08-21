@@ -1,5 +1,5 @@
 {
-  "description": "Control Plane Core 3.1 audit-only hooks; authorizes=false and trust remains pending separate adoption.",
+  "description": "Control Plane Core 3.1 soft-enforce-by-default hooks; authorizes=false and trust remains pending separate adoption.",
   "hooks": {
     "UserPromptSubmit": [
       {

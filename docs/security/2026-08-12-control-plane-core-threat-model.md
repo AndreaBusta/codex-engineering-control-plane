@@ -111,6 +111,14 @@ Repository invariants:
     generation requires its exact release receipt. Output is canonical, at
     most 4096 bytes, excludes transcripts, full diffs, raw tool output, secrets
     and personal data, and always has `authorizes=false`.
+13. The distributed hook launcher defaults to `soft-enforce` but remains
+    `pending_hook_trust`, cooperative and non-authorizing. Recognized local and
+    remote branch-deletion commands are denied. Before a push, the installed
+    Git guard inventories at most 64 local branches, observes only exact local
+    remote-tracking refs and evaluates all remaining candidates with one
+    aggregate reachability query. The loss check uses at most three closed Git
+    subprocesses under one five-second deadline; ambiguity is
+    `GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN`, never PASS.
 
 ## Attack Surface, Mitigations, and Attacker Stories
 
@@ -118,6 +126,8 @@ Repository invariants:
 |---|---|---|
 | A prompt or document says it authorizes commit, install, push, or release | Confused-deputy external effect | Closed outcomes, policy gates, `authorizes=false`, and no active external executor; a compromised host remains outside the model. |
 | A package file is added after the digest is computed | Unreviewed code imports into Core | Exact runtime allowlist and digest before import; filesystem mutation after validation remains residual. |
+| a branch deletion removes the last reachable name for local work | A squash merge plus automatic branch deletion makes an unpushed preservation commit unreachable | The default distributed hook denies recognized `git branch -d/-D`, `git push --delete` and deleting refspecs; the hook is cooperative and can be omitted by another client. |
+| an unrelated push proceeds while another local branch has unique work and no same-name local remote-tracking ref | Later cleanup or automatic remote-branch deletion loses the only useful copy | The pre-push guard compares exact head/tree evidence, exact local remote-tracking ref names and aggregate reachability, permits the exact publishing ref+OID, and otherwise returns `GG_UNPUBLISHED_UNIQUE_BRANCH`; a same-name tracking ref is an explicit exemption even when behind, while unknown or over-budget evidence fails closed. |
 | A task or lease is replayed in another worktree, branch, session, policy, or revision | Wrong-subject write | Immutable bindings, state digests, generation checks, and atomic compensation. |
 | Two Core verifiers or writers start together | Duplicate full suite or overlapping edits | Nonblocking verification mutex and scoped generational Core leases. |
 | A same-UID v2.1 writer starts after Core inventories legacy state | Overlapping legacy/Core edits | Active observed legacy state fails closed. There is no bilateral lock: the orchestrating host must not run legacy and Core writers concurrently; external adoption remains prohibited. |
@@ -199,7 +209,17 @@ authority, project bytes, or external state.
 - Stable Pause cannot exclude same-UID/filesystem compromise after the last
   descriptor check or non-cooperating external writers that ignore its lock
   domains. It is an observation, not an OS freeze.
-- Hooks remain advisory and may be skipped or coexist with other hooks.
+- Hooks default to `soft-enforce` in the distributed launcher but remain
+  cooperative, `pending_hook_trust`, bypassable by clients that do not invoke
+  them, and may coexist with other hooks. They are not branch protection.
+- The unpublished-branch guard binds the local `refs/remotes/<remote>/...`
+  inventory by name, not containment of the local HEAD or current server
+  state. A behind or stale tracking ref can overstate preservation until a
+  separate authenticated remote observation refreshes it; same-UID ref
+  mutation after the final observation remains TOCTOU.
+- More than 64 local branches or an aggregate observation longer than five
+  seconds returns `GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN`. This is a bounded
+  safety stop, not evidence that work is unpublished.
 - Existing installed and legacy generations may need their owning stable
   runtime for safe closure; Core deliberately will not resume them.
 - A same-UID legacy runtime can start after Core's bounded inventory because
@@ -219,7 +239,8 @@ authority, project bytes, or external state.
   handling, detached-worktree substitution, discovery-to-walk TOCTOU,
   newline-bearing paths, APFS case-equivalent Git markers, canonical lock
   completeness, redirected `.git/config` writes, linked-worktree rollback
-  inventory and add-only branch-equivalence guidance. They remain
+  inventory, the top-level `orphan_work` meaning, and the add-only
+  `only_in_branch` field whose name does not describe commits. They remain
   non-authorizing local risks; external consumer adoption stays prohibited
   until a later bounded front closes or explicitly accepts them.
 - The snapshot binds immutable anchor
@@ -235,4 +256,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:4c1f0338a011e57560a60066bb663e0040049f322b474eb887d67bc3bf3d2c56
+Version: codex-security-snapshot/v1:sha256:e7e877e33de103aa3234e5927410eaa34bc69ed7d8c0d806c80f0d70fe9004ee
