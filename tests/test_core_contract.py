@@ -38,6 +38,10 @@ class CoreContractTests(unittest.TestCase):
             for module in ACTIVE_RUNTIME_MODULES
         )
         self.assertLessEqual(active_lines, 21_530)
+        survey_lines = (ROOT / "control_plane" / "survey.py").read_text(
+            encoding="utf-8"
+        ).count("\n") + 1
+        self.assertLessEqual(survey_lines, 450)
 
     def test_active_runtime_has_no_advanced_import_edge(self) -> None:
         active_stems = {Path(name).stem for name in ACTIVE_RUNTIME_MODULES}

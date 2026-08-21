@@ -165,10 +165,14 @@ def _git_text(
         ) from error
 
 
-def _is_shallow_repository(repo: Path) -> bool:
+def _is_shallow_repository(repo: Path, *, timeout: float = 5.0) -> bool:
     """Return Git's exact shallow state, failing closed on ambiguity."""
 
-    value = _git_text(repo, ["rev-parse", "--is-shallow-repository"])
+    value = _git_text(
+        repo,
+        ["rev-parse", "--is-shallow-repository"],
+        timeout=timeout,
+    )
     if value == "true":
         return True
     if value == "false":
@@ -883,6 +887,16 @@ def _unpublished_branch_errors(
             candidate_refs.append(local_ref)
         if not candidate_refs:
             return []
+
+        try:
+            shallow = _is_shallow_repository(
+                repo,
+                timeout=_remaining_unpublished_branch_budget(deadline),
+            )
+        except ValueError:
+            return [unknown]
+        if shallow:
+            return [unknown]
 
         unique_commit = _git_text(
             repo,

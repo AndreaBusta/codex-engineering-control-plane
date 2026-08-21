@@ -228,6 +228,23 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
             ["GG_UNPUBLISHED_UNIQUE_BRANCH"],
         )
 
+    def test_pre_push_reports_unknown_for_shallow_unpublished_reachability(
+        self,
+    ) -> None:
+        self._create_unpublished_branch()
+        base = git(self.repo, "rev-parse", "refs/remotes/origin/main")
+        common = Path(git(self.repo, "rev-parse", "--git-common-dir"))
+        if not common.is_absolute():
+            common = self.repo / common
+        (common / "shallow").write_text(f"{base}\n", encoding="ascii")
+
+        payload = self._guard([self._unrelated_update()])
+
+        self.assertEqual(
+            [error["code"] for error in payload["errors"]],
+            ["GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN"],
+        )
+
     def test_pre_push_accepts_valid_git_branch_names(self) -> None:
         for branch in (
             "feature/c++",
@@ -490,7 +507,7 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
         )
         self.assertFalse(any("rev-list" in command for command in commands))
 
-    def test_pre_push_batches_unique_commit_observation_in_three_processes(
+    def test_pre_push_batches_unique_commit_observation_in_four_processes(
         self,
     ) -> None:
         for index in range(3):
@@ -518,15 +535,27 @@ class CoreGitGuardUnpublishedBranchTests(unittest.TestCase):
             2,
         )
         self.assertEqual(
+            sum(
+                "rev-parse" in command
+                and "--is-shallow-repository" in command
+                for command in commands
+            ),
+            1,
+        )
+        self.assertEqual(
             sum("rev-list" in command for command in commands),
             1,
         )
         observation_commands = [
             command
             for command in commands
-            if "for-each-ref" in command or "rev-list" in command
+            if (
+                "for-each-ref" in command
+                or "--is-shallow-repository" in command
+                or "rev-list" in command
+            )
         ]
-        self.assertLessEqual(len(observation_commands), 3)
+        self.assertLessEqual(len(observation_commands), 4)
         rev_list = next(
             command for command in observation_commands if "rev-list" in command
         )

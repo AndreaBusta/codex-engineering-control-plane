@@ -27,6 +27,16 @@ _CORE_STATES = (
 )
 _QUARANTINED = "E_CAPABILITY_QUARANTINED"
 _JSON_INPUT_MAX_BYTES = 1_048_576
+_SURVEY_CONTEXT_MAX_CHARS = 1_024
+_SURVEY_ERROR_CODES = frozenset(
+    {
+        "E_SURVEY_BASE_UNKNOWN",
+        "E_SURVEY_INVENTORY",
+        "E_SURVEY_LIMIT",
+        "E_SURVEY_REMOTE_UNKNOWN",
+    }
+)
+_SURVEY_ERROR_MESSAGE = "Survey observation could not be completed."
 
 
 class _StoreOnce(argparse.Action):
@@ -127,11 +137,12 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _render_human(payload: Mapping[str, Any]) -> str:
     command = str(payload.get("command", "control-plane"))
-    if command in {"risk-status", "survey"} and payload.get("status") in {
-        "PASS",
-        "FAIL",
-        "UNKNOWN",
-    }:
+    status = payload.get("status")
+    if (
+        command == "risk-status" and status in {"PASS", "FAIL", "UNKNOWN"}
+    ) or (
+        command == "survey" and status in {"PASS", "WARN", "FAIL", "UNKNOWN"}
+    ):
         lines = [f"{payload['status']} {command}"]
     else:
         diagnostic = (
@@ -176,9 +187,12 @@ def _emit(payload: dict[str, Any], as_json: bool) -> int:
     )
     if payload.get("error_code") == _QUARANTINED:
         return 2
+    if payload.get("command") == "survey":
+        survey_exit = {"PASS": 0, "FAIL": 1, "UNKNOWN": 2, "WARN": 3}
+        status = payload.get("status")
+        if status in survey_exit:
+            return survey_exit[status]
     if payload.get("command") == "risk-status" and payload.get("status") == "UNKNOWN":
-        return 2
-    if payload.get("command") == "survey" and payload.get("status") == "UNKNOWN":
         return 2
     return 0 if payload.get("ok") else 1
 
@@ -386,32 +400,122 @@ def command_inventory(arguments: argparse.Namespace) -> int:
 
 
 
+def _bounded_survey_context(value: Any) -> str:
+    if type(value) is str and len(value) <= _SURVEY_CONTEXT_MAX_CHARS:
+        return value
+    return "UNKNOWN"
+
+
+def _survey_error_code(error: BaseException) -> str:
+    candidate: str | None = None
+    if error.args:
+        first = error.args[0]
+        if type(first) is str and len(first) <= _SURVEY_CONTEXT_MAX_CHARS:
+            candidate = first.split(":", 1)[0]
+    return candidate if candidate in _SURVEY_ERROR_CODES else "E_SURVEY_INVENTORY"
+
+
+def _survey_failure(
+    arguments: argparse.Namespace, error: BaseException,
+) -> dict[str, Any]:
+    requested = arguments.repo
+    root = str(requested) if isinstance(requested, Path) else "UNKNOWN"
+    base = _bounded_survey_context(arguments.base)
+    remote = _bounded_survey_context(arguments.remote)
+    error_code = _survey_error_code(error)
+    return {
+        "schema_version": 2,
+        "kind": "RepositorySurveyV2",
+        "comparison": {
+            "base_ref": base,
+            "base_head": None,
+            "remote_name": remote,
+        },
+        "clone": {
+            "root": root,
+            "common_git_dir": None,
+            "branch": None,
+            "head": None,
+        },
+        "worktrees": None,
+        "branches": None,
+        "orphan_work": {
+            "stashes": None,
+            "untracked_total": None,
+            "unpublished_unique_branches": None,
+        },
+        "other_clones": "UNKNOWN",
+        "command": "survey",
+        "ok": False,
+        "status": "UNKNOWN",
+        "error_code": error_code,
+        "facts": {
+            "branch": "UNKNOWN",
+            "worktrees": "UNKNOWN",
+            "worktrees_dirty": "UNKNOWN",
+            "branches": "UNKNOWN",
+            "branches_content_equivalent": "UNKNOWN",
+            "orphan_stashes": "UNKNOWN",
+            "orphan_untracked": "UNKNOWN",
+            "orphan_unpublished_unique_branches": "UNKNOWN",
+            "other_clones": "UNKNOWN",
+        },
+        "errors": [{"code": error_code, "message": _SURVEY_ERROR_MESSAGE}],
+        "authorizes": False,
+    }
+
+
 def command_survey(arguments: argparse.Namespace) -> int:
     from control_plane.survey import survey_payload, survey_repository
 
     try:
-        observed = survey_repository(Path(arguments.repo), base=arguments.base)
+        observed = survey_repository(
+            Path(arguments.repo),
+            base=arguments.base,
+            remote_name=arguments.remote,
+        )
+        payload = survey_payload(observed)
+        worktrees = observed.worktrees
+        branches = observed.branches
+        payload.update(
+            {
+                "command": "survey",
+                "ok": observed.status == "PASS",
+                "facts": {
+                    "branch": observed.branch
+                    if observed.branch is not None
+                    else "UNKNOWN",
+                    "worktrees": len(worktrees)
+                    if worktrees is not None
+                    else "UNKNOWN",
+                    "worktrees_dirty": sum(1 for item in worktrees if item.dirty)
+                    if worktrees is not None
+                    else "UNKNOWN",
+                    "branches": len(branches)
+                    if branches is not None
+                    else "UNKNOWN",
+                    "branches_content_equivalent": sum(
+                        1 for item in branches if item.content_equivalent_to_base
+                    )
+                    if branches is not None
+                    else "UNKNOWN",
+                    "orphan_stashes": observed.stashes
+                    if observed.stashes is not None
+                    else "UNKNOWN",
+                    "orphan_untracked": observed.untracked_total
+                    if observed.untracked_total is not None
+                    else "UNKNOWN",
+                    "orphan_unpublished_unique_branches": (
+                        observed.unpublished_unique_branches
+                        if observed.unpublished_unique_branches is not None
+                        else "UNKNOWN"
+                    ),
+                    "other_clones": "UNKNOWN",
+                },
+            }
+        )
     except Exception as error:  # noqa: BLE001 - surfaced as a closed payload
-        return _emit(_failure("survey", error), arguments.json)
-    payload = survey_payload(observed)
-    payload.update(
-        {
-            "command": "survey",
-            "ok": observed.status == "PASS",
-            "facts": {
-                "branch": observed.branch,
-                "worktrees": len(observed.worktrees),
-                "worktrees_dirty": sum(1 for item in observed.worktrees if item.dirty),
-                "branches": len(observed.branches),
-                "branches_content_equivalent": sum(
-                    1 for item in observed.branches if item.content_equivalent_to_base
-                ),
-                "orphan_stashes": observed.stashes,
-                "orphan_untracked": observed.untracked_total,
-                "other_clones": "UNKNOWN",
-            },
-        }
-    )
+        payload = _survey_failure(arguments, error)
     return _emit(payload, arguments.json)
 
 
@@ -1101,6 +1205,7 @@ def build_parser() -> argparse.ArgumentParser:
     survey = commands.add_parser("survey")
     survey.add_argument("--repo", type=Path, default=Path.cwd())
     survey.add_argument("--base", default="origin/main")
+    survey.add_argument("--remote", default="origin")
     _output(survey)
     survey.set_defaults(handler=command_survey)
 
