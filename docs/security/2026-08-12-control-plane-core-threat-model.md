@@ -116,8 +116,16 @@ Repository invariants:
     remote branch-deletion commands are denied. Before a push, the installed
     Git guard inventories at most 64 local branches, observes only exact local
     remote-tracking refs and evaluates all remaining candidates with one
-    aggregate reachability query. The loss check uses at most three closed Git
-    subprocesses under one five-second deadline; ambiguity is
+    aggregate reachability query. `RepositorySurveyV2` and the guard share the
+    tree-difference, unique-reachability and homonymous-local-ref predicate;
+    Survey fixes base and branch commit/tree OIDs and freezes normative status
+    before optional enrichment. Local remote-tracking refs can be stale and
+    other clones remain `UNKNOWN`, so neither path is remote proof.
+    Shallow reachability is untrusted. After tree, remote-ref and exact-publication
+    filtering leaves a candidate, the guard's candidate-only shallow check
+    consumes only the remaining time in the existing five-second deadline; it
+    adds no second budget. The loss check uses at most four closed Git
+    subprocesses under that deadline; ambiguity is
     `GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN`, never PASS.
 
 ## Attack Surface, Mitigations, and Attacker Stories
@@ -128,6 +136,10 @@ Repository invariants:
 | A package file is added after the digest is computed | Unreviewed code imports into Core | Exact runtime allowlist and digest before import; filesystem mutation after validation remains residual. |
 | a branch deletion removes the last reachable name for local work | A squash merge plus automatic branch deletion makes an unpushed preservation commit unreachable | The default distributed hook denies recognized `git branch -d/-D`, `git push --delete` and deleting refspecs; the hook is cooperative and can be omitted by another client. |
 | an unrelated push proceeds while another local branch has unique work and no same-name local remote-tracking ref | Later cleanup or automatic remote-branch deletion loses the only useful copy | The pre-push guard compares exact head/tree evidence, exact local remote-tracking ref names and aggregate reachability, permits the exact publishing ref+OID, and otherwise returns `GG_UNPUBLISHED_UNIQUE_BRANCH`; a same-name tracking ref is an explicit exemption even when behind, while unknown or over-budget evidence fails closed. |
+| a stale local remote-tracking ref is treated as remote proof | Survey or the guard overstates preservation after the server ref changed or disappeared | Both surfaces label the ref inventory local-only and retain the stale-ref residual; authenticated remote observation remains separate and absence of it proves no server state. |
+| a wrapper collapses `WARN` into `PASS` or `FAIL` | Local residue is either ignored or presented as the critical unpublished-branch signal | The closed mapping preserves `PASS=0`, `FAIL=1`, `UNKNOWN=2`, `WARN=3`; in WARN, `WARN=3` and `ok=false` remain explicit while FAIL retains the branch-loss meaning. |
+| optional `added_paths` is treated as mandatory evidence | A best-effort timeout erases a complete preservation verdict or invents zero added paths | Tree, reachability and remote-ref inventory are mandatory; normative status is frozen before optional `added_paths` enrichment, and any incomplete add-only count is `null` without changing status or `error_code`. |
+| a mutable base ref is substituted between observations | Branch equality and reachability are calculated against different bases | Survey resolves fixed base commit and tree OIDs before inventory, uses those OIDs throughout, validates the frozen local map again before deriving status and fails closed on drift. |
 | A task or lease is replayed in another worktree, branch, session, policy, or revision | Wrong-subject write | Immutable bindings, state digests, generation checks, and atomic compensation. |
 | Two Core verifiers or writers start together | Duplicate full suite or overlapping edits | Nonblocking verification mutex and scoped generational Core leases. |
 | A same-UID v2.1 writer starts after Core inventories legacy state | Overlapping legacy/Core edits | Active observed legacy state fails closed. There is no bilateral lock: the orchestrating host must not run legacy and Core writers concurrently; external adoption remains prohibited. |
@@ -238,11 +250,10 @@ authority, project bytes, or external state.
   execution and output/resource bounds, submodule/Gitlink and object-alternate
   handling, detached-worktree substitution, discovery-to-walk TOCTOU,
   newline-bearing paths, APFS case-equivalent Git markers, canonical lock
-  completeness, redirected `.git/config` writes, linked-worktree rollback
-  inventory, the top-level `orphan_work` meaning, and the add-only
-  `only_in_branch` field whose name does not describe commits. They remain
-  non-authorizing local risks; external consumer adoption stays prohibited
-  until a later bounded front closes or explicitly accepts them.
+  completeness, writes redirected through a symlinked `.git/config`, and
+  linked-worktree rollback inventory. They remain non-authorizing local risks;
+  external consumer adoption stays prohibited until a later bounded front
+  closes or explicitly accepts them.
 - The snapshot binds immutable anchor
   `929d3f8a0656fed190bb65ceb3a29deef8de07d6`, its canonical final tracked
   overlay, non-ignored untracked regular files excluding this threat-model
@@ -256,4 +267,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:25da4a797145ed083c0833d2bfed672812077130a124b7b2b702317f854f9cf3
+Version: codex-security-snapshot/v1:sha256:fc5125fc64154a8a7c0368569f9af109669c8ec4d11e244acf8ad6ba4d4c3666

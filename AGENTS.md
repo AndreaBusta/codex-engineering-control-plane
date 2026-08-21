@@ -154,7 +154,12 @@ Para una referencia exacta `codex://threads/<UUID>`, usa solo la lectura nativa 
 - `git worktree list` solo ve los worktrees de su propio clon. No afirmes nada
   global sobre el repositorio desde un único checkout.
 - Bajo `squash`, toda rama fusionada parece adelantada. Compara contenido con
-  `git diff --diff-filter=A --name-only origin/main..<rama>`, no commits.
+  OIDs fijados mediante
+  `git diff --quiet <fixed-base-oid>..<fixed-branch-oid>` o compara directamente
+  sus tree OIDs; no uses el número de commits. Reserva
+  `git diff --diff-filter=A --name-only <fixed-base-oid>..<fixed-branch-oid>`
+  únicamente para enriquecer el campo informativo y nullable `added_paths`;
+  una lista add-only nunca demuestra equivalencia.
 
 ## Seguridad
 

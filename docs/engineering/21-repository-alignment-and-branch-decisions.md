@@ -74,12 +74,29 @@ clones.
 
 ## Prueba aplicada a cada rama
 
-Comparar commits induce a error bajo `squash`. La prueba usada aquí es de
-contenido: qué archivos existen en la rama y no existen en `origin/main`.
+Comparar commits induce a error bajo `squash`. La prueba operativa de
+equivalencia fija primero los OIDs de base y rama y exige exit 0 de:
 
 ```bash
-git diff --diff-filter=A --name-only origin/main..<rama>
+git diff --quiet <fixed-base-oid>..<fixed-branch-oid>
 ```
+
+Comparar directamente los dos tree OIDs fijados es equivalente. El listado
+add-only se conserva solo como enriquecimiento forense de `RepositorySurveyV2`:
+
+```bash
+git diff --diff-filter=A --name-only <fixed-base-oid>..<fixed-branch-oid>
+```
+
+Ese resultado alimenta únicamente el campo informativo y nullable
+`added_paths`; no prueba equivalencia, reachability ni publicación. V2 deriva
+`unpublished_unique` de tree distinto, commits exclusivos y ausencia probada de
+la ref remota local homónima. Las refs remotas locales pueden estar obsoletas,
+`other_clones=UNKNOWN` limita el resultado al clon seleccionado y ninguna de
+esas observaciones constituye prueba remota.
+
+Los exits actuales separan `PASS=0`, `FAIL=1`, `UNKNOWN=2` y `WARN=3`.
+`added_paths=null` conserva el estado normativo ya calculado.
 
 ## Hallazgo determinante
 
@@ -185,9 +202,11 @@ porque el mismo procedimiento sirve para la próxima limpieza. Estas transicione
 son externas y destructivas: no se ejecutan sin autorización explícita para cada
 una. El orden importa: primero se preserva, después se borra.
 
-Resultado, verificado por `survey`: `PASS`, cero stashes, cero archivos sin
-rastrear, cero worktrees sucios. Ramas remotas reducidas a `main` más las dos
-líneas activas. Todo lo retirado sigue alcanzable por etiqueta:
+Resultado histórico, verificado entonces por `RepositorySurveyV1`: `PASS`,
+cero stashes, cero archivos sin rastrear y cero worktrees sucios. Esa evidencia
+no satisface por sí sola el predicado `unpublished_unique` de V2 ni prueba el
+estado actual del servidor. Ramas remotas reducidas entonces a `main` más las
+dos líneas activas. Todo lo retirado sigue alcanzable por etiqueta:
 
 | Etiqueta | Contenido preservado |
 |---|---|
@@ -269,7 +288,8 @@ git branch -D codex/control-plane-v2-3 codex/control-plane-v2-4 codex/control-pl
 ```
 
 Se usa `-D` y no `-d` porque `squash` impide que Git reconozca la fusión.
-La equivalencia de contenido ya quedó probada arriba, no la asume Git.
+La equivalencia de contenido debe quedar probada antes con los OIDs fijados y
+el `git diff --quiet` anterior; Git no la infiere de la historia.
 
 ### 5. Borrar ramas remotas
 

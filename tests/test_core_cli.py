@@ -149,13 +149,18 @@ def run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def run_cli_in_process(*arguments: str) -> tuple[int, dict]:
+def run_cli_output_in_process(*arguments: str) -> tuple[int, str]:
     from control_plane.cli import main
 
     output = io.StringIO()
     with redirect_stdout(output):
         return_code = main(arguments)
-    return return_code, json.loads(output.getvalue())
+    return return_code, output.getvalue()
+
+
+def run_cli_in_process(*arguments: str) -> tuple[int, dict]:
+    return_code, output = run_cli_output_in_process(*arguments)
+    return return_code, json.loads(output)
 
 
 def tree_snapshot(root: Path) -> tuple[tuple[str, bytes], ...]:
@@ -661,32 +666,386 @@ class CoreCliTests(unittest.TestCase):
                     self.assertEqual(completed.returncode, 0, completed.stderr)
                     self.assertEqual(completed.stdout.strip(), "E_JSON_INPUT")
 
-    def test_survey_command_exit_codes_and_payload(self) -> None:
+    def _assert_closed_survey_unknown(
+        self,
+        payload: dict,
+        *,
+        root: str,
+        base: str = "HEAD",
+        remote: str = "origin",
+        error_code: str = "E_SURVEY_INVENTORY",
+    ) -> None:
+        self.assertEqual(
+            payload,
+            {
+                "schema_version": 2,
+                "kind": "RepositorySurveyV2",
+                "comparison": {
+                    "base_ref": base,
+                    "base_head": None,
+                    "remote_name": remote,
+                },
+                "clone": {
+                    "root": root,
+                    "common_git_dir": None,
+                    "branch": None,
+                    "head": None,
+                },
+                "worktrees": None,
+                "branches": None,
+                "orphan_work": {
+                    "stashes": None,
+                    "untracked_total": None,
+                    "unpublished_unique_branches": None,
+                },
+                "other_clones": "UNKNOWN",
+                "command": "survey",
+                "ok": False,
+                "status": "UNKNOWN",
+                "error_code": error_code,
+                "facts": {
+                    "branch": "UNKNOWN",
+                    "worktrees": "UNKNOWN",
+                    "worktrees_dirty": "UNKNOWN",
+                    "branches": "UNKNOWN",
+                    "branches_content_equivalent": "UNKNOWN",
+                    "orphan_stashes": "UNKNOWN",
+                    "orphan_untracked": "UNKNOWN",
+                    "orphan_unpublished_unique_branches": "UNKNOWN",
+                    "other_clones": "UNKNOWN",
+                },
+                "errors": [
+                    {
+                        "code": error_code,
+                        "message": "Survey observation could not be completed.",
+                    }
+                ],
+                "authorizes": False,
+            },
+        )
+
+    def _assert_closed_survey_output(
+        self,
+        return_code: int,
+        output: str,
+        *,
+        as_json: bool,
+        root: str,
+        error_code: str = "E_SURVEY_INVENTORY",
+        forbidden: tuple[str, ...] = (),
+    ) -> None:
+        self.assertEqual(return_code, 2)
+        self.assertNotIn("RepositorySurveyV1", output)
+        for text in forbidden:
+            self.assertNotIn(text, output)
+        if as_json:
+            self._assert_closed_survey_unknown(
+                json.loads(output), root=root, error_code=error_code
+            )
+        else:
+            self.assertTrue(output.startswith("UNKNOWN survey\n"), output)
+            self.assertIn(
+                f"ERROR {error_code}: Survey observation could not be completed.",
+                output,
+            )
+
+    def test_survey_command_v2_states_exits_payload_and_human_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = make_repo(Path(directory) / "repo")
+            root = Path(directory)
+            repositories = {
+                status: make_repo(root / status.lower())
+                for status in ("PASS", "WARN", "FAIL", "UNKNOWN")
+            }
+            for repository in repositories.values():
+                git(repository, "remote", "add", "origin", str(repository))
+
+            (repositories["WARN"] / "orphan.md").write_text(
+                "only here\n", encoding="utf-8"
+            )
+            fail_repo = repositories["FAIL"]
+            git(fail_repo, "switch", "-qc", "unpublished")
+            (fail_repo / "README.md").write_text("unique\n", encoding="utf-8")
+            git(fail_repo, "commit", "-qam", "unique")
+            git(fail_repo, "switch", "codex/core-test")
+
+            cases = (
+                ("PASS", 0, "HEAD"),
+                ("WARN", 3, "HEAD"),
+                ("FAIL", 1, "HEAD"),
+                ("UNKNOWN", 2, "missing-base"),
+            )
+            for status, expected_exit, base in cases:
+                repository = repositories[status]
+                for as_json in (True, False):
+                    with self.subTest(status=status, json=as_json):
+                        arguments = [
+                            "survey",
+                            "--repo",
+                            str(repository),
+                            "--base",
+                            base,
+                        ]
+                        if as_json:
+                            arguments.append("--json")
+                        return_code, output = run_cli_output_in_process(*arguments)
+                        self.assertEqual(return_code, expected_exit)
+                        self.assertNotIn("RepositorySurveyV1", output)
+                        if not as_json:
+                            self.assertTrue(
+                                output.startswith(f"{status} survey\n"), output
+                            )
+                            continue
+                        payload = json.loads(output)
+                        self.assertEqual(payload["kind"], "RepositorySurveyV2")
+                        self.assertEqual(payload["status"], status)
+                        self.assertIs(payload["ok"], status == "PASS")
+                        self.assertIs(payload["authorizes"], False)
+                        if status == "PASS":
+                            self.assertTrue(payload["ok"])
+                        elif status == "WARN":
+                            self.assertFalse(payload["ok"])
+                            self.assertEqual(
+                                payload["orphan_work"]["untracked_total"], 1
+                            )
+                        elif status == "FAIL":
+                            self.assertEqual(
+                                payload["facts"][
+                                    "orphan_unpublished_unique_branches"
+                                ],
+                                1,
+                            )
+                        else:
+                            self.assertEqual(
+                                payload["facts"],
+                                {
+                                    "branch": "UNKNOWN",
+                                    "worktrees": "UNKNOWN",
+                                    "worktrees_dirty": "UNKNOWN",
+                                    "branches": "UNKNOWN",
+                                    "branches_content_equivalent": "UNKNOWN",
+                                    "orphan_stashes": "UNKNOWN",
+                                    "orphan_untracked": "UNKNOWN",
+                                    "orphan_unpublished_unique_branches": "UNKNOWN",
+                                    "other_clones": "UNKNOWN",
+                                },
+                            )
+                            self.assertEqual(
+                                payload["error_code"], "E_SURVEY_BASE_UNKNOWN"
+                            )
+
+            pass_repo = repositories["PASS"]
+            git(pass_repo, "remote", "add", "upstream", str(pass_repo))
+            self.assertEqual(
+                git(pass_repo, "remote", "get-url", "upstream"), str(pass_repo)
+            )
             return_code, payload = run_cli_in_process(
-                "survey", "--repo", str(repo), "--base", "HEAD", "--json"
+                "survey",
+                "--repo",
+                str(pass_repo),
+                "--base",
+                "HEAD",
+                "--remote",
+                "upstream",
+                "--json",
             )
             self.assertEqual(return_code, 0)
-            self.assertEqual(payload["kind"], "RepositorySurveyV1")
-            self.assertEqual(payload["other_clones"], "UNKNOWN")
-            self.assertIs(payload["authorizes"], False)
-            self.assertTrue(payload["clone"]["branch"])
-            self.assertEqual(len(payload["clone"]["head"]), 40)
+            self.assertEqual(payload["comparison"]["remote_name"], "upstream")
 
-            (repo / "orphan.md").write_text("only here\n", encoding="utf-8")
-            return_code, payload = run_cli_in_process(
-                "survey", "--repo", str(repo), "--base", "HEAD", "--json"
-            )
-            self.assertEqual(return_code, 1)
-            self.assertEqual(payload["orphan_work"]["untracked_total"], 1)
+    def test_survey_repository_exceptions_are_closed_v2_and_redacted(self) -> None:
+        class Unstringable:
+            def __str__(self) -> str:
+                raise AssertionError("exception argument was coerced")
 
-            return_code, payload = run_cli_in_process(
-                "survey", "--repo", str(repo), "--base", "nope", "--json"
+        requested = Path("lexical") / ".." / "requested"
+        oversized = "E_SURVEY_LIMIT:" + ("secret-suffix-" * 100)
+        faults = (
+            (
+                ValueError("E_SURVEY_INVENTORY: induced"),
+                "E_SURVEY_INVENTORY",
+                ("induced",),
+            ),
+            (
+                RuntimeError("attacker-controlled text without a code"),
+                "E_SURVEY_INVENTORY",
+                ("attacker-controlled",),
+            ),
+            (
+                RuntimeError(oversized),
+                "E_SURVEY_INVENTORY",
+                ("secret-suffix",),
+            ),
+            (RuntimeError(Unstringable()), "E_SURVEY_INVENTORY", ()),
+        )
+        for error, expected_code, forbidden in faults:
+            for as_json in (True, False):
+                with self.subTest(error=type(error).__name__, json=as_json):
+                    arguments = [
+                        "survey",
+                        "--repo",
+                        str(requested),
+                        "--base",
+                        "HEAD",
+                    ]
+                    if as_json:
+                        arguments.append("--json")
+                    with patch(
+                        "control_plane.survey.survey_repository", side_effect=error
+                    ):
+                        return_code, output = run_cli_output_in_process(*arguments)
+                    self._assert_closed_survey_output(
+                        return_code,
+                        output,
+                        as_json=as_json,
+                        root=str(requested),
+                        error_code=expected_code,
+                        forbidden=forbidden,
+                    )
+
+    def test_survey_resolve_exception_does_not_trigger_fallback_resolution(self) -> None:
+        requested = Path("lexical") / ".." / "requested"
+        leaked = "resolve attacker suffix"
+        for as_json in (True, False):
+            with self.subTest(json=as_json):
+                arguments = [
+                    "survey",
+                    "--repo",
+                    str(requested),
+                    "--base",
+                    "HEAD",
+                ]
+                if as_json:
+                    arguments.append("--json")
+                with patch.object(
+                    Path, "resolve", side_effect=OSError(leaked)
+                ) as resolve:
+                    return_code, output = run_cli_output_in_process(*arguments)
+                self.assertEqual(resolve.call_count, 1)
+                self._assert_closed_survey_output(
+                    return_code,
+                    output,
+                    as_json=as_json,
+                    root=str(requested),
+                    forbidden=(leaked,),
+                )
+
+    def test_survey_payload_exception_after_observation_is_closed_v2(self) -> None:
+        leaked = "payload attacker suffix"
+        with tempfile.TemporaryDirectory() as directory:
+            repository = make_repo(Path(directory) / "repo")
+            git(repository, "remote", "add", "origin", str(repository))
+            for as_json in (True, False):
+                with self.subTest(json=as_json):
+                    arguments = [
+                        "survey",
+                        "--repo",
+                        str(repository),
+                        "--base",
+                        "HEAD",
+                    ]
+                    if as_json:
+                        arguments.append("--json")
+                    with patch(
+                        "control_plane.survey.survey_payload",
+                        side_effect=RuntimeError(leaked),
+                    ):
+                        return_code, output = run_cli_output_in_process(*arguments)
+                    self._assert_closed_survey_output(
+                        return_code,
+                        output,
+                        as_json=as_json,
+                        root=str(repository),
+                        forbidden=(leaked,),
+                    )
+
+    def test_survey_facts_exception_after_payload_is_closed_v2(self) -> None:
+        leaked = "facts attacker suffix"
+
+        class ObservationDouble:
+            root = "observed-root"
+            common_git_dir = "observed-git-dir"
+            branch = "observed-branch"
+            head = "a" * 40
+            base_ref = "HEAD"
+            base_head = "b" * 40
+            remote_name = "origin"
+            worktrees = ()
+            stashes = 0
+            untracked_total = 0
+            unpublished_unique_branches = 0
+            status = "PASS"
+            error_code = None
+
+            def __init__(self) -> None:
+                self.branch_reads = 0
+
+            @property
+            def branches(self):
+                self.branch_reads += 1
+                if self.branch_reads >= 3:
+                    raise RuntimeError(leaked)
+                return ()
+
+        requested = Path("lexical") / "facts"
+        for as_json in (True, False):
+            observations: list[ObservationDouble] = []
+
+            def observe(*_args, **_kwargs):
+                observation = ObservationDouble()
+                observations.append(observation)
+                return observation
+
+            with self.subTest(json=as_json):
+                arguments = [
+                    "survey",
+                    "--repo",
+                    str(requested),
+                    "--base",
+                    "HEAD",
+                ]
+                if as_json:
+                    arguments.append("--json")
+                with patch(
+                    "control_plane.survey.survey_repository", side_effect=observe
+                ):
+                    return_code, output = run_cli_output_in_process(*arguments)
+                self.assertEqual(observations[0].branch_reads, 3)
+                self._assert_closed_survey_output(
+                    return_code,
+                    output,
+                    as_json=as_json,
+                    root=str(requested),
+                    forbidden=(leaked,),
+                )
+
+    def test_survey_emit_exception_is_outside_observation_boundary(self) -> None:
+        from control_plane.cli import main
+
+        class EmitFailure(RuntimeError):
+            pass
+
+        requested = Path("lexical") / "emit"
+        leaked = "repository attacker suffix"
+        with patch(
+            "control_plane.survey.survey_repository",
+            side_effect=RuntimeError(leaked),
+        ), patch(
+            "control_plane.cli._emit", side_effect=EmitFailure("emit failure")
+        ) as emit, self.assertRaises(EmitFailure):
+            main(
+                (
+                    "survey",
+                    "--repo",
+                    str(requested),
+                    "--base",
+                    "HEAD",
+                    "--json",
+                )
             )
-            self.assertEqual(return_code, 2)
-            self.assertEqual(payload["error_code"], "E_SURVEY_BASE_UNKNOWN")
-            self.assertIs(payload["authorizes"], False)
+        self.assertEqual(emit.call_count, 1)
+        payload, as_json = emit.call_args.args
+        self.assertTrue(as_json)
+        self._assert_closed_survey_unknown(payload, root=str(requested))
+        self.assertNotIn(leaked, json.dumps(payload))
 
     def test_doctor_reports_git_state_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
