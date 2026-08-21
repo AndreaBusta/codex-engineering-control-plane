@@ -312,7 +312,9 @@ de 10 segundos para todas las ramas, no 10 segundos multiplicados por rama.
 Cada subprocess recibe como timeout, como máximo, el tiempo restante. Si una
 comparación falla o el deadline se agota, esa rama y todas las que no llegaron a
 observarse usan `added_paths=null`; la respuesta normativa ya calculada se
-conserva. Un timeout en los pasos 1–3 sí produce `UNKNOWN`.
+conserva. Cualquier timeout o error en cualquier paso de evidencia normativa
+anterior al enriquecimiento, incluido el postinventario (pasos 1–4), produce
+`UNKNOWN` con `E_SURVEY_INVENTORY`.
 
 Los límites existentes de 64 ramas, 64 worktrees, 10 segundos por invocación y
 1 MiB de salida siguen gobernando este frente. Cambiar esos presupuestos o
