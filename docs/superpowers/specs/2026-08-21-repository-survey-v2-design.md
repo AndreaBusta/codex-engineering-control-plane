@@ -277,9 +277,17 @@ acotado prueba la ausencia. Un fallo de observación normativa nunca se presenta
 como ref ausente. No hay `PASS`, `WARN` ni `FAIL` parcial. Esta regla no convierte
 el enriquecimiento opcional de `added_paths` en evidencia normativa.
 
-Los códigos existentes `E_SURVEY_BASE_UNKNOWN`, `E_SURVEY_INVENTORY` y
-`E_SURVEY_LIMIT` se conservan. La incapacidad de establecer el remote exacto se
-expresa como `E_SURVEY_REMOTE_UNKNOWN`.
+Todo fallo de evidencia obligatoria fija `status="UNKNOWN"`; `error_code`
+identifica su dominio:
+
+- `E_SURVEY_BASE_UNKNOWN` cubre una base ausente, inválida o no fijable;
+- `E_SURVEY_INVENTORY` cubre inventario local, reachability y postinventario
+  (pasos 1, 3 y 4), incluidos timeout, error Git, decode o estructura inválida,
+  ref local inválida o duplicada, drift y ambigüedad shallow;
+- `E_SURVEY_REMOTE_UNKNOWN` cubre `remote_name` y el inventario remoto
+  obligatorio (paso 2), incluidos timeout, error Git, decode o estructura
+  inválida y una ref remota que no apunte a commit;
+- `E_SURVEY_LIMIT` cubre los límites declarados de ramas y worktrees.
 
 ## 8. Modelo de observación
 
@@ -314,7 +322,9 @@ comparación falla o el deadline se agota, esa rama y todas las que no llegaron 
 observarse usan `added_paths=null`; la respuesta normativa ya calculada se
 conserva. Cualquier timeout o error en cualquier paso de evidencia normativa
 anterior al enriquecimiento, incluido el postinventario (pasos 1–4), produce
-`UNKNOWN` con `E_SURVEY_INVENTORY`.
+`UNKNOWN`. Los pasos locales 1, 3 y 4 usan `E_SURVEY_INVENTORY`; `remote_name`
+y el paso remoto 2 usan `E_SURVEY_REMOTE_UNKNOWN`; un límite declarado de
+ramas o worktrees usa `E_SURVEY_LIMIT`.
 
 Los límites existentes de 64 ramas, 64 worktrees, 10 segundos por invocación y
 1 MiB de salida siguen gobernando este frente. Cambiar esos presupuestos o

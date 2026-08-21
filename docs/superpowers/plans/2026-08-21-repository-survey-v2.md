@@ -730,6 +730,8 @@ only the exact Task 0 shallow RED can activate its closed exception.
   Use `--sort=refname`, `--count max_branches+1` and `refs/heads/`. Reject the
   entire mandatory observation unless every row is unique, under
   `refs/heads/`, type `commit`, and contains non-zero 40-hex head/tree OIDs.
+  Invalid, duplicate or undecodable local rows use `E_SURVEY_INVENTORY`; an
+  actual `max_branches` overflow remains `E_SURVEY_LIMIT`.
 
   Freeze the validated local inventory as an exact map from refname to
   `(objectname, objecttype, tree)`. Derive the candidate merged set with this
@@ -811,16 +813,23 @@ only the exact Task 0 shallow RED can activate its closed exception.
   1 implementation. This task now adds only the uncertainty and integrity
   fixtures that depend on the closed V2 model.
 
-  Add separate uncertainty tests for: missing configured remote, invalid remote
-  name, duplicate inventory row, remote ref to a blob, mandatory timeout,
-  non-UTF-8 mandatory output, branch/remote limit overflow, a local shallow
-  clone and ambiguous shallow-state output. The shallow fixtures must use only
-  local temporary repositories and must not contact a network. Each uncertainty
-  fixture must assert `status="UNKNOWN"` plus `E_SURVEY_REMOTE_UNKNOWN`,
-  `E_SURVEY_INVENTORY` or `E_SURVEY_LIMIT` as defined by its failure domain. At
-  least one UNKNOWN payload test must also assert `worktrees is None`,
-  `branches is None` and every `orphan_work` value is `None`; never accept a
-  fabricated boolean, zero or empty collection.
+  Add separate uncertainty tests partitioned by failure domain:
+
+  - missing or invalid remote, remote-inventory timeout or decode/structure
+    failure, duplicate/unexpected remote row, remote count overflow, and a
+    remote ref that does not point to commit assert `status="UNKNOWN"` with
+    `E_SURVEY_REMOTE_UNKNOWN`;
+  - local-inventory, reachability or postinventory timeout/decode failure,
+    invalid or duplicate local rows, identity mismatch or ref drift, and local
+    shallow or ambiguous shallow-state observation assert `status="UNKNOWN"`
+    with `E_SURVEY_INVENTORY`;
+  - branch or worktree limit overflow asserts `status="UNKNOWN"` with
+    `E_SURVEY_LIMIT`.
+
+  The shallow fixtures must use only local temporary repositories and must not
+  contact a network. At least one UNKNOWN payload test must also assert
+  `worktrees is None`, `branches is None` and every `orphan_work` value is
+  `None`; never accept a fabricated boolean, zero or empty collection.
 
   Add two separate complete-inventory edge tests; neither is an UNKNOWN case:
 
