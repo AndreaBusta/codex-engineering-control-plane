@@ -1046,6 +1046,19 @@ class RepositorySurveyTests(unittest.TestCase):
             self.assertIn("main", names)
             self.assertIn("side", names)
 
+    def test_unborn_linked_worktree_head_is_inventory_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repository = _repository(Path(raw))
+            linked = Path(raw) / "unborn"
+            _git(repository, "worktree", "add", "--quiet", "--orphan", str(linked))
+
+            _assert_unknown_without_mutation(
+                self,
+                repository,
+                lambda: survey_repository(repository, base="main"),
+                "E_SURVEY_INVENTORY",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

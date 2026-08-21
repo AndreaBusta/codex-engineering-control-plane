@@ -135,6 +135,8 @@ def _worktrees(root: Path, limit: int) -> tuple[WorktreeObservation, ...] | None
         elif not line and path:
             if len(entries) >= limit:
                 raise _SurveyLimit
+            if not _valid_oid(head):
+                return None
             dirty = untracked = 0
             status = _text(Path(path), ("status", "--porcelain", "-uall"))
             if status is None:
@@ -144,9 +146,7 @@ def _worktrees(root: Path, limit: int) -> tuple[WorktreeObservation, ...] | None
                     untracked += 1
                 elif item:
                     dirty += 1
-            entries.append(
-                WorktreeObservation(path, branch, head, detached, dirty, untracked)
-            )
+            entries.append(WorktreeObservation(path, branch, head, detached, dirty, untracked))
             path = head = branch = ""
             detached = False
     return tuple(entries)
