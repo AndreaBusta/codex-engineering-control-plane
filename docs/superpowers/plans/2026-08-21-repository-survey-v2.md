@@ -588,6 +588,58 @@ only the exact Task 0 shallow RED can activate its closed exception.
           self.assertFalse(branch.content_equivalent_to_base)
           self.assertFalse(branch.has_unique_commits)
           self.assertFalse(branch.unpublished_unique)
+
+  def test_branch_ref_drift_around_merged_observation_is_unknown(self) -> None:
+      from unittest.mock import patch
+
+      from control_plane import survey as survey_module
+
+      for phase in ("before_reachability", "before_postvalidation"):
+          with self.subTest(phase=phase), tempfile.TemporaryDirectory() as raw:
+              repository = _repository(Path(raw))
+              _git(repository, "switch", "-c", "feature")
+              (repository / "a.txt").write_text("unique\n", encoding="utf-8")
+              _git(repository, "commit", "--quiet", "-am", "unique")
+              _git(repository, "switch", "main")
+              main_head = _git_output(repository, "rev-parse", "main")
+              real_text = survey_module._text
+              moved = False
+
+              def drifting_text(repo, arguments):
+                  nonlocal moved
+                  is_merged = (
+                      arguments
+                      and arguments[0] == "for-each-ref"
+                      and any(
+                          argument.startswith("--merged=")
+                          for argument in arguments
+                      )
+                  )
+                  if not is_merged or moved:
+                      return real_text(repo, arguments)
+                  if phase == "before_reachability":
+                      _git(
+                          repository,
+                          "update-ref",
+                          "refs/heads/feature",
+                          main_head,
+                      )
+                  result = real_text(repo, arguments)
+                  if phase == "before_postvalidation":
+                      _git(
+                          repository,
+                          "update-ref",
+                          "refs/heads/feature",
+                          main_head,
+                      )
+                  moved = True
+                  return result
+
+              with patch.object(survey_module, "_text", drifting_text):
+                  observed = survey_repository(repository, base="main")
+
+              self.assertEqual(observed.status, "UNKNOWN")
+              self.assertEqual(observed.error_code, "E_SURVEY_INVENTORY")
   ```
 
   Split the existing stash/untracked test so stash-only and untracked-only each
@@ -679,23 +731,32 @@ only the exact Task 0 shallow RED can activate its closed exception.
   entire mandatory observation unless every row is unique, under
   `refs/heads/`, type `commit`, and contains non-zero 40-hex head/tree OIDs.
 
-  Derive `has_unique_commits` with this subcommand tuple passed to the existing
-  trusted `_text()` helper (Python pseudocode, not a shell command or direct
-  `subprocess` argv):
+  Freeze the validated local inventory as an exact map from refname to
+  `(objectname, objecttype, tree)`. Derive the candidate merged set with this
+  subcommand tuple passed to the existing trusted `_text()` helper (Python
+  pseudocode, not a shell command or direct `subprocess` argv):
 
   ```python
   (
       "for-each-ref",
       f"--merged={base_head}",
       "--sort=refname",
-      "--format=%(refname)",
+      f"--count={max_branches + 1}",
+      "--format=%(refname)%00%(objectname)%00%(objecttype)%00%(tree)",
       "refs/heads/",
   )
   ```
 
-  A local branch absent from that validated merged set has a unique commit.
-  This attributes reachability per branch and handles shared heads without
-  copying the guard's existential `rev-list --max-count=1` result.
+  Parse the merged rows with the same closed row validator. Each row must be
+  unique, belong to the initial inventory and match its exact head, type and
+  tree. Immediately after that query, repeat the initial bounded local
+  inventory with the same sort, count, four-field format and `refs/heads/`
+  prefix; require exact equality of the complete ref/head/type/tree map. A
+  duplicate, unexpected row, identity mismatch or post-query map drift returns
+  `UNKNOWN` with `E_SURVEY_INVENTORY`. Only then may a local branch absent from
+  the validated merged set derive `has_unique_commits=True`. This attributes
+  reachability per branch and handles shared heads without copying the guard's
+  existential `rev-list --max-count=1` result or adding a process per branch.
 
   Validate `remote_name` against the bounded `git remote` inventory and
   `git check-ref-format refs/remotes/<remote>/sentinel`. Query only the expected
@@ -1456,6 +1517,11 @@ only the exact Task 0 shallow RED can activate its closed exception.
   survey_branch=codex/survey-orphan-semantics-v1
   survey_target=main
   survey_local_head="$(git rev-parse HEAD)"
+  survey_current_branch="$(git symbolic-ref --short HEAD)" || exit $?
+  test "$survey_current_branch" = "$survey_branch"
+  survey_branch_head="$(git rev-parse --verify \
+    "refs/heads/$survey_branch^{commit}")" || exit $?
+  test "$survey_branch_head" = "$survey_local_head"
   survey_fetch_urls="$(git remote get-url --all origin)" || exit $?
   survey_push_urls="$(git remote get-url --push --all origin)" || exit $?
   case "$survey_fetch_urls" in
@@ -1501,11 +1567,14 @@ only the exact Task 0 shallow RED can activate its closed exception.
     --json number,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,url
   ```
 
-  The raw fetch and push URL values stay captured and are never echoed. The
-  closed `case` values accept exactly one standard credential-free HTTPS or SSH
-  destination for this provider repository; multiple URLs, userinfo/PAT,
-  `pushurl` or `pushInsteadOf` redirection to any other destination fail before
-  mutation. Expected: `gh repo view` resolves the same repository to exactly
+  The symbolic branch and its full local ref must bind exactly to
+  `survey_branch` and `survey_local_head`; detached HEAD, a different branch or
+  a moved branch ref is a Stable Pause. The raw fetch and push URL values stay
+  captured and are never echoed. The closed `case` values accept exactly one
+  standard credential-free HTTPS or SSH destination for this provider
+  repository; multiple URLs, userinfo/PAT, `pushurl` or `pushInsteadOf`
+  redirection to any other destination fail before mutation. Expected:
+  `gh repo view` resolves the same repository to exactly
   `AndreaBusta/codex-engineering-control-plane`; its reported HTTPS or SSH URL
   matches the normalized identity, its default branch is `main`, the target API
   reports protected `main` at the task base and the GraphQL protection inventory is complete
@@ -1537,8 +1606,13 @@ only the exact Task 0 shallow RED can activate its closed exception.
       git merge-base --is-ancestor \
         "$survey_last_published_head" "$survey_local_head"
     fi
+    survey_current_branch="$(git symbolic-ref --short HEAD)" || exit $?
+    test "$survey_current_branch" = "$survey_branch"
+    survey_branch_head="$(git rev-parse --verify \
+      "refs/heads/$survey_branch^{commit}")" || exit $?
+    test "$survey_branch_head" = "$survey_local_head"
     git push --set-upstream origin \
-      codex/survey-orphan-semantics-v1:refs/heads/codex/survey-orphan-semantics-v1
+      "refs/heads/$survey_branch:refs/heads/$survey_branch"
   fi
   git ls-remote --heads origin \
     refs/heads/main \

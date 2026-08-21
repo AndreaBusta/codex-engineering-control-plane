@@ -291,13 +291,21 @@ por rama:
 
 1. inventario conjunto de refs locales con head y tree;
 2. inventario exacto de las refs remotas homónimas esperadas;
-3. una consulta agregada que produzca el conjunto de ramas con commits no
-   alcanzables desde la base fijada;
-4. solo después de fijar las tres señales y el status, enriquecimiento
+3. una consulta agregada `--merged` que serialice para cada fila `refname`,
+   `objectname`, `objecttype` y `tree`, y valide esa identidad completa contra
+   el inventario local inicial congelado;
+4. inmediatamente después, repetición del mismo inventario local acotado y
+   exigencia de igualdad exacta del mapa ref/head/type/tree con el inicial;
+5. solo después de fijar las tres señales y el status, enriquecimiento
    best-effort para contar `added_paths`.
 
 El tree ya inventariado decide equivalencia de contenido. No se usa el número
-de commits para inferir equivalencia bajo squash.
+de commits para inferir equivalencia bajo squash. Una fila `--merged`
+duplicada, inesperada o cuyo head, tipo o tree no coincida con el inventario
+inicial, así como cualquier diferencia en el inventario local repetido,
+produce `UNKNOWN` con `E_SURVEY_INVENTORY`. Solo después de cerrar ambas
+validaciones se deriva `has_unique_commits`; la consulta permanece agregada y
+no se añade un proceso de reachability por rama.
 
 Las comparaciones de `added_paths` comparten un único deadline de enriquecimiento
 de 10 segundos para todas las ramas, no 10 segundos multiplicados por rama.
