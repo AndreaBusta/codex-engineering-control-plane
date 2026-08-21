@@ -29,6 +29,36 @@ class GitSkillContractTests(unittest.TestCase):
         for forbidden in ("adapter", "cross_thread_audit"):
             self.assertNotIn(forbidden, content)
 
+    def test_skill_documents_repository_survey_v2_semantics(self) -> None:
+        content = SKILL.read_text(encoding="utf-8")
+        for token in (
+            "RepositorySurveyV2",
+            "PASS=0",
+            "FAIL=1",
+            "UNKNOWN=2",
+            "WARN=3",
+            "unpublished_unique",
+            "added_paths=null",
+            "other_clones=UNKNOWN",
+            "Local remote-tracking refs can be stale",
+            "git diff --quiet <fixed-base-oid>..<fixed-branch-oid>",
+        ):
+            self.assertIn(token, content)
+
+        add_only = (
+            "git diff --diff-filter=A --name-only "
+            "<fixed-base-oid>..<fixed-branch-oid>"
+        )
+        self.assertIn(add_only, content)
+        offset = content.index(add_only)
+        context = content[max(0, offset - 240) : offset + len(add_only) + 240]
+        self.assertIn("added_paths", context)
+        self.assertIn("informational", context)
+        self.assertNotIn(
+            "Compare content: `git diff --diff-filter=A --name-only <base>..<branch>`",
+            content,
+        )
+
     def test_skill_carries_the_bounded_autonomy_contract(self) -> None:
         content = SKILL.read_text(encoding="utf-8")
         for token in (

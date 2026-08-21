@@ -1,8 +1,6 @@
 # Diseño RepositorySurveyV2 — semántica de trabajo huérfano
 
-Fecha: 2026-08-21. Estado:
-`APPROVED_CONTRACT / ADR_ACCEPTED / PLAN_PREPARED / SCOPE_REFRAME_ACCEPTED` y
-`IMPLEMENTATION_AUTHORITY_OBSERVED`.
+Fecha: 2026-08-21. Estado: `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING`.
 `authorizes=false`.
 
 Contrato WHAT/WHY para que `survey` describa de forma veraz el trabajo que
@@ -10,6 +8,9 @@ puede perderse dentro del clon seleccionado. Este documento sustituye el
 contrato de salida `RepositorySurveyV1`; no implementa ni modifica el runtime.
 Como documento sigue siendo `authorizes=false`; las transiciones Git se rigen
 por la policy integrada en la base protegida, no por este artefacto.
+El estado declara únicamente el candidato local observado tras Tasks 1–5: no
+prueba gate final, integración, CI, release, adopción, instalación ni estado
+remoto.
 
 ---
 
@@ -507,10 +508,10 @@ ejecución.
 
 - **Escribe en:** este hilo.
 - **Rol:** orquestadora y ejecutora principal.
-- **Para continuar:** ejecutar Task 0 Step 4 y después el RED shallow exacto de
-  Step 5, antes de cualquier otro runtime.
-- **Mensaje exacto:** `Continúa con Task 0 Step 4 y el RED shallow exacto de Step 5.`
-- **Estado de partida:** `codex/survey-orphan-semantics-v1` sobre
-  `origin/main@250af122`; reframe shallow aceptado, autoridad de implementación
-  observada y documentos contractuales preservados por este checkpoint;
-  todavía sin edición ni test runtime.
+- **Para continuar:** ejecutar Task 7 sobre los bytes congelados, reseñar el
+  footer y completar solo los gates finales previstos.
+- **Mensaje exacto:** `Continúa con Task 7: congela bytes, reseña el threat footer y ejecuta los gates finales sin ampliar alcance.`
+- **Estado de partida:** `RepositorySurveyV2` es
+  `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING`; Tasks 1–5 produjeron el
+  candidato local y la evidencia final, la revisión independiente, el footer y
+  cualquier estado remoto permanecen pendientes. `authorizes=false`.

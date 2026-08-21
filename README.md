@@ -164,10 +164,31 @@ El contrato completo está en
 scripts/control-plane survey --repo /ruta/al/repositorio --json
 ```
 
-Informa clon, worktrees, ramas comparadas **por contenido** y trabajo huérfano
-—stashes y archivos sin rastrear—. `other_clones` es siempre `UNKNOWN`: un
-checkout no puede enumerar otros checkouts, y declararlo evita confundir «no lo
-veo» con «no existe». Exit codes `PASS=0`, `FAIL=1`, `UNKNOWN=2`.
+Emite exclusivamente `RepositorySurveyV2`: informa clon, worktrees, ramas y
+trabajo huérfano. Fija primero los OIDs de base y rama; la equivalencia de
+contenido se demuestra con
+`git diff --quiet <fixed-base-oid>..<fixed-branch-oid>` o comparando sus tree
+OIDs, nunca contando commits. Una rama es `unpublished_unique` solo cuando su
+tree difiere, conserva commits no alcanzables desde la base y no existe su ref
+remota local homónima.
+
+Las refs remotas locales pueden estar obsoletas respecto del servidor: Survey
+no hace red ni constituye prueba remota. `other_clones=UNKNOWN` es permanente
+porque un checkout no puede enumerar otros clones. El conteo add-only:
+
+```bash
+git diff --diff-filter=A --name-only <fixed-base-oid>..<fixed-branch-oid>
+```
+
+alimenta únicamente el campo informativo y nullable `added_paths`;
+`added_paths=null` no cambia el resultado normativo.
+
+Los estados y exits son `PASS=0`, `FAIL=1`, `UNKNOWN=2` y `WARN=3`. `FAIL`
+señala al menos una rama `unpublished_unique`; `WARN` separa stashes o archivos
+sin rastrear cuando no existe esa rama; evidencia normativa incompleta produce
+`UNKNOWN`. Todos los resultados siguen siendo locales, read-only y
+`authorizes=false`: no prueban final gate, integración, release, adopción,
+instalación ni estado remoto.
 
 `doctor` y `preflight` añaden `git_state_materialized`. Un archivo `dataless`
 cambia su inodo en la primera lectura, así que un fallo de almacenamiento puede

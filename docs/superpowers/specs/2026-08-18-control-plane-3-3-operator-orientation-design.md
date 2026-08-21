@@ -141,6 +141,17 @@ entrega como skill, sin una línea de runtime.
 
 ## 6. Contratos
 
+### Supersesión del Survey V1 — 2026-08-21
+
+Solo el bloque de contrato `RepositorySurveyV1` de este diseño queda sustituido
+por [RepositorySurveyV2](2026-08-21-repository-survey-v2-design.md) y la decisión
+aceptada en [ADR 0008](../../adr/0008-repository-survey-v2-contract.md). La tabla
+de tres exits de `PRD-R-008` queda sustituida junto con ese bloque. El JSON V1
+que sigue se conserva byte-visible como procedencia histórica del diseño; no
+gobierna el runtime actual. El resto del contrato 3.3 permanece vigente. Esta
+supersesión local no prueba gate final, integración, CI, estado remoto, release,
+adopción ni instalación y conserva `authorizes=false`.
+
 `EnvironmentObservationV1`, devuelto por la materialización extendida:
 
 ```json

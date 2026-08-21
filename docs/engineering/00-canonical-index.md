@@ -44,6 +44,19 @@ a quarantined capability or grant authority.
 | `docs/superpowers/specs/2026-08-18-control-plane-3-2-specpack-design.md` | `GOVERNING_CORE` | Current SpecPack design: PRD, TRD, UX/UI, flow, and backend contracts. |
 | `docs/superpowers/specs/2026-08-18-control-plane-3-3-operator-orientation-design.md` | `GOVERNING_CORE` | Implemented operator-orientation contract and blind-spot evidence. |
 
+## RepositorySurveyV2 local candidate documents
+
+Tasks 1–5 have produced the local V2 behavior candidate. These three artifacts
+govern that candidate while its final repository gate and independent review
+remain pending. Their status does not prove integration, release, adoption,
+installation, CI or remote state and grants no authority.
+
+| Path | Status | Purpose |
+|---|---|---|
+| `docs/adr/0008-repository-survey-v2-contract.md` | `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING` | Accepted V1-to-V2 decision and preservation predicate. |
+| `docs/superpowers/specs/2026-08-21-repository-survey-v2-design.md` | `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING` | Governing V2 output, state, bounded-observation and rollback contract. |
+| `docs/superpowers/plans/2026-08-21-repository-survey-v2.md` | `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING` | Local implementation plan; terminal evidence remains outside the tracked tree after freeze. |
+
 ## Governing local enablement documents
 
 These artifacts govern only the separately locked local adoption tool. Their

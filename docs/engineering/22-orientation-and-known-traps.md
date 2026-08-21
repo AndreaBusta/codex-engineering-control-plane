@@ -25,11 +25,16 @@ scripts/control-plane survey --repo . --json
 scripts/control-plane doctor
 ```
 
-`survey` te da clon, worktrees, ramas por contenido y trabajo huérfano en una
-lectura. `doctor` informa `git_state_materialized`. Además, el gate de escritura
-ya se detiene solo: `preflight --mode write` falla si el estado Git no está
-materializado, así que la trampa de la sección 3.1 dejó de ser evitable por
-disciplina y pasó a ser imposible de pisar en el caso común.
+`survey` emite `RepositorySurveyV2`: clon, worktrees, ramas, trabajo huérfano y
+el predicado `unpublished_unique` en una lectura. Distingue `PASS=0`, `FAIL=1`,
+`UNKNOWN=2` y `WARN=3`; `added_paths=null` solo declara que falta el detalle
+add-only opcional. Las refs remotas observadas son locales y pueden estar
+obsoletas; `other_clones=UNKNOWN` limita siempre la respuesta al clon
+seleccionado. No es prueba remota ni autoridad. `doctor` informa
+`git_state_materialized`. Además, el gate de escritura ya se detiene solo:
+`preflight --mode write` falla si el estado Git no está materializado, así que
+la trampa de la sección 3.1 dejó de ser evitable por disciplina y pasó a ser
+imposible de pisar en el caso común.
 
 Residuo conocido: si el propio archivo de policy es un marcador, `preflight`
 falla antes con `E_POLICY_PARSE` y sin pista del entorno. `doctor` y `survey`
@@ -67,9 +72,11 @@ hallazgos heredados que no bloquean R1: ejecución de filtros y límites de
 Survey, submódulos/Gitlinks y alternates, sustitución de worktrees,
 discovery-to-walk TOCTOU, paths con salto de línea, colisiones case-fold de
 APFS, validación canónica completa del lock de Adoption, escritura desviada
-por `.git/config` enlazado, inventario de rollback entre linked worktrees y la
-guía add-only para equivalencia de ramas. Este frente solo se decide después de
-que R1 aterrice y se use; la adopción externa continúa prohibida.
+por `.git/config` enlazado e inventario de rollback entre linked worktrees. La
+semántica superior de `orphan_work` y el nombre add-only ambiguo quedaron
+cerrados por V2; no se usa esa mejora para absorber el hardening restante. Este
+frente solo se decide después de que R1 aterrice y se use; la adopción externa
+continúa prohibida.
 
 ### Contrato SpecPack
 
@@ -110,11 +117,20 @@ Confundirlos lleva a «arreglar» guardas que funcionan bien.
 La policy declara `integration_strategy = "squash"`. Los commits originales de
 una rama fusionada nunca entran en `main`; entra un commit aplastado
 equivalente. **El número de commits no es evidencia de trabajo pendiente.** La
-prueba válida es de contenido:
+prueba válida fija ambos OIDs y compara el contenido:
 
 ```bash
-git diff --diff-filter=A --name-only origin/main..<rama>
+git diff --quiet <fixed-base-oid>..<fixed-branch-oid>
 ```
+
+También vale comparar directamente sus tree OIDs. Reserva el listado add-only:
+
+```bash
+git diff --diff-filter=A --name-only <fixed-base-oid>..<fixed-branch-oid>
+```
+
+solo para el campo informativo y nullable `added_paths`; nunca demuestra
+equivalencia, reachability o publicación.
 
 ### 3.3 Cuatro ramas históricas concretas no se fusionan
 

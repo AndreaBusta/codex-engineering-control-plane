@@ -8,7 +8,11 @@ description: Use when Git state must be established across clones and worktrees,
 ## Establish state before judging it
 
 Run `scripts/control-plane survey --repo <path> --json` first. It reports this
-clone, its worktrees, its branches compared by content, and orphan work.
+clone, its worktrees, branches, and orphan work as `RepositorySurveyV2`.
+`PASS=0`, `FAIL=1`, `UNKNOWN=2`, and `WARN=3` distinguish clean evidence,
+`unpublished_unique` branches, incomplete evidence, and local residue.
+Local remote-tracking refs can be stale, so they are not remote proof;
+`added_paths=null` is only missing optional detail and never changes status.
 `preflight` and `doctor` report whether the Git state is materialized.
 
 ## Four blind spots that produce wrong verdicts
@@ -17,7 +21,11 @@ clone, its worktrees, its branches compared by content, and orphan work.
   and another clone's local branches never appear. `survey` reports
   `other_clones=UNKNOWN`. Treat that as unknown, never as none.
 - **`squash` makes merged branches look ahead.** Commit counts prove nothing.
-  Compare content: `git diff --diff-filter=A --name-only <base>..<branch>`.
+  Fix both OIDs and compare content with
+  `git diff --quiet <fixed-base-oid>..<fixed-branch-oid>` or their tree OIDs.
+  The add-only command
+  `git diff --diff-filter=A --name-only <fixed-base-oid>..<fixed-branch-oid>`
+  is informational nullable `added_paths` enrichment, never equivalence.
 - **Orphan work hides outside commits.** Stashes and untracked files exist
   nowhere else. A refused `git worktree remove` is the signal; never force it.
 - **`dataless` files imitate defects.** A placeholder changes inode identity on

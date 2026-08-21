@@ -74,6 +74,26 @@ ORIENTATION_PLAN = (
     / "plans"
     / "2026-08-18-control-plane-3-3-operator-orientation.md"
 )
+REPOSITORY_SURVEY_V2_ADR = (
+    ROOT / "docs" / "adr" / "0008-repository-survey-v2-contract.md"
+)
+REPOSITORY_SURVEY_V2_SPEC = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-21-repository-survey-v2-design.md"
+)
+REPOSITORY_SURVEY_V2_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-21-repository-survey-v2.md"
+)
+ORIENTATION_PLAN_SHA256 = (
+    "7a2d275cadeaaa497a8a097da242a6b76f1dfccfbea1dd6f0320f78f27813475"
+)
 THREAT_PATH = Path("docs/security/2026-08-12-control-plane-core-threat-model.md")
 THREAT_MODEL = ROOT / THREAT_PATH
 REPOSITORY_ID = "sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959"
@@ -1457,6 +1477,159 @@ class CoreDocumentationTests(unittest.TestCase):
         self.assertNotIn("Gate integral `395 OK`", orientation)
         self.assertNotIn("AE-09 pendiente", orientation)
         self.assertNotIn("protección de rama ausente", alignment)
+
+    def test_repository_survey_v2_governing_documentation_contract(self) -> None:
+        index = read(CANONICAL_INDEX)
+        candidate_status = "IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING"
+        for path in (
+            REPOSITORY_SURVEY_V2_ADR,
+            REPOSITORY_SURVEY_V2_SPEC,
+            REPOSITORY_SURVEY_V2_PLAN,
+        ):
+            relative = path.relative_to(ROOT).as_posix()
+            rows = re.findall(
+                rf"(?m)^\| `{re.escape(relative)}` \| `([^`]+)` \|",
+                index,
+            )
+            self.assertEqual(rows, [candidate_status], relative)
+
+        orientation_design = read(ORIENTATION_DESIGN)
+        self.assertIn("### Supersesión del Survey V1 — 2026-08-21", orientation_design)
+        self.assertIn(
+            "[RepositorySurveyV2](2026-08-21-repository-survey-v2-design.md)",
+            orientation_design,
+        )
+        self.assertIn(
+            "[ADR 0008](../../adr/0008-repository-survey-v2-contract.md)",
+            orientation_design,
+        )
+        self.assertIn(
+            "Solo el bloque de contrato `RepositorySurveyV1` de este diseño "
+            "queda sustituido",
+            orientation_design,
+        )
+        self.assertEqual(
+            sha256(ORIENTATION_PLAN.read_bytes()).hexdigest(),
+            ORIENTATION_PLAN_SHA256,
+        )
+
+        specification = read(REPOSITORY_SURVEY_V2_SPEC)
+        plan = read(REPOSITORY_SURVEY_V2_PLAN)
+        self.assertIn(
+            "Estado: `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING`",
+            specification,
+        )
+        self.assertIn(
+            "**Status:** `EXECUTION_AUTHORIZED / EVIDENCE_PENDING / "
+            "SHALLOW_SCOPE_REFRAME_ACCEPTED`",
+            plan,
+        )
+
+        readme = read(ROOT / "README.md")
+        skill = read(ROOT / "skills" / "control-plane-git" / "SKILL.md")
+        for document in (readme, skill):
+            for token in (
+                "RepositorySurveyV2",
+                "PASS=0",
+                "FAIL=1",
+                "UNKNOWN=2",
+                "WARN=3",
+                "unpublished_unique",
+                "added_paths=null",
+                "other_clones=UNKNOWN",
+            ):
+                self.assertIn(token, document)
+        self.assertIn(
+            "refs remotas locales pueden estar obsoletas",
+            readme.lower(),
+        )
+        self.assertIn(
+            "local remote-tracking refs can be stale",
+            skill.lower(),
+        )
+
+        equivalence_command = (
+            "git diff --quiet <fixed-base-oid>..<fixed-branch-oid>"
+        )
+        add_only_command = (
+            "git diff --diff-filter=A --name-only "
+            "<fixed-base-oid>..<fixed-branch-oid>"
+        )
+        operational_documents = (
+            ROOT / "AGENTS.md",
+            ROOT / "skills" / "control-plane-git" / "SKILL.md",
+            ALIGNMENT,
+            ORIENTATION,
+        )
+        for path in operational_documents:
+            document = read(path)
+            self.assertIn(equivalence_command, document, path)
+            self.assertNotIn(
+                "git diff --diff-filter=A --name-only origin/main..<rama>",
+                document,
+                path,
+            )
+            self.assertNotIn(
+                "git diff --diff-filter=A --name-only <base>..<branch>",
+                document,
+                path,
+            )
+            for match in re.finditer(re.escape(add_only_command), document):
+                context = document[
+                    max(0, match.start() - 300) : min(len(document), match.end() + 300)
+                ]
+                self.assertIn("added_paths", context, path)
+                self.assertRegex(context.lower(), r"informati(?:onal|vo)|nullable")
+
+        threat = read(THREAT_MODEL)
+        _, marker, residual = threat.partition("## Residual risks")
+        self.assertEqual(marker, "## Residual risks")
+        residual_flat = " ".join(residual.split())
+        for closed_residual in (
+            "the top-level `orphan_work` meaning",
+            "the add-only `only_in_branch` field",
+        ):
+            self.assertNotIn(closed_residual, residual_flat)
+        for retained_residual in (
+            "filter execution",
+            "submodule/Gitlink",
+            "object-alternate",
+            "detached-worktree substitution",
+            "discovery-to-walk TOCTOU",
+            "newline-bearing paths",
+            "APFS case-equivalent Git markers",
+            "symlinked `.git/config`",
+            "linked-worktree rollback inventory",
+        ):
+            self.assertIn(retained_residual, residual_flat)
+
+        for attacker_story in (
+            "a stale local remote-tracking ref is treated as remote proof",
+            "a wrapper collapses `warn` into `pass` or `fail`",
+            "optional `added_paths` is treated as mandatory evidence",
+            "a mutable base ref is substituted between observations",
+        ):
+            self.assertIn(attacker_story, threat.lower())
+        for mitigation in (
+            "authenticated remote observation remains separate",
+            "`WARN=3` and `ok=false`",
+            "normative status is frozen before optional `added_paths` enrichment",
+            "fixed base commit and tree OIDs",
+            "Shallow reachability is untrusted",
+            "candidate-only shallow check",
+            "remaining time in the existing five-second deadline",
+        ):
+            self.assertIn(mitigation, threat)
+
+        for document in (index, specification, orientation_design, readme, skill, threat):
+            for unsupported_claim in (
+                "FINAL_GATE_PASSED",
+                "RELEASED_CANDIDATE",
+                "ADOPTION_APPROVED",
+                "INSTALLATION_PROVEN",
+                "REMOTE_PROOF_CONFIRMED",
+            ):
+                self.assertNotIn(unsupported_claim, document)
 
     def test_readme_recommends_only_governing_core_documents_and_local_preflight(self) -> None:
         readme = read(ROOT / "README.md")
