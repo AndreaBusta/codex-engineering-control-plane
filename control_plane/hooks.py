@@ -1,4 +1,4 @@
-"""Bounded audit hooks for Codex lifecycle events."""
+"""Bounded hooks for Codex lifecycle events."""
 
 from __future__ import annotations
 
@@ -77,6 +77,28 @@ DESTRUCTIVE_PATTERNS = (
     re.compile(
         r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+push\b[^\n]*"
         r"(?:--force(?:-with-lease)?|-f)(?:\s|$)"
+    ),
+    re.compile(
+        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+branch\s+-d\s+"
+        r"(?P<branch_delete_quote>['\"]?)[A-Za-z0-9]"
+        r"[A-Za-z0-9._/-]{0,126}(?P=branch_delete_quote)(?:\s|$)"
+    ),
+    re.compile(
+        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+branch\s+-D\s+"
+        r"(?P<branch_force_delete_quote>['\"]?)[A-Za-z0-9]"
+        r"[A-Za-z0-9._/-]{0,126}(?P=branch_force_delete_quote)(?:\s|$)"
+    ),
+    re.compile(
+        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+push\s+--delete\s+"
+        r"[A-Za-z0-9][A-Za-z0-9._/-]{0,126}\s+"
+        r"(?P<push_delete_quote>['\"]?)[A-Za-z0-9]"
+        r"[A-Za-z0-9._/-]{0,126}(?P=push_delete_quote)(?:\s|$)"
+    ),
+    re.compile(
+        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+push\s+"
+        r"[A-Za-z0-9][A-Za-z0-9._/-]{0,126}\s+"
+        r"(?P<push_refspec_quote>['\"]?):refs/heads/[A-Za-z0-9]"
+        r"[A-Za-z0-9._/-]{0,126}(?P=push_refspec_quote)(?:\s|$)"
     ),
     re.compile(
         r"(?:^|\s)rm\b(?=[^\n]*(?:-[a-z]*r))"
@@ -1402,8 +1424,6 @@ def _untrusted_pretool_reason(
             if isinstance(tool_input, Mapping)
             else ""
         )
-        if any(pattern.search(command) for pattern in DESTRUCTIVE_PATTERNS):
-            return "destructive_command_requires_explicit_authority", True
         if _SHELL_META.search(command):
             return "ambiguous_shell_command", True
         try:
@@ -1423,6 +1443,8 @@ def _untrusted_pretool_reason(
             and _validate_safe_read_argv(argv[5:], root) is not None
         ):
             return None, False
+        if any(pattern.search(command) for pattern in DESTRUCTIVE_PATTERNS):
+            return "destructive_command_requires_explicit_authority", True
         parsed_git = _git_command_tokens(argv, root)
         if parsed_git is not None and parsed_git[0][0] in {
             "status",
@@ -1474,6 +1496,13 @@ def _task_warning_bindings(
     return task_digest, route_digest
 
 
+def _hook_mode() -> str:
+    mode = os.environ.get(
+        "CODEX_CONTROL_PLANE_HOOK_MODE", "soft-enforce"
+    )
+    return mode if mode in {"audit", "soft-enforce", "enforce"} else "soft-enforce"
+
+
 def _manifest(root: Path) -> str:
     raw_task_id = os.environ.get("CODEX_CONTROL_PLANE_TASK_ID", "")
     task_id = raw_task_id if validate_task_id(raw_task_id) else ""
@@ -1492,14 +1521,14 @@ def _manifest(root: Path) -> str:
             except (KeyError, OSError, json.JSONDecodeError):
                 state = "invalid"
     return (
-        "CONTROL_PLANE_CORE_AUDIT "
+        "CONTROL_PLANE_CORE "
         f"task={rendered_task_id} state={state} "
         f"policy={_digest(root / '.codex/project-policy.toml')} "
         f"registry={_digest(root / '.codex/resource-registry.toml')} "
         "authority=selection-is-not-authorization "
         "routing=frame-route-load-required-resources "
         "automatic_resource_selection=true "
-        f"hook_mode={os.environ.get('CODEX_CONTROL_PLANE_HOOK_MODE', 'audit')} "
+        f"hook_mode={_hook_mode()} "
         "hook_trust=pending-or-user-reviewed"
     )
 
@@ -1565,9 +1594,7 @@ def evaluate_hook(
             tool_name, tool_input, root
         )
         if reason is not None:
-            mode = os.environ.get(
-                "CODEX_CONTROL_PLANE_HOOK_MODE", "audit"
-            )
+            mode = _hook_mode()
             deny = mode == "enforce" or (
                 mode == "soft-enforce" and block_without_host
             )
@@ -1609,8 +1636,8 @@ def evaluate_hook(
             return {
                 "continue": True,
                 "systemMessage": (
-                    "CONTROL_PLANE_AUDIT: active task has no compact receipt; "
-                    "audit mode does not continue the turn automatically."
+                    "CONTROL_PLANE_CORE: active task has no compact receipt; "
+                    "the hook does not continue the turn automatically."
                 ),
             }
         return {"continue": True}

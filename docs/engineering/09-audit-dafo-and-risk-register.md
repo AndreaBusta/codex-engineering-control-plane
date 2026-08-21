@@ -36,7 +36,8 @@ tests, JSON, un MCP ni la policy de la rama candidata.
 - Registry estricto, inventario separado de autorización y resolver puro.
 - Lifecycle con estados, evidencias y terminal por resultado solicitado.
 - TaskLease y ownership mecánico para writers.
-- Hooks audit acotados, reversibles y pendientes de trust humano.
+- Hooks acotados y reversibles, con launcher distribuido `soft-enforce` por
+  defecto y trust humano todavía pendiente.
 - Adopción transaccional e idempotente con plan target-specific, apply,
   verify, status, upgrade y rollback.
 - Suite hermética y contratos de ausencia para superficies remotas diferidas.
@@ -45,7 +46,9 @@ tests, JSON, un MCP ni la policy de la rama candidata.
 
 - `main` no tiene protección efectiva por limitación del plan de GitHub.
 - El smoke macOS está disponible, pero no se ejecuta automáticamente.
-- Hooks en audit todavía `pending_hook_trust`; no existe enforcement activo.
+- Hooks todavía `pending_hook_trust`: pueden omitirse, no sustituyen branch
+  protection y su inventario `refs/remotes/*` no demuestra frescura del
+  servidor.
 - Sin telemetría exacta de tokens.
 - Clasificación T0–T3 sigue requiriendo juicio del modelo.
 - Policy v1 es intencionalmente pequeña; comandos reales se adaptan por
@@ -77,7 +80,8 @@ tests, JSON, un MCP ni la policy de la rama candidata.
 - Archive o build antiguo enviado a TestFlight.
 - Prompt injection desde web, Issues, PR o MCP.
 - Secretos en logs, Markdown o fixtures.
-- Force push, reset o limpieza destructiva.
+- Force push, reset, limpieza destructiva o borrado de una rama que sea el
+  último alcance de trabajo único.
 - Supply chain de acciones, plugins o dependencias.
 - Grafo con writers solapados y consumo duplicado.
 - Exceso de documentación que oculta los gates importantes.

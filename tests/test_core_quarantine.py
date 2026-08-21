@@ -179,13 +179,15 @@ class CoreQuarantineTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
-    def test_hooks_metadata_is_core_audit_only_and_uses_closed_launcher(self) -> None:
+    def test_hooks_metadata_is_core_soft_enforce_and_uses_closed_launcher(self) -> None:
         raw = (ROOT / ".codex" / "hooks.json").read_text(encoding="utf-8")
         value = json.loads(raw)
         description = value["description"]
         self.assertIn("Control Plane Core 3.1", description)
-        self.assertIn("audit-only", description)
+        self.assertIn("soft-enforce-by-default", description)
+        self.assertNotIn("audit-only", description)
         self.assertIn("authorizes=false", description)
+        self.assertIn("trust remains pending", description)
         self.assertNotIn("v2", description)
         commands = {
             hook["command"]
@@ -238,8 +240,51 @@ class CoreQuarantineTests(unittest.TestCase):
         lock = tomllib.loads(
             (ROOT / ".codex" / "control-plane.lock").read_text(encoding="utf-8")
         )
-        self.assertEqual(lock["hook_mode"], "audit")
+        self.assertEqual(lock["hook_mode"], "soft-enforce")
         self.assertEqual(lock["hook_trust"], "pending_hook_trust")
+
+    def test_distributed_hook_ignores_host_audit_downgrade(self) -> None:
+        hooks = json.loads(
+            (ROOT / ".codex" / "hooks.json").read_text(encoding="utf-8")
+        )
+        commands = {
+            hook["command"]
+            for entries in hooks["hooks"].values()
+            for entry in entries
+            for hook in entry["hooks"]
+        }
+        self.assertEqual(len(commands), 1)
+        environment = os.environ.copy()
+        environment["CODEX_CONTROL_PLANE_HOOK_MODE"] = "audit"
+        completed = subprocess.run(
+            ["/bin/sh", "-c", commands.pop()],
+            cwd=ROOT,
+            env=environment,
+            input=json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "cwd": str(ROOT),
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "git branch -D feature/old"
+                    },
+                },
+                separators=(",", ":"),
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        output = json.loads(completed.stdout)["hookSpecificOutput"]
+        self.assertEqual(output.get("permissionDecision"), "deny")
+        self.assertEqual(
+            output.get("permissionDecisionReason"),
+            "CONTROL_PLANE_SOFT_ENFORCE: "
+            "destructive_command_requires_explicit_authority",
+        )
 
     def test_launcher_clean_reexec_preserves_empty_and_payload_hook_stdin_once(self) -> None:
         cases = (
@@ -356,7 +401,8 @@ class CoreQuarantineTests(unittest.TestCase):
 
     def test_hook_manifest_label_is_core_generation_not_v2(self) -> None:
         source = (ROOT / "control_plane" / "hooks.py").read_text(encoding="utf-8")
-        self.assertIn("CONTROL_PLANE_CORE_AUDIT", source)
+        self.assertIn('"CONTROL_PLANE_CORE "', source)
+        self.assertNotIn("CONTROL_PLANE_CORE_AUDIT", source)
         self.assertNotIn("CONTROL_PLANE_AUDIT_V2", source)
 
 

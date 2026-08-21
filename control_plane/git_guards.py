@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
+import time
 import tomllib
 from typing import Any, Callable, Iterable, Mapping
 
@@ -36,6 +37,8 @@ _REQUIRED_ROLES = frozenset(
     }
 )
 _ZERO_OIDS = frozenset({"0" * 40, "0" * 64})
+_MAX_LOCAL_BRANCHES = 64
+_UNPUBLISHED_BRANCH_BUDGET_SECONDS = 5.0
 
 
 def _error(code: str, message: str) -> dict[str, str]:
@@ -101,8 +104,21 @@ def _git_environment() -> dict[str, str]:
 
 
 def _git(
-    repo: Path, arguments: list[str], *, allowed: frozenset[int]
+    repo: Path,
+    arguments: list[str],
+    *,
+    allowed: frozenset[int],
+    timeout: float = 5.0,
 ) -> subprocess.CompletedProcess[bytes]:
+    if (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not math.isfinite(float(timeout))
+        or float(timeout) <= 0
+    ):
+        raise ValueError(
+            "GG_GIT_STATE_UNOBSERVABLE: Git timeout is invalid."
+        )
     try:
         completed = subprocess.run(
             ["/usr/bin/git", *arguments],
@@ -111,7 +127,7 @@ def _git(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=5.0,
+            timeout=min(5.0, float(timeout)),
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as error:
@@ -129,8 +145,18 @@ def _git(
     return completed
 
 
-def _git_text(repo: Path, arguments: list[str]) -> str:
-    completed = _git(repo, arguments, allowed=frozenset({0}))
+def _git_text(
+    repo: Path,
+    arguments: list[str],
+    *,
+    timeout: float = 5.0,
+) -> str:
+    completed = _git(
+        repo,
+        arguments,
+        allowed=frozenset({0}),
+        timeout=timeout,
+    )
     try:
         return completed.stdout.decode("utf-8", errors="strict").strip()
     except UnicodeDecodeError as error:
@@ -724,6 +750,169 @@ def _valid_update(update: object) -> bool:
     return local_ref.startswith("refs/heads/")
 
 
+def _remaining_unpublished_branch_budget(deadline: float) -> float:
+    now = _clock_now(time.monotonic)
+    if now is None or now >= deadline:
+        raise ValueError("unpublished branch observation deadline expired")
+    return min(5.0, deadline - now)
+
+
+def _unpublished_branch_errors(
+    repo: Path,
+    policy: ProtectedGitPolicy,
+    *,
+    updates: Iterable[object],
+    remote_verified: bool,
+) -> list[dict[str, str]]:
+    unknown = _error(
+        "GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN",
+        "Local branch publication state could not be observed.",
+    )
+    remote_prefix = f"refs/remotes/{policy.remote_name}/"
+    remote_base_ref = f"{remote_prefix}{policy.base_branch}"
+    started = _clock_now(time.monotonic)
+    if started is None:
+        return [unknown]
+    deadline = started + _UNPUBLISHED_BRANCH_BUDGET_SECONDS
+    try:
+        branch_inventory = _git_text(
+            repo,
+            [
+                "for-each-ref",
+                "--count",
+                str(_MAX_LOCAL_BRANCHES + 2),
+                "--format=%(refname)%00%(objectname)%00%(tree)",
+                "refs/heads/",
+                f"[r]{remote_base_ref[1:]}",
+            ],
+            timeout=_remaining_unpublished_branch_budget(deadline),
+        )
+        records = branch_inventory.splitlines() if branch_inventory else []
+        local_branches: list[tuple[str, str, str]] = []
+        seen_refs: set[str] = set()
+        base_tree: str | None = None
+        for record in records:
+            fields = record.split("\0")
+            if len(fields) != 3:
+                return [unknown]
+            ref, head, tree = fields
+            if (
+                ref != ref.strip()
+                or ref in seen_refs
+                or _OID.fullmatch(head) is None
+                or head in _ZERO_OIDS
+                or _OID.fullmatch(tree) is None
+                or tree in _ZERO_OIDS
+            ):
+                return [unknown]
+            seen_refs.add(ref)
+            if ref == remote_base_ref:
+                if base_tree is not None:
+                    return [unknown]
+                base_tree = tree
+                continue
+            if not ref.startswith("refs/heads/"):
+                return [unknown]
+            name = ref[len("refs/heads/"):]
+            if not name:
+                return [unknown]
+            local_branches.append((name, head, tree))
+        if (
+            base_tree is None
+            or len(local_branches) > _MAX_LOCAL_BRANCHES
+        ):
+            return [unknown]
+
+        remaining = _remaining_unpublished_branch_budget(deadline)
+        if not local_branches:
+            return []
+
+        expected_remote_refs = {
+            f"{remote_prefix}{name}"
+            for name, _head, _tree in local_branches
+        }
+        remote_inventory = _git_text(
+            repo,
+            [
+                "for-each-ref",
+                "--count",
+                str(_MAX_LOCAL_BRANCHES + 1),
+                "--format=%(refname)%00%(objectname)%00%(objecttype)",
+                *sorted(
+                    f"[r]{remote_ref[1:]}"
+                    for remote_ref in expected_remote_refs
+                ),
+            ],
+            timeout=remaining,
+        )
+        _remaining_unpublished_branch_budget(deadline)
+        observed_remote_refs: set[str] = set()
+        for record in remote_inventory.splitlines() if remote_inventory else []:
+            fields = record.split("\0")
+            ref = fields[0]
+            if ref not in expected_remote_refs:
+                return [unknown]
+            if (
+                len(fields) != 3
+                or ref in observed_remote_refs
+                or _OID.fullmatch(fields[1]) is None
+                or fields[1] in _ZERO_OIDS
+                or fields[2] != "commit"
+            ):
+                return [unknown]
+            observed_remote_refs.add(ref)
+
+        exact_publications: set[tuple[str, str]] = set()
+        if remote_verified:
+            for update in updates:
+                if not _valid_update(update):
+                    continue
+                local_ref, local_oid, remote_ref, _remote_oid = update
+                if local_oid not in _ZERO_OIDS and local_ref == remote_ref:
+                    exact_publications.add((local_ref, local_oid))
+
+        candidate_refs: list[str] = []
+        for name, head, tree in local_branches:
+            local_ref = f"refs/heads/{name}"
+            if (
+                tree == base_tree
+                or f"{remote_prefix}{name}" in observed_remote_refs
+                or (local_ref, head) in exact_publications
+            ):
+                continue
+            candidate_refs.append(local_ref)
+        if not candidate_refs:
+            return []
+
+        unique_commit = _git_text(
+            repo,
+            [
+                "rev-list",
+                "--max-count=1",
+                *candidate_refs,
+                "--not",
+                remote_base_ref,
+            ],
+            timeout=_remaining_unpublished_branch_budget(deadline),
+        )
+        _remaining_unpublished_branch_budget(deadline)
+        if not unique_commit:
+            return []
+        if (
+            _OID.fullmatch(unique_commit) is None
+            or unique_commit in _ZERO_OIDS
+        ):
+            return [unknown]
+        return [
+            _error(
+                "GG_UNPUBLISHED_UNIQUE_BRANCH",
+                "A local branch has unpublished unique commits.",
+            )
+        ]
+    except (AttributeError, TypeError, ValueError):
+        return [unknown]
+
+
 def guard_pre_push(
     repo: Path | str,
     protected_policy: ProtectedGitPolicy,
@@ -744,10 +933,11 @@ def guard_pre_push(
             if isinstance(remote_url, str)
             else None
         )
-        if (
-            remote_name != protected_policy.remote_name
-            or observed_remote_digest != protected_policy.remote_url_digest
-        ):
+        remote_verified = (
+            remote_name == protected_policy.remote_name
+            and observed_remote_digest == protected_policy.remote_url_digest
+        )
+        if not remote_verified:
             errors.append(
                 _error(
                     "GG_REMOTE_UNVERIFIED",
@@ -820,6 +1010,14 @@ def guard_pre_push(
                         "A proven non-fast-forward update is forbidden.",
                     )
                 )
+        errors.extend(
+            _unpublished_branch_errors(
+                canonical,
+                protected_policy,
+                updates=materialized,
+                remote_verified=remote_verified,
+            )
+        )
         unique: list[dict[str, str]] = []
         seen: set[str] = set()
         for item in errors:
