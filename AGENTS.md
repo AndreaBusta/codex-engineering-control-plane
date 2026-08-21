@@ -63,8 +63,18 @@ La prosa no sustituye a los gates, GitHub, CI ni al proveedor de release.
 
 - No trabajes directamente en la rama base protegida.
 - Una rama representa una unidad coherente, revisable y reversible.
-- No hagas commit, push, Pull Request, merge, deploy ni release sin autorización
-  explícita para esa transición.
+- Sobre una rama de trabajo que no sea la base protegida, commit, push, Pull Request y
+  merge están autorizados de forma permanente cuando los gates y CI estén en verde.
+  A estos efectos, commit, push a una ref remota de trabajo no protegida y apertura o
+  actualización del PR requieren los gates locales aplicables sobre los bytes actuales.
+  El merge exige reobservar base, target y HEAD exactos y que la CI requerida de ese SHA
+  esté verde, no ausente, omitida ni obsoleta.
+  Esta autorización nace únicamente de la versión de `AGENTS.md` integrada en la base
+  protegida; una edición no integrada no amplía la autoridad de su propia rama.
+- Deploy, release, publicación, instalación de dependencias, cambios de CI y manejo de
+  secretos siguen requiriendo autorización explícita para esa transición concreta.
+  Esta reserva también se aplica cuando un Pull Request o merge activaría automáticamente
+  cualquiera de esos efectos.
 - No uses `reset --hard`, limpieza destructiva ni force push.
 - No declares integración hasta demostrar el merge remoto en `origin/<base>`.
 
@@ -92,8 +102,9 @@ autocontenido con estos campos:
 - Para continuar: siguiente acción concreta en una frase.
 - Mensaje exacto: texto breve listo para copiar y enviar.
 - Estado de partida: repositorio, worktree, rama, HEAD, PR y gate relevantes.
-- No hacer todavía: transiciones o efectos aún no autorizados.
-- Autoridad: `authorizes=false`.
+- No hacer todavía: incluye esta línea solo si una frontera concreta detiene el trabajo
+  ahora, y nombra únicamente esa. Si nada está bloqueado, omite esta línea y la de autoridad.
+  No conserves como campo obligatorio "- Autoridad: `authorizes=false`."
 
 Usa la tarea padre u orquestadora como destino normal del usuario. Señala otra
 tarea solo tras verificar por separado de Git su identidad visible, estado activo
@@ -114,6 +125,7 @@ Para una referencia exacta `codex://threads/<UUID>`, usa solo la lectura nativa 
 
 - Core acepta solo `answer` y `local_change`. Commit, push, Pull Request, merge,
   deploy, release, instalación y upgrade quedan fuera del runtime activo.
+  Esto describe el runtime de Core, no la autoridad del operador sobre Git.
 - Task, lease, plan, receipt, checkpoint, documento, skill y plugin son
   `authorizes=false`; no serializan, transfieren ni reconstruyen autoridad.
 - Una petición de efecto externo requiere la autorización exacta que impongan
