@@ -224,6 +224,15 @@ authority, project bytes, or external state.
 - Hooks default to `soft-enforce` in the distributed launcher but remain
   cooperative, `pending_hook_trust`, bypassable by clients that do not invoke
   them, and may coexist with other hooks. They are not branch protection.
+- Under `soft-enforce` the only denied classification is
+  `destructive_command_requires_explicit_authority`: recognized local and remote
+  branch deletion, `reset --hard`, forced `clean`, forced `push` and recursive
+  forced `rm`. Raw reads, edits, plain `push` and unrecognized effects stay
+  advisory, so the default mode observes without denying ordinary work. Explicit
+  `enforce` still denies every unattested effect. Residual: an irreversible
+  effect that no `DESTRUCTIVE_PATTERNS` entry recognizes is not denied under the
+  default mode; containment for that class rests on provider branch protection
+  and the repository gates, not on the hook.
 - The unpublished-branch guard binds the local `refs/remotes/<remote>/...`
   inventory by name, not containment of the local HEAD or current server
   state. A behind or stale tracking ref can overstate preservation until a
@@ -267,4 +276,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:fc5125fc64154a8a7c0368569f9af109669c8ec4d11e244acf8ad6ba4d4c3666
+Version: codex-security-snapshot/v1:sha256:b01cf8a3b135b9ea423acf967c30efeaecb8b59c2540c8c4fdac1cac471e7001
