@@ -4,120 +4,102 @@ Status: `AUDIT_ONLY / DEFERRED_TARGET_BOOTSTRAP`.
 
 ## Decision
 
-Provide a compact source-owned readiness kit for an unidentified next project.
-The kit proves that current Control Plane bytes can validate and route a
-project-specific governance bundle without changing a consumer. It is not an
-installer, adoption mechanism, or generic Git workflow.
+Provide the smallest source-owned kit that can answer one question: can an
+already-customized governance bundle be parsed, inventoried, and routed for the
+next project without changing that project?
 
-This is a deliberate recut from an exhaustive prototype: generalized copying,
-transaction, branch, staging, and commit behavior added more trust surface than
-the current objective needs. The preserved prototype is evidence, not an input
-to this candidate.
+The answer is local audit evidence, never adoption. The earlier exhaustive
+prototype is preserved on its own branch but is not part of this candidate.
 
 ## Contract
 
 The source pack contains exactly four files under `templates/new-project/`:
-template `AGENTS.md`, policy, registry, and a source-side README. Only the first
-three can later become project authority. Their generic bytes never enter the
-target: customization and review occur outside it, and the consumer README is
-preserved.
+`AGENTS.md`, `README.md`, `.codex/project-policy.toml`, and
+`.codex/resource-registry.toml`.
 
-The instruction template starts restrictive. It requires evidence, TDD, bounded
-scope, protected-base work, non-destructive Git, and exact target-specific
-authorization for commit, push, Pull Request, and merge. Reserved effects remain
-separately authorized. Every template artifact is `authorizes=false`.
+Only the first file and the two TOML files are future authority candidates.
+They retain `__PROJECT_NAME__` in source, are customized and reviewed outside the
+consumer, and never replace its README. Generic bytes and every result remain
+`authorizes=false`.
 
-The generic policy uses schema v1 and conservative Git/release defaults. The
-minimum registry contains:
+The instruction template starts restrictive: evidence, TDD, explicit scope,
+protected-base work, non-destructive Git, preservation before squash, and
+target-specific authorization. Reserved effects stay separately authorized.
 
-- required project instructions;
-- the real consumer README as a recommendation only for first-use
-  `intent=audit`, `phase=research`, T2 routing;
-- only the builtin gates referenced by policy.
+Policy uses schema v1 and conservative Git and release defaults. Registry
+contains project instructions, the consumer README, and only policy-referenced
+builtin gates. Its single special route recommends the consumer README only for
+first-use T2 `intent=audit`, `phase=research`.
 
-It contains no speculative remote or release provider.
+## Supported v1 environment
+
+The supported v1 environment is deliberately ordinary and local:
+
+- exact integrated, clean, fully materialized Control Plane source;
+- clean standard local Git target with attached branch and committed HEAD
+  contained in its local base;
+- configured remote and local remote-base tracking ref;
+- ordinary index and local object store;
+- customized authority committed at target HEAD;
+- consumer README preserved;
+- regular fully materialized TaskEnvelope outside the target;
+- no submodules, nested repositories, filters, alternates, object redirects,
+  configuration includes, File Provider, or dataless state.
+
+Any false or unknown condition is `UNSUPPORTED / STOP`. V1 contains no
+embedded verifier and makes no claim about hostile or exotic topology. This is
+an explicit containment boundary, not an implementation gap to repair inside
+the audit.
 
 ## Read-only proof
 
-A clean detached, fully materialized local Control Plane source is bound to an
-operator-selected exact integrated SHA by a bounded raw comparison of every tracked blob, symlink and
-Git mode and exact equality between tracked paths and observed non-`.git`
-leaves. The binding forces the physical worktree, so index hints, filters and
-repo-local `core.worktree` cannot redirect it. It disables lazy fetch, bounds
-blob types and sizes before deadlock-free batch capture, streams directory
-fanout, and has one whole-verifier watchdog that reaps any active Git process.
-The selected source index must equal its selected HEAD tree and every bounded
-`ls-files -v` entry must be normal; staged-only content, skip-worktree,
-assume-unchanged, gitlinks and non-zero/error command states stop.
-Before Git or content reads, bounded no-follow metadata inspection rejects
-`UF_DATALESS`, wrong-owner, or group/world-writable source, Git metadata, target,
-README, and authority inputs. File Provider or materialization uncertainty is
-unsupported and stops before audit. Every physical ancestor is identity-bound;
-a writable ancestor is accepted only when sticky-bit semantics protect its
-effective-UID-owned child and the sticky directory is owned by root or that
-effective UID. Source and target object stores must be local: object
-redirect symlinks, alternates, HTTP alternates and repository config includes
-stop before the launcher; a UTF-8 BOM cannot obscure an include. Every direct
-`filter.*` namespace is rejected from repository config before target Git can
-run status or a filter; fsmonitor and untracked cache remain forcibly disabled.
-External stores are not inspected or changed.
+The canonical launcher executes exactly five operations: policy-check,
+registry-check, inventory, offline read preflight, and audit route. Tests run
+those operations against a harness-owned standard local repository containing
+only its README and the three customized authority files.
 
-A read-only guard requires the three externally reviewed SHA-256 values, an
-exact physical target path, and descriptor-relative no-follow reads with stable
-same-owner ancestor and leaf identities. Missing, symlinked, special,
-substituted, oversized, or placeholder-bearing authority fails before the five
-Control Plane commands. All three authority files must also be supported regular
-stage-0 entries in both target index and `HEAD`; each `HEAD` blob, reviewed
-digest and live byte digest must agree, so ignored or merely untracked authority
-cannot pass. It also binds the externally validated TaskEnvelope to
-its literal physical path and reviewed SHA-256 with the same materialization,
-ownership, permissions, ancestor, size and stable-descriptor rules. The target
-Git top, gitdir and common dir must resolve back to those physical bindings, so
-a repo-local `core.worktree` redirect stops. Its index must equal HEAD, every
-index tag must be normal, and an explicitly configured porcelain status must be
-empty with untracked visibility and file-mode comparison forced despite
-repository attempts to hide dirty work. Submodules,
-common-dir module storage and nested `.git` entries are unsupported in v1 and
-stop rather than being traversed. A single
-silent wrapper repeats source, target-authority and TaskEnvelope verification
-immediately before and after every launcher invocation, including optional
-diagnostics.
+The proof requires valid JSON, ready project instructions and README, green
+applicable local preflight checks, T2 audit/research routing, and zero change to
+target HEAD, index, status, or visible files. A local remote and tracking ref
+make offline facts testable but prove no provider state.
 
-The harness-owned target preserves its consumer README, contains only the
-already-customized authority files, and publishes `main` to its own local bare
-`origin`. This makes every applicable local preflight check factual and green;
-the configured remote and local tracking ref remain no proof of provider
-freshness. The source launcher runs policy-check, registry-check, inventory,
-offline read preflight, and audit route only for the first-use
-`intent=audit`, `phase=research`, T2 `TaskEnvelope`; other intents/phases select
-neither this route nor its README recommendation.
+The runbook is 100–150 lines. The test delta is 300–500 lines. There is no
+runtime module, installer, mutator, copier, hook, lock, state store, dependency,
+CI change, consumer write, provider refresh, or publication effect.
 
-All five run under a closed process environment, exit zero, emit bounded valid
-JSON, leave target-visible bytes, symlink state, and exact index state unchanged,
-and keep `authorizes=false` for fully materialized local roots. Inventory must prove the project instructions and
-consumer README ready with no `R_NOT_FOUND`; route success cannot override
-missing local resources. `doctor` and `survey` remain optional diagnostics, not
-expected-red gates.
+## Review convergence
+
+A review finding blocks this v1 only when all five predicates hold:
+
+1. it is reproducible;
+2. it is introduced by this delta;
+3. it affects the supported v1 environment;
+4. it prevents the promised outcome;
+5. it cannot be honestly contained by `UNSUPPORTED / STOP`.
+
+Otherwise record the finding with its reproduction and destination, without
+expanding this front. Set `max_repair_rounds=2`. If either round causes
+`surface_growth_limit=20%` to be exceeded relative to the frozen recut,
+reframe instead of continuing repair.
 
 ## Security and rollback
 
-The attacker story is uncustomized or substituted governance or TaskEnvelope
-being mistaken for reviewed input, including staged/index-hidden bytes, a
-submodule boundary, a promisor source that fills missing bytes, an alternate
-object store, a config include/filter, ignored authority or a writable ancestor
-redirecting verification.
-Mitigation is source/target separation, exact clean index/status checks,
-reviewed digests, physical no-follow ancestor binding, local object stores,
-disabled lazy fetch, explicit submodule rejection, per-command revalidation,
-target-specific authorization, and a no-write audit. Residual risk begins only
-when a later operator chooses target values or performs the deferred write.
+Primary risks are confusing generic governance with reviewed project authority,
+replacing the consumer README, treating local readiness as remote proof, or
+letting prose mint a later write. Source/target separation, exact pack
+inventory, real command tests, restrictive templates, explicit environment
+containment, and `authorizes=false` mitigate them.
 
-Rollback of this source candidate is removal of the pack and its references.
-There is no consumer rollback because this front performs no consumer effect.
+Residual risk begins when an operator chooses substitutions or crosses into the
+target-specific bootstrap. That later transition requires current project
+evidence and authority.
+
+Rollback removes the source pack and discoverability links. There is no
+consumer rollback because this front performs no consumer effect.
 
 ## Deferred decisions
 
-Target identification, inspection, customization, target write, installation,
-and adoption remain `DEFERRED_TARGET_BOOTSTRAP`. If multiple real projects later
-prove the same safe write mechanics are needed, design a reusable mutator ADR
-from that evidence; do not pre-build one here.
+Project selection, target inspection, customization approval, target write,
+commit, push, Pull Request, merge, installation, adoption, deploy, and release
+remain `DEFERRED_TARGET_BOOTSTRAP`. Reusable write automation needs a
+separate decision based on repeated real-project evidence.
