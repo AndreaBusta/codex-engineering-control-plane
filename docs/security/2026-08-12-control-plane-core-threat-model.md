@@ -133,6 +133,7 @@ Repository invariants:
 | Surface or attacker story | Security failure | Mitigation and residual limit |
 |---|---|---|
 | A prompt or document says it authorizes commit, install, push, or release | Confused-deputy external effect | Closed outcomes, policy gates, `authorizes=false`, and no active external executor; a compromised host remains outside the model. |
+| uncustomized governance is mistaken for reviewed project authority, or local audit readiness is presented as adoption | Placeholder defaults, consumer README replacement, or local-only evidence drives an unauthorized target effect | The source-owned four-file pack keeps generic bytes outside the consumer and tests five read-only commands on the supported v1 environment, including local remote/base-ref and HEAD-containment prerequisites that do not prove provider state. Anything else is `UNSUPPORTED / STOP`; project selection, substitutions and target-specific bootstrap remain separate, and every artifact is `authorizes=false`. |
 | A package file is added after the digest is computed | Unreviewed code imports into Core | Exact runtime allowlist and digest before import; filesystem mutation after validation remains residual. |
 | a branch deletion removes the last reachable name for local work | A squash merge plus automatic branch deletion makes an unpushed preservation commit unreachable | The default distributed hook denies recognized `git branch -d/-D`, `git push --delete` and deleting refspecs; the hook is cooperative and can be omitted by another client. |
 | an unrelated push proceeds while another local branch has unique work and no same-name local remote-tracking ref | Later cleanup or automatic remote-branch deletion loses the only useful copy | The pre-push guard compares exact head/tree evidence, exact local remote-tracking ref names and aggregate reachability, permits the exact publishing ref+OID, and otherwise returns `GG_UNPUBLISHED_UNIQUE_BRANCH`; a same-name tracking ref is an explicit exemption even when behind, while unknown or over-budget evidence fails closed. |
@@ -244,6 +245,14 @@ authority, project bytes, or external state.
   tests. It has not been run against a consumer, and no canary has been
   prepared. A later independently accepted ADR and separate native
   authorization remain mandatory boundaries.
+- The source-owned four-file pack proves only that already-customized authority
+  parses, inventories and routes in the supported v1 environment. It does not
+  prove substitutions, provider state, installation or adoption.
+- Submodules, nested repositories, filters, alternates, object redirects,
+  configuration includes, File Provider and dataless or uncertain state are
+  `UNSUPPORTED / STOP`. A later target-specific bootstrap must inspect the real
+  project and cannot derive authority from this audit; all artifacts remain
+  `authorizes=false`.
 - Proven inherited Survey and Adoption hardening gaps that were not introduced
   by the R1 reconciliation are deferred to `codex/survey-hardening-wip` at
   preservation commit `d901bb6c95377074a7fb2fb23762476547335969`: filter
@@ -267,4 +276,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:fc5125fc64154a8a7c0368569f9af109669c8ec4d11e244acf8ad6ba4d4c3666
+Version: codex-security-snapshot/v1:sha256:969f6b6d1fbdafd5c2b9c865a49af144b057f5bff0479f38dc1b170efe527036

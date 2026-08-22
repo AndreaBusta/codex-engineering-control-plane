@@ -10,6 +10,7 @@ import re
 import selectors
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -90,6 +91,24 @@ REPOSITORY_SURVEY_V2_PLAN = (
     / "superpowers"
     / "plans"
     / "2026-08-21-repository-survey-v2.md"
+)
+NEW_PROJECT_PACK = ROOT / "templates" / "new-project"
+NEW_PROJECT_RUNBOOK = (
+    ROOT / "docs" / "engineering" / "23-new-project-audit-bootstrap.md"
+)
+ADOPTION_READINESS_SPEC = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-22-control-plane-adoption-readiness-v1-design.md"
+)
+ADOPTION_READINESS_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-22-control-plane-adoption-readiness-v1.md"
 )
 ORIENTATION_PLAN_SHA256 = (
     "7a2d275cadeaaa497a8a097da242a6b76f1dfccfbea1dd6f0320f78f27813475"
@@ -764,6 +783,481 @@ def normalized_snapshot_version() -> str:
     }
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return "codex-security-snapshot/v1:sha256:" + sha256(encoded).hexdigest()
+
+
+class NewProjectAuditReadinessTests(unittest.TestCase):
+    PACK_PATHS = {
+        "AGENTS.md",
+        "README.md",
+        ".codex/project-policy.toml",
+        ".codex/resource-registry.toml",
+    }
+    AUTHORITY_PATHS = {
+        "AGENTS.md",
+        ".codex/project-policy.toml",
+        ".codex/resource-registry.toml",
+    }
+    RESOURCE_IDS = {
+        "instruction.project-agents",
+        "document.project-readme",
+        "gate.targeted-validation",
+        "gate.diff-review",
+        "gate.relevant-tests",
+        "gate.pull-request",
+        "gate.written-plan",
+        "gate.independent-review",
+        "gate.security-review",
+        "gate.rollback-plan",
+    }
+
+    def _pack_files(self) -> dict[str, bytes]:
+        return {
+            path.relative_to(NEW_PROJECT_PACK).as_posix(): path.read_bytes()
+            for path in NEW_PROJECT_PACK.rglob("*")
+            if path.is_file()
+        }
+
+    def _environment(self, home: Path) -> dict[str, str]:
+        home.mkdir(parents=True, exist_ok=True)
+        return {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        }
+
+    def _run(
+        self, *arguments: str, cwd: Path, env: dict[str, str], timeout: float = 30.0
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            arguments,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def _git(self, repo: Path, env: dict[str, str], *arguments: str) -> str:
+        result = self._run(
+            "/usr/bin/git",
+            "--no-pager",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "color.ui=false",
+            "-C",
+            str(repo),
+            *arguments,
+            cwd=repo,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        return result.stdout
+
+    def _customized_authority(self) -> dict[str, bytes]:
+        customized = {}
+        for relative, payload in self._pack_files().items():
+            if relative not in self.AUTHORITY_PATHS:
+                continue
+            payload = payload.replace(b"__PROJECT_NAME__", b"audit-fixture-project")
+            self.assertNotIn(b"__PROJECT_NAME__", payload)
+            customized[relative] = payload
+        return customized
+
+    def _initialize_target(self, root: Path) -> tuple[Path, dict[str, str]]:
+        env = self._environment(root / "closed-home")
+        origin = root / "origin.git"
+        origin.mkdir()
+        self._git(origin, env, "init", "-q", "--bare")
+
+        target = root / "consumer"
+        target.mkdir()
+        self._git(target, env, "init", "-q", "-b", "main")
+        self._git(target, env, "config", "user.name", "Audit Fixture")
+        self._git(target, env, "config", "user.email", "audit@example.invalid")
+
+        readme = b"# Consumer-owned project\n\nKeep this content.\n"
+        (target / "README.md").write_bytes(readme)
+        self._git(target, env, "add", "README.md")
+        self._git(target, env, "commit", "-qm", "consumer baseline")
+
+        for relative, payload in self._customized_authority().items():
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(payload)
+        self.assertEqual((target / "README.md").read_bytes(), readme)
+        self._git(target, env, "add", "AGENTS.md", ".codex")
+        self._git(target, env, "commit", "-qm", "project governance")
+        self._git(target, env, "remote", "add", "origin", str(origin))
+        self._git(target, env, "push", "-qu", "origin", "main")
+        return target, env
+
+    def _task(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "task_id": "TASK-NEXT-PROJECT-AUDIT-001",
+            "objective": "Audit a structured multi-file change without mutation.",
+            "intent": "audit",
+            "phase": "research",
+            "requested_outcome": "answer",
+            "goals": [
+                {
+                    "id": "goal-audit",
+                    "summary": "Produce bounded local audit evidence.",
+                    "domains": ["project"],
+                    "depends_on": [],
+                }
+            ],
+            "domains": ["project"],
+            "signals": ["multi_file"],
+            "scope_paths": ["AGENTS.md", ".codex/", "README.md"],
+            "risk": {
+                "uncertainty": 2,
+                "blast_radius": 1,
+                "irreversibility": 1,
+                "verification_complexity": 2,
+            },
+            "effects": [{"name": "local_read", "source": "user_explicit"}],
+            "explicit_resources": [],
+            "excluded_resources": [],
+        }
+
+    def _snapshot(self, repo: Path, env: dict[str, str]) -> dict[str, object]:
+        leaves: dict[str, tuple[int, str]] = {}
+        for path in sorted(repo.rglob("*")):
+            relative = path.relative_to(repo)
+            if ".git" in relative.parts or path.is_dir():
+                continue
+            metadata = path.lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode), relative.as_posix())
+            leaves[relative.as_posix()] = (
+                stat.S_IMODE(metadata.st_mode),
+                sha256(path.read_bytes()).hexdigest(),
+            )
+        return {
+            "head": self._git(repo, env, "rev-parse", "HEAD"),
+            "index": self._git(repo, env, "ls-files", "--stage", "-z"),
+            "status": self._git(
+                repo,
+                env,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ),
+            "leaves": leaves,
+        }
+
+    def _control_plane(
+        self,
+        target: Path,
+        env: dict[str, str],
+        *arguments: str,
+    ) -> dict[str, object]:
+        result = self._run(
+            str(ROOT / "scripts" / "control-plane"),
+            *arguments,
+            cwd=target,
+            env=env,
+            timeout=45.0,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            self.fail(f"non-JSON Control Plane output: {error}: {result.stdout}")
+        self.assertIsInstance(payload, dict)
+        return payload
+
+    def test_source_pack_is_exact_minimal_and_schema_valid(self) -> None:
+        pack = self._pack_files()
+        self.assertEqual(set(pack), self.PACK_PATHS)
+        placeholder_paths = {
+            path for path, payload in pack.items() if b"__PROJECT_NAME__" in payload
+        }
+        self.assertEqual(placeholder_paths, self.PACK_PATHS)
+
+        policy = tomllib.loads(pack[".codex/project-policy.toml"].decode())
+        registry = tomllib.loads(
+            pack[".codex/resource-registry.toml"].decode()
+        )
+        self.assertEqual(policy["schema_version"], 1)
+        self.assertEqual(policy["project_name"], "__PROJECT_NAME__")
+        self.assertEqual(policy["project_kind"], "generic")
+        self.assertEqual(registry["schema_version"], 1)
+        self.assertEqual(registry["registry_id"], "__PROJECT_NAME__")
+        resources = {resource["id"]: resource for resource in registry["resources"]}
+        self.assertEqual(set(resources), self.RESOURCE_IDS)
+        self.assertEqual(
+            registry["routes"],
+            [
+                {
+                    "id": "first-use-audit-research",
+                    "priority": 500,
+                    "tiers": ["T2"],
+                    "phases": ["research"],
+                    "intents": ["audit"],
+                    "domains_any": [],
+                    "signals_any": [],
+                    "signals_all": [],
+                    "effects_any": [],
+                    "required_capabilities": [],
+                    "recommended_resources": ["document.project-readme"],
+                    "forbidden_resources": [],
+                }
+            ],
+        )
+        serialized = "\n".join(payload.decode() for payload in pack.values())
+        for forbidden in (
+            "control-plane.lock",
+            "hooks.json",
+            "CoreTaskState",
+            "mcp://github",
+            "release-provider",
+            "user-skill://",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_templates_are_restrictive_source_only_and_non_authorizing(self) -> None:
+        instructions = read(NEW_PROJECT_PACK / "AGENTS.md")
+        flat_instructions = " ".join(instructions.split())
+        source_readme = read(NEW_PROJECT_PACK / "README.md")
+        for token in (
+            "target-specific authorization",
+            "protected base branch",
+            "Never use destructive cleanup",
+            "automatic branch deletion",
+            "Reserved effects",
+            "authorizes=false",
+        ):
+            self.assertIn(token, flat_instructions)
+        for token in (
+            "source-owned",
+            "not an installer",
+            "must not be copied wholesale",
+            "Only the first three are authority candidates",
+            "Preserve the consumer's own",
+            "authorizes=false",
+        ):
+            self.assertIn(token, source_readme)
+        self.assertNotIn("cp -", source_readme)
+        self.assertNotIn("git commit", source_readme)
+
+    def test_runbook_is_small_and_declares_the_supported_environment(self) -> None:
+        runbook = read(NEW_PROJECT_RUNBOOK)
+        line_count = len(runbook.splitlines())
+        self.assertGreaterEqual(line_count, 100)
+        self.assertLessEqual(line_count, 150)
+        lowered = runbook.lower()
+        for token in (
+            "supported v1 environment",
+            "fully materialized",
+            "standard local git repository",
+            "local object store",
+            "configured remote",
+            "local remote-base tracking ref",
+            "head contained",
+            "no submodules",
+            "no nested repositories",
+            "no filters",
+            "no alternates",
+            "file provider",
+            "unsupported / stop",
+        ):
+            self.assertIn(token, lowered)
+        self.assertNotIn("python", lowered)
+        self.assertNotIn("<<", runbook)
+        self.assertNotRegex(runbook, r"(?m)^[A-Za-z_][A-Za-z0-9_]*\(\)")
+        commands = [
+            line
+            for line in runbook.splitlines()
+            if line.startswith('"$CONTROL_PLANE" ')
+        ]
+        self.assertEqual(len(commands), 5)
+        self.assertEqual(
+            [command.split()[1] for command in commands],
+            [
+                "policy-check",
+                "registry-check",
+                "inventory",
+                "preflight",
+                "route",
+            ],
+        )
+        self.assertNotIn("--refresh", "\n".join(commands))
+        self.assertIn("--offline", "\n".join(commands))
+
+    def test_spec_and_plan_bound_recut_and_review_convergence(self) -> None:
+        design = read(ADOPTION_READINESS_SPEC)
+        plan = read(ADOPTION_READINESS_PLAN)
+        combined = design + "\n" + plan
+        for token in (
+            "AUDIT_ONLY / DEFERRED_TARGET_BOOTSTRAP",
+            "exactly four files",
+            "supported v1 environment",
+            "UNSUPPORTED / STOP",
+            "no embedded verifier",
+            "reproducible",
+            "introduced by this delta",
+            "prevents the promised outcome",
+            "max_repair_rounds=2",
+            "surface_growth_limit=20%",
+            "target-specific bootstrap",
+            "authorizes=false",
+        ):
+            self.assertIn(token, combined)
+        for forbidden in (
+            "generalized copier",
+            "Git transaction engine",
+            "embedded Python",
+        ):
+            self.assertNotIn(forbidden, plan)
+        self.assertIn("300–500", plan)
+        self.assertIn("100–150", plan)
+
+    def test_five_commands_are_read_only_on_a_supported_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target, env = self._initialize_target(root)
+            policy = target / ".codex" / "project-policy.toml"
+            registry = target / ".codex" / "resource-registry.toml"
+            task_path = root / "task-envelope.json"
+            task_path.write_text(json.dumps(self._task(), sort_keys=True), encoding="utf-8")
+            before = self._snapshot(target, env)
+
+            policy_result = self._control_plane(
+                target,
+                env,
+                "policy-check",
+                "--policy",
+                str(policy),
+                "--json",
+            )
+            registry_result = self._control_plane(
+                target,
+                env,
+                "registry-check",
+                "--registry",
+                str(registry),
+                "--policy",
+                str(policy),
+                "--json",
+            )
+            inventory = self._control_plane(
+                target,
+                env,
+                "inventory",
+                "--repo",
+                str(target),
+                "--registry",
+                str(registry),
+                "--json",
+            )
+            preflight = self._control_plane(
+                target,
+                env,
+                "preflight",
+                "--mode",
+                "read",
+                "--repo",
+                str(target),
+                "--policy",
+                str(policy),
+                "--offline",
+                "--json",
+            )
+            route = self._control_plane(
+                target,
+                env,
+                "route",
+                "--repo",
+                str(target),
+                "--task",
+                str(task_path),
+                "--policy",
+                str(policy),
+                "--registry",
+                str(registry),
+                "--mode",
+                "audit",
+                "--json",
+            )
+
+            self.assertEqual(self._snapshot(target, env), before)
+            self.assertFalse(before["status"])
+            self.assertTrue(policy_result["ok"], policy_result)
+            self.assertTrue(registry_result["ok"], registry_result)
+            resource_states = {
+                resource["id"]: resource
+                for resource in inventory["resources"]
+            }
+            self.assertTrue(resource_states["instruction.project-agents"]["ready"], inventory)
+            self.assertTrue(resource_states["document.project-readme"]["ready"], inventory)
+            self.assertTrue(
+                all(check["ok"] for check in preflight["checks"]),
+                preflight,
+            )
+            self.assertEqual(route["summary"]["tier"], "T2")
+            self.assertTrue(route["decision_ready"], route)
+            self.assertFalse(route["authorizes"])
+            self.assertIn("instruction.project-agents", route["summary"]["required"])
+            self.assertIn("document.project-readme", route["summary"]["recommended"])
+
+    def test_consumer_readme_is_preserved_and_generic_bytes_do_not_enter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target, env = self._initialize_target(Path(directory))
+            files = {
+                path.relative_to(target).as_posix()
+                for path in target.rglob("*")
+                if path.is_file() and ".git" not in path.relative_to(target).parts
+            }
+            self.assertEqual(files, self.AUTHORITY_PATHS | {"README.md"})
+            self.assertEqual(
+                (target / "README.md").read_bytes(),
+                b"# Consumer-owned project\n\nKeep this content.\n",
+            )
+            self.assertNotEqual(
+                (target / "README.md").read_bytes(),
+                (NEW_PROJECT_PACK / "README.md").read_bytes(),
+            )
+            self.assertEqual(
+                self._git(
+                    target,
+                    env,
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                ),
+                "",
+            )
+
+    def test_readiness_is_discoverable_and_threat_bounded(self) -> None:
+        root_readme = read(ROOT / "README.md")
+        index = read(CANONICAL_INDEX)
+        threat = read(THREAT_MODEL)
+        for document in (root_readme, index):
+            self.assertIn("23-new-project-audit-bootstrap.md", document)
+        for token in (
+            "source-owned four-file pack",
+            "supported v1 environment",
+            "UNSUPPORTED / STOP",
+            "target-specific bootstrap",
+            "authorizes=false",
+        ):
+            self.assertIn(token, threat)
 
 
 class CoreDocumentationTests(unittest.TestCase):

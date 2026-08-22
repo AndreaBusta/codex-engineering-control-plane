@@ -67,6 +67,17 @@ status does not add modules to Core or grant consumer adoption.
 | `docs/superpowers/specs/2026-08-13-control-plane-core-adoption-enablement-design.md` | `GOVERNING_LOCAL_ENABLEMENT` | Accepted transaction and rollback design; canary remains prohibited. |
 | `docs/superpowers/plans/2026-08-13-control-plane-core-adoption-enablement.md` | `GOVERNING_LOCAL_ENABLEMENT` | Local implementation, TDD, temporary-repository evidence and exact rollback. |
 
+## Governing source-only project readiness
+
+These artifacts define an audit-only source kit. They do not install, adopt, or
+mutate a consumer and grant no target authority.
+
+| Path | Status | Purpose |
+|---|---|---|
+| `docs/engineering/23-new-project-audit-bootstrap.md` | `GOVERNING_SOURCE_AUDIT` | Clean-source binding, five-command read-only audit, and deferred target boundary. |
+| `docs/superpowers/specs/2026-08-22-control-plane-adoption-readiness-v1-design.md` | `GOVERNING_SOURCE_AUDIT` | Minimal four-file pack and threat-bound design. |
+| `docs/superpowers/plans/2026-08-22-control-plane-adoption-readiness-v1.md` | `GOVERNING_SOURCE_AUDIT` | Four execution units and deferred continuation. |
+
 ## Historical non-governing documents
 
 These files are intentionally not rewritten. Their operational examples and
