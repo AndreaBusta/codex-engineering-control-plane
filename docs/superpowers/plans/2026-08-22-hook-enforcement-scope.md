@@ -331,6 +331,34 @@ adopción real."
 
 ---
 
+## Corrección aplicada durante la ejecución
+
+*El plan original tenía un hueco. Se documenta aquí en vez de reescribirlo en
+silencio, porque el orden importa y quien repita este tipo de cambio lo necesita.*
+
+**Faltaba re-vincular el lock del runtime.** Cambiar cualquier módulo de
+`control_plane/` invalida el digest `runtime` de `.codex/control-plane.lock`, y
+`policy-check` falla con `E_RUNTIME_DIGEST: source runtime does not match lock`. No es
+opcional ni cosmético: bloquea los post-gates.
+
+El orden correcto, que el plan escribía al revés, es:
+
+1. código y tests en verde;
+2. **re-vincular el lock** con la función canónica, nunca a mano:
+   ```bash
+   python3 -c "import sys;sys.path.insert(0,'.');from pathlib import Path;from control_plane.lockfile import runtime_digest;print(runtime_digest(Path('.').resolve()))"
+   ```
+   y sustituir el valor de `runtime = ` en `.codex/control-plane.lock`;
+3. **después** recalcular el footer del threat model.
+
+El motivo del orden: el lock es un fichero trackeado, así que re-vincularlo invalida a su
+vez el sello. Sellar antes del lock obliga a sellar dos veces. Solo hay que tocar `hooks`
+si cambia `.codex/hooks.json`, que este frente no toca.
+
+Se añade como Task 2b más abajo, ya ejecutada.
+
+---
+
 ## Task 2: Declarar el alcance en el threat model y re-vincular el sello
 
 **Files:**
