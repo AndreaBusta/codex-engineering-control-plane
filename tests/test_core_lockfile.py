@@ -158,6 +158,23 @@ class CoreLockfileTests(unittest.TestCase):
         )
         self._write_bootstrap_lock(root)
 
+    def _valid_repository_lock_fixture(self, root: Path) -> None:
+        shutil.copytree(ROOT / "control_plane", root / "control_plane")
+        for relative in (
+            ".codex/control-plane.lock",
+            ".codex/project-policy.toml",
+            ".codex/resource-registry.toml",
+            ".codex/hooks.json",
+            ".codex/hooks/control_plane_hook.py",
+            ".codex/git-hooks/pre-commit",
+            ".codex/git-hooks/pre-push",
+            "scripts/control-plane",
+        ):
+            source = ROOT / relative
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
     def _run_bootstrap(
         self,
         root: Path,
@@ -284,7 +301,7 @@ class CoreLockfileTests(unittest.TestCase):
         self.assertEqual(lock["runtime_layout"], "source")
         self.assertEqual(lock["runtime_package"], "control_plane")
         self.assertEqual(tuple(lock["runtime_modules"]), EXPECTED_CORE_MODULES)
-        self.assertEqual(lock["hook_mode"], "soft-enforce")
+        self.assertEqual(lock["hook_mode"], "audit")
         self.assertEqual(lock["hook_trust"], "pending_hook_trust")
 
     def test_repository_lock_matches_independent_digest_oracles(self) -> None:
@@ -309,6 +326,28 @@ class CoreLockfileTests(unittest.TestCase):
         self.assertEqual(lock["digests"], observed)
         self.assertEqual(runtime_digest(ROOT), observed["runtime"])
         self.assertEqual(validate_lock(ROOT), [])
+
+    def test_validate_lock_rejects_soft_enforce_hook_mode_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._valid_repository_lock_fixture(root)
+            self.assertEqual(validate_lock(root), [])
+
+            lock_path = root / ".codex" / "control-plane.lock"
+            source = lock_path.read_text(encoding="utf-8")
+            self.assertEqual(source.count('hook_mode = "audit"'), 1)
+            lock_path.write_text(
+                source.replace(
+                    'hook_mode = "audit"',
+                    'hook_mode = "soft-enforce"',
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [issue.code for issue in validate_lock(root)],
+                ["L_HOOK_MODE"],
+            )
 
     def test_bootstraps_hardcode_exact_allowlist_before_every_import(self) -> None:
         for relative in (

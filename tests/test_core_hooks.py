@@ -112,15 +112,18 @@ class CoreHookTests(unittest.TestCase):
 
         self.assertEqual(rendered, "")
 
-    def _assert_branch_deletion_commands_are_denied_by_default(
+    def _assert_branch_deletion_commands_are_denied_in_soft_enforce(
         self, commands: tuple[str, ...]
     ) -> None:
         from control_plane.hooks import run_hook
 
         with tempfile.TemporaryDirectory() as temporary:
             repo = make_repo(Path(temporary) / "repo").resolve()
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("CODEX_CONTROL_PLANE_HOOK_MODE", None)
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_CONTROL_PLANE_HOOK_MODE": "soft-enforce"},
+                clear=False,
+            ):
                 for command in commands:
                     with self.subTest(command=command):
                         rendered = run_hook(
@@ -146,8 +149,10 @@ class CoreHookTests(unittest.TestCase):
                             "destructive_command_requires_explicit_authority",
                         )
 
-    def test_branch_deletion_commands_are_denied_by_default(self) -> None:
-        self._assert_branch_deletion_commands_are_denied_by_default(
+    def test_branch_deletion_commands_are_denied_in_explicit_soft_enforce(
+        self,
+    ) -> None:
+        self._assert_branch_deletion_commands_are_denied_in_soft_enforce(
             (
                 "git branch -d feature/old",
                 "git branch -D feature/old",
@@ -156,8 +161,10 @@ class CoreHookTests(unittest.TestCase):
             )
         )
 
-    def test_quoted_branch_deletion_commands_are_denied_by_default(self) -> None:
-        self._assert_branch_deletion_commands_are_denied_by_default(
+    def test_quoted_branch_deletion_commands_are_denied_in_explicit_soft_enforce(
+        self,
+    ) -> None:
+        self._assert_branch_deletion_commands_are_denied_in_soft_enforce(
             (
                 "git branch -d 'feature/old'",
                 'git branch -D "feature/old"',
@@ -165,6 +172,33 @@ class CoreHookTests(unittest.TestCase):
                 "git push origin ':refs/heads/feature/old'",
             )
         )
+
+    def test_branch_deletion_command_is_advisory_by_default(self) -> None:
+        from control_plane.hooks import run_hook
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CODEX_CONTROL_PLANE_HOOK_MODE", None)
+                rendered = run_hook(
+                    json.dumps(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "cwd": str(repo),
+                            "tool_name": "Bash",
+                            "tool_input": {
+                                "command": "git branch -D feature/old"
+                            },
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                    expected_root=repo,
+                )
+
+        output = json.loads(rendered)["hookSpecificOutput"]
+        self.assertIn("additionalContext", output)
+        self.assertIn("CONTROL PLANE RISK", output["additionalContext"])
+        self.assertNotIn("permissionDecision", output)
 
     def test_explicit_audit_keeps_branch_deletion_advisory(self) -> None:
         from control_plane.hooks import run_hook
@@ -195,7 +229,7 @@ class CoreHookTests(unittest.TestCase):
         self.assertIn("CONTROL PLANE RISK", output["additionalContext"])
         self.assertNotIn("permissionDecision", output)
 
-    def test_invalid_hook_modes_fail_closed_to_soft_enforce(self) -> None:
+    def test_invalid_hook_modes_fall_back_to_advisory_audit(self) -> None:
         from control_plane.hooks import run_hook
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -221,14 +255,108 @@ class CoreHookTests(unittest.TestCase):
                         run_hook(payload, expected_root=repo)
                     )["hookSpecificOutput"]
 
-                    self.assertEqual(
-                        output.get("permissionDecision"), "deny"
+                    self.assertIn("additionalContext", output)
+                    self.assertIn(
+                        "CONTROL PLANE RISK", output["additionalContext"]
                     )
-                    self.assertEqual(
-                        output.get("permissionDecisionReason"),
-                        "CONTROL_PLANE_SOFT_ENFORCE: "
-                        "destructive_command_requires_explicit_authority",
-                    )
+                    self.assertNotIn("permissionDecision", output)
+
+    def test_ordinary_raw_read_is_advisory_by_default(self) -> None:
+        from control_plane.hooks import run_hook
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CODEX_CONTROL_PLANE_HOOK_MODE", None)
+                rendered = run_hook(
+                    json.dumps(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "cwd": str(repo),
+                            "tool_name": "Bash",
+                            "tool_input": {"command": "git status --short"},
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                    expected_root=repo,
+                )
+
+        output = json.loads(rendered)["hookSpecificOutput"]
+        self.assertIn("additionalContext", output)
+        self.assertIn("CONTROL PLANE RISK", output["additionalContext"])
+        self.assertNotIn("permissionDecision", output)
+
+    def test_explicit_enforce_keeps_raw_read_fail_closed(self) -> None:
+        from control_plane.hooks import run_hook
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_CONTROL_PLANE_HOOK_MODE": "enforce"},
+                clear=False,
+            ):
+                rendered = run_hook(
+                    json.dumps(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "cwd": str(repo),
+                            "tool_name": "Bash",
+                            "tool_input": {"command": "git status --short"},
+                        },
+                        separators=(",", ":"),
+                    ).encode(),
+                    expected_root=repo,
+                )
+
+        output = json.loads(rendered)["hookSpecificOutput"]
+        self.assertEqual(output.get("permissionDecision"), "deny")
+        self.assertEqual(
+            output.get("permissionDecisionReason"),
+            "CONTROL_PLANE_SOFT_ENFORCE: raw_read_requires_safe_read",
+        )
+
+    def test_mcp_is_advisory_in_soft_enforce_but_denied_in_enforce(self) -> None:
+        from control_plane.hooks import run_hook
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            payload = json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "cwd": str(repo),
+                    "tool_name": "mcp__github__get_pull_request",
+                    "tool_input": {"owner": "example", "repo": "example"},
+                },
+                separators=(",", ":"),
+            ).encode()
+
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_CONTROL_PLANE_HOOK_MODE": "soft-enforce"},
+                clear=False,
+            ):
+                soft_enforce = json.loads(
+                    run_hook(payload, expected_root=repo)
+                )["hookSpecificOutput"]
+
+            with mock.patch.dict(
+                os.environ,
+                {"CODEX_CONTROL_PLANE_HOOK_MODE": "enforce"},
+                clear=False,
+            ):
+                enforce = json.loads(
+                    run_hook(payload, expected_root=repo)
+                )["hookSpecificOutput"]
+
+        self.assertIn("CONTROL PLANE RISK", soft_enforce["additionalContext"])
+        self.assertNotIn("permissionDecision", soft_enforce)
+        self.assertEqual(enforce.get("permissionDecision"), "deny")
+        self.assertEqual(
+            enforce.get("permissionDecisionReason"),
+            "CONTROL_PLANE_SOFT_ENFORCE: "
+            "mcp_use_requires_task_authorization_and_egress_check",
+        )
 
     def test_closed_safe_read_rg_pattern_is_not_destructive(self) -> None:
         from control_plane.hooks import run_hook

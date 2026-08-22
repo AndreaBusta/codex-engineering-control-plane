@@ -173,7 +173,7 @@ class HookTests(unittest.TestCase):
 
         self.assertEqual(output, "")
 
-    def test_destructive_pretool_is_denied_by_default(self) -> None:
+    def test_destructive_pretool_is_advisory_by_default(self) -> None:
         from control_plane.hooks import run_hook
 
         with patch.dict(os.environ, {}, clear=False):
@@ -191,11 +191,9 @@ class HookTests(unittest.TestCase):
             )
 
         specific = output["hookSpecificOutput"]
-        self.assertEqual(specific.get("permissionDecision"), "deny")
-        self.assertIn(
-            "destructive_command_requires_explicit_authority",
-            specific["permissionDecisionReason"],
-        )
+        self.assertIn("additionalContext", specific)
+        self.assertIn("CONTROL PLANE RISK", specific["additionalContext"])
+        self.assertNotIn("permissionDecision", specific)
 
     def test_stop_reentry_never_creates_continuation_loop(self) -> None:
         from control_plane.hooks import run_hook
@@ -284,7 +282,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("CONTROL PLANE RISK", specific["additionalContext"])
         self.assertNotIn("permissionDecision", specific)
 
-    def test_raw_read_is_denied_by_default_and_advisory_in_explicit_audit(
+    def test_raw_read_is_advisory_by_default_and_in_explicit_audit(
         self,
     ) -> None:
         from control_plane.hooks import run_hook
@@ -313,12 +311,13 @@ class HookTests(unittest.TestCase):
         self.assertNotIn(
             "permissionDecision", audit["hookSpecificOutput"]
         )
-        self.assertEqual(
-            default["hookSpecificOutput"].get("permissionDecision"), "deny"
-        )
+        self.assertIn("additionalContext", default["hookSpecificOutput"])
         self.assertIn(
-            "raw_read_requires_safe_read",
-            default["hookSpecificOutput"]["permissionDecisionReason"],
+            "CONTROL PLANE RISK",
+            default["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertNotIn(
+            "permissionDecision", default["hookSpecificOutput"]
         )
 
     def test_oversized_input_fails_closed(self) -> None:
@@ -327,14 +326,14 @@ class HookTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "E_HOOK_INPUT_LIMIT"):
             run_hook(b"x" * (MAX_INPUT_BYTES + 1))
 
-    def test_hook_config_is_soft_enforce_by_default_and_uses_git_root(self) -> None:
+    def test_hook_config_is_audit_only_by_default_and_uses_git_root(self) -> None:
         config = json.loads(
             Path(".codex/hooks.json").read_text(encoding="utf-8")
         )
         description = config["description"]
         self.assertIn("Control Plane Core 3.1", description)
-        self.assertIn("soft-enforce-by-default", description)
-        self.assertNotIn("audit-only", description)
+        self.assertIn("audit-only", description)
+        self.assertNotIn("soft-enforce-by-default", description)
         self.assertIn("authorizes=false", description)
         self.assertIn("trust remains pending", description)
         self.assertEqual(

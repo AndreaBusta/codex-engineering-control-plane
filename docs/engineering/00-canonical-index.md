@@ -118,6 +118,7 @@ authority models do not govern Core.
 | `docs/superpowers/plans/2026-08-11-control-plane-taskplaybook-v0-progressive-disclosure.md` | `HISTORICAL_NON_GOVERNING` | Pre-Core taskplaybook plan. |
 | `docs/superpowers/plans/2026-08-12-control-plane-core-3-1.md` | `HISTORICAL_NON_GOVERNING` | Original 3.1.0-core.1 implementation plan and checkpoint; superseded by the 3.1.0-core.2 local candidate. |
 | `docs/superpowers/plans/2026-08-18-control-plane-3-3-operator-orientation.md` | `HISTORICAL_NON_GOVERNING` | Executed 3.3 implementation transcript; the design and current runtime govern. |
+| `docs/superpowers/plans/2026-08-22-hook-default-audit-rollback-v1.md` | `HISTORICAL_NON_GOVERNING` | Audit-only default rollback implementation plan; runtime, lock, policy and gates govern. |
 | `docs/superpowers/specs/2026-07-28-codex-engineering-control-plane-design.md` | `HISTORICAL_NON_GOVERNING` | Initial design specification. |
 | `docs/superpowers/specs/2026-07-29-clarification-gate-risk-sentinel-design.md` | `HISTORICAL_NON_GOVERNING` | v2.1 risk design specification. |
 | `docs/superpowers/specs/2026-08-08-control-plane-v2-3-outcome-bridge-design.md` | `HISTORICAL_NON_GOVERNING` | v2.3 design specification. |

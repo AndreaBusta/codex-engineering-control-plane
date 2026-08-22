@@ -36,19 +36,22 @@ tests, JSON, un MCP ni la policy de la rama candidata.
 - Registry estricto, inventario separado de autorización y resolver puro.
 - Lifecycle con estados, evidencias y terminal por resultado solicitado.
 - TaskLease y ownership mecánico para writers.
-- Hooks acotados y reversibles, con launcher distribuido `soft-enforce` por
-  defecto y trust humano todavía pendiente.
+- Hooks acotados y reversibles, con launcher distribuido `audit-only`,
+  advisory y trust humano todavía pendiente.
 - Adopción transaccional e idempotente con plan target-specific, apply,
   verify, status, upgrade y rollback.
 - Suite hermética y contratos de ausencia para superficies remotas diferidas.
 
 ### Debilidades
 
-- `main` no tiene protección efectiva por limitación del plan de GitHub.
+- Branch protection es un control separado del proveedor y su estado vivo debe
+  reobservarse; el launcher audit no la crea ni compensa su ausencia o deriva.
 - El smoke macOS está disponible, pero no se ejecuta automáticamente.
-- Hooks todavía `pending_hook_trust`: pueden omitirse, no sustituyen branch
-  protection y su inventario `refs/remotes/*` no demuestra frescura del
-  servidor.
+- Hooks todavía `pending_hook_trust`: pueden omitirse y el default audit no
+  detiene comandos destructivos ni afirma cobertura del shell. No sustituyen
+  branch protection, el guard pre-push de trabajo no publicado, observación
+  remota ni autoridad exacta; su inventario `refs/remotes/*` tampoco demuestra
+  frescura del servidor.
 - Sin telemetría exacta de tokens.
 - Clasificación T0–T3 sigue requiriendo juicio del modelo.
 - Policy v1 es intencionalmente pequeña; comandos reales se adaptan por
@@ -70,6 +73,9 @@ tests, JSON, un MCP ni la policy de la rama candidata.
 - Métricas reales de agentes, reintentos, contexto y tokens.
 - Consolidación de skills/plugins duplicados tras una prueba de procedencia.
 - Recibos firmados o almacenados como artefactos de CI.
+- Reevaluar `soft-enforce` solo con evidencia estructurada de comandos del host
+  y una nueva decisión de producto; el modo de API directa no es un default
+  distribuido soportado.
 
 ### Amenazas
 
@@ -153,6 +159,7 @@ Fallo evitado: infra-documentación de un cambio pequeño pero crítico.
 | R10 | coste de contexto | alta | medio | budgets + manifiesto menor de 4 KiB | sin tokens exactos |
 | R11 | agentes solapados | media | alto | graph + lease con exclusión mutua + máximo 2 | proceso externo no cooperativo |
 | R12 | plugin duplicado | media | medio | canonicalidad y digest fail-closed | duplicación instalada vigente |
+| R13 | aviso audit interpretado como bloqueo de destructivos | media | muy alto | launcher `audit-only` explícito; branch protection, guard pre-push, observación remota y autoridad exacta | hook cooperativo, `pending_hook_trust` y clientes que pueden omitirlo |
 
 ## Condiciones para “sobresaliente”
 
