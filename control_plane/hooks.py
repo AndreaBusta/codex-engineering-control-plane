@@ -1497,10 +1497,8 @@ def _task_warning_bindings(
 
 
 def _hook_mode() -> str:
-    mode = os.environ.get(
-        "CODEX_CONTROL_PLANE_HOOK_MODE", "soft-enforce"
-    )
-    return mode if mode in {"audit", "soft-enforce", "enforce"} else "soft-enforce"
+    mode = os.environ.get("CODEX_CONTROL_PLANE_HOOK_MODE", "audit")
+    return mode if mode in {"audit", "soft-enforce", "enforce"} else "audit"
 
 
 def _manifest(root: Path) -> str:

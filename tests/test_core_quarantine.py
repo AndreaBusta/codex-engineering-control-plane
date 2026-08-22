@@ -179,13 +179,13 @@ class CoreQuarantineTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
-    def test_hooks_metadata_is_core_soft_enforce_and_uses_closed_launcher(self) -> None:
+    def test_hooks_metadata_is_core_audit_only_and_uses_closed_launcher(self) -> None:
         raw = (ROOT / ".codex" / "hooks.json").read_text(encoding="utf-8")
         value = json.loads(raw)
         description = value["description"]
         self.assertIn("Control Plane Core 3.1", description)
-        self.assertIn("soft-enforce-by-default", description)
-        self.assertNotIn("audit-only", description)
+        self.assertIn("audit-only", description)
+        self.assertNotIn("soft-enforce-by-default", description)
         self.assertIn("authorizes=false", description)
         self.assertIn("trust remains pending", description)
         self.assertNotIn("v2", description)
@@ -240,10 +240,10 @@ class CoreQuarantineTests(unittest.TestCase):
         lock = tomllib.loads(
             (ROOT / ".codex" / "control-plane.lock").read_text(encoding="utf-8")
         )
-        self.assertEqual(lock["hook_mode"], "soft-enforce")
+        self.assertEqual(lock["hook_mode"], "audit")
         self.assertEqual(lock["hook_trust"], "pending_hook_trust")
 
-    def test_distributed_hook_ignores_host_audit_downgrade(self) -> None:
+    def test_distributed_hook_ignores_host_soft_enforce_promotion(self) -> None:
         hooks = json.loads(
             (ROOT / ".codex" / "hooks.json").read_text(encoding="utf-8")
         )
@@ -255,7 +255,7 @@ class CoreQuarantineTests(unittest.TestCase):
         }
         self.assertEqual(len(commands), 1)
         environment = os.environ.copy()
-        environment["CODEX_CONTROL_PLANE_HOOK_MODE"] = "audit"
+        environment["CODEX_CONTROL_PLANE_HOOK_MODE"] = "soft-enforce"
         completed = subprocess.run(
             ["/bin/sh", "-c", commands.pop()],
             cwd=ROOT,
@@ -279,12 +279,9 @@ class CoreQuarantineTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         output = json.loads(completed.stdout)["hookSpecificOutput"]
-        self.assertEqual(output.get("permissionDecision"), "deny")
-        self.assertEqual(
-            output.get("permissionDecisionReason"),
-            "CONTROL_PLANE_SOFT_ENFORCE: "
-            "destructive_command_requires_explicit_authority",
-        )
+        self.assertIn("additionalContext", output)
+        self.assertIn("CONTROL PLANE RISK", output["additionalContext"])
+        self.assertNotIn("permissionDecision", output)
 
     def test_launcher_clean_reexec_preserves_empty_and_payload_hook_stdin_once(self) -> None:
         cases = (

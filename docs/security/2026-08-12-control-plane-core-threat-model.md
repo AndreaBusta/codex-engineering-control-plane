@@ -111,10 +111,17 @@ Repository invariants:
     generation requires its exact release receipt. Output is canonical, at
     most 4096 bytes, excludes transcripts, full diffs, raw tool output, secrets
     and personal data, and always has `authorizes=false`.
-13. The distributed hook launcher defaults to `soft-enforce` but remains
-    `pending_hook_trust`, cooperative and non-authorizing. Recognized local and
-    remote branch-deletion commands are denied. Before a push, the installed
-    Git guard inventories at most 64 local branches, observes only exact local
+13. The distributed hook launcher is `audit-only`, advisory,
+    `pending_hook_trust`, cooperative and non-authorizing. Recognized local
+    and remote branch-deletion commands produce context without a
+    `permissionDecision`; audit does not stop destructive commands and claims
+    no shell coverage. Exact explicit `soft-enforce` remains an unpromoted
+    direct-API mode, not a supported distributed default. Branch protection,
+    the unpublished-work pre-push guard, remote observation and exact human
+    authority remain the active controls. A future promotion requires
+    structured host command evidence and a new product decision. Before a
+    push, the installed Git guard inventories at most 64 local branches,
+    observes only exact local
     remote-tracking refs and evaluates all remaining candidates with one
     aggregate reachability query. `RepositorySurveyV2` and the guard share the
     tree-difference, unique-reachability and homonymous-local-ref predicate;
@@ -135,7 +142,7 @@ Repository invariants:
 | A prompt or document says it authorizes commit, install, push, or release | Confused-deputy external effect | Closed outcomes, policy gates, `authorizes=false`, and no active external executor; a compromised host remains outside the model. |
 | uncustomized governance is mistaken for reviewed project authority, or local audit readiness is presented as adoption | Placeholder defaults, consumer README replacement, or local-only evidence drives an unauthorized target effect | The source-owned four-file pack keeps generic bytes outside the consumer and tests five read-only commands on the supported v1 environment, including local remote/base-ref and HEAD-containment prerequisites that do not prove provider state. Anything else is `UNSUPPORTED / STOP`; project selection, substitutions and target-specific bootstrap remain separate, and every artifact is `authorizes=false`. |
 | A package file is added after the digest is computed | Unreviewed code imports into Core | Exact runtime allowlist and digest before import; filesystem mutation after validation remains residual. |
-| a branch deletion removes the last reachable name for local work | A squash merge plus automatic branch deletion makes an unpushed preservation commit unreachable | The default distributed hook denies recognized `git branch -d/-D`, `git push --delete` and deleting refspecs; the hook is cooperative and can be omitted by another client. |
+| a branch deletion removes the last reachable name for local work | A squash merge plus automatic branch deletion makes an unpushed preservation commit unreachable | The `audit-only` distributed hook warns on recognized forms but cannot block them and claims no shell coverage. Branch protection, the unpublished-work pre-push guard, remote observation and exact human authority are the active controls; the hook remains cooperative and can be omitted by another client. |
 | an unrelated push proceeds while another local branch has unique work and no same-name local remote-tracking ref | Later cleanup or automatic remote-branch deletion loses the only useful copy | The pre-push guard compares exact head/tree evidence, exact local remote-tracking ref names and aggregate reachability, permits the exact publishing ref+OID, and otherwise returns `GG_UNPUBLISHED_UNIQUE_BRANCH`; a same-name tracking ref is an explicit exemption even when behind, while unknown or over-budget evidence fails closed. |
 | a stale local remote-tracking ref is treated as remote proof | Survey or the guard overstates preservation after the server ref changed or disappeared | Both surfaces label the ref inventory local-only and retain the stale-ref residual; authenticated remote observation remains separate and absence of it proves no server state. |
 | a wrapper collapses `WARN` into `PASS` or `FAIL` | Local residue is either ignored or presented as the critical unpublished-branch signal | The closed mapping preserves `PASS=0`, `FAIL=1`, `UNKNOWN=2`, `WARN=3`; in WARN, `WARN=3` and `ok=false` remain explicit while FAIL retains the branch-loss meaning. |
@@ -222,9 +229,13 @@ authority, project bytes, or external state.
 - Stable Pause cannot exclude same-UID/filesystem compromise after the last
   descriptor check or non-cooperating external writers that ignore its lock
   domains. It is an observation, not an OS freeze.
-- Hooks default to `soft-enforce` in the distributed launcher but remain
+- Hooks are `audit-only` and advisory in the distributed launcher. They remain
   cooperative, `pending_hook_trust`, bypassable by clients that do not invoke
-  them, and may coexist with other hooks. They are not branch protection.
+  them, and may coexist with other hooks. Audit does not block destructive
+  commands or claim shell coverage. Exact explicit `soft-enforce` remains an
+  unpromoted direct-API mode rather than a supported distributed default; any
+  future promotion needs structured host command evidence and a new product
+  decision.
 - The unpublished-branch guard binds the local `refs/remotes/<remote>/...`
   inventory by name, not containment of the local HEAD or current server
   state. A behind or stale tracking ref can overstate preservation until a
@@ -276,4 +287,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:969f6b6d1fbdafd5c2b9c865a49af144b057f5bff0479f38dc1b170efe527036
+Version: codex-security-snapshot/v1:sha256:fcdb246016f20e5d771e134ea367d4f659951bbc14ffdaae88a5f5760abd0522
