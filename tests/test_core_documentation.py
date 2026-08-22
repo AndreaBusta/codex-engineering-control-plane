@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from hashlib import sha256
 import inspect
 import json
@@ -8,8 +9,10 @@ import errno
 from pathlib import Path
 import re
 import selectors
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -90,6 +93,24 @@ REPOSITORY_SURVEY_V2_PLAN = (
     / "superpowers"
     / "plans"
     / "2026-08-21-repository-survey-v2.md"
+)
+NEW_PROJECT_PACK = ROOT / "templates" / "new-project"
+NEW_PROJECT_RUNBOOK = (
+    ROOT / "docs" / "engineering" / "23-new-project-audit-bootstrap.md"
+)
+ADOPTION_READINESS_SPEC = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-22-control-plane-adoption-readiness-v1-design.md"
+)
+ADOPTION_READINESS_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-22-control-plane-adoption-readiness-v1.md"
 )
 ORIENTATION_PLAN_SHA256 = (
     "7a2d275cadeaaa497a8a097da242a6b76f1dfccfbea1dd6f0320f78f27813475"
@@ -767,6 +788,2580 @@ def normalized_snapshot_version() -> str:
 
 
 class CoreDocumentationTests(unittest.TestCase):
+    class NewProjectAuditReadinessTests(unittest.TestCase):
+        PACK_PATHS = {
+            "AGENTS.md",
+            "README.md",
+            ".codex/project-policy.toml",
+            ".codex/resource-registry.toml",
+        }
+        AUTHORITY_PATHS = {
+            "AGENTS.md",
+            ".codex/project-policy.toml",
+            ".codex/resource-registry.toml",
+        }
+
+        def _pack_files(self) -> dict[str, bytes]:
+            return {
+                path.relative_to(NEW_PROJECT_PACK).as_posix(): path.read_bytes()
+                for path in NEW_PROJECT_PACK.rglob("*")
+                if path.is_file()
+            }
+
+        def _run(
+            self,
+            *arguments: str,
+            cwd: Path,
+            timeout: float = 30.0,
+            env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess[bytes]:
+            process = subprocess.Popen(
+                list(arguments),
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                close_fds=True,
+                start_new_session=True,
+            )
+            selector = selectors.DefaultSelector()
+            payload = bytearray()
+            deadline = time.monotonic() + timeout
+            try:
+                self.assertIsNotNone(process.stdout)
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._terminate_process_group(process)
+                        raise AssertionError("E_AUDIT_PROCESS_TIMEOUT")
+                    events = selector.select(timeout=min(remaining, 0.05))
+                    if not events:
+                        continue
+                    for key, _ in events:
+                        chunk = os.read(key.fileobj.fileno(), _STREAM_CHUNK)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        if len(payload) + len(chunk) > 256 * 1_024:
+                            self._terminate_process_group(process)
+                            raise AssertionError("E_AUDIT_PROCESS_OUTPUT_LIMIT")
+                        payload.extend(chunk)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._terminate_process_group(process)
+                    raise AssertionError("E_AUDIT_PROCESS_TIMEOUT")
+                try:
+                    return_code = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired as error:
+                    self._terminate_process_group(process)
+                    raise AssertionError("E_AUDIT_PROCESS_TIMEOUT") from error
+                return subprocess.CompletedProcess(
+                    list(arguments), return_code, bytes(payload), None
+                )
+            except BaseException:
+                self._terminate_process_group(process)
+                raise
+            finally:
+                selector.close()
+                if process.stdout is not None:
+                    process.stdout.close()
+
+        def _terminate_process_group(self, process: subprocess.Popen[bytes]) -> None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired as error:
+                raise AssertionError("E_AUDIT_PROCESS_CLEANUP") from error
+
+        def _closed_environment(self, home: Path) -> dict[str, str]:
+            return {
+                "HOME": str(home),
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+                "XDG_CONFIG_HOME": str(home),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+            }
+
+        def _assert_audit_resources_ready(self, inventory: dict[str, object]) -> None:
+            resources = {
+                str(item["id"]): item
+                for item in inventory["resources"]  # type: ignore[index]
+            }
+            for resource_id in (
+                "instruction.project-agents",
+                "document.project-readme",
+            ):
+                resource = resources[resource_id]
+                self.assertTrue(resource["ready"], resource)
+                self.assertNotIn("R_NOT_FOUND", resource["reason_codes"])
+
+        def _authority_digest_environment(
+            self, target: Path, task_envelope: Path
+        ) -> dict[str, str]:
+            return {
+                "TARGET_REPO": str(target.resolve(strict=True)),
+                "TARGET_AGENTS_SHA256": sha256(
+                    (target / "AGENTS.md").read_bytes()
+                ).hexdigest(),
+                "TARGET_POLICY_SHA256": sha256(
+                    (target / ".codex" / "project-policy.toml").read_bytes()
+                ).hexdigest(),
+                "TARGET_REGISTRY_SHA256": sha256(
+                    (target / ".codex" / "resource-registry.toml").read_bytes()
+                ).hexdigest(),
+                "TASK_ENVELOPE": str(task_envelope.resolve(strict=True)),
+                "TASK_ENVELOPE_SHA256": sha256(task_envelope.read_bytes()).hexdigest(),
+            }
+
+        def _task_envelope(self, root: Path, name: str = "task-envelope.json") -> Path:
+            path = root / name
+            path.write_text(json.dumps(self._task()), encoding="utf-8")
+            return path
+
+        def _object_store_snapshot(self, repo: Path) -> dict[str, tuple[int, str]]:
+            git_directory = Path(
+                self._git(repo, "rev-parse", "--absolute-git-dir").decode().strip()
+            )
+            objects = git_directory / "objects"
+            snapshot: dict[str, tuple[int, str]] = {}
+            for path in sorted(objects.rglob("*")):
+                if path.is_dir():
+                    continue
+                metadata = path.lstat()
+                self.assertTrue(stat.S_ISREG(metadata.st_mode))
+                snapshot[path.relative_to(objects).as_posix()] = (
+                    stat.S_IMODE(metadata.st_mode),
+                    sha256(path.read_bytes()).hexdigest(),
+                )
+            return snapshot
+
+        def _source_binding(self) -> str:
+            runbook = read(NEW_PROJECT_RUNBOOK)
+            section = runbook.split("<!-- BEGIN SOURCE_BINDING -->", 1)[1].split(
+                "<!-- END SOURCE_BINDING -->", 1
+            )[0]
+            return section.split("```bash", 1)[1].split("```", 1)[0]
+
+        def _embedded_python(self, shell_block: str) -> str:
+            return shell_block.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+
+        def _materialization_predicate(self, shell_block: str):
+            tree = ast.parse(self._embedded_python(shell_block))
+            selected = [
+                node
+                for node in tree.body
+                if (
+                    isinstance(node, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name)
+                        and target.id == "UF_DATALESS"
+                        for target in node.targets
+                    )
+                )
+                or (
+                    isinstance(node, ast.FunctionDef)
+                    and node.name == "fully_materialized"
+                )
+            ]
+            self.assertEqual(len(selected), 2)
+            namespace: dict[str, object] = {}
+            exec(
+                compile(
+                    ast.Module(body=selected, type_ignores=[]),
+                    "<materialization-predicate>",
+                    "exec",
+                ),
+                namespace,
+            )
+            return namespace["fully_materialized"]
+
+        def _task_envelope_reader(self):
+            tree = ast.parse(self._embedded_python(self._source_binding()))
+            selected = [
+                node
+                for node in tree.body
+                if (
+                    isinstance(node, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name)
+                        and target.id == "UF_DATALESS"
+                        for target in node.targets
+                    )
+                )
+                or (
+                    isinstance(node, ast.FunctionDef)
+                    and node.name
+                    in {
+                        "fully_materialized",
+                        "safe",
+                        "identity",
+                        "task_envelope_bytes",
+                    }
+                )
+            ]
+            namespace: dict[str, object] = {
+                "os": os,
+                "stat": stat,
+                "EUID": os.geteuid(),
+                "MAX_TASK": 1024 * 1024,
+            }
+            exec(
+                compile(
+                    ast.Module(body=selected, type_ignores=[]),
+                    "<task-envelope-reader>",
+                    "exec",
+                ),
+                namespace,
+            )
+            return namespace["task_envelope_bytes"]
+
+        def _customization_guard(self) -> str:
+            runbook = read(NEW_PROJECT_RUNBOOK)
+            begin = "<!-- BEGIN CUSTOMIZATION_GUARD -->"
+            end = "<!-- END CUSTOMIZATION_GUARD -->"
+            self.assertIn(begin, runbook)
+            self.assertIn(end, runbook)
+            section = runbook.split(begin, 1)[1].split(end, 1)[0]
+            return section.split("```bash", 1)[1].split("```", 1)[0]
+
+        def _customization_guard_script(self) -> str:
+            return self._source_binding() + "\n" + self._customization_guard()
+
+        def _happy_commands(self) -> tuple[str, ...]:
+            runbook = read(NEW_PROJECT_RUNBOOK)
+            section = runbook.split("<!-- BEGIN HAPPY_PATH -->", 1)[1].split(
+                "<!-- END HAPPY_PATH -->", 1
+            )[0]
+            lines = tuple(
+                line
+                for line in section.splitlines()
+                if line.startswith(
+                    ('"$CONTROL_PLANE"', 'control_plane_audit "$CONTROL_PLANE"')
+                )
+            )
+            self.assertEqual(len(lines), 5)
+            return lines
+
+        def _audit_command_script(self, command: str) -> str:
+            return (
+                self._source_binding()
+                + "\n"
+                + self._customization_guard()
+                + "\n"
+                + command
+            )
+
+        def _git_result(self, repo: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+            return self._run(
+                "/usr/bin/git",
+                "--no-pager",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "color.ui=false",
+                "-c",
+                "core.pager=cat",
+                "-C",
+                str(repo),
+                *arguments,
+                cwd=repo,
+                env=self._closed_environment(Path("/var/empty")),
+            )
+
+        def _git(self, repo: Path, *arguments: str) -> bytes:
+            result = self._git_result(repo, *arguments)
+            self.assertEqual(result.returncode, 0, result.stdout.decode(errors="replace"))
+            return result.stdout
+
+        def _project_snapshot(self, repo: Path) -> dict[str, object]:
+            root = repo.resolve(strict=True)
+            files: dict[str, dict[str, object]] = {}
+            stack = [root]
+            while stack:
+                directory = stack.pop()
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        relative = Path(entry.path).relative_to(root)
+                        if relative.parts == (".git",):
+                            continue
+                        metadata = entry.stat(follow_symlinks=False)
+                        key = relative.as_posix()
+                        mode = stat.S_IMODE(metadata.st_mode)
+                        if stat.S_ISLNK(metadata.st_mode):
+                            target = os.fsencode(os.readlink(entry.path))
+                            self.assertEqual(
+                                entry.stat(follow_symlinks=False), metadata
+                            )
+                            files[key] = {
+                                "type": "symlink",
+                                "mode": mode,
+                                "target_sha256": sha256(target).hexdigest(),
+                            }
+                        elif stat.S_ISDIR(metadata.st_mode):
+                            files[key] = {"type": "directory", "mode": mode}
+                            stack.append(Path(entry.path))
+                        elif stat.S_ISREG(metadata.st_mode):
+                            descriptor = os.open(
+                                entry.path,
+                                os.O_RDONLY
+                                | getattr(os, "O_NOFOLLOW", 0)
+                                | getattr(os, "O_CLOEXEC", 0),
+                            )
+                            try:
+                                opened = os.fstat(descriptor)
+                                with os.fdopen(
+                                    descriptor, "rb", closefd=False
+                                ) as stream:
+                                    payload = stream.read(_MAX_DOCUMENT_BYTES + 1)
+                                after_open = os.fstat(descriptor)
+                            finally:
+                                os.close(descriptor)
+                            self.assertEqual(opened, metadata)
+                            self.assertEqual(after_open, metadata)
+                            self.assertLessEqual(len(payload), _MAX_DOCUMENT_BYTES)
+                            files[key] = {
+                                "type": "regular",
+                                "mode": mode,
+                                "sha256": sha256(payload).hexdigest(),
+                            }
+                        else:
+                            self.fail(f"E_AUDIT_TARGET_SPECIAL: {key}")
+            return {
+                "head": self._git(repo, "rev-parse", "HEAD"),
+                "branch": self._git(repo, "branch", "--show-current"),
+                "status": self._git(
+                    repo, "status", "--porcelain=v1", "--untracked-files=all"
+                ),
+                "index": self._git_index_snapshot(repo),
+                "files": files,
+            }
+
+        def _git_index_snapshot(self, repo: Path) -> dict[str, object]:
+            git_directory = Path(
+                self._git(repo, "rev-parse", "--absolute-git-dir").decode().strip()
+            )
+            index_path = Path(
+                self._git(
+                    repo,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "index",
+                ).decode().strip()
+            )
+            self.assertEqual(index_path.parent.resolve(strict=True), git_directory.resolve(strict=True))
+            metadata = index_path.lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertFalse(index_path.is_symlink())
+            return {
+                "mode": stat.S_IMODE(metadata.st_mode),
+                "sha256": sha256(index_path.read_bytes()).hexdigest(),
+            }
+
+        def _customized_authority(self) -> dict[str, bytes]:
+            replacements = {
+                b"__PROJECT_NAME__": b"audit-fixture-project",
+            }
+            customized: dict[str, bytes] = {}
+            for relative, payload in self._pack_files().items():
+                if relative not in self.AUTHORITY_PATHS:
+                    continue
+                for old, new in replacements.items():
+                    payload = payload.replace(old, new)
+                self.assertNotIn(b"__", payload)
+                customized[relative] = payload
+            return customized
+
+        def _initialize_target(self, root: Path, *, customized: bool = True) -> Path:
+            origin = root / "origin.git"
+            self._git(root, "init", "-q", "--bare", str(origin))
+            target = root / "consumer"
+            target.mkdir()
+            self._git(target, "init", "-q", "-b", "main")
+            self._git(target, "config", "user.name", "Audit Fixture")
+            self._git(target, "config", "user.email", "audit@example.invalid")
+            consumer_readme = b"# Consumer-owned project\n\nKeep this content.\n"
+            (target / "README.md").write_bytes(consumer_readme)
+            self._git(target, "add", "README.md")
+            self._git(target, "commit", "-qm", "consumer baseline")
+
+            authority = (
+                self._customized_authority()
+                if customized
+                else {
+                    relative: payload
+                    for relative, payload in self._pack_files().items()
+                    if relative in self.AUTHORITY_PATHS
+                }
+            )
+            for relative, payload in authority.items():
+                destination = target / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(payload)
+            self.assertEqual((target / "README.md").read_bytes(), consumer_readme)
+            self._git(target, "add", "AGENTS.md", ".codex")
+            self._git(target, "commit", "-qm", "target-specific governance")
+            self._git(target, "remote", "add", "origin", str(origin))
+            self._git(target, "push", "-qu", "origin", "main")
+            return target
+
+        def _initialize_source(self, root: Path) -> tuple[Path, str]:
+            source = root.resolve(strict=True) / "source"
+            integrated_sha = self._git(ROOT, "rev-parse", "HEAD").decode().strip()
+            clone = self._run(
+                "/usr/bin/git",
+                "--no-pager",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "clone",
+                "-q",
+                "--no-checkout",
+                str(ROOT),
+                str(source),
+                cwd=root,
+                env=self._closed_environment(Path("/var/empty")),
+                timeout=60.0,
+            )
+            self.assertEqual(clone.returncode, 0, clone.stdout.decode(errors="replace"))
+            self._git(source, "checkout", "-q", "--detach", integrated_sha)
+            self.assertEqual(
+                self._git(source, "rev-parse", "HEAD").decode().strip(),
+                integrated_sha,
+            )
+            self.assertEqual(
+                self._git(
+                    source, "status", "--porcelain=v1", "--untracked-files=all"
+                ),
+                b"",
+            )
+            detached = self._git_result(source, "symbolic-ref", "-q", "HEAD")
+            self.assertEqual(detached.returncode, 1, detached.stdout)
+            return source, integrated_sha
+
+        def _task(self) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "task_id": "TASK-NEXT-PROJECT-AUDIT-001",
+                "objective": "Audit a structured multi-file change without mutation.",
+                "intent": "audit",
+                "phase": "research",
+                "requested_outcome": "answer",
+                "goals": [
+                    {
+                        "id": "goal-audit",
+                        "summary": "Produce bounded local audit evidence.",
+                        "domains": ["project"],
+                        "depends_on": [],
+                    }
+                ],
+                "domains": ["project"],
+                "signals": ["multi_file"],
+                "scope_paths": ["AGENTS.md", ".codex/", "README.md"],
+                "risk": {
+                    "uncertainty": 2,
+                    "blast_radius": 1,
+                    "irreversibility": 1,
+                    "verification_complexity": 2,
+                },
+                "effects": [{"name": "local_read", "source": "user_explicit"}],
+                "explicit_resources": [],
+                "excluded_resources": [],
+            }
+
+        def test_source_pack_is_exact_minimal_and_schema_valid(self) -> None:
+            pack = self._pack_files()
+            self.assertEqual(set(pack), self.PACK_PATHS)
+            self.assertNotEqual(pack["README.md"], b"")
+            policy = tomllib.loads(pack[".codex/project-policy.toml"].decode())
+            registry = tomllib.loads(pack[".codex/resource-registry.toml"].decode())
+            self.assertEqual(policy["project_name"], "__PROJECT_NAME__")
+            self.assertEqual(policy["project_kind"], "generic")
+            self.assertEqual(registry["registry_id"], "__PROJECT_NAME__")
+            resources = {resource["id"]: resource for resource in registry["resources"]}
+            self.assertEqual(
+                set(resources),
+                {
+                    "instruction.project-agents",
+                    "document.project-readme",
+                    "gate.targeted-validation",
+                    "gate.diff-review",
+                    "gate.relevant-tests",
+                    "gate.pull-request",
+                    "gate.written-plan",
+                    "gate.independent-review",
+                    "gate.security-review",
+                    "gate.rollback-plan",
+                },
+            )
+            self.assertEqual(resources["instruction.project-agents"]["selection"], "required")
+            self.assertEqual(resources["document.project-readme"]["selection"], "available")
+            self.assertTrue(
+                all(
+                    resource["locator"].startswith(("repo://", "builtin://"))
+                    for resource in resources.values()
+                )
+            )
+            self.assertEqual(
+                registry["routes"][0]["recommended_resources"],
+                ["document.project-readme"],
+            )
+            serialized = "\n".join(payload.decode() for payload in pack.values())
+            for forbidden in (
+                "control-plane.lock",
+                "hooks.json",
+                "CoreTaskState",
+                "receipt",
+                "mcp://github",
+                "release-provider",
+                "user-skill://",
+            ):
+                self.assertNotIn(forbidden, serialized)
+
+        def test_registry_recommends_readme_only_for_first_use_audit_research(self) -> None:
+            registry = tomllib.loads(
+                (NEW_PROJECT_PACK / ".codex/resource-registry.toml").read_text()
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, _ = self._initialize_source(root)
+                target = self._initialize_target(root)
+                environment = self._closed_environment(root / "closed-home")
+                launcher = source / "scripts" / "control-plane"
+                policy = target / ".codex" / "project-policy.toml"
+                registry_path = target / ".codex" / "resource-registry.toml"
+                cases = (
+                    ("audit", "frame"),
+                    ("audit", "observe"),
+                    ("explain", "research"),
+                    ("release", "release"),
+                    ("plan", "plan"),
+                    ("implement", "implement"),
+                )
+                for index, (intent, phase) in enumerate(cases):
+                    with self.subTest(intent=intent, phase=phase):
+                        task = json.loads(json.dumps(self._task()))
+                        task["task_id"] = f"TASK-UNSUPPORTED-{index}"
+                        task["intent"] = intent
+                        task["phase"] = phase
+                        task_path = root / f"task-{index}.json"
+                        task_path.write_text(json.dumps(task), encoding="utf-8")
+                        result = self._run(
+                            str(launcher),
+                            "route",
+                            "--repo",
+                            str(target),
+                            "--task",
+                            str(task_path),
+                            "--policy",
+                            str(policy),
+                            "--registry",
+                            str(registry_path),
+                            "--mode",
+                            "audit",
+                            "--json",
+                            cwd=target,
+                            env=environment,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stdout)
+                        payload = json.loads(result.stdout)
+                        self.assertEqual(payload["matched_routes"], [])
+                        self.assertNotIn(
+                            "document.project-readme",
+                            payload["summary"]["recommended"],
+                        )
+            route = registry["routes"][0]
+            self.assertEqual(route["tiers"], ["T2"])
+            self.assertEqual(route["phases"], ["research"])
+            self.assertEqual(route["intents"], ["audit"])
+            self.assertNotIn("T2/T3", (NEW_PROJECT_PACK / "README.md").read_text())
+
+        def test_template_authority_is_restrictive_and_non_authorizing(self) -> None:
+            agents = (NEW_PROJECT_PACK / "AGENTS.md").read_text(encoding="utf-8")
+            for token in (
+                "evidence",
+                "TDD",
+                "scope",
+                "protected base",
+                "authorizes=false",
+                "commit",
+                "push",
+                "Pull Request",
+                "merge",
+                "deploy",
+                "release",
+                "dependencies",
+                "CI",
+                "secrets",
+            ):
+                self.assertIn(token, agents)
+            self.assertIn("exact target-specific authorization", agents)
+            self.assertNotIn("authorized permanently", agents)
+            self.assertNotIn("standing Git authority", agents)
+
+        def test_runbook_and_plan_keep_target_mutation_deferred(self) -> None:
+            runbook = read(NEW_PROJECT_RUNBOOK)
+            spec = read(ADOPTION_READINESS_SPEC)
+            plan = read(ADOPTION_READINESS_PLAN)
+            self.assertLessEqual(len(runbook.splitlines()), 350)
+            for token in (
+                "AUDIT_ONLY",
+                "DEFERRED_TARGET_BOOTSTRAP",
+                "authorizes=false",
+                "clean detached source",
+                "exact integrated SHA",
+                "outside the target",
+                "consumer README",
+            ):
+                self.assertIn(token, runbook)
+            self.assertLess(
+                runbook.index("<!-- END CUSTOMIZATION_GUARD -->"),
+                runbook.index("<!-- BEGIN HAPPY_PATH -->"),
+            )
+            for variable in (
+                "TARGET_AGENTS_SHA256",
+                "TARGET_POLICY_SHA256",
+                "TARGET_REGISTRY_SHA256",
+                "TASK_ENVELOPE_SHA256",
+            ):
+                self.assertIn(variable, runbook)
+            happy = "\n".join(self._happy_commands())
+            for command in (
+                "policy-check",
+                "registry-check",
+                "inventory",
+                "preflight --mode read",
+                "route",
+            ):
+                self.assertIn(command, happy)
+            for command in ("doctor", "survey"):
+                self.assertNotIn(command, happy)
+                self.assertIn(command, runbook)
+            fenced = "\n".join(re.findall(r"```(?:bash|sh)\n(.*?)```", runbook, re.DOTALL))
+            launcher_lines = tuple(
+                line.strip()
+                for line in fenced.splitlines()
+                if any(
+                    f" {command} " in f" {line} "
+                    for command in (
+                        "policy-check",
+                        "registry-check",
+                        "inventory",
+                        "preflight",
+                        "route",
+                        "doctor",
+                        "survey",
+                    )
+                )
+                and "$CONTROL_PLANE" in line
+            )
+            self.assertEqual(len(launcher_lines), 7)
+            self.assertTrue(
+                all(
+                    line.startswith('control_plane_audit "$CONTROL_PLANE"')
+                    for line in launcher_lines
+                ),
+                launcher_lines,
+            )
+            self.assertFalse(
+                any(
+                    re.match(r'^\s*"\$CONTROL_PLANE"\s', line)
+                    for line in fenced.splitlines()
+                )
+            )
+            self.assertEqual(runbook.count("control_plane_audit() {"), 1)
+            for mutation in (
+                "git switch",
+                "git add",
+                "git commit",
+                "git push",
+                "mkdir ",
+                "cp ",
+                "rsync",
+                "control-plane-adoption",
+            ):
+                self.assertNotIn(mutation, fenced)
+            for document in (spec, plan):
+                self.assertIn("AUDIT_ONLY", document)
+                self.assertIn("DEFERRED_TARGET_BOOTSTRAP", document)
+                self.assertIn("reusable mutator ADR", document)
+                self.assertNotIn("Survey V2", document)
+                self.assertNotIn("Adoption preview", document)
+            self.assertEqual(plan.count("## Unit "), 4)
+
+        def test_materialization_contract_is_lstat_first_and_fail_closed(self) -> None:
+            source = self._source_binding()
+            fully_materialized = self._materialization_predicate(source)
+            self.assertTrue(fully_materialized(SimpleNamespace(st_flags=0)))
+            self.assertFalse(
+                fully_materialized(SimpleNamespace(st_flags=0x40000000))
+            )
+            self.assertIn("E_AUDIT_STABLE_PAUSE_MATERIALIZATION", source)
+            self.assertIn(
+                "verify_control_plane_target_and_task", self._customization_guard()
+            )
+
+            self.assertLess(
+                source.index("source_metadata_preflight(source)"),
+                source.index("physical = source.resolve"),
+            )
+            self.assertLess(
+                source.index("source_metadata_preflight(source)"),
+                source.index("_, raw_gitdir = git("),
+            )
+            self.assertLess(
+                source.index("target_metadata_preflight(literal)"),
+                source.index("physical = literal.resolve"),
+            )
+            self.assertLess(
+                source.index("task_metadata_preflight(task_path)"),
+                source.index("task_envelope_bytes(task_path)"),
+            )
+            dataless = SimpleNamespace(st_flags=0x40000000)
+
+            class MetadataOnlyPath:
+                def lstat(self) -> SimpleNamespace:
+                    return dataless
+
+            task_envelope_reader = self._task_envelope_reader()
+            with patch.object(
+                os, "open", side_effect=AssertionError("content open reached")
+            ) as opened:
+                with self.assertRaisesRegex(
+                    SystemExit, "E_AUDIT_STABLE_PAUSE_MATERIALIZATION"
+                ):
+                    task_envelope_reader(MetadataOnlyPath())
+                opened.assert_not_called()
+            runbook = read(NEW_PROJECT_RUNBOOK)
+            self.assertIn("FULLY_MATERIALIZED_LOCAL_ONLY", runbook)
+            self.assertIn("File Provider", runbook)
+            self.assertIn("before the audit", runbook)
+
+        def test_source_and_target_permissions_fail_closed(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, integrated_sha = self._initialize_source(root)
+                source_environment = self._closed_environment(root / "closed-home")
+                source_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                scripts = source / "scripts"
+                scripts_mode = stat.S_IMODE(scripts.stat().st_mode)
+                scripts.chmod(0o777)
+                unsafe_source = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=source_environment,
+                )
+                self.assertNotEqual(unsafe_source.returncode, 0, unsafe_source.stdout)
+                scripts.chmod(scripts_mode)
+
+                scenario = root / "target-scenario"
+                scenario.mkdir()
+                target = self._initialize_target(scenario)
+                task_path = self._task_envelope(root, "permission-task.json")
+                target_environment = self._closed_environment(root / "target-home")
+                target_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                target_environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                guard = self._customization_guard_script()
+
+                agents = target / "AGENTS.md"
+                agents_mode = stat.S_IMODE(agents.stat().st_mode)
+                agents.chmod(0o666)
+                unsafe_agents = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=target_environment
+                )
+                self.assertNotEqual(unsafe_agents.returncode, 0, unsafe_agents.stdout)
+                agents.chmod(agents_mode)
+
+                target_mode = stat.S_IMODE(target.stat().st_mode)
+                target.chmod(0o777)
+                unsafe_root = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=target_environment
+                )
+                self.assertNotEqual(unsafe_root.returncode, 0, unsafe_root.stdout)
+                target.chmod(target_mode)
+
+        def test_writable_source_target_task_and_git_metadata_ancestors_stop(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                source_parent = root / "source-parent"
+                source_parent.mkdir()
+                source, integrated_sha = self._initialize_source(source_parent)
+                source_environment = self._closed_environment(root / "source-home")
+                source_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                source_parent.chmod(0o777)
+                unsafe_source_parent = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=source_environment,
+                )
+                self.assertNotEqual(
+                    unsafe_source_parent.returncode, 0, unsafe_source_parent.stdout
+                )
+                source_parent.chmod(0o1777)
+                sticky_source_parent = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=source_environment,
+                )
+                self.assertEqual(
+                    sticky_source_parent.returncode,
+                    0,
+                    sticky_source_parent.stdout,
+                )
+                source_parent.chmod(0o755)
+
+                target_parent = root / "target-parent"
+                target_parent.mkdir()
+                target = self._initialize_target(target_parent)
+                task_parent = root / "task-parent"
+                task_parent.mkdir()
+                task_path = self._task_envelope(task_parent)
+                target_environment = self._closed_environment(root / "target-home")
+                target_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                target_environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                target_parent.chmod(0o777)
+                unsafe_target_parent = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=target,
+                    env=target_environment,
+                )
+                self.assertNotEqual(
+                    unsafe_target_parent.returncode, 0, unsafe_target_parent.stdout
+                )
+                target_parent.chmod(0o755)
+
+                task_parent.chmod(0o777)
+                unsafe_task_parent = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=target,
+                    env=target_environment,
+                )
+                self.assertNotEqual(
+                    unsafe_task_parent.returncode, 0, unsafe_task_parent.stdout
+                )
+                task_parent.chmod(0o755)
+
+                target_worktree = root / "safe-target-worktree"
+                self._git(
+                    target,
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    str(target_worktree),
+                )
+                target_gitdir = Path(
+                    self._git(
+                        target_worktree, "rev-parse", "--absolute-git-dir"
+                    )
+                    .decode()
+                    .strip()
+                )
+                self.assertTrue((target_gitdir / "commondir").is_file())
+                linked_target_environment = self._closed_environment(
+                    root / "linked-target-home"
+                )
+                linked_target_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                linked_target_environment.update(
+                    self._authority_digest_environment(target_worktree, task_path)
+                )
+                valid_target_common_directory = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=target_worktree,
+                    env=linked_target_environment,
+                )
+                self.assertEqual(
+                    valid_target_common_directory.returncode,
+                    0,
+                    valid_target_common_directory.stdout,
+                )
+                worktree_config = target_gitdir / "config.worktree"
+                worktree_config.write_text(
+                    '[includeIf "gitdir:/"]\n'
+                    f"\tpath = {root / 'outside-worktree.config'}\n",
+                    encoding="utf-8",
+                )
+                rejected_worktree_config = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=target_worktree,
+                    env=linked_target_environment,
+                )
+                self.assertNotEqual(
+                    rejected_worktree_config.returncode,
+                    0,
+                    rejected_worktree_config.stdout,
+                )
+                worktree_config.unlink()
+                restored_target_common_directory = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=target_worktree,
+                    env=linked_target_environment,
+                )
+                self.assertEqual(
+                    restored_target_common_directory.returncode,
+                    0,
+                    restored_target_common_directory.stdout,
+                )
+
+                worktree = root / "safe-worktree"
+                self._git(
+                    source,
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    str(worktree),
+                    integrated_sha,
+                )
+                source_mode = stat.S_IMODE(source.stat().st_mode)
+                git_environment = self._closed_environment(root / "git-home")
+                git_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(worktree),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                valid_common_directory = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=git_environment,
+                )
+                self.assertEqual(
+                    valid_common_directory.returncode,
+                    0,
+                    valid_common_directory.stdout,
+                )
+                source.chmod(0o777)
+                unsafe_git_parent = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=git_environment,
+                )
+                self.assertNotEqual(
+                    unsafe_git_parent.returncode, 0, unsafe_git_parent.stdout
+                )
+                source.chmod(source_mode)
+
+                source_binding = self._source_binding()
+                self.assertIn("stat.S_ISVTX", source_binding)
+                self.assertIn("child_item.st_uid==EUID", source_binding)
+                tree = ast.parse(self._embedded_python(source_binding))
+                chain_node = next(
+                    node
+                    for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "chain_identity"
+                )
+                namespace: dict[str, object] = {}
+                exec(
+                    compile(
+                        ast.Module(body=[chain_node], type_ignores=[]),
+                        "<chain-identity>",
+                        "exec",
+                    ),
+                    namespace,
+                )
+                chain_identity = namespace["chain_identity"]
+                ancestor = SimpleNamespace(
+                    st_dev=1,
+                    st_ino=2,
+                    st_mode=stat.S_IFDIR | 0o755,
+                    st_nlink=3,
+                    st_uid=os.geteuid(),
+                    st_gid=20,
+                    st_size=96,
+                    st_mtime_ns=1,
+                    st_ctime_ns=1,
+                )
+                churned = SimpleNamespace(**{**vars(ancestor), "st_mtime_ns": 2})
+                writable = SimpleNamespace(
+                    **{**vars(ancestor), "st_mode": stat.S_IFDIR | 0o777}
+                )
+                self.assertEqual(chain_identity(ancestor), chain_identity(churned))
+                self.assertNotEqual(chain_identity(ancestor), chain_identity(writable))
+                sticky_node = next(
+                    node
+                    for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "sticky_protects"
+                )
+                sticky_namespace: dict[str, object] = {
+                    "stat": stat,
+                    "EUID": os.geteuid(),
+                }
+                exec(
+                    compile(
+                        ast.Module(body=[sticky_node], type_ignores=[]),
+                        "<sticky-protection>",
+                        "exec",
+                    ),
+                    sticky_namespace,
+                )
+                sticky_protects = sticky_namespace["sticky_protects"]
+                owned_sticky = SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o1777, st_uid=os.geteuid()
+                )
+                foreign_sticky = SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o1777, st_uid=os.geteuid() + 1
+                )
+                owned_child = SimpleNamespace(st_uid=os.geteuid())
+                foreign_child = SimpleNamespace(st_uid=os.geteuid() + 1)
+                self.assertTrue(sticky_protects(owned_sticky, owned_child))
+                self.assertFalse(sticky_protects(foreign_sticky, owned_child))
+                self.assertFalse(sticky_protects(owned_sticky, foreign_child))
+
+        def test_each_happy_command_revalidates_the_exact_source(self) -> None:
+            binding = self._source_binding()
+            self.assertTrue(
+                all(
+                    command.startswith('control_plane_audit "$CONTROL_PLANE"')
+                    for command in self._happy_commands()
+                )
+            )
+            marker = "\nverify_control_plane_source\n"
+            self.assertEqual(binding.count(marker), 1)
+            self.assertIn("verify_control_plane_source()", binding)
+            self.assertIn("control_plane_audit()", binding)
+            self.assertIn("verify_control_plane_audit_context()", binding)
+            wrapper = binding.split("control_plane_audit() {", 1)[1].split("}", 1)[0]
+            self.assertEqual(wrapper.count("verify_control_plane_audit_context"), 2)
+            self.assertLess(
+                wrapper.index("verify_control_plane_audit_context"),
+                wrapper.index('if "$@"'),
+            )
+            self.assertLess(
+                wrapper.index('if "$@"'),
+                wrapper.rindex("verify_control_plane_audit_context"),
+            )
+
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                source = root / "source"
+                source.mkdir()
+                self._git(source, "init", "-q", "-b", "main")
+                self._git(source, "config", "user.name", "Audit Fixture")
+                self._git(source, "config", "user.email", "audit@example.invalid")
+                sentinel = root / "launcher-called"
+                launcher = source / "scripts" / "control-plane"
+                launcher.parent.mkdir()
+                launcher.write_text(
+                    "#!/bin/sh\n"
+                    f"/usr/bin/touch {str(sentinel)!r}\n"
+                    'if [ -n "${AUDIT_MUTATE_PATH-}" ]; then '\
+                    "printf '\\n# post-launch drift\\n' >> \"$AUDIT_MUTATE_PATH\"; fi\n"
+                    "printf '{\\\"ok\\\":true}\\n'\n",
+                    encoding="utf-8",
+                )
+                launcher.chmod(0o755)
+                (source / "README.md").write_text("A\n", encoding="utf-8")
+                self._git(source, "add", ".")
+                self._git(source, "commit", "-qm", "source A")
+                sha_a = self._git(source, "rev-parse", "HEAD").decode().strip()
+                (source / "README.md").write_text("B\n", encoding="utf-8")
+                self._git(source, "add", "README.md")
+                self._git(source, "commit", "-qm", "source B")
+                sha_b = self._git(source, "rev-parse", "HEAD").decode().strip()
+                self._git(source, "checkout", "-q", "--detach", sha_a)
+                scenario = root / "target-scenario"
+                scenario.mkdir()
+                target = self._initialize_target(scenario)
+                task_path = self._task_envelope(root)
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE": str(launcher),
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": sha_a,
+                    }
+                )
+                environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                invocation = self._audit_command_script(
+                    'control_plane_audit "$CONTROL_PLANE"'
+                )
+                accepted = self._run(
+                    "/bin/sh", "-eu", "-c", invocation, cwd=root, env=environment
+                )
+                self.assertEqual(accepted.returncode, 0, accepted.stdout)
+                self.assertTrue(sentinel.exists())
+                sentinel.unlink()
+
+                for mutable in (
+                    source / "README.md",
+                    target / "AGENTS.md",
+                    task_path,
+                ):
+                    original = mutable.read_bytes()
+                    mutation_environment = dict(environment)
+                    mutation_environment["AUDIT_MUTATE_PATH"] = str(mutable)
+                    rejected_after_launcher = self._run(
+                        "/bin/sh",
+                        "-eu",
+                        "-c",
+                        invocation,
+                        cwd=root,
+                        env=mutation_environment,
+                    )
+                    self.assertNotEqual(
+                        rejected_after_launcher.returncode,
+                        0,
+                        rejected_after_launcher.stdout,
+                    )
+                    self.assertTrue(sentinel.exists())
+                    sentinel.unlink()
+                    mutable.write_bytes(original)
+
+                self._git(source, "checkout", "-q", "--detach", sha_b)
+                rejected = self._run(
+                    "/bin/sh", "-eu", "-c", invocation, cwd=root, env=environment
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+                self.assertFalse(sentinel.exists())
+
+                self._git(source, "checkout", "-q", "--detach", sha_a)
+                task_path.write_bytes(task_path.read_bytes() + b"\n")
+                changed_task = self._run(
+                    "/bin/sh", "-eu", "-c", invocation, cwd=root, env=environment
+                )
+                self.assertNotEqual(changed_task.returncode, 0, changed_task.stdout)
+                self.assertFalse(sentinel.exists())
+
+        def test_five_source_commands_are_read_only_and_resource_ready(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, integrated_sha = self._initialize_source(root)
+                target = self._initialize_target(root)
+                controlled_home = root / "closed-home"
+                controlled_home.mkdir()
+                environment = self._closed_environment(controlled_home)
+                task_path = self._task_envelope(root)
+                launcher = source / "scripts" / "control-plane"
+                policy = target / ".codex" / "project-policy.toml"
+                registry = target / ".codex" / "resource-registry.toml"
+                before = self._project_snapshot(target)
+                environment.update(
+                    {
+                        "CONTROL_PLANE": str(launcher),
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                guarded = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=target,
+                    env=environment,
+                )
+                self.assertEqual(guarded.returncode, 0, guarded.stdout)
+                payloads = []
+                for command in self._happy_commands():
+                    result = self._run(
+                        "/bin/sh",
+                        "-eu",
+                        "-c",
+                        self._audit_command_script(command),
+                        cwd=target,
+                        env=environment,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        result.stdout.decode(errors="replace"),
+                    )
+                    payloads.append(json.loads(result.stdout))
+                self.assertEqual(self._project_snapshot(target), before)
+                self._assert_audit_resources_ready(payloads[2])
+                preflight_payload = payloads[3]
+                self.assertEqual(
+                    {check["code"] for check in preflight_payload["checks"]},
+                    {
+                        "GIT_REPOSITORY",
+                        "GIT_COMMITTED_HEAD",
+                        "GIT_ATTACHED_BRANCH",
+                        "GIT_CLEAN_TREE",
+                        "GIT_REMOTE_PRESENT",
+                        "GIT_REMOTE_BASE_PRESENT",
+                        "GIT_BASE_CONTAINED",
+                        "GIT_STATE_MATERIALIZED",
+                    },
+                )
+                self.assertTrue(
+                    all(check["ok"] for check in preflight_payload["checks"]),
+                    preflight_payload,
+                )
+                self.assertEqual(
+                    {
+                        key: preflight_payload["facts"][key]
+                        for key in (
+                            "remote_present",
+                            "remote_base_present",
+                            "git_state_materialized",
+                        )
+                    },
+                    {
+                        "remote_present": True,
+                        "remote_base_present": True,
+                        "git_state_materialized": True,
+                    },
+                )
+                self.assertEqual(
+                    {
+                        key: preflight_payload["facts"][key]
+                        for key in ("dirty", "detached", "unborn")
+                    },
+                    {"dirty": False, "detached": False, "unborn": False},
+                )
+                self.assertEqual(preflight_payload["facts"]["ahead"], 0)
+                self.assertEqual(preflight_payload["facts"]["behind"], 0)
+                route = payloads[-1]
+                self.assertEqual(route["summary"]["tier"], "T2")
+                self.assertTrue(route["decision_ready"], route)
+                self.assertFalse(route["authorizes"])
+                self.assertIn("instruction.project-agents", route["summary"]["required"])
+                self.assertIn("document.project-readme", route["summary"]["recommended"])
+                preflight = next(
+                    line for line in self._happy_commands() if " preflight " in line
+                )
+                unsafe = preflight.replace("--offline", "--refresh")
+                refreshed = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._audit_command_script(unsafe),
+                    cwd=target,
+                    env=environment,
+                )
+                self.assertNotEqual(refreshed.returncode, 0, refreshed.stdout)
+
+        def test_missing_project_resources_stop_even_when_route_exits_zero(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, integrated_sha = self._initialize_source(root)
+                controlled_home = root / "closed-home"
+                controlled_home.mkdir()
+                environment = self._closed_environment(controlled_home)
+                launcher = source / "scripts" / "control-plane"
+                for missing in ("AGENTS.md", "README.md"):
+                    with self.subTest(missing=missing):
+                        scenario = root / missing.replace(".", "-")
+                        scenario.mkdir()
+                        target = self._initialize_target(scenario)
+                        (target / missing).unlink()
+                        policy = target / ".codex" / "project-policy.toml"
+                        registry = target / ".codex" / "resource-registry.toml"
+                        task_path = root / f"task-{missing}.json"
+                        task_path.write_text(json.dumps(self._task()), encoding="utf-8")
+                        inventory_result = self._run(
+                            str(launcher),
+                            "inventory",
+                            "--repo",
+                            str(target),
+                            "--registry",
+                            str(registry),
+                            "--json",
+                            cwd=target,
+                            env=environment,
+                        )
+                        self.assertEqual(inventory_result.returncode, 0)
+                        inventory = json.loads(inventory_result.stdout)
+                        missing_id = (
+                            "instruction.project-agents"
+                            if missing == "AGENTS.md"
+                            else "document.project-readme"
+                        )
+                        resource = next(
+                            item
+                            for item in inventory["resources"]
+                            if item["id"] == missing_id
+                        )
+                        self.assertFalse(resource["ready"])
+                        self.assertIn("R_NOT_FOUND", resource["reason_codes"])
+                        with self.assertRaises(AssertionError):
+                            self._assert_audit_resources_ready(inventory)
+                        route_result = self._run(
+                            str(launcher),
+                            "route",
+                            "--repo",
+                            str(target),
+                            "--task",
+                            str(task_path),
+                            "--policy",
+                            str(policy),
+                            "--registry",
+                            str(registry),
+                            "--mode",
+                            "audit",
+                            "--json",
+                            cwd=target,
+                            env=environment,
+                        )
+                        self.assertEqual(route_result.returncode, 0)
+                        route = json.loads(route_result.stdout)
+                        self.assertFalse(route["authorizes"])
+                        if missing == "README.md":
+                            self.assertTrue(route["decision_ready"], route)
+
+        def test_snapshot_detects_index_flags_that_status_hides(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                target = self._initialize_target(Path(directory))
+                baseline = self._project_snapshot(target)
+                for enable, disable in (
+                    ("--assume-unchanged", "--no-assume-unchanged"),
+                    ("--skip-worktree", "--no-skip-worktree"),
+                ):
+                    with self.subTest(flag=enable):
+                        self._git(target, "update-index", enable, "README.md")
+                        changed = self._project_snapshot(target)
+                        self.assertEqual(changed["status"], baseline["status"])
+                        self.assertNotEqual(changed["index"], baseline["index"])
+                        self._git(target, "update-index", disable, "README.md")
+                        restored = self._project_snapshot(target)
+                        self.assertEqual(restored["status"], baseline["status"])
+                        baseline = restored
+
+        def test_bounded_runner_reaps_overflow_and_timeout_process_groups(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with self.assertRaisesRegex(
+                    AssertionError, "E_AUDIT_PROCESS_OUTPUT_LIMIT"
+                ):
+                    self._run(
+                        sys.executable,
+                        "-c",
+                        "import os; os.write(1, b'x' * (256 * 1024 + 1))",
+                        cwd=root,
+                    )
+
+                pid_path = root / "child.pid"
+                program = (
+                    "import pathlib,subprocess,sys,time;"
+                    "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+                    f"pathlib.Path({str(pid_path)!r}).write_text(str(child.pid));"
+                    "time.sleep(60)"
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "E_AUDIT_PROCESS_TIMEOUT"
+                ):
+                    self._run(sys.executable, "-c", program, cwd=root, timeout=1.0)
+                child_pid = int(pid_path.read_text())
+                child_gone = False
+                for _ in range(50):
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        child_gone = True
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(child_gone, f"child process {child_pid} leaked")
+
+        def test_source_binding_is_raw_tree_bound_and_rejects_index_bypasses(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, integrated_sha = self._initialize_source(root)
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                binding = self._source_binding()
+                self.assertIn("observed_paths = set()", binding)
+                self.assertIn("if observed_paths != set(expected): fail()", binding)
+                clean = self._run("/bin/sh", "-c", binding, cwd=root, env=environment)
+                self.assertEqual(clean.returncode, 0, clean.stdout)
+
+                readme = source / "README.md"
+                readme_bytes = readme.read_bytes()
+                readme.write_bytes(readme_bytes + b"\n# staged alternate\n")
+                self._git(source, "add", "README.md")
+                readme.write_bytes(readme_bytes)
+                staged_only = self._run(
+                    "/bin/sh", "-c", binding, cwd=root, env=environment
+                )
+                self.assertNotEqual(staged_only.returncode, 0, staged_only.stdout)
+                self._git(
+                    source,
+                    "restore",
+                    "--staged",
+                    "--source=HEAD",
+                    "README.md",
+                )
+                restored_clean = self._run(
+                    "/bin/sh", "-c", binding, cwd=root, env=environment
+                )
+                self.assertEqual(
+                    restored_clean.returncode, 0, restored_clean.stdout
+                )
+
+                self._git(source, "switch", "-q", "-c", "test-attached")
+                rejected = self._run("/bin/sh", "-c", binding, cwd=root, env=environment)
+                self.assertNotEqual(rejected.returncode, 0)
+                self._git(source, "switch", "-q", "--detach", integrated_sha)
+
+                launcher = source / "scripts" / "control-plane"
+                original = launcher.read_bytes()
+                self._git(source, "update-index", "--skip-worktree", "scripts/control-plane")
+                flag_only = self._run(
+                    "/bin/sh", "-c", binding, cwd=root, env=environment
+                )
+                self.assertNotEqual(flag_only.returncode, 0, flag_only.stdout)
+                launcher.write_bytes(original + b"\n# hidden drift\n")
+                hidden = self._run("/bin/sh", "-c", binding, cwd=root, env=environment)
+                self.assertNotEqual(hidden.returncode, 0)
+                launcher.write_bytes(original)
+                self._git(source, "update-index", "--no-skip-worktree", "scripts/control-plane")
+
+                redirect = root / "redirect"
+                redirect.mkdir()
+                self._git(source, "config", "core.worktree", str(redirect))
+                launcher.write_bytes(original + b"\n# redirected drift\n")
+                redirected = self._run("/bin/sh", "-c", binding, cwd=root, env=environment)
+                self.assertNotEqual(redirected.returncode, 0)
+                launcher.write_bytes(original)
+                self._git(source, "config", "--unset", "core.worktree")
+
+                ignored = source / "control_plane" / "__pycache__"
+                ignored.mkdir()
+                (ignored / "hidden.pyc").write_bytes(b"ignored-extra")
+                extra = self._run("/bin/sh", "-c", binding, cwd=root, env=environment)
+                self.assertNotEqual(extra.returncode, 0)
+                (ignored / "hidden.pyc").unlink()
+                ignored.rmdir()
+
+                readme.unlink()
+                missing = self._run("/bin/sh", "-c", binding, cwd=root, env=environment)
+                self.assertNotEqual(missing.returncode, 0)
+                readme.write_bytes(readme_bytes)
+
+                head_path = source / ".git" / "HEAD"
+                head_path.write_text("broken\n", encoding="utf-8")
+                error = self._run("/bin/sh", "-c", binding, cwd=root, env=environment)
+                self.assertNotEqual(error.returncode, 0)
+
+        def test_target_cleanliness_rejects_hidden_status_and_index_flags(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, integrated_sha = self._initialize_source(root)
+                target = self._initialize_target(root)
+                task_path = self._task_envelope(root)
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                guard = self._customization_guard_script()
+                self.assertIn(
+                    'index_rc,_=git(bound+["diff-index","--cached","--quiet",head,"--"],256,(0,1)); need(index_rc==0)',
+                    guard,
+                )
+                clean = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertEqual(clean.returncode, 0, clean.stdout)
+
+                readme = target / "README.md"
+                readme_bytes = readme.read_bytes()
+                readme.write_bytes(readme_bytes + b"\n# staged alternate\n")
+                self._git(target, "add", "README.md")
+                readme.write_bytes(readme_bytes)
+                staged_only = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertNotEqual(staged_only.returncode, 0, staged_only.stdout)
+                self._git(
+                    target,
+                    "restore",
+                    "--staged",
+                    "--source=HEAD",
+                    "README.md",
+                )
+                restored_index = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertEqual(
+                    restored_index.returncode, 0, restored_index.stdout
+                )
+
+                self._git(target, "config", "status.showUntrackedFiles", "no")
+                hidden = target / "hidden-by-config.txt"
+                hidden.write_bytes(b"must be observed\n")
+                hidden_status = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertNotEqual(
+                    hidden_status.returncode, 0, hidden_status.stdout
+                )
+                hidden.unlink()
+                self._git(target, "config", "--unset", "status.showUntrackedFiles")
+
+                readme_mode = stat.S_IMODE(readme.stat().st_mode)
+                self._git(target, "config", "core.fileMode", "false")
+                readme.chmod(readme_mode | stat.S_IXUSR)
+                hidden_mode = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertNotEqual(hidden_mode.returncode, 0, hidden_mode.stdout)
+                readme.chmod(readme_mode)
+                self._git(target, "config", "--unset", "core.fileMode")
+
+                for enable, disable in (
+                    ("--skip-worktree", "--no-skip-worktree"),
+                    ("--assume-unchanged", "--no-assume-unchanged"),
+                ):
+                    with self.subTest(flag=enable):
+                        self._git(target, "update-index", enable, "README.md")
+                        readme.write_bytes(readme_bytes + b"hidden drift\n")
+                        hidden_index = self._run(
+                            "/bin/sh",
+                            "-eu",
+                            "-c",
+                            guard,
+                            cwd=target,
+                            env=environment,
+                        )
+                        self.assertNotEqual(
+                            hidden_index.returncode, 0, hidden_index.stdout
+                        )
+                        readme.write_bytes(readme_bytes)
+                        self._git(target, "update-index", disable, "README.md")
+
+                restored = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertEqual(restored.returncode, 0, restored.stdout)
+
+        def test_target_filter_config_stops_before_filter_and_preserves_snapshot(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                source, integrated_sha = self._initialize_source(root)
+                target = self._initialize_target(root)
+                task_path = self._task_envelope(root)
+                attributes = target / ".gitattributes"
+                payload = target / "payload.probe"
+                attributes.write_bytes(b"*.probe filter=audit\n")
+                payload.write_bytes(b"filter input\n")
+                self._git(target, "add", ".gitattributes", "payload.probe")
+                self._git(target, "commit", "-qm", "filter fixture")
+                self._git(target, "push", "-q", "origin", "main")
+                before = self._project_snapshot(target)
+
+                marker = root / "filter-invoked"
+                sentinel = root / "filter-sentinel.py"
+                sentinel.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import pathlib,sys\n"
+                    f"pathlib.Path({str(marker)!r}).write_bytes(b'called')\n"
+                    "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+                    encoding="utf-8",
+                )
+                sentinel.chmod(0o755)
+                config = target / ".git" / "config"
+                original_config = config.read_bytes()
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                guard = self._customization_guard_script()
+
+                config.write_bytes(
+                    original_config
+                    + b'\n[filter "audit"]\n\tclean = '
+                    + str(sentinel).encode()
+                    + b"\n\trequired = true\n"
+                )
+                rejected = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+                self.assertFalse(marker.exists(), "target clean filter executed")
+
+                for suspicious in (
+                    b'\n[FiLtEr "unused"]\r\n\tSmUdGe = /bin/false\r\n',
+                    b'\n[core] [FILTER "unused"] process = /bin/false\n',
+                    b"\n[filter.unused]\n\trequired = true\n",
+                    b"\nfilter.unused.clean = /bin/false\n",
+                    b'\xef\xbb\xbf[filter "unused"]\n\tclean = /bin/false\n',
+                ):
+                    with self.subTest(config=suspicious):
+                        config.write_bytes(original_config + suspicious)
+                        variant = self._run(
+                            "/bin/sh",
+                            "-eu",
+                            "-c",
+                            guard,
+                            cwd=target,
+                            env=environment,
+                        )
+                        self.assertNotEqual(
+                            variant.returncode, 0, variant.stdout
+                        )
+                        self.assertFalse(marker.exists())
+
+                config.write_bytes(original_config)
+                self.assertEqual(self._project_snapshot(target), before)
+
+        def test_authority_must_be_committed_head_content_not_ignored_files(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                source, integrated_sha = self._initialize_source(root)
+                origin = root / "ignored-origin.git"
+                self._git(root, "init", "-q", "--bare", str(origin))
+                target = root / "ignored-consumer"
+                target.mkdir()
+                self._git(target, "init", "-q", "-b", "main")
+                self._git(target, "config", "user.name", "Audit Fixture")
+                self._git(target, "config", "user.email", "audit@example.invalid")
+                (target / "README.md").write_bytes(b"# Consumer-owned project\n")
+                (target / ".gitignore").write_bytes(b"/AGENTS.md\n/.codex/\n")
+                self._git(target, "add", "README.md", ".gitignore")
+                self._git(target, "commit", "-qm", "consumer baseline")
+                for relative, payload in self._customized_authority().items():
+                    destination = target / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(payload)
+                self._git(target, "remote", "add", "origin", str(origin))
+                self._git(target, "push", "-qu", "origin", "main")
+                self.assertEqual(
+                    self._git(
+                        target,
+                        "status",
+                        "--porcelain=v1",
+                        "--untracked-files=all",
+                    ),
+                    b"",
+                )
+
+                task_path = self._task_envelope(root)
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                before = self._project_snapshot(target)
+                guard = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=target,
+                    env=environment,
+                )
+                self.assertNotEqual(guard.returncode, 0, guard.stdout)
+                for command in self._happy_commands():
+                    result = self._run(
+                        "/bin/sh",
+                        "-eu",
+                        "-c",
+                        self._audit_command_script(command),
+                        cwd=target,
+                        env=environment,
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(self._project_snapshot(target), before)
+
+        def test_submodules_and_nested_repositories_stop_before_launcher(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                source, integrated_sha = self._initialize_source(root)
+                task_path = self._task_envelope(root)
+
+                def environment_for(target: Path, name: str) -> dict[str, str]:
+                    environment = self._closed_environment(root / f"home-{name}")
+                    environment.update(
+                        {
+                            "CONTROL_PLANE_SOURCE": str(source),
+                            "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                        }
+                    )
+                    environment.update(
+                        self._authority_digest_environment(target, task_path)
+                    )
+                    return environment
+
+                def assert_clean_then_rejected(
+                    target: Path, environment: dict[str, str], name: str, mutate
+                ) -> None:
+                    clean = self._run(
+                        "/bin/sh",
+                        "-eu",
+                        "-c",
+                        self._customization_guard_script(),
+                        cwd=target,
+                        env=environment,
+                    )
+                    self.assertEqual(clean.returncode, 0, clean.stdout)
+                    mutate()
+                    sentinel = root / f"launcher-{name}"
+                    rejected = self._run(
+                        "/bin/sh",
+                        "-eu",
+                        "-c",
+                        self._audit_command_script(
+                            f"control_plane_audit /usr/bin/touch {str(sentinel)!r}"
+                        ),
+                        cwd=target,
+                        env=environment,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+                    self.assertFalse(sentinel.exists())
+
+                gitlink_root = root / "gitlink-case"
+                gitlink_root.mkdir()
+                gitlink_target = self._initialize_target(gitlink_root)
+                gitlink_environment = environment_for(gitlink_target, "gitlink")
+
+                def add_isolated_gitlink() -> None:
+                    oid = self._git(gitlink_target, "rev-parse", "HEAD").decode().strip()
+                    (gitlink_target / "vendor" / "module").mkdir(parents=True)
+                    self._git(
+                        gitlink_target,
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        "160000",
+                        oid,
+                        "vendor/module",
+                    )
+                    self._git(gitlink_target, "commit", "-qm", "isolated gitlink")
+                    self.assertEqual(
+                        self._git(
+                            gitlink_target,
+                            "status",
+                            "--porcelain=v1",
+                            "-z",
+                            "--untracked-files=all",
+                        ),
+                        b"",
+                    )
+                    self.assertFalse((gitlink_target / ".git" / "modules").exists())
+                    self.assertFalse((gitlink_target / "vendor" / "module" / ".git").exists())
+
+                assert_clean_then_rejected(
+                    gitlink_target,
+                    gitlink_environment,
+                    "gitlink",
+                    add_isolated_gitlink,
+                )
+
+                modules_root = root / "modules-case"
+                modules_root.mkdir()
+                modules_target = self._initialize_target(modules_root)
+                modules_environment = environment_for(modules_target, "modules")
+                assert_clean_then_rejected(
+                    modules_target,
+                    modules_environment,
+                    "modules",
+                    lambda: (modules_target / ".git" / "modules").mkdir(),
+                )
+
+                nested_root = root / "nested-case"
+                nested_root.mkdir()
+                nested_target = self._initialize_target(nested_root)
+                nested_environment = environment_for(nested_target, "nested")
+
+                def add_ignored_nested_git() -> None:
+                    exclude = nested_target / ".git" / "info" / "exclude"
+                    exclude.write_bytes(exclude.read_bytes() + b"\n/ignored-nested/\n")
+                    nested = nested_target / "ignored-nested"
+                    nested.mkdir()
+                    (nested / ".git").write_bytes(b"gitdir: /outside\n")
+                    self.assertEqual(
+                        self._git(
+                            nested_target,
+                            "status",
+                            "--porcelain=v1",
+                            "-z",
+                            "--untracked-files=all",
+                        ),
+                        b"",
+                    )
+                    self.assertFalse((nested_target / ".git" / "modules").exists())
+
+                assert_clean_then_rejected(
+                    nested_target,
+                    nested_environment,
+                    "nested",
+                    add_ignored_nested_git,
+                )
+
+                combined_root = root / "combined-case"
+                combined_root.mkdir()
+                target = self._initialize_target(combined_root)
+                combined_environment = environment_for(target, "combined")
+                clean_combined = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=target,
+                    env=combined_environment,
+                )
+                self.assertEqual(
+                    clean_combined.returncode, 0, clean_combined.stdout
+                )
+                module_source = root / "module-source"
+                module_source.mkdir()
+                self._git(module_source, "init", "-q", "-b", "main")
+                self._git(module_source, "config", "user.name", "Audit Fixture")
+                self._git(
+                    module_source,
+                    "config",
+                    "user.email",
+                    "audit@example.invalid",
+                )
+                (module_source / "README.md").write_bytes(b"module\n")
+                self._git(module_source, "add", "README.md")
+                self._git(module_source, "commit", "-qm", "module")
+                self._git(
+                    target,
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    str(module_source),
+                    "vendor/module",
+                )
+                self._git(target, "commit", "-qam", "add nested module")
+                module = target / "vendor" / "module"
+                module_gitdir = Path(
+                    self._git(module, "rev-parse", "--absolute-git-dir")
+                    .decode()
+                    .strip()
+                )
+                external_worktree = root / "module-external-worktree"
+                external_worktree.mkdir()
+                self._git(
+                    module,
+                    "config",
+                    "core.worktree",
+                    str(external_worktree),
+                )
+                external_config = root / "module-external.config"
+                external_config.write_bytes(b"[alias]\n\tpwn = status\n")
+                with (module_gitdir / "config").open("ab") as stream:
+                    stream.write(
+                        b"\n[include]\n\tpath = "
+                        + str(external_config).encode()
+                        + b"\n"
+                    )
+                alternates = module_gitdir / "objects" / "info" / "alternates"
+                alternates.parent.mkdir(parents=True, exist_ok=True)
+                alternates.write_text(
+                    str(module_source / ".git" / "objects") + "\n",
+                    encoding="utf-8",
+                )
+                index_rows = self._git(target, "ls-files", "-s", "-z")
+                self.assertIn(b"160000 ", index_rows)
+                self.assertTrue((module / ".git").is_file())
+                self.assertTrue((target / ".git" / "modules").is_dir())
+
+                sentinel = root / "launcher-called"
+                invocation = self._audit_command_script(
+                    f"control_plane_audit /usr/bin/touch {str(sentinel)!r}"
+                )
+                rejected = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    invocation,
+                    cwd=target,
+                    env=combined_environment,
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+                self.assertFalse(sentinel.exists())
+
+        def test_customization_guard_is_required_before_the_five_commands(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, integrated_sha = self._initialize_source(root)
+                controlled_home = root / "closed-home"
+                controlled_home.mkdir()
+                environment = self._closed_environment(controlled_home)
+                task_path = self._task_envelope(root)
+                customized_root = root / "customized"
+                customized_root.mkdir()
+                target = self._initialize_target(customized_root)
+                environment.update(
+                    {
+                        "CONTROL_PLANE": str(source / "scripts" / "control-plane"),
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                guard = self._customization_guard_script()
+                accepted = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertEqual(accepted.returncode, 0, accepted.stdout)
+
+                wrong_digest = dict(environment)
+                wrong_digest["TASK_ENVELOPE_SHA256"] = "0" * 64
+                rejected_digest = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=wrong_digest
+                )
+                self.assertNotEqual(
+                    rejected_digest.returncode, 0, rejected_digest.stdout
+                )
+
+                task_link = root / "task-link.json"
+                task_link.symlink_to(task_path)
+                linked_task_environment = dict(environment)
+                linked_task_environment["TASK_ENVELOPE"] = str(task_link.absolute())
+                linked_task = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    guard,
+                    cwd=target,
+                    env=linked_task_environment,
+                )
+                self.assertNotEqual(linked_task.returncode, 0, linked_task.stdout)
+
+                raw_root = root / "raw"
+                raw_root.mkdir()
+                target = self._initialize_target(raw_root, customized=False)
+                environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                raw_guard = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertNotEqual(raw_guard.returncode, 0, raw_guard.stdout)
+                payloads = []
+                for command in self._happy_commands():
+                    result = self._run(
+                        "/bin/sh",
+                        "-eu",
+                        "-c",
+                        self._audit_command_script(command),
+                        cwd=target,
+                        env=environment,
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(payloads, [])
+
+        def test_customization_guard_binds_reviewed_bytes_and_physical_ancestors(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, integrated_sha = self._initialize_source(root)
+                scenario = root / "reviewed"
+                scenario.mkdir()
+                target = self._initialize_target(scenario)
+                task_path = self._task_envelope(root)
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                environment.update(
+                    self._authority_digest_environment(target, task_path)
+                )
+                guard = self._customization_guard_script()
+                accepted = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertEqual(accepted.returncode, 0, accepted.stdout)
+
+                agents = target / "AGENTS.md"
+                original = agents.read_bytes()
+                agents.write_bytes(
+                    original.replace(b"audit-fixture-project", b"attacker-project")
+                )
+                self.assertNotIn(b"__PROJECT_NAME__", agents.read_bytes())
+                substituted = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertNotEqual(substituted.returncode, 0, substituted.stdout)
+                agents.write_bytes(original)
+
+                external_worktree = root / "external-worktree"
+                external_worktree.mkdir()
+                external_worktree = external_worktree.resolve(strict=True)
+                self._git(
+                    target,
+                    "config",
+                    "core.worktree",
+                    str(external_worktree),
+                )
+                observed_top = Path(
+                    self._git(target, "rev-parse", "--show-toplevel")
+                    .decode()
+                    .strip()
+                )
+                self.assertEqual(observed_top, external_worktree)
+                redirected_worktree = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertNotEqual(
+                    redirected_worktree.returncode,
+                    0,
+                    redirected_worktree.stdout,
+                )
+                self._git(target, "config", "--unset", "core.worktree")
+
+                target_link = root / "target-link"
+                target_link.symlink_to(target, target_is_directory=True)
+                environment["TARGET_REPO"] = str(target_link.absolute())
+                aliased = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=target, env=environment
+                )
+                self.assertNotEqual(aliased.returncode, 0, aliased.stdout)
+
+                linked_root = root / "linked-codex"
+                linked_root.mkdir()
+                linked_target = self._initialize_target(linked_root)
+                environment.update(
+                    self._authority_digest_environment(linked_target, task_path)
+                )
+                external = root / "external-codex"
+                (linked_target / ".codex").rename(external)
+                (linked_target / ".codex").symlink_to(external, target_is_directory=True)
+                linked = self._run(
+                    "/bin/sh", "-eu", "-c", guard, cwd=linked_target, env=environment
+                )
+                self.assertNotEqual(linked.returncode, 0, linked.stdout)
+
+        def test_snapshot_records_symlink_leaves_and_directories_without_following(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = self._initialize_target(root)
+                outside = root / "outside"
+                outside.mkdir()
+                (outside / "hidden.txt").write_bytes(b"outside")
+                (target / "linked-file").symlink_to(outside / "hidden.txt")
+                (target / "linked-directory").symlink_to(
+                    outside, target_is_directory=True
+                )
+                snapshot = self._project_snapshot(target)
+                files = snapshot["files"]
+                self.assertEqual(files["linked-file"]["type"], "symlink")
+                self.assertEqual(files["linked-directory"]["type"], "symlink")
+                self.assertNotIn("linked-directory/hidden.txt", files)
+
+        def test_source_binding_disables_lazy_fetch_and_preserves_missing_objects(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                producer = root / "producer"
+                producer.mkdir()
+                self._git(producer, "init", "-q", "-b", "main")
+                self._git(producer, "config", "user.name", "Audit Fixture")
+                self._git(producer, "config", "user.email", "audit@example.invalid")
+                launcher = producer / "scripts" / "control-plane"
+                launcher.parent.mkdir()
+                launcher.write_bytes(b"#!/bin/sh\nexit 0\n")
+                launcher.chmod(0o755)
+                payload = producer / "payload.txt"
+                payload.write_bytes(b"promisor-only-payload\n")
+                self._git(producer, "add", "scripts/control-plane", "payload.txt")
+                self._git(producer, "commit", "-qm", "partial source")
+                integrated_sha = self._git(producer, "rev-parse", "HEAD").decode().strip()
+                payload_oid = self._git(
+                    producer, "rev-parse", f"{integrated_sha}:payload.txt"
+                ).decode().strip()
+
+                origin = root / "partial-origin.git"
+                self._git(root, "clone", "-q", "--bare", str(producer), str(origin))
+                self._git(origin, "config", "uploadpack.allowFilter", "true")
+                source = root / "partial-source"
+                clone = self._run(
+                    "/usr/bin/git",
+                    "--no-pager",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "protocol.file.allow=always",
+                    "clone",
+                    "-q",
+                    "--filter=blob:none",
+                    "--no-checkout",
+                    origin.as_uri(),
+                    str(source),
+                    cwd=root,
+                    env=self._closed_environment(Path("/var/empty")),
+                    timeout=60.0,
+                )
+                self.assertEqual(clone.returncode, 0, clone.stdout)
+                self._git(source, "update-ref", "--no-deref", "HEAD", integrated_sha)
+                (source / "scripts").mkdir()
+                (source / "scripts" / "control-plane").write_bytes(launcher.read_bytes())
+                (source / "scripts" / "control-plane").chmod(0o755)
+                (source / "payload.txt").write_bytes(payload.read_bytes())
+                missing = self._git(
+                    source, "rev-list", "--objects", "--missing=print", integrated_sha
+                )
+                self.assertIn(f"?{payload_oid}".encode(), missing)
+
+                marker = root / "upload-pack-called"
+                upload_pack = root / "upload-pack-sentinel.py"
+                upload_pack.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import os,pathlib,sys\n"
+                    f"pathlib.Path({str(marker)!r}).write_bytes(b'called')\n"
+                    "os.execv('/usr/bin/git', ['/usr/bin/git', 'upload-pack', *sys.argv[1:]])\n",
+                    encoding="utf-8",
+                )
+                upload_pack.chmod(0o755)
+                self._git(source, "config", "remote.origin.uploadpack", str(upload_pack))
+                before = self._object_store_snapshot(source)
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                result = self._run(
+                    "/bin/sh", "-c", self._source_binding(), cwd=root, env=environment
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertFalse(marker.exists())
+                self.assertEqual(self._object_store_snapshot(source), before)
+                self.assertRegex(
+                    self._source_binding(), r'"GIT_NO_LAZY_FETCH"\s*:\s*"1"'
+                )
+
+        def test_shared_source_and_target_object_stores_fail_without_external_change(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                producer = root / "producer"
+                producer.mkdir()
+                self._git(producer, "init", "-q", "-b", "main")
+                self._git(producer, "config", "user.name", "Audit Fixture")
+                self._git(producer, "config", "user.email", "audit@example.invalid")
+                launcher = producer / "scripts" / "control-plane"
+                launcher.parent.mkdir()
+                launcher.write_bytes(b"#!/bin/sh\nexit 0\n")
+                launcher.chmod(0o755)
+                (producer / "README.md").write_text("shared source\n", encoding="utf-8")
+                self._git(producer, "add", ".")
+                self._git(producer, "commit", "-qm", "shared source")
+                integrated_sha = self._git(
+                    producer, "rev-parse", "HEAD"
+                ).decode().strip()
+
+                shared_source = root / "shared-source"
+                self._git(
+                    root,
+                    "clone",
+                    "-q",
+                    "--shared",
+                    str(producer),
+                    str(shared_source),
+                )
+                self._git(
+                    shared_source, "checkout", "-q", "--detach", integrated_sha
+                )
+                producer_before = self._object_store_snapshot(producer)
+                source_environment = self._closed_environment(root / "source-home")
+                source_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(shared_source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                rejected_source = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=source_environment,
+                )
+                self.assertNotEqual(
+                    rejected_source.returncode, 0, rejected_source.stdout
+                )
+                self.assertEqual(self._object_store_snapshot(producer), producer_before)
+
+                target_root = root / "target-origin"
+                target_root.mkdir()
+                target_origin = self._initialize_target(target_root)
+                shared_target = root / "shared-target"
+                self._git(
+                    root,
+                    "clone",
+                    "-q",
+                    "--shared",
+                    str(target_origin),
+                    str(shared_target),
+                )
+                task_path = self._task_envelope(root)
+                target_before = self._object_store_snapshot(target_origin)
+                safe_source, safe_source_sha = self._initialize_source(root)
+                safe_source_environment = self._closed_environment(
+                    root / "safe-source-home"
+                )
+                safe_source_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(safe_source),
+                        "CONTROL_PLANE_SOURCE_SHA": safe_source_sha,
+                    }
+                )
+                accepted_source = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=safe_source_environment,
+                )
+                self.assertEqual(
+                    accepted_source.returncode, 0, accepted_source.stdout
+                )
+
+                objects = safe_source / ".git" / "objects"
+                info = objects / "info"
+                info.mkdir(exist_ok=True)
+                http_alternates = info / "http-alternates"
+                http_alternates.write_text(
+                    "https://example.invalid/objects\n", encoding="utf-8"
+                )
+                rejected_http_alternates = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=safe_source_environment,
+                )
+                self.assertNotEqual(
+                    rejected_http_alternates.returncode,
+                    0,
+                    rejected_http_alternates.stdout,
+                )
+                http_alternates.unlink()
+
+                config = safe_source / ".git" / "config"
+                config_bytes = config.read_bytes()
+                outside_config = root / "outside.config"
+                outside_config.write_bytes(b"[alias]\n\tpwn = status\n")
+                for include_header in (
+                    b"[include]\n",
+                    b'[includeIf "gitdir:/"]\n',
+                ):
+                    config.write_bytes(
+                        config_bytes
+                        + include_header
+                        + f"\tpath = {outside_config}\n".encode()
+                    )
+                    rejected_config_include = self._run(
+                        "/bin/sh",
+                        "-c",
+                        self._source_binding(),
+                        cwd=root,
+                        env=safe_source_environment,
+                    )
+                    self.assertNotEqual(
+                        rejected_config_include.returncode,
+                        0,
+                        rejected_config_include.stdout,
+                    )
+                config.write_bytes(
+                    b"\xef\xbb\xbf[include]\n"
+                    + f"\tpath = {outside_config}\n".encode()
+                    + config_bytes
+                )
+                self.assertEqual(
+                    self._git(safe_source, "config", "--get", "alias.pwn").strip(),
+                    b"status",
+                )
+                rejected_bom_include = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=safe_source_environment,
+                )
+                self.assertNotEqual(
+                    rejected_bom_include.returncode,
+                    0,
+                    rejected_bom_include.stdout,
+                )
+                for inline_config in (
+                    b"[core] [include] path = "
+                    + str(outside_config).encode()
+                    + b"\n",
+                    b"[core]\r[include]\rpath = "
+                    + str(outside_config).encode()
+                    + b"\r\n",
+                ):
+                    config.write_bytes(inline_config + config_bytes)
+                    self.assertEqual(
+                        self._git(
+                            safe_source, "config", "--get", "alias.pwn"
+                        ).strip(),
+                        b"status",
+                    )
+                    rejected_inline_include = self._run(
+                        "/bin/sh",
+                        "-c",
+                        self._source_binding(),
+                        cwd=root,
+                        env=safe_source_environment,
+                    )
+                    self.assertNotEqual(
+                        rejected_inline_include.returncode,
+                        0,
+                        rejected_inline_include.stdout,
+                    )
+                config.write_bytes(config_bytes)
+
+                object_store_before = self._object_store_snapshot(safe_source)
+                external_objects = root / "external-objects"
+                objects.rename(external_objects)
+                objects.symlink_to(external_objects, target_is_directory=True)
+                rejected_object_redirect = self._run(
+                    "/bin/sh",
+                    "-c",
+                    self._source_binding(),
+                    cwd=root,
+                    env=safe_source_environment,
+                )
+                self.assertNotEqual(
+                    rejected_object_redirect.returncode,
+                    0,
+                    rejected_object_redirect.stdout,
+                )
+                self.assertEqual(
+                    self._object_store_snapshot(safe_source), object_store_before
+                )
+                objects.unlink()
+                external_objects.rename(objects)
+
+                target_environment = self._closed_environment(root / "target-home")
+                target_environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(safe_source),
+                        "CONTROL_PLANE_SOURCE_SHA": safe_source_sha,
+                    }
+                )
+                target_environment.update(
+                    self._authority_digest_environment(shared_target, task_path)
+                )
+                rejected_target = self._run(
+                    "/bin/sh",
+                    "-eu",
+                    "-c",
+                    self._customization_guard_script(),
+                    cwd=shared_target,
+                    env=target_environment,
+                )
+                self.assertNotEqual(
+                    rejected_target.returncode, 0, rejected_target.stdout
+                )
+                self.assertEqual(
+                    self._object_store_snapshot(target_origin), target_before
+                )
+
+                source_binding = self._source_binding()
+                self.assertIn("reject_external_object_store", source_binding)
+                self.assertIn('"alternates","http-alternates"', source_binding)
+                self.assertIn("stat.S_ISLNK(objects_item.st_mode)", source_binding)
+
+        def test_source_binding_streams_high_fanout_under_a_global_watchdog(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, integrated_sha = self._initialize_source(root)
+                fanout = source / "fanout"
+                fanout.mkdir()
+                for index in range(4_096 * 4 + 1):
+                    (fanout / f"entry-{index:05d}").mkdir()
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                binding = self._source_binding()
+                started = time.monotonic()
+                result = self._run(
+                    "/bin/sh", "-c", binding, cwd=root, env=environment, timeout=12.0
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertLess(time.monotonic() - started, 10.0)
+                self.assertNotIn("list(os.scandir", binding)
+                self.assertIn("signal.setitimer(signal.ITIMER_REAL", binding)
+
+        def test_source_binding_handles_a_batch_request_larger_than_a_pipe(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                binding = self._source_binding()
+                self.assertIn("process.communicate(input=input_bytes", binding)
+                self.assertIn('"cat-file", "--batch-check=', binding)
+                source, _ = self._initialize_source(root)
+                self._git(source, "config", "user.name", "Audit Fixture")
+                self._git(source, "config", "user.email", "audit@example.invalid")
+                bulk = source / "bulk"
+                bulk.mkdir()
+                for index in range(1_800):
+                    (bulk / f"item-{index:04d}.txt").write_bytes(
+                        f"payload-{index:04d}\n".encode()
+                    )
+                self._git(source, "add", "bulk")
+                self._git(source, "commit", "-qm", "large raw-tree fixture")
+                integrated_sha = self._git(source, "rev-parse", "HEAD").decode().strip()
+                environment = self._closed_environment(root / "closed-home")
+                environment.update(
+                    {
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": integrated_sha,
+                    }
+                )
+                result = self._run(
+                    "/bin/sh",
+                    "-c",
+                    binding,
+                    cwd=root,
+                    env=environment,
+                    timeout=12.0,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout)
+
+        def test_fixture_git_ignores_ambient_signing_and_keeps_index_bytes_stable(self) -> None:
+            hostile = {
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": "commit.gpgSign",
+                "GIT_CONFIG_VALUE_0": "true",
+                "GIT_CONFIG_KEY_1": "gpg.program",
+                "GIT_CONFIG_VALUE_1": "/usr/bin/false",
+            }
+            with tempfile.TemporaryDirectory() as directory, patch.dict(
+                os.environ, hostile, clear=False
+            ):
+                target = self._initialize_target(Path(directory))
+                before = self._project_snapshot(target)
+                index_before = before["index"]
+                readme = target / "README.md"
+                metadata = readme.stat()
+                os.utime(readme, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1))
+                first = self._project_snapshot(target)
+                second = self._project_snapshot(target)
+                self.assertEqual(first["index"], index_before)
+                self.assertEqual(second["index"], index_before)
+
+        def test_target_fixture_never_receives_generic_pack_or_replaces_readme(self) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                target = self._initialize_target(Path(directory))
+                files = {
+                    path.relative_to(target).as_posix()
+                    for path in target.rglob("*")
+                    if path.is_file() and ".git" not in path.relative_to(target).parts
+                }
+                self.assertEqual(files, self.AUTHORITY_PATHS | {"README.md"})
+                self.assertEqual(
+                    (target / "README.md").read_bytes(),
+                    b"# Consumer-owned project\n\nKeep this content.\n",
+                )
+                self.assertNotEqual(
+                    (target / "README.md").read_bytes(),
+                    (NEW_PROJECT_PACK / "README.md").read_bytes(),
+                )
+
     def test_final_verification_budget_and_reconciliation_review_are_bounded(self) -> None:
         maintenance = read(MAINTENANCE)
         stable_pause_plan = read(STABLE_PAUSE_PLAN)
@@ -2231,6 +4826,9 @@ class CoreDocumentationTests(unittest.TestCase):
             r"^Version: codex-security-snapshot/v1:sha256:[0-9a-f]{64}$",
         )
         self.assertEqual(lines[-1], f"Version: {normalized_snapshot_version()}")
+
+
+NewProjectAuditReadinessTests = CoreDocumentationTests.NewProjectAuditReadinessTests
 
 
 class CoreSnapshotSafetyTests(unittest.TestCase):

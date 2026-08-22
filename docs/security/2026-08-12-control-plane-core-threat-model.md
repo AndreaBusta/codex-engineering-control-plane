@@ -133,6 +133,7 @@ Repository invariants:
 | Surface or attacker story | Security failure | Mitigation and residual limit |
 |---|---|---|
 | A prompt or document says it authorizes commit, install, push, or release | Confused-deputy external effect | Closed outcomes, policy gates, `authorizes=false`, and no active external executor; a compromised host remains outside the model. |
+| uncustomized, ignored or substituted governance or TaskEnvelope is treated as reviewed input, staged/index-hidden bytes or a submodule changes the repository meaning, a promisor/alternate object store supplies bytes, repository filters execute, or File Provider/unsafe permissions change inputs during verification | Placeholder defaults, untracked authority, staged-only content, skip-worktree/assume-unchanged, hidden-untracked or hidden-file-mode state, nested Git repositories, redirected ancestors, `core.worktree` or object stores, remotely supplied blobs, config includes or `filter.*` namespaces (including BOM/CR/case variants), dataless reads or writable inputs change the decision substrate or execute target code | The four-file pack stays source-owned and the consumer README is preserved. Before launcher access, bounded no-follow metadata inspection limits the contract to fully materialized, same-effective-UID, non-group/world-writable local source, Git metadata, target, README, authority and TaskEnvelope inputs; every physical ancestor is identity-bound, with sticky protection admitted only when root/the effective UID owns the sticky directory and the effective UID owns its child. The raw-tree verifier forces the physical source, disables lazy fetch, rejects alternates, HTTP alternates, object-store symlinks, BOM-bearing Git config, repository config includes and every direct filter namespace before target status/filter execution; fsmonitor and untracked cache remain forcibly disabled. It bounds blob batches before concurrent capture, streams fanout under a whole-process watchdog, and requires exact tracked/observed paths independently of filters and `core.worktree`. Bounded closed Git checks require normal index tags and source index equality to the selected HEAD. The target Git top, gitdir and common dir must equal their physical bindings; its index must equal HEAD and porcelain status must be empty with untracked visibility and file-mode comparison forced regardless of hiding config. Gitlinks, common-dir module storage and nested `.git` entries stop because submodules are unsupported in v1. Externally reviewed SHA-256 values must equal both live bytes and the raw `HEAD` blobs of the exact three supported regular stage-0 authority entries; ignored/untracked authority therefore stops. The exact physical TaskEnvelope is descriptor-bound in the same way. One wrapper revalidates source, target authority and TaskEnvelope immediately before and after every launcher command, including diagnostics. Missing, special, symlinked, substituted, placeholder-bearing or uncertain materialization stops. Inventory and every local preflight check must pass; only first-use audit/research T2 routing recommends README, local remote refs remain no provider proof, and the later write is separately authorized. |
 | A package file is added after the digest is computed | Unreviewed code imports into Core | Exact runtime allowlist and digest before import; filesystem mutation after validation remains residual. |
 | a branch deletion removes the last reachable name for local work | A squash merge plus automatic branch deletion makes an unpushed preservation commit unreachable | The default distributed hook denies recognized `git branch -d/-D`, `git push --delete` and deleting refspecs; the hook is cooperative and can be omitted by another client. |
 | an unrelated push proceeds while another local branch has unique work and no same-name local remote-tracking ref | Later cleanup or automatic remote-branch deletion loses the only useful copy | The pre-push guard compares exact head/tree evidence, exact local remote-tracking ref names and aggregate reachability, permits the exact publishing ref+OID, and otherwise returns `GG_UNPUBLISHED_UNIQUE_BRANCH`; a same-name tracking ref is an explicit exemption even when behind, while unknown or over-budget evidence fails closed. |
@@ -244,6 +245,18 @@ authority, project bytes, or external state.
   tests. It has not been run against a consumer, and no canary has been
   prepared. A later independently accepted ADR and separate native
   authorization remain mandatory boundaries.
+- The audit-only new-project pack cannot prove that later project-specific
+  substitutions are correct or that a future operator preserves the
+  source/target boundary. Target identification, customized-byte review, the
+  write itself, and any subsequent adoption remain separate decisions; generic
+  pack bytes are `authorizes=false`.
+- The audit verifier supports only fully materialized, same-owner local source,
+  target, TaskEnvelope and Git object stores without alternates or config
+  includes. Unsupported or uncertain topology stops; it is not normalized or
+  traversed, and the external store is neither inspected nor changed.
+- First-use v1 supports only clean, ordinary source and target indexes without
+  submodules or nested repositories. Hidden index flags, staged-only state,
+  dirty/untracked target state, gitlinks or module storage stop before audit.
 - Proven inherited Survey and Adoption hardening gaps that were not introduced
   by the R1 reconciliation are deferred to `codex/survey-hardening-wip` at
   preservation commit `d901bb6c95377074a7fb2fb23762476547335969`: filter
@@ -267,4 +280,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:fc5125fc64154a8a7c0368569f9af109669c8ec4d11e244acf8ad6ba4d4c3666
+Version: codex-security-snapshot/v1:sha256:6945363bcb5e14607ed8d7ebfc420dcad88dc9e370d0ed36a783170088b6ff6d

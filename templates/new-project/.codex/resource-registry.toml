@@ -1,0 +1,281 @@
+schema_version = 1
+registry_id = "__PROJECT_NAME__"
+
+[router]
+default_mode = "audit"
+external_effect_default = "deny"
+max_context_output_bytes = 4096
+
+[budgets.T0]
+max_recommended = 0
+max_agents = 0
+max_context_units = 1
+
+[budgets.T1]
+max_recommended = 1
+max_agents = 0
+max_context_units = 4
+
+[budgets.T2]
+max_recommended = 2
+max_agents = 1
+max_context_units = 8
+
+[budgets.T3]
+max_recommended = 3
+max_agents = 2
+max_context_units = 12
+
+[[resources]]
+id = "instruction.project-agents"
+kind = "instruction"
+provider = "codex-host"
+locator = "repo://AGENTS.md"
+capabilities = ["instructions.project"]
+scope = "project"
+authority = "project"
+trust = "trusted_project"
+selection = "required"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "native"
+context_class = "tiny"
+canonical = true
+priority = 1000
+requires = []
+conflicts = []
+supersedes = []
+aliases = []
+output_contract = "instructions"
+
+[[resources]]
+id = "document.project-readme"
+kind = "document"
+provider = "repository"
+locator = "repo://README.md"
+capabilities = ["documentation.project-overview"]
+scope = "project"
+authority = "project"
+trust = "trusted_project"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "progressive"
+context_class = "small"
+canonical = true
+priority = 700
+requires = []
+conflicts = []
+supersedes = []
+aliases = []
+output_contract = "markdown"
+
+[[resources]]
+id = "gate.targeted-validation"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/targeted-validation"
+capabilities = ["gate.targeted_validation"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["targeted_validation"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.diff-review"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/diff-review"
+capabilities = ["gate.diff_review"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["diff_review"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.relevant-tests"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/relevant-tests"
+capabilities = ["gate.relevant_tests"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["relevant_tests"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.pull-request"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/pull-request"
+capabilities = ["gate.pull_request"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["pull_request"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.written-plan"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/written-plan"
+capabilities = ["gate.written_plan"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["written_plan"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.independent-review"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/independent-review"
+capabilities = ["gate.independent_review"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["independent_review"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.security-review"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/security-review"
+capabilities = ["gate.security_review"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["security_review"]
+output_contract = "gate-result-v1"
+
+[[resources]]
+id = "gate.rollback-plan"
+kind = "gate"
+provider = "control-plane"
+locator = "builtin://gate/rollback-plan"
+capabilities = ["gate.rollback_plan"]
+scope = "host"
+authority = "system"
+trust = "trusted_host"
+selection = "available"
+effects = ["local_read"]
+egress = "none"
+data_classes = ["project_metadata"]
+approval = "none"
+load_strategy = "metadata"
+context_class = "none"
+canonical = true
+priority = 800
+requires = []
+conflicts = []
+supersedes = []
+aliases = ["rollback_plan"]
+output_contract = "gate-result-v1"
+
+[[routes]]
+id = "first-use-audit-research"
+priority = 500
+tiers = ["T2"]
+phases = ["research"]
+intents = ["audit"]
+domains_any = []
+signals_any = []
+signals_all = []
+effects_any = []
+required_capabilities = []
+recommended_resources = ["document.project-readme"]
+forbidden_resources = []

@@ -1,0 +1,38 @@
+schema_version = 1
+project_name = "__PROJECT_NAME__"
+project_kind = "generic"
+
+[git]
+remote = "origin"
+base_branch = "main"
+require_pull_request = true
+allow_direct_base_push = false
+integration_strategy = "squash"
+
+[reasoning]
+model = "gpt-5.6-sol"
+default = "high"
+plan = "xhigh"
+subagent = "medium"
+normal_max_workers = 2
+sequential_default = true
+
+[documentation]
+require_impact_assessment = true
+
+[release]
+official_source = "remote_base"
+require_manifest = true
+allow_local_official_release = false
+
+[gates.T0]
+required = ["targeted_validation", "diff_review"]
+
+[gates.T1]
+required = ["relevant_tests", "diff_review", "pull_request"]
+
+[gates.T2]
+required = ["written_plan", "relevant_tests", "independent_review", "pull_request"]
+
+[gates.T3]
+required = ["written_plan", "security_review", "rollback_plan", "independent_review"]

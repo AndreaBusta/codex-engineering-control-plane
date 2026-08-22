@@ -68,6 +68,14 @@ Core. Consulta la
 y el [plan de implementación](docs/superpowers/plans/2026-08-13-control-plane-core-adoption-enablement.md)
 para sus contratos y límites.
 
+## Readiness para un proyecto nuevo
+
+El repositorio incluye un
+[pack de auditoría source-only](docs/engineering/23-new-project-audit-bootstrap.md)
+para preparar la gobernanza de un proyecto todavía no identificado. Valida un
+bundle personalizado mediante cinco comandos read-only; no copia archivos al
+consumidor, no instala Control Plane y no concede adopción.
+
 ## Inicio rápido
 
 ```bash
