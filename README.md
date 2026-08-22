@@ -68,6 +68,31 @@ Core. Consulta la
 y el [plan de implementación](docs/superpowers/plans/2026-08-13-control-plane-core-adoption-enablement.md)
 para sus contratos y límites.
 
+## Bootstrap de auditoría para un proyecto nuevo
+
+El [starter project-owned](templates/new-project/README.md) y el
+[runbook de bootstrap](docs/engineering/23-new-project-audit-bootstrap.md)
+permiten empezar con una auditoría source-driven desde una
+`selected clean source` detached, ligada al SHA integrado exacto que prepara
+la Task 8; no dependen de un checkout mutable ni copian runtime. El pack fuente
+contiene cuatro ficheros, pero solo se extraen del commit fijado y se copian
+`AGENTS.md`, el policy y el registry; el README propio del consumidor se
+preserva.
+
+```text
+external_consumer_adoption=PROHIBITED
+consumer_adoption_commands=PROHIBITED
+source-driven=AUDIT_ONLY
+authorizes=false
+```
+
+Antes de copiar se comprueban conjuntamente los tres destinos, incluidos
+symlinks rotos. Cualquier autoridad existente devuelve
+`E_BOOTSTRAP_AUTHORITY_EXISTS`: no se sobrescribe ni auto-mergea. El runbook
+exige primero un baseline consumer-owned limpio y una rama no-base autorizada.
+Después usa `scripts/control-plane` solo en lectura/audit; ejecutar
+`scripts/control-plane-adoption` contra el consumidor continúa prohibido.
+
 ## Inicio rápido
 
 ```bash

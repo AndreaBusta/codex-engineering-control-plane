@@ -1,10 +1,11 @@
 # ADR 0008: RepositorySurveyV2 separa preservación crítica y residuo local
 
-- Estado: accepted para el contrato base de `RepositorySurveyV2`
+- Estado: `GOVERNING_CORE / INTEGRATED`
 - Fecha: 2026-08-21
 - Responsables: tarea orquestadora del Control Plane
-- PR: pendiente
-- Sustituye: ningún ADR; sustituirá el contrato `RepositorySurveyV1` del diseño 3.3 cuando se integre
+- PR: #28; squash integrado en `main@f1fdecbb26fed9272d07823c31f06ef15ac89f78`
+- Integración observada: 2026-08-21T22:00:55Z; CI exacta de `main` terminal green
+- Sustituye: contrato `RepositorySurveyV1` del diseño 3.3
 - Sustituido por: ninguno
 - Enmienda de alcance shallow: accepted 2026-08-21; excepción condicional al
   RED exacto
@@ -13,7 +14,9 @@
 
 La [especificación RepositorySurveyV2](../superpowers/specs/2026-08-21-repository-survey-v2-design.md)
 fue aprobada expresamente para ADR y planificación, sin autorización de
-implementación. El [diseño 3.3](../superpowers/specs/2026-08-18-control-plane-3-3-operator-orientation-design.md)
+implementación en ese momento. Esa frontera histórica quedó satisfecha por la
+autorización posterior y la integración exacta registrada en la metadata de
+este ADR. El [diseño 3.3](../superpowers/specs/2026-08-18-control-plane-3-3-operator-orientation-design.md)
 define `RepositorySurveyV1`: observa clon, worktrees, ramas, stashes y archivos
 sin rastrear, pero su agregado `orphan_work` solo incluye las dos últimas clases.
 Una rama local cuyo tree y commits difieren de la base, sin una ref remota
@@ -49,11 +52,10 @@ es más honesta.
 
 ## Decisión
 
-Cuando se implemente mediante una autorización posterior,
-`scripts/control-plane survey` emitirá por defecto y exclusivamente
+`scripts/control-plane survey` emite por defecto y exclusivamente
 `RepositorySurveyV2`, con `schema_version=2` y `kind=RepositorySurveyV2`. No se
-mantendrá V1 en paralelo, no habrá `--schema-version` y `only_in_branch`
-desaparecerá en lugar de reinterpretarse.
+mantiene V1 en paralelo, no hay `--schema-version` y `only_in_branch`
+desaparece en lugar de reinterpretarse.
 
 Para una base fijada `B`, una rama local `L` y un remote seleccionado `R`, una
 rama es `unpublished_unique` si y solo si se cumplen las tres condiciones:
@@ -91,7 +93,7 @@ comparten un único deadline de 10 segundos. Timeout, error o presupuesto
 agotado produce `null` en la rama afectada y en las no observadas después; no
 cambia `status`, `error_code` ni el predicado normativo.
 
-Survey y el guard pre-push compartirán el predicado y fixtures cruzadas, no una
+Survey y el guard pre-push comparten el predicado y fixtures cruzadas, no una
 dependencia runtime. El guard conserva su contexto de publicación en curso;
 Survey sigue siendo una observación read-only sin esa exención. Ambos conservan
 la limitación deliberada de confiar en refs remotas locales, que pueden estar
@@ -207,16 +209,16 @@ mismo deadline; no añade otro presupuesto.
 
 ## Migración y compatibilidad
 
-La migración es atómica dentro de un único cambio revisable:
+La migración integrada fue atómica dentro de un único cambio revisable:
 
-1. ejecutar el RED shallow exacto y, solo si produce el error previsto, aplicar
-   el cambio mínimo del guard y demostrar GREEN;
-2. introducir tests V2 y demostrar RED sobre V1;
-3. actualizar modelo, observación y payload;
-4. migrar CLI, renderer y consumidores internos a cuatro estados;
-5. alinear fixtures con el guard sin añadir dependencia entre runtimes;
-6. actualizar documentación gobernante, lock y threat snapshot;
-7. ejecutar focales, un full gate final y revisión independiente sobre bytes
+1. ejecutó el RED shallow exacto y aplicó solo el cambio mínimo del guard tras
+   observar el error previsto y demostrar GREEN;
+2. introdujo tests V2 y demostró RED sobre V1;
+3. actualizó modelo, observación y payload;
+4. migró CLI, renderer y consumidores internos a cuatro estados;
+5. alineó fixtures con el guard sin añadir dependencia entre runtimes;
+6. actualizó documentación gobernante, lock y threat snapshot;
+7. ejecutó focales, un full gate final y revisión independiente sobre bytes
    congelados.
 
 No existe migración de datos persistentes. El rollback posterior es un revert
@@ -227,7 +229,7 @@ por sí mismo la versión publicada, la cuarentena de ADR 0006 ni
 
 ## Validación
 
-La decisión se considera implementada solo si:
+La integración observada satisface estos criterios:
 
 - cada una de las tres condiciones del predicado tiene contraejemplo probado;
 - `PASS=0`, `FAIL=1`, `UNKNOWN=2` y `WARN=3` aparecen en JSON, salida humana y
@@ -244,13 +246,10 @@ La decisión se considera implementada solo si:
 - el Core permanece en 27 módulos, el lock valida, el threat snapshot coincide
   y el full gate final pasa sobre los bytes revisados.
 
-El estado de la enmienda lo determina exclusivamente su línea de metadata:
-mientras sea `proposed`, el `accepted` general cubre solo el contrato base y
-una instrucción nativa debe aceptar la ampliación sobre los bytes exactos antes
-de cualquier edición runtime. Si Task 0 observa esa instrucción y reemplaza la
-metadata por `Enmienda de alcance shallow: accepted 2026-08-21; excepción
-condicional al RED exacto`, esa nueva línea registra su aceptación antes del
-primer commit documental.
+La línea de metadata registra `Enmienda de alcance shallow: accepted
+2026-08-21; excepción condicional al RED exacto`. Task 0 observó la instrucción
+nativa, registró esa aceptación antes de editar runtime y mantuvo la excepción
+cerrada al RED exacto.
 
 Este ADR y su plan son `authorizes=false`: ni el estado del documento ni esa
 transición registral autorizan por sí mismos la implementación. Las

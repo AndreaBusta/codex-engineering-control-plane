@@ -44,18 +44,39 @@ a quarantined capability or grant authority.
 | `docs/superpowers/specs/2026-08-18-control-plane-3-2-specpack-design.md` | `GOVERNING_CORE` | Current SpecPack design: PRD, TRD, UX/UI, flow, and backend contracts. |
 | `docs/superpowers/specs/2026-08-18-control-plane-3-3-operator-orientation-design.md` | `GOVERNING_CORE` | Implemented operator-orientation contract and blind-spot evidence. |
 
-## RepositorySurveyV2 local candidate documents
+## RepositorySurveyV2
 
-Tasks 1–5 have produced the local V2 behavior candidate. These three artifacts
-govern that candidate while its final repository gate and independent review
-remain pending. Their status does not prove integration, release, adoption,
-installation, CI or remote state and grants no authority.
+RepositorySurveyV2 is integrated governing Core behavior. PR #28 was merged by
+squash into `main@f1fdecbb26fed9272d07823c31f06ef15ac89f78` at
+`2026-08-21T22:00:55Z`, and exact-main CI was observed terminal green. This
+evidence does not prove release, adoption, installation or current remote
+state, and it grants no authority.
 
 | Path | Status | Purpose |
 |---|---|---|
-| `docs/adr/0008-repository-survey-v2-contract.md` | `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING` | Accepted V1-to-V2 decision and preservation predicate. |
-| `docs/superpowers/specs/2026-08-21-repository-survey-v2-design.md` | `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING` | Governing V2 output, state, bounded-observation and rollback contract. |
-| `docs/superpowers/plans/2026-08-21-repository-survey-v2.md` | `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING` | Local implementation plan; terminal evidence remains outside the tracked tree after freeze. |
+| `docs/adr/0008-repository-survey-v2-contract.md` | `GOVERNING_CORE` | Integrated V1-to-V2 decision and preservation predicate. |
+| `docs/superpowers/specs/2026-08-21-repository-survey-v2-design.md` | `GOVERNING_CORE` | Integrated V2 output, state, bounded-observation and rollback contract. |
+| `docs/superpowers/plans/2026-08-21-repository-survey-v2.md` | `GOVERNING_CORE` | Historical execution steps plus the integrated V2 result. |
+
+## Governing new-project audit bootstrap
+
+These artifacts govern only a project-owned, source-driven audit bootstrap.
+They do not install Control Plane or authorize consumer adoption.
+
+```text
+external_consumer_adoption=PROHIBITED
+consumer_adoption_commands=PROHIBITED
+source-driven=AUDIT_ONLY
+authorizes=false
+scripts/control-plane-adoption=PROHIBITED_AGAINST_CONSUMER
+```
+
+| Path | Status | Purpose |
+|---|---|---|
+| `docs/engineering/23-new-project-audit-bootstrap.md` | `GOVERNING_AUDIT_BOOTSTRAP` | Exact copy-three, customize, commit and source-driven audit runbook. |
+| `docs/superpowers/specs/2026-08-22-control-plane-adoption-readiness-v1-design.md` | `GOVERNING_AUDIT_BOOTSTRAP` | Audit dispositions, starter contract, prohibitions and rollback. |
+| `docs/superpowers/plans/2026-08-22-control-plane-adoption-readiness-v1.md` | `GOVERNING_AUDIT_BOOTSTRAP` | TDD, verification and provider-integration plan for the bootstrap. |
+| `templates/new-project/README.md` | `GOVERNING_AUDIT_BOOTSTRAP` | Source-side customization guide; never copied over a consumer README. |
 
 ## Governing local enablement documents
 

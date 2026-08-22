@@ -1,6 +1,6 @@
 # Diseño RepositorySurveyV2 — semántica de trabajo huérfano
 
-Fecha: 2026-08-21. Estado: `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING`.
+Fecha: 2026-08-21. Estado: `GOVERNING_CORE / INTEGRATED`.
 `authorizes=false`.
 
 Contrato WHAT/WHY para que `survey` describa de forma veraz el trabajo que
@@ -8,15 +8,16 @@ puede perderse dentro del clon seleccionado. Este documento sustituye el
 contrato de salida `RepositorySurveyV1`; no implementa ni modifica el runtime.
 Como documento sigue siendo `authorizes=false`; las transiciones Git se rigen
 por la policy integrada en la base protegida, no por este artefacto.
-El estado declara únicamente el candidato local observado tras Tasks 1–5: no
-prueba gate final, integración, CI, release, adopción, instalación ni estado
-remoto.
+La integración exacta observada es PR #28, squash en
+`main@f1fdecbb26fed9272d07823c31f06ef15ac89f78` a
+`2026-08-21T22:00:55Z`, con CI exacta de `main` terminal green. Ese hecho no
+prueba release, adopción, instalación ni estado remoto actual.
 
 ---
 
 ## 1. Decisión
 
-El comando `survey` emitirá `RepositorySurveyV2` por defecto. No habrá salida
+El comando `survey` emite `RepositorySurveyV2` por defecto. No hay salida
 V1 paralela, flag de compatibilidad ni reinterpretación silenciosa de campos.
 
 V2 hace cuatro cambios de contrato inseparables:
@@ -66,7 +67,7 @@ Una única observación read-only debe responder, dentro del clon seleccionado:
 > ¿Existe trabajo que puede quedar sin una referencia remota propia y perderse
 > durante una limpieza, un squash o el borrado automático de una rama?
 
-Survey y el guard pre-push compartirán la misma definición lógica de rama no
+Survey y el guard pre-push comparten la misma definición lógica de rama no
 publicada con contenido único. No necesitan compartir implementación mutable:
 la paridad se fija mediante el contrato y pruebas cruzadas sobre las mismas
 fixtures.
@@ -292,7 +293,7 @@ identifica su dominio:
 
 ## 8. Modelo de observación
 
-La implementación deberá fijar primero `base_ref` a un commit y tree concretos.
+La implementación integrada fija primero `base_ref` a un commit y tree concretos.
 Todas las comparaciones posteriores usan ese commit fijado, no una ref mutable.
 
 El diseño exige resolver la señal normativa sin un proceso Git de reachability
@@ -359,17 +360,17 @@ Este es un corte de contrato, no una extensión compatible:
   stashes/untracked sin ese riesgo (`WARN=3`). Para `survey`, esta especificación
   sustituye el requisito 3.3 que solo enumeraba `PASS=0`, `FAIL=1` y
   `UNKNOWN=2`; los otros comandos no cambian.
-- Los tests y consumidores internos deben migrar de forma atómica con el
+- Los tests y consumidores internos migraron de forma atómica con el
   runtime y la documentación. Ningún consumidor puede colapsar `WARN` y
   `FAIL` a un único status o asumir que todo no-cero es exit 1.
-- El diseño gobernante 3.3 debe declarar su bloque V1 como sustituido por este
+- El diseño gobernante 3.3 declara su bloque V1 como sustituido por este
   documento; el plan histórico 3.3 no se reescribe.
 - README, skill `control-plane-git`, orientación, runbook de ramas, threat model
-  y contratos CLI deben describir V2 antes del cierre.
+  y contratos CLI describen V2.
 
 No se ofrece compatibilidad externa porque `external_consumer_adoption` sigue
-`PROHIBITED`. Si aparece un consumidor externo antes de implementar, la nueva
-evidencia invalida este corte y exige reabrir la decisión, no añadir un flag de
+`PROHIBITED`. La integración no observó un consumidor externo; si apareciera
+uno, esa nueva evidencia exigiría reabrir la decisión, no añadir un flag de
 forma oportunista.
 
 ## 11. Seguridad y límites residuales
@@ -383,15 +384,15 @@ forma oportunista.
 - `added_paths=null` declara una carencia informativa, no una ausencia ni una
   degradación de la señal de pérdida.
 - `WARN` sigue siendo no-cero y no autorizante; no permite limpiar ni borrar.
-- El threat model debe declarar que Survey y pre-push comparten el predicado,
+- El threat model declara que Survey y pre-push comparten el predicado,
   además de nombrar las diferencias de contexto: publicación en curso, frescura
   remota y visibilidad de otros clones.
 - Los hallazgos preservados de hardening permanecen abiertos y no bloquean esta
   decisión semántica salvo que una prueba V2 dependa de resolverlos.
 
-## 12. Alcance de implementación posterior
+## 12. Historia de implementación cumplida
 
-Rutas candidatas, sujetas al plan escrito y TDD:
+Las rutas que formaron el alcance integrado fueron:
 
 - `control_plane/survey.py`
 - `control_plane/cli.py`
@@ -406,17 +407,16 @@ Rutas candidatas, sujetas al plan escrito y TDD:
 - documentación gobernante y threat model directamente afectados
 - footer repository-scoped del threat model, calculado al final
 
-No se añade un módulo. No se tocan hooks, Adoption, CI ni dependencias. La
-implementación del guard permanece fuera de alcance salvo una excepción
-cerrada: si el RED exacto de Task 0 demuestra que un candidato unpublished en
-un repositorio shallow devuelve `GG_UNPUBLISHED_UNIQUE_BRANCH`, se permite
-únicamente una consulta estricta y acotada del estado shallow, dentro del mismo
-budget agregado y antes de observar reachability, para devolver
-`GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN`. Si el test ya es GREEN, falla por otra
-causa o exige cualquier otro cambio del guard, se para y se reframa.
+No se añadió un módulo y no se tocaron hooks, Adoption, CI ni dependencias. La
+implementación del guard quedó fuera de alcance salvo la excepción cerrada que
+el RED exacto de Task 0 activó: el candidato unpublished en un repositorio
+shallow devolvió `GG_UNPUBLISHED_UNIQUE_BRANCH`, y se añadió únicamente una
+consulta estricta y acotada del estado shallow dentro del mismo budget agregado
+y antes de observar reachability para devolver
+`GG_UNPUBLISHED_BRANCH_STATE_UNKNOWN`.
 
-El router ha clasificado el frente como T2 estructurado. Antes de implementar
-requiere, además de esta especificación aprobada:
+El router clasificó el frente como T2 estructurado y exigió, además de esta
+especificación aprobada:
 
 - ADR para el corte V1 → V2;
 - plan escrito;
@@ -507,11 +507,11 @@ ejecución.
 ## Continuación
 
 - **Escribe en:** este hilo.
-- **Rol:** orquestadora y ejecutora principal.
-- **Para continuar:** ejecutar Task 7 sobre los bytes congelados, reseñar el
-  footer y completar solo los gates finales previstos.
-- **Mensaje exacto:** `Continúa con Task 7: congela bytes, reseña el threat footer y ejecuta los gates finales sin ampliar alcance.`
-- **Estado de partida:** `RepositorySurveyV2` es
-  `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING`; Tasks 1–5 produjeron el
-  candidato local y la evidencia final, la revisión independiente, el footer y
-  cualquier estado remoto permanecen pendientes. `authorizes=false`.
+- **Rol:** orquestadora.
+- **Para continuar:** usar RepositorySurveyV2 como contrato gobernante local y
+  mantener toda afirmación remota ligada a evidencia separada del proveedor.
+- **Mensaje exacto:** `RepositorySurveyV2 está integrado; continúa desde el contrato V2 gobernante sin reabrir sus pasos históricos.`
+- **Estado de partida:** PR #28 integrado por squash en
+  `main@f1fdecbb26fed9272d07823c31f06ef15ac89f78` a
+  `2026-08-21T22:00:55Z`, con CI exacta de `main` terminal green;
+  `GOVERNING_CORE / INTEGRATED`, `authorizes=false`.

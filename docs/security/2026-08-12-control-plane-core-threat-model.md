@@ -148,6 +148,12 @@ Repository invariants:
 | A recovery journal drifts or a legacy writer starts during recovery | Partial or attacker-directed rollback | Complete mutation-free preflight followed by `E_ADOPT_QUIESCENCE_UNKNOWN`; no caller-forgeable flag substitutes for a shared writer barrier. |
 | `HOME`, Git variables, locators, or executable lookup are redirected | Resource or repository substitution | Trusted toolchain context, canonical exact resource revision, bounded subprocesses, and fail-closed unknown. |
 | A local green result is presented as stable adoption | Self-certification or supply-chain promotion | `GREEN_LOCAL / PENDING_STABLE_ADOPTION`, `self_certified=false`, manual dogfood, and separate adoption authority. |
+| An uncustomized `new-project` starter is treated as real project governance | Generic identifiers, gates, or resources are mistaken for a reviewed project contract | The source pack has four source files but copies only three project-owned authority files. Publication starts from a clean project-owned baseline on a non-base work branch, requires conspicuous `new-project` markers and project-owned review, stays audit-only, makes external effects default to `deny`, and states that no runtime is installed and `external_consumer_adoption=PROHIBITED`. Schema validity remains only structural evidence. |
+| Existing project authority is overwritten or the starter is treated as self-authorizing | A bootstrap branch replaces prior policy or turns its own unintegrated instructions into permission | Before writing, the guide checks all three destinations with no-follow existence semantics; any existing path, including a dangling symlink, returns `E_BOOTSTRAP_AUTHORITY_EXISTS` with no intended publication. The bounded publication uses one writer and one `apply_patch` operation. Bootstrap needs pre-existing authority or exact operator authorization; after project instructions are integrated, local gates govern commit while push, PR and merge additionally require fresh host/provider observation, and a branch edit cannot authorize itself. |
+| A selected bootstrap source hides tracked drift with index hints or is substituted by a stale checkout | Different runtime or starter bytes are treated as the reviewed source | The operator supplies a selected clean source path and independent exact 40-hex SHA. Git runs with closed global environment/config and `core.hooksPath=/dev/null`. Raw no-follow worktree reads hash regular tracked bytes and compare index entries and blob OIDs against the fixed `HEAD` tree without invoking clean filters. Every `git ls-files -v -z` record must have its normal tag, so `assume-unchanged` and `skip-worktree` fail closed; symlinks, Gitlinks and other unsupported modes return `E_CONTROL_PLANE_SOURCE_UNSUPPORTED_MODE`. `CONTROL_PLANE_SOURCE_BINDING` runs immediately before object extraction, immediately before audit, and after audit. The three governing bytes are read only with `cat-file blob` from the fixed source commit object, never from mutable live templates. |
+| A shell composition masks a failing Git producer | A corrupt index, malformed ref or failed observation is mistaken for an empty set and mutation proceeds | Each governing block invokes Git directly from isolated Python, captures stdout, stderr and producer return code separately, and admits only command-specific results. `show-ref` accepts documented 0/1 only, then rejects a malformed loose ref before branch creation; all other unexpected codes, timeouts and decode failures stop before mutation. |
+| Repository or global Git identity is inherited for the bootstrap commit | An unintended person or host fallback is recorded as author or committer | The operator must supply exact `CONTROL_PLANE_GIT_AUTHOR_NAME`, author email, committer name and committer email. Closed Git uses `user.useConfigOnly=true`; `git var` validates the exact exported author and committer identities before index mutation, and the created commit is checked byte-for-byte for both identities. |
+| Target hooks or clean filters execute while the bootstrap branch or authority commit is created | Target-controlled code hangs or transforms the three governing files before they become project history | Both mutating blocks use closed Git with `core.hooksPath=/dev/null`, reject every non-normal target index tag with `E_BOOTSTRAP_TARGET_INDEX_FLAGS`, compare the real index to `HEAD`, and hash bounded raw no-follow worktree reads without invoking clean filters. Each authority blob is created with `hash-object -w --no-filters`, linked with `update-index --cacheinfo` in a private index, then checked through `cat-file` byte comparisons against the customized raw file; `write-tree` plus `commit-tree` construct the commit and `update-ref` advances the branch by compare-and-swap. The private index is atomically published only after full validation. A failed ref CAS performs byte-exact atomic index restoration from the captured bytes and mode; failure emits `E_BOOTSTRAP_INDEX_RESTORE_FAILED` rather than hiding partial state. The resulting index and `HEAD` remain bound to the exact blob OIDs. |
 | source substitution changes managed bytes after preview | A different runtime is published under a reviewed plan | Apply repeats the immutable source observation, manifest and plan binding; any drift is `E_ADOPTION_SOURCE_DRIFT` with zero target mutation. |
 | selected-source authority substitution makes the host checkout decide target validity | A different parser approves policy or registry than the Core bytes being installed | Execute only `scripts/control-plane` from the selected source and compare its full source manifest, including HEAD and tree, before journal creation. |
 | wrong-target selection redirects a valid plan | A fresh but unintended repository is mutated | Canonical repo, common-dir, worktree, branch, HEAD, policy and registry bindings are re-observed before journal creation. |
@@ -240,10 +246,28 @@ authority, project bytes, or external state.
   bilateral migration; Core does not claim atomic legacy exclusion.
 - Fresh `3.1.0-core.2` manual dogfood is pending; the `3.1.0-core.1` rows are
   historical only, and stable external adoption is unproven.
-- The local adoption tool has passed only harness-owned temporary repository
-  tests. It has not been run against a consumer, and no canary has been
-  prepared. A later independently accepted ADR and separate native
-  authorization remain mandatory boundaries.
+- Schema-valid `new-project` values do not prove project-specific correctness;
+  the generic identifiers, gates, commands and resource choices still require
+  project-owned review before they can govern real work.
+- A same-UID process can create a destination between the all-path precheck and
+  the single `apply_patch` publication. The documented one-writer discipline is
+  cooperative rather than an atomic filesystem transaction; any competing
+  writer or observed destination requires stopping and semantic reconciliation.
+- A same-UID writer can change a file or index after the final raw-byte
+  comparison. The closed Git wrapper, raw blob binding and single-writer rule
+  narrow that race but do not provide an OS transaction; any observed mismatch
+  is `UNKNOWN` and stops further work.
+- A failed raw staging can leave unreachable blob objects even when the block
+  restores the byte-exact pre-staging index and leaves `HEAD` unchanged. Those
+  objects grant no authority and normal repository GC is a separate operation;
+  the bootstrap does not run cleanup automatically. If atomic index
+  restoration itself cannot complete or verify, the block emits
+  `E_BOOTSTRAP_INDEX_RESTORE_FAILED`, preserves the failure evidence and leaves
+  the repository blocked for explicit recovery rather than claiming rollback.
+- No consumer repository or canary has been exercised. The local adoption tool
+  has passed only harness-owned temporary repository tests; a later
+  independently accepted ADR and separate native authorization remain mandatory
+  boundaries.
 - Proven inherited Survey and Adoption hardening gaps that were not introduced
   by the R1 reconciliation are deferred to `codex/survey-hardening-wip` at
   preservation commit `d901bb6c95377074a7fb2fb23762476547335969`: filter
@@ -267,4 +291,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:fc5125fc64154a8a7c0368569f9af109669c8ec4d11e244acf8ad6ba4d4c3666
+Version: codex-security-snapshot/v1:sha256:c8d7de6a4cc3faa73494dca8927f68efbbfaac6750df5b82b5c3a9913dd04eb5

@@ -8,6 +8,8 @@ import errno
 from pathlib import Path
 import re
 import selectors
+import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -16,6 +18,11 @@ from types import SimpleNamespace
 import tomllib
 import unittest
 from unittest.mock import patch
+
+from tests.adoption_enablement_test_support import (
+    content_snapshot,
+    initialize_full_source,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +98,47 @@ REPOSITORY_SURVEY_V2_PLAN = (
     / "plans"
     / "2026-08-21-repository-survey-v2.md"
 )
+NEW_PROJECT_BOOTSTRAP = ROOT / "templates" / "new-project"
+NEW_PROJECT_BOOTSTRAP_RUNBOOK = (
+    ROOT / "docs" / "engineering" / "23-new-project-audit-bootstrap.md"
+)
+ADOPTION_READINESS_DESIGN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-08-22-control-plane-adoption-readiness-v1-design.md"
+)
+ADOPTION_READINESS_PLAN = (
+    ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-22-control-plane-adoption-readiness-v1.md"
+)
+NEW_PROJECT_AUTHORITY_FILES = (
+    ".codex/project-policy.toml",
+    ".codex/resource-registry.toml",
+    "AGENTS.md",
+)
+NEW_PROJECT_STARTER_FILES = (
+    *NEW_PROJECT_AUTHORITY_FILES,
+    "README.md",
+)
+BOOTSTRAP_GIT_IDENTITY = {
+    "CONTROL_PLANE_GIT_AUTHOR_NAME": "Exact Bootstrap Author",
+    "CONTROL_PLANE_GIT_AUTHOR_EMAIL": "bootstrap-author@example.invalid",
+    "CONTROL_PLANE_GIT_COMMITTER_NAME": "Exact Bootstrap Committer",
+    "CONTROL_PLANE_GIT_COMMITTER_EMAIL": "bootstrap-committer@example.invalid",
+}
+NEW_PROJECT_CONSUMER_README = (
+    b"# Existing consumer project\n\n"
+    b"This README is consumer-owned product documentation.\n"
+)
+SOURCE_CONTROL_PLANE = ROOT / "scripts" / "control-plane"
+_SOURCE_COMMAND_OUTPUT_MAX_BYTES = 256 * 1_024
+_SOURCE_COMMAND_DEADLINE_SECONDS = 30.0
+_SOURCE_COMMAND_REAP_SECONDS = 1.0
 ORIENTATION_PLAN_SHA256 = (
     "7a2d275cadeaaa497a8a097da242a6b76f1dfccfbea1dd6f0320f78f27813475"
 )
@@ -445,6 +493,430 @@ def index_statuses() -> dict[str, str]:
     return statuses
 
 
+def _fixture_git(repository: Path, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+    completed = subprocess.run(
+        [
+            "/usr/bin/git",
+            "--no-pager",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "core.pager=cat",
+            "-C",
+            str(repository),
+            *arguments,
+        ],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/var/empty",
+            "XDG_CONFIG_HOME": "/var/empty",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+        },
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"fixture Git failed: {arguments!r}, rc={completed.returncode}, "
+            f"stderr={completed.stderr[:1024]!r}"
+        )
+    return completed
+
+
+def _runbook_shell_block(name: str) -> str:
+    content = read(NEW_PROJECT_BOOTSTRAP_RUNBOOK)
+    begin = f"# BEGIN {name}\n"
+    end = f"# END {name}\n"
+    if content.count(begin) != 1 or content.count(end) != 1:
+        raise AssertionError(f"runbook shell block is not unique: {name}")
+    _, _, tail = content.partition(begin)
+    block, separator, _ = tail.partition(end)
+    if separator != end or not block.strip():
+        raise AssertionError(f"runbook shell block is incomplete: {name}")
+    return block
+
+
+def _run_runbook_shell_block(
+    name: str,
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[bytes]:
+    closed_environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/var/empty",
+        "XDG_CONFIG_HOME": "/var/empty",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        **environment,
+    }
+    process = subprocess.Popen(
+        ["/bin/sh", "-c", _runbook_shell_block(name)],
+        cwd=cwd,
+        env=closed_environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = process.communicate(timeout=1)
+        return subprocess.CompletedProcess(
+            process.args,
+            124,
+            stdout,
+            stderr + b"E_RUNBOOK_BLOCK_TIMEOUT\n",
+        )
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+
+def _bootstrap_git_state(repository: Path) -> tuple[bytes, ...]:
+    return (
+        _fixture_git(
+            repository,
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            "refs/heads",
+        ).stdout,
+        _fixture_git(repository, "symbolic-ref", "HEAD").stdout,
+        _fixture_git(repository, "rev-list", "--all", "--count").stdout,
+        _fixture_git(repository, "diff", "--cached", "--name-only").stdout,
+        _fixture_git(
+            repository,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ).stdout,
+    )
+
+
+def _initialize_new_project_audit_target(repository: Path) -> Path:
+    repository.mkdir(parents=True, mode=0o700)
+    _fixture_git(repository, "init", "-b", "main")
+    _fixture_git(repository, "config", "user.name", "Control Plane Audit Test")
+    _fixture_git(
+        repository,
+        "config",
+        "user.email",
+        "control-plane-audit@example.invalid",
+    )
+    (repository / "README.md").write_bytes(NEW_PROJECT_CONSUMER_README)
+    _fixture_git(repository, "add", "README.md")
+    _fixture_git(repository, "commit", "-m", "fixture: consumer baseline")
+    _fixture_git(repository, "switch", "-c", "codex/bootstrap-audit")
+    _copy_new_project_authority_files(repository)
+
+    task = {
+        "schema_version": 1,
+        "task_id": "TASK-NEW-PROJECT-FIRST-AUDIT",
+        "objective": "Audit project-owned governance without mutation.",
+        "intent": "audit",
+        "phase": "research",
+        "requested_outcome": "answer",
+        "goals": [
+            {
+                "id": "goal-audit",
+                "summary": "Observe the project-owned Control Plane contract.",
+                "domains": ["generic"],
+                "depends_on": [],
+            }
+        ],
+        "domains": ["generic"],
+        "signals": [],
+        "scope_paths": [
+            ".codex/project-policy.toml",
+            ".codex/resource-registry.toml",
+            "AGENTS.md",
+        ],
+        "risk": {
+            "uncertainty": 1,
+            "blast_radius": 1,
+            "irreversibility": 1,
+            "verification_complexity": 1,
+        },
+        "effects": [{"name": "local_read", "source": "user_explicit"}],
+        "explicit_resources": [],
+        "excluded_resources": [],
+    }
+    task_path = repository / ".codex" / "task-envelope.json"
+    task_path.write_text(json.dumps(task, sort_keys=True) + "\n", encoding="utf-8")
+    _fixture_git(repository, "add", "--all")
+    _fixture_git(repository, "commit", "-m", "fixture: project-owned audit bootstrap")
+    return repository.resolve(strict=True)
+
+
+def _copy_new_project_authority_files(repository: Path) -> None:
+    codex_directory = repository / ".codex"
+    codex_identity: tuple[int, int, int] | None = None
+    if os.path.lexists(codex_directory):
+        metadata = codex_directory.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("E_BOOTSTRAP_AUTHORITY_EXISTS")
+        codex_identity = (metadata.st_dev, metadata.st_ino, metadata.st_mode)
+
+    destinations = tuple(
+        (relative, repository / relative)
+        for relative in NEW_PROJECT_AUTHORITY_FILES
+    )
+    if any(os.path.lexists(destination) for _, destination in destinations):
+        raise ValueError("E_BOOTSTRAP_AUTHORITY_EXISTS")
+
+    prepared: list[tuple[Path, bytes, int]] = []
+    for relative, _ in destinations:
+        source = NEW_PROJECT_BOOTSTRAP / relative
+        before = source.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > _MAX_DOCUMENT_BYTES
+        ):
+            raise ValueError("E_BOOTSTRAP_SOURCE_INVALID")
+        payload = source.read_bytes()
+        after = source.lstat()
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_size,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_size,
+        )
+        if before_identity != after_identity or len(payload) != before.st_size:
+            raise ValueError("E_BOOTSTRAP_SOURCE_INVALID")
+        prepared.append(
+            (repository / relative, payload, stat.S_IMODE(before.st_mode))
+        )
+
+    if codex_identity is None:
+        if os.path.lexists(codex_directory):
+            raise ValueError("E_BOOTSTRAP_AUTHORITY_EXISTS")
+    else:
+        try:
+            current_codex = codex_directory.lstat()
+        except OSError as error:
+            raise ValueError("E_BOOTSTRAP_AUTHORITY_EXISTS") from error
+        if (
+            (current_codex.st_dev, current_codex.st_ino, current_codex.st_mode)
+            != codex_identity
+            or not stat.S_ISDIR(current_codex.st_mode)
+            or stat.S_ISLNK(current_codex.st_mode)
+        ):
+            raise ValueError("E_BOOTSTRAP_AUTHORITY_EXISTS")
+    if any(os.path.lexists(destination) for _, destination in destinations):
+        raise ValueError("E_BOOTSTRAP_AUTHORITY_EXISTS")
+
+    created_files: list[tuple[Path, int, int]] = []
+    created_codex: tuple[int, int] | None = None
+
+    def rollback_own_creations() -> None:
+        for destination, device, inode in reversed(created_files):
+            try:
+                metadata = destination.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                metadata.st_dev == device
+                and metadata.st_ino == inode
+                and stat.S_ISREG(metadata.st_mode)
+            ):
+                destination.unlink()
+        if created_codex is not None:
+            try:
+                metadata = codex_directory.lstat()
+            except FileNotFoundError:
+                return
+            if (
+                (metadata.st_dev, metadata.st_ino) == created_codex
+                and stat.S_ISDIR(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+            ):
+                try:
+                    codex_directory.rmdir()
+                except OSError:
+                    pass
+
+    try:
+        if codex_identity is None:
+            codex_directory.mkdir(mode=0o700)
+            metadata = codex_directory.lstat()
+            created_codex = (metadata.st_dev, metadata.st_ino)
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        for destination, payload, mode in prepared:
+            descriptor = os.open(destination, flags, mode)
+            metadata = os.fstat(descriptor)
+            created_files.append((destination, metadata.st_dev, metadata.st_ino))
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+    except FileExistsError as error:
+        rollback_own_creations()
+        raise ValueError("E_BOOTSTRAP_AUTHORITY_EXISTS") from error
+    except BaseException:
+        rollback_own_creations()
+        raise
+
+
+def _kill_source_process_group(
+    process: subprocess.Popen[bytes],
+    *,
+    reason: str,
+) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as error:
+        raise AssertionError(
+            f"source command process group could not be killed after {reason}"
+        ) from error
+    try:
+        process.wait(timeout=_SOURCE_COMMAND_REAP_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(
+            f"source command process could not be reaped after {reason}"
+        ) from error
+
+
+def _collect_source_process(
+    process: subprocess.Popen[bytes],
+    arguments: tuple[str, ...],
+) -> tuple[int, bytes, bytes]:
+    if process.stdout is None or process.stderr is None:
+        _kill_source_process_group(process, reason="missing-pipe")
+        raise AssertionError("source command did not expose closed output pipes")
+    selector = selectors.DefaultSelector()
+    streams = {
+        "stdout": process.stdout,
+        "stderr": process.stderr,
+    }
+    payloads = {name: bytearray() for name in streams}
+    total = 0
+    deadline = time.monotonic() + _SOURCE_COMMAND_DEADLINE_SECONDS
+    try:
+        for name, stream in streams.items():
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, data=name)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_source_process_group(process, reason="timeout")
+                raise AssertionError(
+                    f"source command exceeded its deadline: {arguments!r}"
+                )
+            events = selector.select(timeout=min(remaining, 0.1))
+            if not events:
+                continue
+            for key, _ in events:
+                try:
+                    chunk = os.read(
+                        key.fileobj.fileno(),
+                        min(
+                            65_536,
+                            _SOURCE_COMMAND_OUTPUT_MAX_BYTES - total + 1,
+                        ),
+                    )
+                except BlockingIOError:
+                    continue
+                except OSError as error:
+                    _kill_source_process_group(process, reason="output-read-error")
+                    raise AssertionError(
+                        f"source command output could not be read: {arguments!r}"
+                    ) from error
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                total += len(chunk)
+                if total > _SOURCE_COMMAND_OUTPUT_MAX_BYTES:
+                    _kill_source_process_group(process, reason="output-overflow")
+                    raise AssertionError(
+                        f"source command exceeded its output limit: {arguments!r}"
+                    )
+                payloads[str(key.data)].extend(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_source_process_group(process, reason="timeout")
+            raise AssertionError(
+                f"source command exceeded its deadline: {arguments!r}"
+            )
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as error:
+            _kill_source_process_group(process, reason="timeout")
+            raise AssertionError(
+                f"source command exceeded its deadline: {arguments!r}"
+            ) from error
+    finally:
+        selector.close()
+        for stream in streams.values():
+            stream.close()
+    return return_code, bytes(payloads["stdout"]), bytes(payloads["stderr"])
+
+
+def _run_source_json(
+    *arguments: str,
+    cwd: Path,
+    source_control_plane: Path = SOURCE_CONTROL_PLANE,
+) -> tuple[int, dict[str, object], bytes]:
+    try:
+        process = subprocess.Popen(
+            [str(source_control_plane), *arguments, "--json"],
+            cwd=cwd,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as error:
+        raise AssertionError(
+            f"source command could not start: {arguments!r}"
+        ) from error
+    return_code, stdout, stderr = _collect_source_process(process, arguments)
+    try:
+        payload = json.loads(stdout.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AssertionError(
+            f"source command did not emit JSON: {arguments!r}, "
+            f"rc={return_code}, stdout={stdout[:1024]!r}, "
+            f"stderr={stderr[:1024]!r}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise AssertionError(f"source command emitted non-object JSON: {arguments!r}")
+    return return_code, payload, stderr
+
+
 class _BoundedAccumulator:
     def __init__(self, maximum: int, *, digest_only: bool) -> None:
         if maximum < 1:
@@ -767,6 +1239,1716 @@ def normalized_snapshot_version() -> str:
 
 
 class CoreDocumentationTests(unittest.TestCase):
+    def test_new_project_bootstrap_is_valid_and_audit_only(self) -> None:
+        expected = set(NEW_PROJECT_STARTER_FILES)
+        observed = {
+            path.relative_to(NEW_PROJECT_BOOTSTRAP).as_posix()
+            for path in NEW_PROJECT_BOOTSTRAP.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(observed, expected)
+
+        from control_plane.policy import load_policy, validate_policy
+        from control_plane.resource_registry import (
+            load_registry,
+            validate_policy_references,
+            validate_registry,
+        )
+
+        policy = load_policy(
+            NEW_PROJECT_BOOTSTRAP / ".codex" / "project-policy.toml"
+        )
+        registry = load_registry(
+            NEW_PROJECT_BOOTSTRAP / ".codex" / "resource-registry.toml"
+        )
+        self.assertEqual(validate_policy(policy), [])
+        self.assertEqual(validate_registry(registry), [])
+        self.assertEqual(validate_policy_references(policy, registry), [])
+        self.assertEqual(policy["project_name"], "new-project")
+        self.assertEqual(policy["project_kind"], "generic")
+        self.assertEqual(policy["git"]["remote"], "origin")
+        self.assertEqual(policy["git"]["base_branch"], "main")
+        self.assertIs(policy["git"]["require_pull_request"], True)
+        self.assertIs(policy["git"]["allow_direct_base_push"], False)
+        self.assertEqual(policy["git"]["integration_strategy"], "squash")
+        self.assertIs(policy["reasoning"]["sequential_default"], True)
+        self.assertEqual(policy["reasoning"]["normal_max_workers"], 2)
+        self.assertEqual(policy["release"]["official_source"], "remote_base")
+        self.assertIs(policy["release"]["require_manifest"], True)
+        self.assertEqual(registry["registry_id"], "new-project")
+        self.assertEqual(registry["router"]["default_mode"], "audit")
+        self.assertEqual(registry["router"]["external_effect_default"], "deny")
+        required_resources = [
+            resource["id"]
+            for resource in registry["resources"]
+            if resource.get("selection") == "required"
+        ]
+        self.assertEqual(required_resources, ["instruction.project-agents"])
+        resources_by_id = {
+            resource["id"]: resource for resource in registry["resources"]
+        }
+        self.assertNotIn("document.operating-model", resources_by_id)
+        for route in registry["routes"]:
+            self.assertNotIn(
+                "document.operating-model",
+                route.get("recommended_resources", []),
+                route.get("id"),
+            )
+        for resource_id in (
+            "skill.verified-workflow",
+            "mcp.github-pr-read",
+            "mcp.release-provider-evidence",
+        ):
+            self.assertIn(resource_id, resources_by_id)
+            self.assertEqual(
+                resources_by_id[resource_id]["selection"],
+                "available",
+                resource_id,
+            )
+        for relative in ("AGENTS.md", "README.md"):
+            content = read(NEW_PROJECT_BOOTSTRAP / relative)
+            self.assertIn("new-project", content, relative)
+            self.assertIn("custom", content.lower(), relative)
+        source_guide = read(NEW_PROJECT_BOOTSTRAP / "README.md")
+        self.assertIn("source-side", source_guide)
+        self.assertIn("Copy exactly `AGENTS.md`", source_guide)
+        self.assertIn("never overwrite it", source_guide)
+
+        starter_agents = " ".join(
+            read(NEW_PROJECT_BOOTSTRAP / "AGENTS.md").split()
+        )
+        for authority_contract in (
+            "Commit requires the applicable local gates over the current bytes; "
+            "it does not require remote CI.",
+            "Push, opening or updating a Pull Request, and merge require fresh "
+            "host/provider observation",
+            "The confirmed absence of a remote work ref authorizes only creation "
+            "of that exact ref by the first push.",
+            "Merge requires required CI to be terminal green for the exact head",
+            "This standing Git authority exists only when these instructions are "
+            "already integrated in the protected base.",
+            "An edit on a work branch does not authorize itself.",
+            "A merge that would automatically trigger deploy, release, "
+            "publication, dependency installation, a CI change or secret "
+            "handling is not covered",
+            "Before these instructions are integrated, the bootstrap branch and "
+            "commit require pre-existing authority or exact operator "
+            "authorization.",
+        ):
+            self.assertIn(authority_contract, starter_agents)
+
+    def test_new_project_bootstrap_preserves_existing_authority(self) -> None:
+        cases = (
+            ("AGENTS.md", "regular"),
+            (".codex/project-policy.toml", "regular"),
+            (".codex/resource-registry.toml", "regular"),
+            ("AGENTS.md", "dangling_symlink"),
+        )
+        for relative, kind in cases:
+            with (
+                self.subTest(relative=relative, kind=kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                target = Path(directory).resolve(strict=True) / "target"
+                target.mkdir(mode=0o700)
+                authority = target / relative
+                authority.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "dangling_symlink":
+                    authority.symlink_to("missing-authority-target")
+                else:
+                    authority.write_bytes(b"consumer-owned-authority\n")
+                before = content_snapshot(target)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"^E_BOOTSTRAP_AUTHORITY_EXISTS$",
+                ):
+                    _copy_new_project_authority_files(target)
+
+                self.assertEqual(before, content_snapshot(target))
+
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory).resolve(strict=True)
+            target = container / "target"
+            outside = container / "outside"
+            target.mkdir(mode=0o700)
+            outside.mkdir(mode=0o700)
+            (target / ".codex").symlink_to(outside, target_is_directory=True)
+            target_before = content_snapshot(target)
+            outside_before = content_snapshot(outside)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^E_BOOTSTRAP_AUTHORITY_EXISTS$",
+            ):
+                _copy_new_project_authority_files(target)
+
+            self.assertEqual(target_before, content_snapshot(target))
+            self.assertEqual(outside_before, content_snapshot(outside))
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory).resolve(strict=True) / "target"
+            target.mkdir(mode=0o700)
+            (target / ".codex").write_bytes(b"not-a-directory\n")
+            before = content_snapshot(target)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"^E_BOOTSTRAP_AUTHORITY_EXISTS$",
+            ):
+                _copy_new_project_authority_files(target)
+
+            self.assertEqual(before, content_snapshot(target))
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory).resolve(strict=True) / "target"
+            target.mkdir(mode=0o700)
+            real_open = os.open
+            publish_calls = 0
+            collided = target / ".codex" / "resource-registry.toml"
+
+            def collide_on_second_publish(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+            ) -> int:
+                nonlocal publish_calls
+                if flags & os.O_CREAT:
+                    publish_calls += 1
+                    if publish_calls == 2:
+                        Path(path).write_bytes(b"same-UID foreign authority\n")
+                        raise FileExistsError(
+                            errno.EEXIST,
+                            "induced same-UID collision",
+                            path,
+                        )
+                return real_open(path, flags, mode)
+
+            with (
+                patch.object(os, "open", collide_on_second_publish),
+                self.assertRaisesRegex(
+                    ValueError,
+                    r"^E_BOOTSTRAP_AUTHORITY_EXISTS$",
+                ),
+            ):
+                _copy_new_project_authority_files(target)
+
+            self.assertFalse(
+                os.path.lexists(target / ".codex" / "project-policy.toml")
+            )
+            self.assertEqual(
+                collided.read_bytes(),
+                b"same-UID foreign authority\n",
+            )
+            self.assertFalse(os.path.lexists(target / "AGENTS.md"))
+
+    def test_new_project_bootstrap_is_governing_without_authorizing_adoption(
+        self,
+    ) -> None:
+        self.assertTrue(
+            NEW_PROJECT_BOOTSTRAP_RUNBOOK.is_file(),
+            "new-project audit bootstrap runbook is missing",
+        )
+        self.assertTrue(ADOPTION_READINESS_DESIGN.is_file())
+        self.assertTrue(ADOPTION_READINESS_PLAN.is_file())
+        self.assertTrue((NEW_PROJECT_BOOTSTRAP / "AGENTS.md").is_file())
+        self.assertTrue((NEW_PROJECT_BOOTSTRAP / "README.md").is_file())
+        documents = {
+            "runbook": read(NEW_PROJECT_BOOTSTRAP_RUNBOOK),
+            "design": read(ADOPTION_READINESS_DESIGN),
+            "index": read(CANONICAL_INDEX),
+            "README": read(ROOT / "README.md"),
+            "starter AGENTS": read(NEW_PROJECT_BOOTSTRAP / "AGENTS.md"),
+            "starter README": read(NEW_PROJECT_BOOTSTRAP / "README.md"),
+        }
+        for name, document in documents.items():
+            self.assertIn("external_consumer_adoption=PROHIBITED", document, name)
+            self.assertIn("consumer_adoption_commands=PROHIBITED", document, name)
+            self.assertIn("source-driven", document.lower(), name)
+            self.assertIn("authorizes=false", document, name)
+            self.assertIn("scripts/control-plane-adoption", document, name)
+        runbook = documents["runbook"]
+        design = documents["design"]
+        self.assertIn("copy_customize_commit=PROJECT_OWNED_MUTATION", runbook)
+        self.assertIn("section_5_source_driven_audit=READ_ONLY", runbook)
+        self.assertIn("selected_source=REQUIRED", runbook)
+        self.assertIn("selected_source_sha=REQUIRED", runbook)
+        self.assertIn("precheck=READ_ONLY", runbook)
+        self.assertIn("apply_patch", runbook)
+        self.assertIn("*** Add File:", runbook)
+        self.assertIn("same-UID", runbook)
+        self.assertIn("single writer", runbook)
+        for bootstrap_order in (
+            "baseline_commit=REQUIRED",
+            "clean_worktree=REQUIRED",
+            "clean_index=REQUIRED",
+            "work_branch_before_precheck=REQUIRED",
+            "no_head=BLOCKED",
+            "bootstrap_authority=PREEXISTING_OR_EXACT_OPERATOR_AUTHORIZATION",
+        ):
+            self.assertIn(bootstrap_order, runbook)
+        _, matrix_marker, matrix = runbook.partition("## Matriz de resultado")
+        self.assertEqual(matrix_marker, "## Matriz de resultado")
+        blocked_row = next(
+            line for line in matrix.splitlines() if line.startswith("| `BLOCKED`")
+        )
+        unknown_row = next(
+            line for line in matrix.splitlines() if line.startswith("| `UNKNOWN`")
+        )
+        self.assertNotIn("base local", blocked_row.lower())
+        self.assertIn("base local", unknown_row.lower())
+        self.assertNotIn("os.O_CREAT", runbook)
+        self.assertNotIn("shutil.copy", runbook)
+        for source_contract in (runbook, design, documents["README"]):
+            self.assertNotIn(
+                "/Users/bustaseo/Developer/codex-engineering-control-plane",
+                source_contract,
+            )
+            self.assertIn("selected clean source", source_contract.lower())
+
+    def test_new_project_mutating_runbook_blocks_fail_closed(self) -> None:
+        work_branch = "codex/control-plane-bootstrap-v1"
+
+        def initialize_repository(
+            repository: Path,
+            *,
+            branch: str = "main",
+            with_head: bool = True,
+        ) -> None:
+            repository.mkdir(parents=True, mode=0o700)
+            _fixture_git(repository, "init", "-b", branch)
+            _fixture_git(repository, "config", "user.name", "Bootstrap Guard Test")
+            _fixture_git(
+                repository,
+                "config",
+                "user.email",
+                "bootstrap-guard@example.invalid",
+            )
+            if with_head:
+                (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+                _fixture_git(repository, "add", "README.md")
+                _fixture_git(repository, "commit", "-m", "consumer baseline")
+
+        branch_cases = (
+            "no_head",
+            "tracked_dirty",
+            "staged_dirty",
+            "untracked_dirty",
+            "wrong_branch",
+        )
+        for case in branch_cases:
+            with (
+                self.subTest(block="create-branch", case=case),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                repository = Path(directory).resolve(strict=True) / "target"
+                initialize_repository(repository, with_head=case != "no_head")
+                if case == "tracked_dirty":
+                    (repository / "README.md").write_bytes(b"tracked drift\n")
+                elif case == "staged_dirty":
+                    (repository / "README.md").write_bytes(b"staged drift\n")
+                    _fixture_git(repository, "add", "README.md")
+                elif case == "untracked_dirty":
+                    (repository / "foreign.txt").write_bytes(b"foreign work\n")
+                elif case == "wrong_branch":
+                    _fixture_git(repository, "switch", "-c", "codex/wrong-branch")
+
+                before = _bootstrap_git_state(repository)
+                completed = _run_runbook_shell_block(
+                    "NEW_PROJECT_CREATE_WORK_BRANCH",
+                    cwd=repository,
+                    environment={
+                        "NEW_PROJECT_ROOT": str(repository),
+                        "NEW_PROJECT_BASE": "main",
+                        "NEW_PROJECT_WORK_BRANCH": work_branch,
+                    },
+                )
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertEqual(before, _bootstrap_git_state(repository))
+                self.assertNotIn(
+                    f"refs/heads/{work_branch}".encode(),
+                    before[0],
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory).resolve(strict=True) / "target"
+            initialize_repository(repository)
+            baseline = _fixture_git(repository, "rev-parse", "HEAD").stdout.strip()
+            commit_count = _fixture_git(
+                repository,
+                "rev-list",
+                "--all",
+                "--count",
+            ).stdout
+            completed = _run_runbook_shell_block(
+                "NEW_PROJECT_CREATE_WORK_BRANCH",
+                cwd=repository,
+                environment={
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                },
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                _fixture_git(repository, "symbolic-ref", "--short", "HEAD").stdout.strip(),
+                work_branch.encode(),
+            )
+            self.assertEqual(
+                _fixture_git(repository, "rev-parse", "HEAD").stdout.strip(),
+                baseline,
+            )
+            self.assertEqual(
+                _fixture_git(repository, "rev-list", "--all", "--count").stdout,
+                commit_count,
+            )
+            self.assertEqual(
+                _fixture_git(repository, "diff", "--cached", "--name-only").stdout,
+                b"",
+            )
+            self.assertEqual(
+                _fixture_git(repository, "status", "--porcelain=v1").stdout,
+                b"",
+            )
+        def customize_authority(repository: Path) -> None:
+            for relative in NEW_PROJECT_AUTHORITY_FILES:
+                path = repository / relative
+                path.write_bytes(path.read_bytes().replace(b"new-project", b"fixture-project"))
+
+        commit_cases = ("no_head", "wrong_branch", "unrelated_dirty")
+        for case in commit_cases:
+            with (
+                self.subTest(block="commit-bootstrap", case=case),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                repository = Path(directory).resolve(strict=True) / "target"
+                if case == "no_head":
+                    initialize_repository(
+                        repository,
+                        branch=work_branch,
+                        with_head=False,
+                    )
+                    baseline = "0" * 40
+                else:
+                    initialize_repository(repository)
+                    baseline = _fixture_git(
+                        repository,
+                        "rev-parse",
+                        "HEAD",
+                    ).stdout.decode().strip()
+                    if case == "unrelated_dirty":
+                        _fixture_git(repository, "switch", "-c", work_branch)
+                _copy_new_project_authority_files(repository)
+                customize_authority(repository)
+                if case == "unrelated_dirty":
+                    (repository / "foreign.txt").write_bytes(b"foreign work\n")
+
+                before = _bootstrap_git_state(repository)
+                completed = _run_runbook_shell_block(
+                    "NEW_PROJECT_COMMIT_BOOTSTRAP",
+                    cwd=repository,
+                    environment={
+                        "NEW_PROJECT_ROOT": str(repository),
+                        "NEW_PROJECT_BASE": "main",
+                        "NEW_PROJECT_WORK_BRANCH": work_branch,
+                        "BASELINE_HEAD": baseline,
+                        **BOOTSTRAP_GIT_IDENTITY,
+                    },
+                )
+                self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertEqual(before, _bootstrap_git_state(repository))
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory).resolve(strict=True) / "target"
+            initialize_repository(repository)
+            baseline = _fixture_git(repository, "rev-parse", "HEAD").stdout.strip()
+            _fixture_git(repository, "switch", "-c", work_branch)
+            _copy_new_project_authority_files(repository)
+            customize_authority(repository)
+            completed = _run_runbook_shell_block(
+                "NEW_PROJECT_COMMIT_BOOTSTRAP",
+                cwd=repository,
+                environment={
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                    "BASELINE_HEAD": baseline.decode(),
+                    **BOOTSTRAP_GIT_IDENTITY,
+                },
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                _fixture_git(repository, "rev-list", "--all", "--count").stdout.strip(),
+                b"2",
+            )
+            self.assertEqual(
+                _fixture_git(
+                    repository,
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "HEAD",
+                ).stdout.splitlines(),
+                sorted(relative.encode() for relative in NEW_PROJECT_AUTHORITY_FILES),
+            )
+            self.assertEqual(
+                _fixture_git(repository, "status", "--porcelain=v1").stdout,
+                b"",
+            )
+            identity = _fixture_git(
+                repository,
+                "show",
+                "-s",
+                "--format=%an%x00%ae%x00%cn%x00%ce",
+                "HEAD",
+            ).stdout.rstrip(b"\n").split(b"\0")
+            self.assertEqual(
+                identity,
+                [
+                    BOOTSTRAP_GIT_IDENTITY["CONTROL_PLANE_GIT_AUTHOR_NAME"].encode(),
+                    BOOTSTRAP_GIT_IDENTITY["CONTROL_PLANE_GIT_AUTHOR_EMAIL"].encode(),
+                    BOOTSTRAP_GIT_IDENTITY["CONTROL_PLANE_GIT_COMMITTER_NAME"].encode(),
+                    BOOTSTRAP_GIT_IDENTITY["CONTROL_PLANE_GIT_COMMITTER_EMAIL"].encode(),
+                ],
+            )
+
+    def test_new_project_source_binding_is_exact_clean_and_read_only(self) -> None:
+        source_block = _runbook_shell_block("CONTROL_PLANE_SOURCE_BINDING")
+        self.assertIn("ls-files -v -z", source_block)
+        self.assertIn("E_CONTROL_PLANE_SOURCE_INDEX_FLAGS", source_block)
+        self.assertIn("GIT_CONFIG_GLOBAL=/dev/null", source_block)
+        self.assertIn("core.hooksPath=/dev/null", source_block)
+        cases = (
+            "clean",
+            "sha_mismatch",
+            "tracked_dirty",
+            "staged_dirty",
+            "untracked",
+            "assume_unchanged",
+            "skip_worktree",
+        )
+        for case in cases:
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                container = Path(directory).resolve(strict=True)
+                source = initialize_full_source(container / "source", ROOT)
+                source_sha = _fixture_git(source, "rev-parse", "HEAD").stdout.decode().strip()
+                selected_sha = source_sha
+                if case == "sha_mismatch":
+                    selected_sha = "0" * 40 if source_sha != "0" * 40 else "1" * 40
+                elif case in {"tracked_dirty", "staged_dirty"}:
+                    launcher = source / "scripts" / "control-plane"
+                    launcher.write_bytes(launcher.read_bytes() + b"\n# induced drift\n")
+                    if case == "staged_dirty":
+                        _fixture_git(source, "add", "scripts/control-plane")
+                elif case == "untracked":
+                    (source / "foreign.tmp").write_bytes(b"untracked source drift\n")
+                elif case == "assume_unchanged":
+                    _fixture_git(
+                        source,
+                        "update-index",
+                        "--assume-unchanged",
+                        "scripts/control-plane",
+                    )
+                elif case == "skip_worktree":
+                    _fixture_git(
+                        source,
+                        "update-index",
+                        "--skip-worktree",
+                        "scripts/control-plane",
+                    )
+
+                before = content_snapshot(source)
+                git_before = _bootstrap_git_state(source)
+                completed = _run_runbook_shell_block(
+                    "CONTROL_PLANE_SOURCE_BINDING",
+                    cwd=source,
+                    environment={
+                        "CONTROL_PLANE_SOURCE": str(source),
+                        "CONTROL_PLANE_SOURCE_SHA": selected_sha,
+                    },
+                )
+                if case == "clean":
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(completed.stdout, b"source_binding=PASS\n")
+                else:
+                    self.assertNotEqual(completed.returncode, 0, completed.stdout)
+                self.assertEqual(git_before, _bootstrap_git_state(source))
+                self.assertEqual(before, content_snapshot(source))
+
+    def test_new_project_runbook_git_blocks_have_no_masking_shell_constructs(
+        self,
+    ) -> None:
+        for name in (
+            "CONTROL_PLANE_SOURCE_BINDING",
+            "CONTROL_PLANE_STAGE_AUTHORITY_BLOBS",
+            "NEW_PROJECT_CREATE_WORK_BRANCH",
+            "NEW_PROJECT_COMMIT_BOOTSTRAP",
+        ):
+            block = _runbook_shell_block(name)
+            self.assertNotIn("$(", block, name)
+            self.assertTrue(
+                block.lstrip().startswith(
+                    "/usr/local/bin/python3 -I -S -B - <<'PY'"
+                ),
+                name,
+            )
+            self.assertEqual(block.rstrip().splitlines()[-1], "PY", name)
+            self.assertNotIn('["diff"', block, name)
+            self.assertNotIn('["status"', block, name)
+            self.assertNotIn("read-tree", block, name)
+        commit_block = _runbook_shell_block("NEW_PROJECT_COMMIT_BOOTSTRAP")
+        self.assertIn("E_BOOTSTRAP_INDEX_RESTORE_FAILED", commit_block)
+        self.assertIn("E_BOOTSTRAP_INDEX_RESTORED_AFTER_FAILURE", commit_block)
+        self.assertIn("user.useConfigOnly=true", commit_block)
+        for identity_variable in BOOTSTRAP_GIT_IDENTITY:
+            self.assertIn(identity_variable, commit_block)
+        runbook = read(NEW_PROJECT_BOOTSTRAP_RUNBOOK)
+        self.assertIn(
+            "source_binding_checks=BEFORE_EXTRACTION_BEFORE_AUDIT_AFTER_AUDIT",
+            runbook,
+        )
+
+    def test_new_project_source_binding_preserves_git_producer_failures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory).resolve(strict=True)
+            source = initialize_full_source(container / "source", ROOT)
+            source_sha = _fixture_git(source, "rev-parse", "HEAD").stdout.decode().strip()
+            index_value = _fixture_git(
+                source,
+                "rev-parse",
+                "--git-path",
+                "index",
+            ).stdout.decode().strip()
+            index_path = Path(index_value)
+            if not index_path.is_absolute():
+                index_path = source / index_path
+            index_path.write_bytes(b"not-a-git-index\n")
+            before = index_path.read_bytes()
+
+            completed = _run_runbook_shell_block(
+                "CONTROL_PLANE_SOURCE_BINDING",
+                cwd=source,
+                environment={
+                    "CONTROL_PLANE_SOURCE": str(source),
+                    "CONTROL_PLANE_SOURCE_SHA": source_sha,
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(b"E_CONTROL_PLANE_SOURCE_GIT", completed.stderr)
+            self.assertEqual(index_path.read_bytes(), before)
+
+    def test_new_project_raw_cleanliness_never_invokes_clean_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory).resolve(strict=True)
+            source = initialize_full_source(container / "source", ROOT)
+            attributes = source / ".gitattributes"
+            attributes.write_text(
+                "scripts/control-plane filter=hostile\n",
+                encoding="utf-8",
+            )
+            _fixture_git(source, "add", ".gitattributes")
+            _fixture_git(source, "commit", "-m", "fixture source attributes")
+            source_sha = _fixture_git(source, "rev-parse", "HEAD").stdout.decode().strip()
+            source_sentinel = source / ".git" / "source-filter-invoked"
+            source_filter = source / ".git" / "hostile-source-filter"
+            source_filter.write_text(
+                "#!/bin/sh\n"
+                f"printf invoked > {source_sentinel}\n"
+                "while :; do /bin/sleep 1; done\n",
+                encoding="utf-8",
+            )
+            source_filter.chmod(0o755)
+            _fixture_git(source, "config", "filter.hostile.clean", str(source_filter))
+            _fixture_git(source, "config", "filter.hostile.required", "true")
+            launcher = source / "scripts" / "control-plane"
+            launcher.write_bytes(launcher.read_bytes() + b"\n# raw source drift\n")
+
+            source_result = _run_runbook_shell_block(
+                "CONTROL_PLANE_SOURCE_BINDING",
+                cwd=source,
+                environment={
+                    "CONTROL_PLANE_SOURCE": str(source),
+                    "CONTROL_PLANE_SOURCE_SHA": source_sha,
+                },
+            )
+
+            self.assertNotEqual(source_result.returncode, 0)
+            self.assertIn(b"E_CONTROL_PLANE_SOURCE_DIRTY", source_result.stderr)
+            self.assertFalse(source_sentinel.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory).resolve(strict=True) / "target"
+            repository.mkdir(parents=True, mode=0o700)
+            _fixture_git(repository, "init", "-b", "main")
+            _fixture_git(repository, "config", "user.name", "Raw Target Filter")
+            _fixture_git(
+                repository,
+                "config",
+                "user.email",
+                "raw-target-filter@example.invalid",
+            )
+            (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+            (repository / ".gitattributes").write_text(
+                "README.md filter=hostile\n",
+                encoding="utf-8",
+            )
+            _fixture_git(repository, "add", "README.md", ".gitattributes")
+            _fixture_git(repository, "commit", "-m", "consumer baseline")
+            target_sentinel = repository / ".git" / "target-filter-invoked"
+            target_filter = repository / ".git" / "hostile-target-filter"
+            target_filter.write_text(
+                "#!/bin/sh\n"
+                f"printf invoked > {target_sentinel}\n"
+                "while :; do /bin/sleep 1; done\n",
+                encoding="utf-8",
+            )
+            target_filter.chmod(0o755)
+            _fixture_git(repository, "config", "filter.hostile.clean", str(target_filter))
+            _fixture_git(repository, "config", "filter.hostile.required", "true")
+            (repository / "README.md").write_bytes(b"# Raw target drift\n")
+            before = _bootstrap_git_state(repository)
+
+            target_result = _run_runbook_shell_block(
+                "NEW_PROJECT_CREATE_WORK_BRANCH",
+                cwd=repository,
+                environment={
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": "codex/control-plane-bootstrap-v1",
+                },
+            )
+
+            self.assertNotEqual(target_result.returncode, 0)
+            self.assertIn(b"E_BOOTSTRAP_TARGET_DIRTY", target_result.stderr)
+            self.assertFalse(target_sentinel.exists())
+            self.assertEqual(before, _bootstrap_git_state(repository))
+
+    def test_new_project_target_index_hints_fail_before_mutation(self) -> None:
+        for block, flag in (
+            ("branch", "--assume-unchanged"),
+            ("branch", "--skip-worktree"),
+            ("commit", "--assume-unchanged"),
+            ("commit", "--skip-worktree"),
+        ):
+            with (
+                self.subTest(block=block, flag=flag),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                repository = Path(directory).resolve(strict=True) / "target"
+                repository.mkdir(parents=True, mode=0o700)
+                _fixture_git(repository, "init", "-b", "main")
+                _fixture_git(repository, "config", "user.name", "Index Hint Test")
+                _fixture_git(
+                    repository,
+                    "config",
+                    "user.email",
+                    "index-hint@example.invalid",
+                )
+                (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+                _fixture_git(repository, "add", "README.md")
+                _fixture_git(repository, "commit", "-m", "consumer baseline")
+                baseline = _fixture_git(repository, "rev-parse", "HEAD").stdout.strip()
+                work_branch = "codex/control-plane-bootstrap-v1"
+                if block == "commit":
+                    _fixture_git(repository, "switch", "-c", work_branch)
+                    _copy_new_project_authority_files(repository)
+                    for relative in NEW_PROJECT_AUTHORITY_FILES:
+                        path = repository / relative
+                        path.write_bytes(
+                            path.read_bytes().replace(
+                                b"new-project",
+                                b"index-hint-fixture",
+                            )
+                        )
+                _fixture_git(repository, "update-index", flag, "README.md")
+                before = _bootstrap_git_state(repository)
+                tags_before = _fixture_git(repository, "ls-files", "-v", "-z").stdout
+                environment = {
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                }
+                marker = "NEW_PROJECT_CREATE_WORK_BRANCH"
+                if block == "commit":
+                    marker = "NEW_PROJECT_COMMIT_BOOTSTRAP"
+                    environment.update(
+                        {
+                            "BASELINE_HEAD": baseline.decode(),
+                            **BOOTSTRAP_GIT_IDENTITY,
+                        }
+                    )
+
+                completed = _run_runbook_shell_block(
+                    marker,
+                    cwd=repository,
+                    environment=environment,
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"E_BOOTSTRAP_TARGET_INDEX_FLAGS", completed.stderr)
+                self.assertEqual(before, _bootstrap_git_state(repository))
+                self.assertEqual(
+                    tags_before,
+                    _fixture_git(repository, "ls-files", "-v", "-z").stdout,
+                )
+
+    def test_new_project_raw_cleanliness_rejects_unsupported_git_modes(self) -> None:
+        for case in ("source_symlink", "target_gitlink"):
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                container = Path(directory).resolve(strict=True)
+                if case == "source_symlink":
+                    repository = initialize_full_source(container / "source", ROOT)
+                    (repository / "unsupported-link").symlink_to("README.md")
+                    _fixture_git(repository, "add", "unsupported-link")
+                    _fixture_git(repository, "commit", "-m", "fixture symlink")
+                    source_sha = _fixture_git(
+                        repository,
+                        "rev-parse",
+                        "HEAD",
+                    ).stdout.decode().strip()
+                    completed = _run_runbook_shell_block(
+                        "CONTROL_PLANE_SOURCE_BINDING",
+                        cwd=repository,
+                        environment={
+                            "CONTROL_PLANE_SOURCE": str(repository),
+                            "CONTROL_PLANE_SOURCE_SHA": source_sha,
+                        },
+                    )
+                    expected_error = b"E_CONTROL_PLANE_SOURCE_UNSUPPORTED_MODE"
+                else:
+                    repository = container / "target"
+                    repository.mkdir(parents=True, mode=0o700)
+                    _fixture_git(repository, "init", "-b", "main")
+                    _fixture_git(repository, "config", "user.name", "Gitlink Test")
+                    _fixture_git(
+                        repository,
+                        "config",
+                        "user.email",
+                        "gitlink@example.invalid",
+                    )
+                    (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+                    _fixture_git(repository, "add", "README.md")
+                    _fixture_git(repository, "commit", "-m", "consumer baseline")
+                    gitlink_oid = _fixture_git(
+                        repository,
+                        "rev-parse",
+                        "HEAD",
+                    ).stdout.decode().strip()
+                    _fixture_git(
+                        repository,
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        "160000",
+                        gitlink_oid,
+                        "embedded-module",
+                    )
+                    _fixture_git(repository, "commit", "-m", "fixture gitlink")
+                    completed = _run_runbook_shell_block(
+                        "NEW_PROJECT_CREATE_WORK_BRANCH",
+                        cwd=repository,
+                        environment={
+                            "NEW_PROJECT_ROOT": str(repository),
+                            "NEW_PROJECT_BASE": "main",
+                            "NEW_PROJECT_WORK_BRANCH": "codex/control-plane-bootstrap-v1",
+                        },
+                    )
+                    expected_error = b"E_BOOTSTRAP_TARGET_UNSUPPORTED_MODE"
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected_error, completed.stderr)
+
+    def test_new_project_branch_query_error_is_not_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory).resolve(strict=True) / "target"
+            repository.mkdir(parents=True, mode=0o700)
+            _fixture_git(repository, "init", "-b", "main")
+            _fixture_git(repository, "config", "user.name", "Branch Query Test")
+            _fixture_git(
+                repository,
+                "config",
+                "user.email",
+                "branch-query@example.invalid",
+            )
+            (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+            _fixture_git(repository, "add", "README.md")
+            _fixture_git(repository, "commit", "-m", "consumer baseline")
+            work_branch = "codex/control-plane-bootstrap-v1"
+            malformed_ref = repository / ".git" / "refs" / "heads" / work_branch
+            malformed_ref.parent.mkdir(parents=True, exist_ok=True)
+            malformed_ref.write_bytes(b"not-an-object-id\n")
+            head_before = _fixture_git(repository, "rev-parse", "HEAD").stdout
+            symbolic_before = _fixture_git(repository, "symbolic-ref", "HEAD").stdout
+            index_before = _fixture_git(
+                repository,
+                "ls-files",
+                "--stage",
+                "-z",
+            ).stdout
+
+            completed = _run_runbook_shell_block(
+                "NEW_PROJECT_CREATE_WORK_BRANCH",
+                cwd=repository,
+                environment={
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(b"E_BOOTSTRAP_BRANCH_QUERY", completed.stderr)
+            self.assertEqual(
+                _fixture_git(repository, "rev-parse", "HEAD").stdout,
+                head_before,
+            )
+            self.assertEqual(
+                _fixture_git(repository, "symbolic-ref", "HEAD").stdout,
+                symbolic_before,
+            )
+            self.assertEqual(
+                _fixture_git(repository, "ls-files", "--stage", "-z").stdout,
+                index_before,
+            )
+            self.assertEqual(malformed_ref.read_bytes(), b"not-an-object-id\n")
+
+    def test_new_project_authority_staging_is_bound_to_selected_commit(self) -> None:
+        stage_block = _runbook_shell_block(
+            "CONTROL_PLANE_STAGE_AUTHORITY_BLOBS"
+        )
+        self.assertIn("cat-file", stage_block)
+        self.assertIn("CONTROL_PLANE_SOURCE_SHA", stage_block)
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory).resolve(strict=True)
+            source = initialize_full_source(container / "source", ROOT)
+            source_sha = _fixture_git(source, "rev-parse", "HEAD").stdout.decode().strip()
+            stage = container / "stage"
+
+            completed = _run_runbook_shell_block(
+                "CONTROL_PLANE_STAGE_AUTHORITY_BLOBS",
+                cwd=source,
+                environment={
+                    "CONTROL_PLANE_SOURCE": str(source),
+                    "CONTROL_PLANE_SOURCE_SHA": source_sha,
+                    "CONTROL_PLANE_AUTHORITY_STAGE": str(stage),
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            observed = {
+                path.relative_to(stage).as_posix()
+                for path in stage.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(observed, set(NEW_PROJECT_AUTHORITY_FILES))
+            for relative in NEW_PROJECT_AUTHORITY_FILES:
+                self.assertEqual(
+                    (stage / relative).read_bytes(),
+                    _fixture_git(
+                        source,
+                        "show",
+                        f"{source_sha}:templates/new-project/{relative}",
+                    ).stdout,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory).resolve(strict=True)
+            source = initialize_full_source(container / "source", ROOT)
+            source_sha = _fixture_git(source, "rev-parse", "HEAD").stdout.decode().strip()
+            initial = _run_runbook_shell_block(
+                "CONTROL_PLANE_SOURCE_BINDING",
+                cwd=source,
+                environment={
+                    "CONTROL_PLANE_SOURCE": str(source),
+                    "CONTROL_PLANE_SOURCE_SHA": source_sha,
+                },
+            )
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            live_template = source / "templates" / "new-project" / "AGENTS.md"
+            live_template.write_bytes(live_template.read_bytes() + b"\n# live drift\n")
+            source_before = content_snapshot(source)
+            stage = container / "stage"
+
+            completed = _run_runbook_shell_block(
+                "CONTROL_PLANE_STAGE_AUTHORITY_BLOBS",
+                cwd=source,
+                environment={
+                    "CONTROL_PLANE_SOURCE": str(source),
+                    "CONTROL_PLANE_SOURCE_SHA": source_sha,
+                    "CONTROL_PLANE_AUTHORITY_STAGE": str(stage),
+                },
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn(b"E_CONTROL_PLANE_SOURCE_DIRTY", completed.stderr)
+            self.assertFalse(stage.exists())
+            self.assertEqual(source_before, content_snapshot(source))
+
+    def test_new_project_mutating_blocks_bypass_hooks_and_clean_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory).resolve(strict=True) / "target"
+            repository.mkdir(parents=True, mode=0o700)
+            _fixture_git(repository, "init", "-b", "main")
+            _fixture_git(repository, "config", "user.name", "Hostile Filter Test")
+            _fixture_git(
+                repository,
+                "config",
+                "user.email",
+                "hostile-filter@example.invalid",
+            )
+            (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+            (repository / ".gitattributes").write_text(
+                "AGENTS.md filter=hostile\n"
+                ".codex/*.toml filter=hostile\n",
+                encoding="utf-8",
+            )
+            _fixture_git(repository, "add", "README.md", ".gitattributes")
+            _fixture_git(repository, "commit", "-m", "consumer baseline")
+            baseline = _fixture_git(repository, "rev-parse", "HEAD").stdout.strip()
+
+            hooks = repository / ".git" / "hostile-hooks"
+            hooks.mkdir(mode=0o700)
+            hook_sentinel = repository / ".git" / "hostile-hook-invoked"
+            hook_body = (
+                "#!/bin/sh\n"
+                "printf invoked > .git/hostile-hook-invoked\n"
+                "while :; do /bin/sleep 1; done\n"
+            )
+            for hook_name in ("post-checkout", "pre-commit"):
+                hook = hooks / hook_name
+                hook.write_text(hook_body, encoding="utf-8")
+                hook.chmod(0o755)
+            _fixture_git(repository, "config", "core.hooksPath", str(hooks))
+
+            filter_sentinel = repository / ".git" / "hostile-filter-invoked"
+            hostile_filter = repository / ".git" / "hostile-filter"
+            hostile_filter.write_text(
+                "#!/bin/sh\n"
+                "printf invoked > .git/hostile-filter-invoked\n"
+                "while :; do /bin/sleep 1; done\n",
+                encoding="utf-8",
+            )
+            hostile_filter.chmod(0o755)
+            _fixture_git(
+                repository,
+                "config",
+                "filter.hostile.clean",
+                str(hostile_filter),
+            )
+            _fixture_git(repository, "config", "filter.hostile.required", "true")
+
+            work_branch = "codex/control-plane-bootstrap-v1"
+            branch = _run_runbook_shell_block(
+                "NEW_PROJECT_CREATE_WORK_BRANCH",
+                cwd=repository,
+                environment={
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                },
+            )
+            self.assertEqual(branch.returncode, 0, branch.stderr)
+            self.assertFalse(hook_sentinel.exists())
+            self.assertFalse(filter_sentinel.exists())
+
+            _copy_new_project_authority_files(repository)
+            for relative in NEW_PROJECT_AUTHORITY_FILES:
+                path = repository / relative
+                path.write_bytes(
+                    path.read_bytes().replace(b"new-project", b"hostile-fixture")
+                )
+            commit = _run_runbook_shell_block(
+                "NEW_PROJECT_COMMIT_BOOTSTRAP",
+                cwd=repository,
+                environment={
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                    "BASELINE_HEAD": baseline.decode(),
+                    **BOOTSTRAP_GIT_IDENTITY,
+                },
+            )
+            self.assertEqual(commit.returncode, 0, commit.stderr)
+            self.assertFalse(hook_sentinel.exists())
+            self.assertFalse(filter_sentinel.exists())
+            self.assertEqual(
+                _fixture_git(repository, "rev-parse", "HEAD^").stdout.strip(),
+                baseline,
+            )
+            self.assertEqual(
+                _fixture_git(repository, "diff", "--cached", "--quiet").returncode,
+                0,
+            )
+            for relative in NEW_PROJECT_AUTHORITY_FILES:
+                expected = (repository / relative).read_bytes()
+                self.assertEqual(
+                    _fixture_git(repository, "show", f":{relative}").stdout,
+                    expected,
+                    relative,
+                )
+                self.assertEqual(
+                    _fixture_git(repository, "show", f"HEAD:{relative}").stdout,
+                    expected,
+                    relative,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory).resolve(strict=True) / "target"
+            repository.mkdir(parents=True, mode=0o700)
+            _fixture_git(repository, "init", "-b", "main")
+            _fixture_git(repository, "config", "user.name", "Raw Stage Failure")
+            _fixture_git(
+                repository,
+                "config",
+                "user.email",
+                "raw-stage-failure@example.invalid",
+            )
+            (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+            _fixture_git(repository, "add", "README.md")
+            _fixture_git(repository, "commit", "-m", "consumer baseline")
+            baseline = _fixture_git(repository, "rev-parse", "HEAD").stdout.strip()
+            work_branch = "codex/control-plane-bootstrap-v1"
+            _fixture_git(repository, "switch", "-c", work_branch)
+            _copy_new_project_authority_files(repository)
+            for relative in NEW_PROJECT_AUTHORITY_FILES:
+                path = repository / relative
+                path.write_bytes(path.read_bytes().replace(b"new-project", b"fixture"))
+            authority = repository / "AGENTS.md"
+            authority.unlink()
+            authority.symlink_to("README.md")
+            head_before = _fixture_git(repository, "rev-parse", "HEAD").stdout
+            index_before = _fixture_git(
+                repository,
+                "ls-files",
+                "--stage",
+                "-z",
+            ).stdout
+            commit = _run_runbook_shell_block(
+                "NEW_PROJECT_COMMIT_BOOTSTRAP",
+                cwd=repository,
+                environment={
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                    "BASELINE_HEAD": baseline.decode(),
+                    **BOOTSTRAP_GIT_IDENTITY,
+                },
+            )
+            self.assertNotEqual(commit.returncode, 0)
+            self.assertEqual(
+                _fixture_git(repository, "rev-parse", "HEAD").stdout,
+                head_before,
+            )
+            self.assertEqual(
+                _fixture_git(repository, "ls-files", "--stage", "-z").stdout,
+                index_before,
+            )
+
+    def test_new_project_commit_requires_exact_operator_identity(self) -> None:
+        for case in ("none", "local_only", "global_only"):
+            with (
+                self.subTest(case=case),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                container = Path(directory).resolve(strict=True)
+                repository = container / "target"
+                repository.mkdir(parents=True, mode=0o700)
+                _fixture_git(repository, "init", "-b", "main")
+                _fixture_git(repository, "config", "user.name", "Baseline Identity")
+                _fixture_git(
+                    repository,
+                    "config",
+                    "user.email",
+                    "baseline-identity@example.invalid",
+                )
+                (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+                _fixture_git(repository, "add", "README.md")
+                _fixture_git(repository, "commit", "-m", "consumer baseline")
+                baseline = _fixture_git(repository, "rev-parse", "HEAD").stdout.strip()
+                work_branch = "codex/control-plane-bootstrap-v1"
+                _fixture_git(repository, "switch", "-c", work_branch)
+                _copy_new_project_authority_files(repository)
+                for relative in NEW_PROJECT_AUTHORITY_FILES:
+                    path = repository / relative
+                    path.write_bytes(
+                        path.read_bytes().replace(b"new-project", b"fixture-project")
+                    )
+                if case != "local_only":
+                    _fixture_git(repository, "config", "--unset", "user.name")
+                    _fixture_git(repository, "config", "--unset", "user.email")
+                environment = {
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                    "BASELINE_HEAD": baseline.decode(),
+                }
+                if case == "global_only":
+                    global_home = container / "global-home"
+                    global_home.mkdir(mode=0o700)
+                    (global_home / ".gitconfig").write_text(
+                        "[user]\n"
+                        "\tname = Global Only\n"
+                        "\temail = global-only@example.invalid\n",
+                        encoding="utf-8",
+                    )
+                    environment["HOME"] = str(global_home)
+                head_before = _fixture_git(repository, "rev-parse", "HEAD").stdout
+                index_before = _fixture_git(
+                    repository,
+                    "ls-files",
+                    "--stage",
+                    "-z",
+                ).stdout
+
+                commit = _run_runbook_shell_block(
+                    "NEW_PROJECT_COMMIT_BOOTSTRAP",
+                    cwd=repository,
+                    environment=environment,
+                )
+
+                self.assertNotEqual(commit.returncode, 0)
+                self.assertIn(b"E_BOOTSTRAP_GIT_IDENTITY_REQUIRED", commit.stderr)
+                self.assertEqual(
+                    _fixture_git(repository, "rev-parse", "HEAD").stdout,
+                    head_before,
+                )
+                self.assertEqual(
+                    _fixture_git(repository, "ls-files", "--stage", "-z").stdout,
+                    index_before,
+                )
+
+    def test_new_project_commit_restores_index_after_update_ref_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory).resolve(strict=True) / "target"
+            repository.mkdir(parents=True, mode=0o700)
+            _fixture_git(repository, "init", "-b", "main")
+            _fixture_git(repository, "config", "user.name", "Baseline Only")
+            _fixture_git(
+                repository,
+                "config",
+                "user.email",
+                "baseline-only@example.invalid",
+            )
+            (repository / "README.md").write_bytes(b"# Consumer baseline\n")
+            _fixture_git(repository, "add", "README.md")
+            _fixture_git(repository, "commit", "-m", "consumer baseline")
+            baseline = _fixture_git(repository, "rev-parse", "HEAD").stdout.strip()
+            work_branch = "codex/control-plane-bootstrap-v1"
+            _fixture_git(repository, "switch", "-c", work_branch)
+            _copy_new_project_authority_files(repository)
+            for relative in NEW_PROJECT_AUTHORITY_FILES:
+                path = repository / relative
+                path.write_bytes(
+                    path.read_bytes().replace(b"new-project", b"fixture-project")
+                )
+            ref_lock = (
+                repository
+                / ".git"
+                / "refs"
+                / "heads"
+                / "codex"
+                / "control-plane-bootstrap-v1.lock"
+            )
+            ref_lock.write_bytes(b"induced update-ref lock\n")
+            head_before = _fixture_git(repository, "rev-parse", "HEAD").stdout
+            index_before = _fixture_git(
+                repository,
+                "ls-files",
+                "--stage",
+                "-z",
+            ).stdout
+            index_value = _fixture_git(
+                repository,
+                "rev-parse",
+                "--git-path",
+                "index",
+            ).stdout.decode().strip()
+            index_path = Path(index_value)
+            if not index_path.is_absolute():
+                index_path = repository / index_path
+            index_bytes_before = index_path.read_bytes()
+
+            commit = _run_runbook_shell_block(
+                "NEW_PROJECT_COMMIT_BOOTSTRAP",
+                cwd=repository,
+                environment={
+                    "NEW_PROJECT_ROOT": str(repository),
+                    "NEW_PROJECT_BASE": "main",
+                    "NEW_PROJECT_WORK_BRANCH": work_branch,
+                    "BASELINE_HEAD": baseline.decode(),
+                    **BOOTSTRAP_GIT_IDENTITY,
+                },
+            )
+
+            self.assertNotEqual(commit.returncode, 0)
+            self.assertIn(
+                b"E_BOOTSTRAP_INDEX_RESTORED_AFTER_FAILURE",
+                commit.stderr,
+            )
+            self.assertNotIn(b"E_BOOTSTRAP_INDEX_RESTORE_FAILED", commit.stderr)
+            self.assertEqual(
+                _fixture_git(repository, "rev-parse", "HEAD").stdout,
+                head_before,
+            )
+            self.assertEqual(
+                _fixture_git(repository, "ls-files", "--stage", "-z").stdout,
+                index_before,
+            )
+            self.assertEqual(index_path.read_bytes(), index_bytes_before)
+
+    def test_new_project_documented_setup_exports_and_reaches_audit(self) -> None:
+        setup = _runbook_shell_block("CONTROL_PLANE_BOOTSTRAP_SETUP")
+        for variable in (
+            "CONTROL_PLANE_SOURCE",
+            "CONTROL_PLANE_SOURCE_SHA",
+            "NEW_PROJECT_ROOT",
+            "NEW_PROJECT_TASK",
+            "NEW_PROJECT_BASE",
+            "NEW_PROJECT_WORK_BRANCH",
+            "BASELINE_HEAD",
+            "CONTROL_PLANE_AUTHORITY_STAGE",
+            *BOOTSTRAP_GIT_IDENTITY,
+        ):
+            self.assertRegex(setup, rf"(?m)^export {variable}=")
+        self.assertNotIn("export BASELINE_HEAD=$(", setup)
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory).resolve(strict=True)
+            source = initialize_full_source(container / "source", ROOT)
+            source_sha = _fixture_git(source, "rev-parse", "HEAD").stdout.decode().strip()
+            target = _initialize_new_project_audit_target(container / "target")
+            baseline = _fixture_git(target, "rev-parse", "HEAD").stdout.decode().strip()
+            stage = container / "authority-stage"
+            input_environment = {
+                "BOOTSTRAP_CONTROL_PLANE_SOURCE": str(source),
+                "BOOTSTRAP_CONTROL_PLANE_SOURCE_SHA": source_sha,
+                "BOOTSTRAP_NEW_PROJECT_ROOT": str(target),
+                "BOOTSTRAP_NEW_PROJECT_TASK": str(
+                    target / ".codex" / "task-envelope.json"
+                ),
+                "BOOTSTRAP_NEW_PROJECT_BASE": "main",
+                "BOOTSTRAP_NEW_PROJECT_WORK_BRANCH": "codex/bootstrap-audit",
+                "BOOTSTRAP_BASELINE_HEAD": baseline,
+                "BOOTSTRAP_CONTROL_PLANE_AUTHORITY_STAGE": str(stage),
+                **{
+                    "BOOTSTRAP_" + key: value
+                    for key, value in BOOTSTRAP_GIT_IDENTITY.items()
+                },
+            }
+            audit = r'''
+"$CONTROL_PLANE_SOURCE/scripts/control-plane" policy-check --policy "$NEW_PROJECT_ROOT/.codex/project-policy.toml" --json >/dev/null
+"$CONTROL_PLANE_SOURCE/scripts/control-plane" registry-check --registry "$NEW_PROJECT_ROOT/.codex/resource-registry.toml" --policy "$NEW_PROJECT_ROOT/.codex/project-policy.toml" --json >/dev/null
+"$CONTROL_PLANE_SOURCE/scripts/control-plane" inventory --repo "$NEW_PROJECT_ROOT" --registry "$NEW_PROJECT_ROOT/.codex/resource-registry.toml" --json >/dev/null
+set +e
+"$CONTROL_PLANE_SOURCE/scripts/control-plane" doctor --repo "$NEW_PROJECT_ROOT" --json >"$NEW_PROJECT_ROOT/doctor.json"
+doctor_rc=$?
+set -e
+if [ "$doctor_rc" -ne 1 ]; then
+    printf '%s\n' E_DOCUMENTED_SETUP_DOCTOR >&2
+    exit 1
+fi
+"$CONTROL_PLANE_SOURCE/scripts/control-plane" preflight --mode read --offline --repo "$NEW_PROJECT_ROOT" --policy "$NEW_PROJECT_ROOT/.codex/project-policy.toml" --json >/dev/null
+"$CONTROL_PLANE_SOURCE/scripts/control-plane" route --repo "$NEW_PROJECT_ROOT" --task "$NEW_PROJECT_TASK" --policy "$NEW_PROJECT_ROOT/.codex/project-policy.toml" --registry "$NEW_PROJECT_ROOT/.codex/resource-registry.toml" --mode audit --json >/dev/null
+''' + _runbook_shell_block("CONTROL_PLANE_SOURCE_BINDING") + r'''
+printf '%s\n' documented_setup_audit=PASS
+'''
+            completed = subprocess.run(
+                [
+                    "/bin/sh",
+                    "-c",
+                    setup
+                    + "\n"
+                    + _runbook_shell_block("CONTROL_PLANE_SOURCE_BINDING")
+                    + "\n"
+                    + audit,
+                ],
+                cwd=source,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": "/var/empty",
+                    "XDG_CONFIG_HOME": "/var/empty",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    **input_environment,
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertNotIn(b"E_", completed.stderr)
+            self.assertEqual(completed.stdout.count(b"source_binding=PASS\n"), 2)
+            self.assertIn(b"documented_setup_audit=PASS", completed.stdout)
+
+    def test_adoption_readiness_plan_records_actual_progress(self) -> None:
+        plan = read(ADOPTION_READINESS_PLAN)
+        self.assertIn(
+            "TASKS_0_5_COMPLETE / FINAL_REVIEW_IN_PROGRESS",
+            "\n".join(plan.splitlines()[:30]),
+        )
+
+        def task_section(heading: str) -> str:
+            _, marker, tail = plan.partition(heading)
+            self.assertEqual(marker, heading)
+            section, _, _ = tail.partition("\n## Task ")
+            return section
+
+        for heading in (
+            "## Task 0:",
+            "## Task 1:",
+            "## Task 2:",
+            "## Task 3:",
+            "## Task 3.5:",
+            "## Task 4:",
+            "## Task 5:",
+        ):
+            section = task_section(heading)
+            self.assertIn("- [x]", section, heading)
+            self.assertNotIn("- [ ]", section, heading)
+        for heading in ("## Task 6:", "## Task 7:", "## Task 8:"):
+            section = task_section(heading)
+            self.assertIn("- [ ]", section, heading)
+            self.assertNotIn("- [x]", section, heading)
+
+        task_3_5 = task_section("## Task 3.5:")
+        self.assertIn("initialize_full_source", task_3_5)
+        self.assertIn("temporary clean source", task_3_5.lower())
+        self.assertNotIn(
+            "/Users/bustaseo/Developer/control-plane-worktrees/"
+            "adoption-readiness-v1/scripts/control-plane",
+            task_3_5,
+        )
+        task_8 = task_section("## Task 8:")
+        for post_merge_source_contract in (
+            "exact integrated `origin/main` SHA",
+            "clean detached worktree",
+            "CONTROL_PLANE_SOURCE_SHA",
+            "source_binding=PASS",
+            "required starter paths",
+        ):
+            self.assertIn(post_merge_source_contract, task_8)
+        for required_source_path in (
+            "`scripts/control-plane`",
+            "`templates/new-project/AGENTS.md`",
+            "`templates/new-project/README.md`",
+            "`templates/new-project/.codex/project-policy.toml`",
+            "`templates/new-project/.codex/resource-registry.toml`",
+        ):
+            self.assertIn(required_source_path, task_8)
+        self.assertIn("only then", task_8.lower())
+        self.assertIn("consumer", task_8.lower())
+
+        _, marker, continuation = plan.rpartition("## Continuación")
+        self.assertEqual(marker, "## Continuación")
+        self.assertIn("Task 6", continuation)
+        self.assertIn("revisión", continuation.lower())
+        self.assertNotIn("ejecutar Task 0 review", continuation)
+        self.assertNotIn("entra en RED", continuation)
+
+    def test_repository_survey_v2_index_status_is_integrated(self) -> None:
+        statuses = index_statuses()
+        for path in (
+            REPOSITORY_SURVEY_V2_ADR,
+            REPOSITORY_SURVEY_V2_SPEC,
+            REPOSITORY_SURVEY_V2_PLAN,
+        ):
+            relative = path.relative_to(ROOT).as_posix()
+            self.assertEqual(statuses.get(relative), "GOVERNING_CORE", relative)
+            status_header = "\n".join(read(path).splitlines()[:40])
+            self.assertIn("GOVERNING_CORE", status_header, relative)
+            self.assertIn("INTEGRATED", status_header, relative)
+            self.assertNotIn("FINAL_GATE_PENDING", status_header, relative)
+
+        index = read(CANONICAL_INDEX)
+        _, marker, survey_section = index.partition("## RepositorySurveyV2")
+        self.assertEqual(marker, "## RepositorySurveyV2")
+        survey_section, _, _ = survey_section.partition("\n## ")
+        self.assertNotIn("FINAL_GATE_PENDING", survey_section)
+
+    def test_repository_survey_v2_governing_text_is_present_tense(self) -> None:
+        adr = read(REPOSITORY_SURVEY_V2_ADR)
+        specification = read(REPOSITORY_SURVEY_V2_SPEC)
+        for stale_future in (
+            "Cuando se implemente mediante una autorización posterior",
+            "`scripts/control-plane survey` emitirá",
+            "no habrá `--schema-version`",
+            "Survey y el guard pre-push compartirán",
+            "El comando `survey` emitirá",
+            "No habrá salida V1 paralela",
+            "Survey y el guard pre-push compartirán la misma definición",
+            "La implementación deberá fijar",
+            "Los tests y consumidores internos deben migrar",
+            "El diseño gobernante 3.3 debe declarar",
+            "antes de implementar",
+            "El threat model debe declarar",
+            "## 12. Alcance de implementación posterior",
+            "Rutas candidatas, sujetas al plan escrito y TDD",
+            "Antes de implementar requiere",
+        ):
+            self.assertNotIn(stale_future, adr + "\n" + specification)
+        for current_contract in (
+            "`scripts/control-plane survey` emite por defecto y exclusivamente",
+            "Survey y el guard pre-push comparten el predicado",
+            "El comando `survey` emite `RepositorySurveyV2` por defecto",
+            "La implementación integrada fija primero `base_ref`",
+            "## 12. Historia de implementación cumplida",
+            "El router clasificó el frente como T2 estructurado y exigió",
+        ):
+            self.assertIn(current_contract, adr + "\n" + specification)
+
+    def test_new_project_source_driven_audit_is_real_and_zero_mutation(self) -> None:
+        self.assertTrue(
+            NEW_PROJECT_BOOTSTRAP.is_dir(),
+            "new-project starter pack is missing",
+        )
+        self.assertTrue(SOURCE_CONTROL_PLANE.is_file())
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory).resolve(strict=True)
+            source = initialize_full_source(container / "source", ROOT)
+            source_control_plane = source / "scripts" / "control-plane"
+            source_sha = _fixture_git(source, "rev-parse", "HEAD").stdout.decode().strip()
+            source_before = content_snapshot(source)
+            self.assertEqual(
+                _fixture_git(source, "status", "--porcelain=v1").stdout,
+                b"",
+            )
+            target = _initialize_new_project_audit_target(
+                container / "target"
+            )
+            policy = target / ".codex" / "project-policy.toml"
+            registry = target / ".codex" / "resource-registry.toml"
+            task = target / ".codex" / "task-envelope.json"
+            consumer_readme = target / "README.md"
+            consumer_readme_before = consumer_readme.read_bytes()
+            base_head_before = _fixture_git(target, "rev-parse", "main").stdout.strip()
+            base_tree_before = _fixture_git(
+                target,
+                "rev-parse",
+                "main^{tree}",
+            ).stdout.strip()
+            self.assertEqual(
+                _fixture_git(target, "symbolic-ref", "--short", "HEAD").stdout.strip(),
+                b"codex/bootstrap-audit",
+            )
+            self.assertEqual(
+                _fixture_git(
+                    target,
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    "main",
+                ).stdout.splitlines(),
+                [b"README.md"],
+            )
+            self.assertEqual(
+                _fixture_git(target, "show", "main:README.md").stdout,
+                NEW_PROJECT_CONSUMER_README,
+            )
+            before = content_snapshot(target)
+
+            binding_before = _run_runbook_shell_block(
+                "CONTROL_PLANE_SOURCE_BINDING",
+                cwd=source,
+                environment={
+                    "CONTROL_PLANE_SOURCE": str(source),
+                    "CONTROL_PLANE_SOURCE_SHA": source_sha,
+                },
+            )
+            self.assertEqual(binding_before.returncode, 0, binding_before.stderr)
+            self.assertEqual(binding_before.stdout, b"source_binding=PASS\n")
+
+            commands = (
+                (
+                    "policy-check",
+                    ("policy-check", "--policy", str(policy)),
+                    0,
+                ),
+                (
+                    "registry-check",
+                    (
+                        "registry-check",
+                        "--registry",
+                        str(registry),
+                        "--policy",
+                        str(policy),
+                    ),
+                    0,
+                ),
+                (
+                    "inventory",
+                    ("inventory", "--repo", str(target), "--registry", str(registry)),
+                    0,
+                ),
+                ("doctor", ("doctor", "--repo", str(target)), 1),
+                (
+                    "preflight",
+                    (
+                        "preflight",
+                        "--mode",
+                        "read",
+                        "--offline",
+                        "--repo",
+                        str(target),
+                        "--policy",
+                        str(policy),
+                    ),
+                    0,
+                ),
+                (
+                    "route",
+                    (
+                        "route",
+                        "--repo",
+                        str(target),
+                        "--task",
+                        str(task),
+                        "--policy",
+                        str(policy),
+                        "--registry",
+                        str(registry),
+                        "--mode",
+                        "audit",
+                    ),
+                    0,
+                ),
+            )
+            results: dict[str, dict[str, object]] = {}
+            for command, arguments, expected_exit in commands:
+                with self.subTest(command=command):
+                    return_code, payload, stderr = _run_source_json(
+                        *arguments,
+                        cwd=target,
+                        source_control_plane=source_control_plane,
+                    )
+                    self.assertEqual(return_code, expected_exit, payload)
+                    self.assertEqual(payload.get("command"), command, payload)
+                    self.assertIs(payload.get("authorizes"), False, payload)
+                    self.assertNotIn(b"Traceback", stderr)
+                    results[command] = payload
+
+            for command in (
+                "policy-check",
+                "registry-check",
+                "inventory",
+                "preflight",
+            ):
+                self.assertIs(results[command].get("ok"), True, results[command])
+
+            doctor = results["doctor"]
+            self.assertIs(doctor.get("ok"), False, doctor)
+            doctor_facts = doctor.get("facts")
+            self.assertIsInstance(doctor_facts, dict)
+            assert isinstance(doctor_facts, dict)
+            self.assertIs(doctor_facts.get("policy_valid"), True, doctor)
+            self.assertIs(doctor_facts.get("registry_valid"), True, doctor)
+            self.assertIs(doctor_facts.get("lock_valid"), False, doctor)
+            doctor_errors = doctor.get("errors")
+            self.assertIsInstance(doctor_errors, list)
+            assert isinstance(doctor_errors, list)
+            self.assertEqual(
+                [item.get("code") for item in doctor_errors if isinstance(item, dict)],
+                ["L_PARSE"],
+                doctor,
+            )
+
+            route = results["route"]
+            self.assertIs(route.get("ok"), True, route)
+            self.assertEqual(route.get("mode"), "audit", route)
+            self.assertIs(route.get("decision_ready"), True, route)
+            summary = route.get("summary")
+            self.assertIsInstance(summary, dict)
+            assert isinstance(summary, dict)
+            required = summary.get("required")
+            self.assertIsInstance(required, list)
+            assert isinstance(required, list)
+            self.assertTrue(required, route)
+            self.assertEqual(summary.get("tier"), "T2", route)
+            self.assertIn("structured-engineering", route.get("matched_routes", []))
+            recommended = summary.get("recommended")
+            self.assertIsInstance(recommended, list)
+            assert isinstance(recommended, list)
+            self.assertTrue(recommended, route)
+            self.assertEqual(summary.get("unresolved"), [], route)
+            selected_resource_digests = route.get("selected_resource_digests")
+            self.assertIsInstance(selected_resource_digests, dict)
+            assert isinstance(selected_resource_digests, dict)
+            for resource_id in (*required, *recommended):
+                self.assertIsInstance(resource_id, str)
+                self.assertIn(resource_id, selected_resource_digests, route)
+                self.assertRegex(
+                    str(selected_resource_digests[resource_id]),
+                    r"^sha256:[0-9a-f]{64}$",
+                    route,
+                )
+            inventory_resources = results["inventory"].get("resources")
+            self.assertIsInstance(inventory_resources, list)
+            assert isinstance(inventory_resources, list)
+            inventory_by_id = {
+                item.get("id"): item
+                for item in inventory_resources
+                if isinstance(item, dict)
+            }
+            for resource_id in (*required, *recommended):
+                entry = inventory_by_id.get(resource_id)
+                self.assertIsInstance(entry, dict, resource_id)
+                assert isinstance(entry, dict)
+                self.assertIs(entry.get("ready"), True, entry)
+                self.assertNotIn("R_NOT_FOUND", entry.get("reason_codes", []), entry)
+            interaction = route.get("interaction")
+            self.assertIsInstance(interaction, dict)
+            assert isinstance(interaction, dict)
+            clarification = interaction.get("clarification_gate")
+            self.assertIsInstance(clarification, dict)
+            assert isinstance(clarification, dict)
+            self.assertEqual(
+                clarification.get("status"),
+                "pending_host_capability",
+                route,
+            )
+            self.assertIs(clarification.get("decision_ready"), False, route)
+            binding_after = _run_runbook_shell_block(
+                "CONTROL_PLANE_SOURCE_BINDING",
+                cwd=source,
+                environment={
+                    "CONTROL_PLANE_SOURCE": str(source),
+                    "CONTROL_PLANE_SOURCE_SHA": source_sha,
+                },
+            )
+            self.assertEqual(binding_after.returncode, 0, binding_after.stderr)
+            self.assertEqual(binding_after.stdout, b"source_binding=PASS\n")
+            self.assertEqual(
+                consumer_readme.read_bytes(),
+                consumer_readme_before,
+                "source-driven audit changed the consumer README",
+            )
+            self.assertEqual(
+                _fixture_git(target, "rev-parse", "main").stdout.strip(),
+                base_head_before,
+            )
+            self.assertEqual(
+                _fixture_git(
+                    target,
+                    "rev-parse",
+                    "main^{tree}",
+                ).stdout.strip(),
+                base_tree_before,
+            )
+            self.assertEqual(before, content_snapshot(target))
+            self.assertEqual(source_before, content_snapshot(source))
+
     def test_final_verification_budget_and_reconciliation_review_are_bounded(self) -> None:
         maintenance = read(MAINTENANCE)
         stable_pause_plan = read(STABLE_PAUSE_PLAN)
@@ -1480,7 +3662,7 @@ class CoreDocumentationTests(unittest.TestCase):
 
     def test_repository_survey_v2_governing_documentation_contract(self) -> None:
         index = read(CANONICAL_INDEX)
-        candidate_status = "IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING"
+        candidate_status = "GOVERNING_CORE"
         for path in (
             REPOSITORY_SURVEY_V2_ADR,
             REPOSITORY_SURVEY_V2_SPEC,
@@ -1516,12 +3698,11 @@ class CoreDocumentationTests(unittest.TestCase):
         specification = read(REPOSITORY_SURVEY_V2_SPEC)
         plan = read(REPOSITORY_SURVEY_V2_PLAN)
         self.assertIn(
-            "Estado: `IMPLEMENTED_LOCAL_CANDIDATE / FINAL_GATE_PENDING`",
+            "Estado: `GOVERNING_CORE / INTEGRATED`",
             specification,
         )
         self.assertIn(
-            "**Status:** `EXECUTION_AUTHORIZED / EVIDENCE_PENDING / "
-            "SHALLOW_SCOPE_REFRAME_ACCEPTED`",
+            "**Status:** `GOVERNING_CORE / INTEGRATED`",
             plan,
         )
 
@@ -2193,6 +4374,66 @@ class CoreDocumentationTests(unittest.TestCase):
         )
         self.assertIn("- **Autoridad:** `authorizes=false`", continuation)
         self.assertNotIn("authorizes=true", continuation)
+
+    def test_new_project_bootstrap_threat_model_is_fail_closed(self) -> None:
+        content = read(THREAT_MODEL)
+        normalized = " ".join(content.split())
+        normalized_lower = normalized.lower()
+
+        for attacker_story in (
+            "an uncustomized `new-project` starter is treated as real project governance",
+            "existing project authority is overwritten or the starter is treated as self-authorizing",
+            "a shell composition masks a failing git producer",
+            "repository or global git identity is inherited for the bootstrap commit",
+        ):
+            self.assertIn(attacker_story, normalized_lower)
+
+        for mitigation in (
+            "four source files but copies only three project-owned authority files",
+            "clean project-owned baseline",
+            "non-base work branch",
+            "`E_BOOTSTRAP_AUTHORITY_EXISTS`",
+            "one writer and one `apply_patch` operation",
+            "audit-only",
+            "external effects default to `deny`",
+            "conspicuous `new-project` markers",
+            "no runtime is installed",
+            "`external_consumer_adoption=PROHIBITED`",
+            "local gates",
+            "fresh host/provider observation",
+            "`git ls-files -v -z`",
+            "`assume-unchanged` and `skip-worktree`",
+            "raw no-follow worktree reads",
+            "index entries and blob OIDs against the fixed `HEAD` tree",
+            "`E_CONTROL_PLANE_SOURCE_UNSUPPORTED_MODE`",
+            "`E_BOOTSTRAP_TARGET_INDEX_FLAGS`",
+            "fixed source commit object",
+            "immediately before object extraction, immediately before audit, and after audit",
+            "`core.hooksPath=/dev/null`",
+            "`hash-object -w --no-filters`",
+            "`update-index --cacheinfo`",
+            "`cat-file` byte comparisons",
+            "`CONTROL_PLANE_GIT_AUTHOR_NAME`",
+            "`user.useConfigOnly=true`",
+            "`git var`",
+            "producer return code",
+            "`E_BOOTSTRAP_INDEX_RESTORE_FAILED`",
+            "private index",
+            "byte-exact atomic index restoration",
+        ):
+            self.assertIn(mitigation, normalized)
+
+        _, marker, residual = content.partition("## Residual risks")
+        self.assertEqual(marker, "## Residual risks")
+        residual_normalized = " ".join(residual.split())
+        for retained_residual in (
+            "Schema-valid `new-project` values do not prove project-specific correctness",
+            "same-UID process can create a destination between the all-path precheck and the single `apply_patch` publication",
+            "No consumer repository or canary has been exercised",
+            "same-UID writer can change a file or index after the final raw-byte comparison",
+            "failed raw staging can leave unreachable blob objects",
+        ):
+            self.assertIn(retained_residual, residual_normalized)
 
     def test_threat_model_is_repository_scoped_and_snapshot_bound(self) -> None:
         content = read(THREAT_MODEL)

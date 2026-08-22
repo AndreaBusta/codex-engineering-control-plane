@@ -10,7 +10,10 @@
 
 ---
 
-**Status:** `EXECUTION_AUTHORIZED / EVIDENCE_PENDING / SHALLOW_SCOPE_REFRAME_ACCEPTED`
+**Status:** `GOVERNING_CORE / INTEGRATED`
+
+**Integration:** PR #28, squash `main@f1fdecbb26fed9272d07823c31f06ef15ac89f78`,
+merged at `2026-08-21T22:00:55Z`; exact-main CI observed terminal green.
 
 **Authority:** `authorizes=false`
 
@@ -1811,11 +1814,11 @@ new `origin/main`. Neither state is release, installation or stable adoption.
 ## Continuación
 
 - **Escribe en:** este hilo.
-- **Rol:** orquestadora y ejecutora principal.
-- **Para continuar:** ejecutar Task 0 Step 4 y después el RED shallow exacto de
-  Step 5, antes de cualquier otro runtime.
-- **Mensaje exacto:** `Continúa con Task 0 Step 4 y el RED shallow exacto de Step 5.`
-- **Estado de partida:** `codex/survey-orphan-semantics-v1` sobre
-  `origin/main@250af122`; reframe shallow aceptado, autoridad de implementación
-  observada y documentos contractuales preservados por este checkpoint;
-  todavía sin edición ni test runtime.
+- **Rol:** orquestadora.
+- **Para continuar:** tratar los pasos anteriores como evidencia histórica y
+  usar el contrato RepositorySurveyV2 ya integrado como verdad gobernante.
+- **Mensaje exacto:** `RepositorySurveyV2 está integrado; no repitas el plan histórico y continúa desde main@f1fdecbb.`
+- **Estado de partida:** PR #28 integrado por squash en
+  `main@f1fdecbb26fed9272d07823c31f06ef15ac89f78` a
+  `2026-08-21T22:00:55Z`, con CI exacta de `main` terminal green;
+  `GOVERNING_CORE / INTEGRATED`, `authorizes=false`.

@@ -22,18 +22,79 @@ from adoption_enablement.manifest import (
 )
 from adoption_enablement.repository import observe_target
 from tests.adoption_enablement_test_support import (
+    content_snapshot,
     git,
     initialize_fresh_target,
     initialize_full_source,
+    initialize_repository,
     metadata_snapshot,
     write_file,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
+NEW_PROJECT_STARTER = ROOT / "templates" / "new-project"
+NEW_PROJECT_AUTHORITY_FILES = (
+    ".codex/project-policy.toml",
+    ".codex/resource-registry.toml",
+    "AGENTS.md",
+)
+NEW_PROJECT_CONSUMER_README = (
+    b"# Existing consumer preview fixture\n\n"
+    b"This product README belongs only to the consumer.\n"
+)
+
+
+def initialize_new_project_starter_target(repository: Path) -> Path:
+    return initialize_repository(
+        repository,
+        files=(
+            ("README.md", NEW_PROJECT_CONSUMER_README, 0o644),
+            *(
+                (
+                    relative,
+                    (NEW_PROJECT_STARTER / relative).read_bytes(),
+                    0o644,
+                )
+                for relative in NEW_PROJECT_AUTHORITY_FILES
+            ),
+        ),
+    )
 
 
 class AdoptionPreviewTests(unittest.TestCase):
+    def test_new_project_starter_is_preview_compatible_without_mutation(self) -> None:
+        self.assertTrue(
+            NEW_PROJECT_STARTER.is_dir(),
+            "new-project starter pack is missing",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            container = Path(directory).resolve(strict=True)
+            source = initialize_full_source(container / "source", ROOT)
+            target = initialize_new_project_starter_target(container / "target")
+            consumer_readme = target / "README.md"
+            consumer_readme_before = consumer_readme.read_bytes()
+            self.assertEqual(consumer_readme_before, NEW_PROJECT_CONSUMER_README)
+            self.assertNotEqual(
+                consumer_readme_before,
+                (NEW_PROJECT_STARTER / "README.md").read_bytes(),
+            )
+            source_before = content_snapshot(source)
+            target_before = content_snapshot(target)
+
+            plan = preview(source, target)
+
+            self.assertEqual(validate_plan(plan), ())
+            self.assertIs(plan["authorizes"], False)
+            self.assertIs(plan["mutation"], False)
+            self.assertEqual(source_before, content_snapshot(source))
+            self.assertEqual(target_before, content_snapshot(target))
+            self.assertEqual(consumer_readme.read_bytes(), consumer_readme_before)
+            managed_paths = tuple(record["path"] for record in plan["managed_records"])
+            for relative in NEW_PROJECT_AUTHORITY_FILES:
+                self.assertNotIn(relative, managed_paths)
+            self.assertIn(".codex/control-plane.lock", managed_paths)
+
     def test_source_manifest_is_the_exact_core_projection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = initialize_full_source(Path(directory) / "source", ROOT)
