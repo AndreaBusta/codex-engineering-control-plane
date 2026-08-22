@@ -68,43 +68,6 @@ WARNING_REASON_CODES = frozenset(
         "RS_WARNING_STATE_UNKNOWN",
     }
 )
-DESTRUCTIVE_PATTERNS = (
-    re.compile(r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+reset\s+--hard(?:\s|$)"),
-    re.compile(
-        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+clean\b(?=[^\n]*"
-        r"(?:--force|-[a-z]*f))"
-    ),
-    re.compile(
-        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+push\b[^\n]*"
-        r"(?:--force(?:-with-lease)?|-f)(?:\s|$)"
-    ),
-    re.compile(
-        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+branch\s+-d\s+"
-        r"(?P<branch_delete_quote>['\"]?)[A-Za-z0-9]"
-        r"[A-Za-z0-9._/-]{0,126}(?P=branch_delete_quote)(?:\s|$)"
-    ),
-    re.compile(
-        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+branch\s+-D\s+"
-        r"(?P<branch_force_delete_quote>['\"]?)[A-Za-z0-9]"
-        r"[A-Za-z0-9._/-]{0,126}(?P=branch_force_delete_quote)(?:\s|$)"
-    ),
-    re.compile(
-        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+push\s+--delete\s+"
-        r"[A-Za-z0-9][A-Za-z0-9._/-]{0,126}\s+"
-        r"(?P<push_delete_quote>['\"]?)[A-Za-z0-9]"
-        r"[A-Za-z0-9._/-]{0,126}(?P=push_delete_quote)(?:\s|$)"
-    ),
-    re.compile(
-        r"(?:^|\s)git(?:\s+-C\s+\S+)*\s+push\s+"
-        r"[A-Za-z0-9][A-Za-z0-9._/-]{0,126}\s+"
-        r"(?P<push_refspec_quote>['\"]?):refs/heads/[A-Za-z0-9]"
-        r"[A-Za-z0-9._/-]{0,126}(?P=push_refspec_quote)(?:\s|$)"
-    ),
-    re.compile(
-        r"(?:^|\s)rm\b(?=[^\n]*(?:-[a-z]*r))"
-        r"(?=[^\n]*(?:-[a-z]*f))[^\n]*"
-    ),
-)
 SECRET_PATTERN_SET_VERSION = "repository-literal-secrets-v1"
 SECRET_PATTERNS = (
     r"-----BEGIN (?:ENCRYPTED |RSA |EC |OPENSSH )?PRIVATE KEY-----",
@@ -252,6 +215,14 @@ class CompletedSafeRead:
             raise ValueError("E_SAFE_READ_RESULT: result contract is invalid")
 
 _SHELL_META = re.compile(r"(?:&&|\|\||[;|&<>`]|[$][(]|\r|\n)")
+_STATIC_SHELL_ASSIGNMENT = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*=.*$",
+    re.ASCII,
+)
+_DELETE_BRANCH_REFSPEC = re.compile(
+    r"^:refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,126}$",
+    re.ASCII,
+)
 _SAFE_REF_RANGE = re.compile(
     r"^origin/[A-Za-z0-9][A-Za-z0-9._/-]{0,126}[.]{3}HEAD$",
     re.ASCII,
@@ -422,8 +393,554 @@ def _git_command_tokens(
     return argv[index:], cwd
 
 
+def _exact_safe_read_command(
+    argv: tuple[str, ...], root: Path
+) -> bool:
+    return bool(
+        len(argv) >= 5
+        and argv[0]
+        in {
+            "scripts/control-plane",
+            str(root / "scripts" / "control-plane"),
+        }
+        and argv[1:3] == ("safe-read", "--repo")
+        and Path(argv[3]).resolve(strict=False) == root
+        and argv[4] == "--"
+        and _validate_safe_read_argv(argv[5:], root) is not None
+    )
 
 
+def _contains_executable_shell_expansion(command: str) -> bool:
+    """Recognize executable or unsupported expansion outside inert quoting."""
+
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if quote == "'":
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character == "\\":
+            index += 2
+            continue
+        if character == "'" and quote is None:
+            quote = "'"
+            index += 1
+            continue
+        if character == '"':
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if character == "`":
+            return True
+        if (
+            quote is None
+            and character == "$"
+            and command[index : index + 2] == "$'"
+        ):
+            return True
+        if character == "$" and command[index : index + 2] == "$(":
+            return True
+        if (
+            quote is None
+            and character in {"<", ">"}
+            and command[index : index + 2] in {"<(", ">("}
+        ):
+            return True
+        index += 1
+    return False
+
+
+def _structured_shell_segments(
+    command: str,
+) -> tuple[str, ...] | None:
+    """Return raw text split only at supported top-level shell operators.
+
+    Quotes and opaque command/process expansions are tracked only far enough to
+    avoid treating their contents as top-level syntax. This is deliberately not
+    a complete shell parser; unsupported punctuation and empty segments remain
+    ambiguous and therefore advisory under ``soft-enforce``.
+    """
+
+    if not command.strip():
+        return ()
+    segments: list[str] = []
+    modes: list[str] = []
+    start = 0
+    index = 0
+    while index < len(command):
+        character = command[index]
+        mode = modes[-1] if modes else None
+        if mode == "single":
+            if character == "'":
+                modes.pop()
+            index += 1
+            continue
+        if mode == "ansi":
+            if character == "\\":
+                index += 2
+                continue
+            if character == "'":
+                modes.pop()
+            index += 1
+            continue
+        if mode == "backtick":
+            if character == "\\":
+                index += 2
+                continue
+            if character == "`":
+                modes.pop()
+            index += 1
+            continue
+        if mode == "double":
+            if character == "\\":
+                index += 2
+                continue
+            if character == '"':
+                modes.pop()
+                index += 1
+                continue
+            if command[index : index + 2] == "$(":
+                modes.append("paren")
+                index += 2
+                continue
+            if character == "`":
+                modes.append("backtick")
+            index += 1
+            continue
+        if mode == "paren":
+            if character == "\\":
+                index += 2
+                continue
+            if command[index : index + 2] == "$'":
+                modes.append("ansi")
+                index += 2
+                continue
+            if character == "'":
+                modes.append("single")
+                index += 1
+                continue
+            if character == '"':
+                modes.append("double")
+                index += 1
+                continue
+            if character == "`":
+                modes.append("backtick")
+                index += 1
+                continue
+            if command[index : index + 2] in {"$(", "<(", ">("}:
+                modes.append("paren")
+                index += 2
+                continue
+            if character == "(":
+                modes.append("paren")
+            elif character == ")":
+                modes.pop()
+            index += 1
+            continue
+        if character == "\\":
+            index += 2
+            continue
+        if command[index : index + 2] == "$'":
+            modes.append("ansi")
+            index += 2
+            continue
+        if character == "'":
+            modes.append("single")
+            index += 1
+            continue
+        if character == '"':
+            modes.append("double")
+            index += 1
+            continue
+        if character == "`":
+            modes.append("backtick")
+            index += 1
+            continue
+        if command[index : index + 2] in {"$(", "<(", ">("}:
+            modes.append("paren")
+            index += 2
+            continue
+        if character in {"(", ")", "&"}:
+            if command[index : index + 2] != "&&":
+                return None
+        operator = ""
+        if command[index : index + 2] in {"&&", "||"}:
+            operator = command[index : index + 2]
+        elif character in {";", "|"}:
+            operator = character
+        if not operator:
+            index += 1
+            continue
+        segment = command[start:index].strip()
+        if not segment:
+            return None
+        segments.append(segment)
+        index += len(operator)
+        start = index
+    if modes:
+        return None
+    segment = command[start:].strip()
+    if not segment:
+        return None
+    segments.append(segment)
+    return tuple(segments)
+
+
+def _lexical_git_command_tokens(
+    argv: tuple[str, ...],
+) -> tuple[str, ...] | None:
+    """Return a bounded Git subcommand without executing repository discovery."""
+
+    if not argv or argv[0] != "git":
+        return None
+    index = 1
+    while index < len(argv) and argv[index] == "-C":
+        if index + 1 >= len(argv):
+            return None
+        index += 2
+    if index >= len(argv) or argv[index].startswith("-"):
+        return None
+    return argv[index:]
+
+
+def _option_tokens(arguments: tuple[str, ...]) -> tuple[str, ...]:
+    try:
+        end = arguments.index("--")
+    except ValueError:
+        return arguments
+    return arguments[:end]
+
+
+def _has_short_option(
+    options: tuple[str, ...], flags: frozenset[str]
+) -> bool:
+    return any(
+        len(option) > 1
+        and option.startswith("-")
+        and not option.startswith("--")
+        and any(flag in option[1:] for flag in flags)
+        for option in options
+    )
+
+
+def _leading_static_assignment_count(segment_text: str) -> int:
+    count = 0
+    index = 0
+    while index < len(segment_text):
+        while index < len(segment_text) and segment_text[index].isspace():
+            index += 1
+        match = re.match(
+            r"[A-Za-z_][A-Za-z0-9_]*=",
+            segment_text[index:],
+            re.ASCII,
+        )
+        if match is None:
+            break
+        index += match.end()
+        quote: str | None = None
+        while index < len(segment_text):
+            character = segment_text[index]
+            if quote == "'":
+                if character == "'":
+                    quote = None
+                index += 1
+                continue
+            if character == "\\":
+                index += 2
+                continue
+            if character == "'" and quote is None:
+                quote = "'"
+                index += 1
+                continue
+            if character == '"':
+                quote = None if quote == '"' else '"'
+                index += 1
+                continue
+            if quote is None and character.isspace():
+                break
+            index += 1
+        count += 1
+    return count
+
+
+def _without_static_assignments(
+    segment_text: str,
+    argv: tuple[str, ...],
+) -> tuple[str, ...]:
+    count = _leading_static_assignment_count(segment_text)
+    if count > len(argv) or any(
+        _STATIC_SHELL_ASSIGNMENT.fullmatch(argument) is None
+        for argument in argv[:count]
+    ):
+        return argv
+    return argv[count:]
+
+
+def _destructive_clean(arguments: tuple[str, ...]) -> bool:
+    force = False
+    options_enabled = True
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if options_enabled and argument == "--":
+            options_enabled = False
+            index += 1
+            continue
+        if not options_enabled:
+            index += 1
+            continue
+        if argument in {"-e", "--exclude"}:
+            if index + 1 >= len(arguments):
+                return False
+            index += 2
+            continue
+        if argument.startswith("--exclude="):
+            index += 1
+            continue
+        if argument == "--force":
+            force = True
+            index += 1
+            continue
+        if (
+            len(argument) > 1
+            and argument.startswith("-")
+            and not argument.startswith("--")
+        ):
+            short_index = 1
+            while short_index < len(argument):
+                flag = argument[short_index]
+                if flag == "e":
+                    if short_index + 1 == len(argument):
+                        if index + 1 >= len(arguments):
+                            return False
+                        index += 1
+                    break
+                if flag == "f":
+                    force = True
+                short_index += 1
+        index += 1
+    return force
+
+
+_GIT_BRANCH_OPTIONS_WITH_VALUES = frozenset(
+    {
+        "-u",
+        "--contains",
+        "--format",
+        "--merged",
+        "--no-contains",
+        "--no-merged",
+        "--points-at",
+        "--set-upstream-to",
+        "--sort",
+    }
+)
+_GIT_PUSH_OPTIONS_WITH_VALUES = frozenset(
+    {
+        "-o",
+        "--exec",
+        "--push-option",
+        "--receive-pack",
+        "--recurse-submodules",
+        "--repo",
+    }
+)
+
+
+def _destructive_branch(arguments: tuple[str, ...]) -> bool:
+    delete = False
+    options_enabled = True
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if options_enabled and argument == "--":
+            options_enabled = False
+            index += 1
+            continue
+        if not options_enabled:
+            index += 1
+            continue
+        if argument in _GIT_BRANCH_OPTIONS_WITH_VALUES:
+            if index + 1 >= len(arguments):
+                return False
+            index += 2
+            continue
+        if any(
+            argument.startswith(option + "=")
+            for option in _GIT_BRANCH_OPTIONS_WITH_VALUES
+        ):
+            index += 1
+            continue
+        if argument == "--delete":
+            delete = True
+            index += 1
+            continue
+        if argument == "--no-delete":
+            delete = False
+            index += 1
+            continue
+        if (
+            len(argument) > 1
+            and argument.startswith("-")
+            and not argument.startswith("--")
+        ):
+            if argument.startswith("-u") and argument != "-u":
+                index += 1
+                continue
+            if any(flag in argument[1:] for flag in {"d", "D"}):
+                delete = True
+        index += 1
+    return delete
+
+
+def _destructive_push(arguments: tuple[str, ...]) -> bool:
+    force = False
+    force_with_lease = False
+    delete = False
+    options_enabled = True
+    repository_from_option = False
+    positionals: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if options_enabled and argument == "--":
+            options_enabled = False
+            index += 1
+            continue
+        if options_enabled and argument in _GIT_PUSH_OPTIONS_WITH_VALUES:
+            if index + 1 >= len(arguments):
+                return False
+            repository_from_option = (
+                repository_from_option or argument == "--repo"
+            )
+            index += 2
+            continue
+        if options_enabled and any(
+            argument.startswith(option + "=")
+            for option in _GIT_PUSH_OPTIONS_WITH_VALUES
+            if option != "-o"
+        ):
+            repository_from_option = (
+                repository_from_option or argument.startswith("--repo=")
+            )
+            index += 1
+            continue
+        if options_enabled and argument in {"-d", "--delete"}:
+            delete = True
+            index += 1
+            continue
+        if options_enabled and argument == "--no-delete":
+            delete = False
+            index += 1
+            continue
+        if options_enabled and argument in {"-f", "--force"}:
+            force = True
+            index += 1
+            continue
+        if options_enabled and argument == "--no-force":
+            force = False
+            index += 1
+            continue
+        if options_enabled and argument == "--force-with-lease":
+            force_with_lease = True
+            index += 1
+            continue
+        if (
+            options_enabled
+            and argument.startswith("--force-with-lease=")
+            and argument != "--force-with-lease="
+        ):
+            force_with_lease = True
+            index += 1
+            continue
+        if options_enabled and argument == "--no-force-with-lease":
+            force_with_lease = False
+            index += 1
+            continue
+        if (
+            options_enabled
+            and argument.startswith("-o")
+            and argument != "-o"
+        ):
+            index += 1
+            continue
+        if (
+            options_enabled
+            and len(argument) > 1
+            and argument.startswith("-")
+            and not argument.startswith("--")
+        ):
+            short_index = 1
+            while short_index < len(argument):
+                flag = argument[short_index]
+                if flag == "o":
+                    if short_index + 1 == len(argument):
+                        if index + 1 >= len(arguments):
+                            return False
+                        index += 1
+                    break
+                if flag == "f":
+                    force = True
+                elif flag == "d":
+                    delete = True
+                short_index += 1
+            index += 1
+            continue
+        if options_enabled and argument.startswith("--"):
+            index += 1
+            continue
+        positionals.append(argument)
+        index += 1
+
+    if force or force_with_lease or delete:
+        return True
+    refspecs = (
+        tuple(positionals)
+        if repository_from_option
+        else tuple(positionals[1:])
+    )
+    for argument in refspecs:
+        if _DELETE_BRANCH_REFSPEC.fullmatch(argument) is not None:
+            return True
+        if argument.startswith("+"):
+            source, separator, destination = argument[1:].partition(":")
+            if separator and source and destination:
+                return True
+    return False
+
+
+def _destructive_shell_segment(
+    segment_text: str,
+    argv: tuple[str, ...],
+) -> bool:
+    argv = _without_static_assignments(segment_text, argv)
+    git_argv = _lexical_git_command_tokens(argv)
+    if git_argv is not None:
+        subcommand = git_argv[0]
+        arguments = git_argv[1:]
+        options = _option_tokens(arguments)
+        if subcommand == "reset":
+            return "--hard" in options
+        if subcommand == "clean":
+            return _destructive_clean(arguments)
+        if subcommand == "branch":
+            return _destructive_branch(arguments)
+        if subcommand == "push":
+            return _destructive_push(arguments)
+        return False
+    if argv and argv[0] == "rm":
+        options = _option_tokens(argv[1:])
+        recursive = "--recursive" in options or _has_short_option(
+            options, frozenset({"r", "R"})
+        )
+        forced = "--force" in options or _has_short_option(
+            options, frozenset({"f"})
+        )
+        return recursive and forced
+    return False
 
 
 def _safe_read_rejected(
@@ -1431,27 +1948,40 @@ def _untrusted_pretool_reason(
             if isinstance(tool_input, Mapping)
             else ""
         )
+        segment_texts = _structured_shell_segments(command)
+        if segment_texts is None:
+            return "ambiguous_shell_command", False
+        segments: list[tuple[str, tuple[str, ...], bool]] = []
+        has_ambiguous_segment = False
+        for segment_text in segment_texts:
+            dynamic = _contains_executable_shell_expansion(segment_text)
+            if dynamic:
+                segments.append((segment_text, (), True))
+                continue
+            try:
+                segment = tuple(shlex.split(segment_text, posix=True))
+            except ValueError:
+                has_ambiguous_segment = True
+                segments.append((segment_text, (), False))
+                continue
+            if not segment:
+                has_ambiguous_segment = True
+            segments.append((segment_text, segment, False))
+        if any(
+            not dynamic
+            and _destructive_shell_segment(segment_text, segment)
+            for segment_text, segment, dynamic in segments
+        ):
+            return "destructive_command_requires_explicit_authority", True
+        if has_ambiguous_segment or any(
+            dynamic for _, _, dynamic in segments
+        ):
+            return "ambiguous_shell_command", False
+        argv = segments[0][1] if len(segments) == 1 else ()
+        if len(segments) == 1 and _exact_safe_read_command(argv, root):
+            return None, False
         if _SHELL_META.search(command):
             return "ambiguous_shell_command", False
-        try:
-            argv = tuple(shlex.split(command, posix=True))
-        except ValueError:
-            return "ambiguous_shell_command", False
-        if (
-            len(argv) >= 5
-            and argv[0]
-            in {
-                "scripts/control-plane",
-                str(root / "scripts" / "control-plane"),
-            }
-            and argv[1:3] == ("safe-read", "--repo")
-            and Path(argv[3]).resolve(strict=False) == root
-            and argv[4] == "--"
-            and _validate_safe_read_argv(argv[5:], root) is not None
-        ):
-            return None, False
-        if any(pattern.search(command) for pattern in DESTRUCTIVE_PATTERNS):
-            return "destructive_command_requires_explicit_authority", True
         parsed_git = _git_command_tokens(argv, root)
         if parsed_git is not None and parsed_git[0][0] in {
             "status",

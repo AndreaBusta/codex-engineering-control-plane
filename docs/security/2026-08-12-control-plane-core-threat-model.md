@@ -225,14 +225,23 @@ authority, project bytes, or external state.
   cooperative, `pending_hook_trust`, bypassable by clients that do not invoke
   them, and may coexist with other hooks. They are not branch protection.
 - Under `soft-enforce` the only denied classification is
-  `destructive_command_requires_explicit_authority`: recognized local and remote
-  branch deletion, `reset --hard`, forced `clean`, forced `push` and recursive
-  forced `rm`. Raw reads, edits, plain `push` and unrecognized effects stay
-  advisory, so the default mode observes without denying ordinary work. Explicit
-  `enforce` still denies every unattested effect. Residual: an irreversible
-  effect that no `DESTRUCTIVE_PATTERNS` entry recognizes is not denied under the
-  default mode; containment for that class rests on provider branch protection
-  and the repository gates, not on the hook.
+  `destructive_command_requires_explicit_authority`. Before accepting an exact
+  `safe-read`, the classifier proves that it has one structured segment and no
+  executable command or process expansion. A bounded quote-aware splitter keeps
+  raw top-level segments separated by `&&`, `||`, `;` or `|`; whole static segments
+  are decoded with POSIX `shlex`, including adjacent quote fragments. Any static
+  destructive segment wins before a dynamic or ambiguous sibling becomes advisory.
+  Leading raw POSIX `NAME=value` assignments are recognized, and Git option values,
+  `--`, short clusters and ordered negative cancellations retain their roles. The
+  denied forms remain local/remote branch deletion, `reset --hard`, forced `clean`,
+  forced `push` and recursive forced `rm`. Quoted inert text, raw reads, edits, plain
+  `push` and unrecognized effects stay advisory. Explicit `enforce` still denies
+  every unattested effect. Residual: this is deliberately not a complete shell
+  parser. ANSI-C `$'...'` quoting is unsupported by stdlib `shlex`; `env`, `command`,
+  `eval`, `sh -c`, aliases, functions, and nested or dynamic commands within one
+  segment remain advisory under the default mode. None of those residual segments
+  can mask a separately recognized static destructive segment. Containment rests on
+  provider branch protection and repository gates, not on the hook.
 - The unpublished-branch guard binds the local `refs/remotes/<remote>/...`
   inventory by name, not containment of the local HEAD or current server
   state. A behind or stale tracking ref can overstate preservation until a
@@ -276,4 +285,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:1fcb80f813e11e12945d15972e7c5388d86a1f7aa6b19bf568c0362bc9d3d361
+Version: codex-security-snapshot/v1:sha256:7070042e2e9d360ac634fa6456a7df3bdcbb7ea538fa9c9c3e5c404e43e18d20

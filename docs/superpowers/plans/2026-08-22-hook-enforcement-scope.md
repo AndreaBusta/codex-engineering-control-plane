@@ -4,7 +4,7 @@
 
 **Goal:** Que el modo `soft-enforce` deniegue únicamente comandos destructivos, y avise —sin bloquear— para lecturas, ediciones y el resto de efectos.
 
-**Architecture:** `_untrusted_pretool_reason` clasifica cada acción y devuelve `(motivo, block_without_host)`. El modo de hook decide con `deny = enforce or (soft-enforce and block_without_host)`. Hoy `block_without_host` es `True` en ocho de sus nueve ramas, así que `soft-enforce` se comporta prácticamente como `enforce`. El arreglo no toca el modo por defecto ni el mecanismo: reduce `block_without_host` a la única rama que representa un efecto irreversible.
+**Architecture:** `_untrusted_pretool_reason` conserva `(motivo, block_without_host)` y el modo decide con `deny = enforce or (soft-enforce and block_without_host)`. Para Bash, un splitter privado y acotado conserva el texto raw de segmentos top-level `&&`, `||`, `;` y `|`; cada segmento estático completo se decodifica después con `shlex.split(posix=True)`, lo que concatena correctamente fragmentos POSIX citados. Los segmentos estáticos destructivos se clasifican antes que cualquier residual dinámico de otro segmento. Se admiten solo asignaciones iniciales raw `NAME=value`; clasificadores por roles respetan valores de opciones, `--`, clusters cortos y cancelaciones ordenadas. El fast path de `safe-read` exige un único segmento sin expansión ejecutable. No es un parser de shell completo: ANSI-C `$'...'`, `env`, `command`, `eval`, `sh -c`, aliases, funciones y comandos dinámicos dentro de un segmento continúan como residual advisory.
 
 **Tech Stack:** Python 3.11, biblioteca estándar exclusivamente, `unittest`. Sin dependencias nuevas.
 
@@ -14,7 +14,7 @@
 
 - Core permanece en **27 módulos exactos**. Este frente no añade, renombra ni elimina ninguno.
 - **Cero dependencias nuevas.** Solo biblioteca estándar de Python 3.11.
-- **No se toca CI** (`.github/workflows/`) ni la política, el registry ni los locks salvo el sello documental.
+- **No se toca CI** (`.github/workflows/`), la policy ni el registry. La frontera exacta consta de seis rutas: `.codex/control-plane.lock`, `control_plane/hooks.py`, el threat model, este plan, `tests/test_core_hooks.py` y `tests/test_hooks.py`.
 - **No se toca ADR 0006** ni la cuarentena de `adopt`/`upgrade`.
 - El footer del threat model se recalcula **al final**, cuando el resto de bytes sea definitivo.
 - Base exacta: `origin/main@f1fdecbb26fed9272d07823c31f06ef15ac89f78`.
@@ -115,9 +115,10 @@ Registrado aquí para que no se amplíe el alcance a mitad de la implementación
 
 | Fichero | Responsabilidad en este frente |
 |---|---|
-| `control_plane/hooks.py` | Modificar. Siete valores de retorno en `_untrusted_pretool_reason`. Nada más. |
-| `tests/test_core_hooks.py` | Modificar. Test nuevo que fija el contrato: destructivo deniega, el resto avisa. **Este fichero sí lo ejecuta el gate.** |
-| `tests/test_hooks.py` | Modificar. Un test afirma el contrato viejo y hay que actualizarlo. **El gate no ejecuta este fichero** (`grep -c "tests\.test_hooks\b" tests/run.sh` = 0); se actualiza igualmente para no dejar una afirmación falsa en el árbol. |
+| `.codex/control-plane.lock` | Modificar únicamente el digest `runtime` mediante `runtime_digest()` después de congelar el runtime. |
+| `control_plane/hooks.py` | Modificar con helpers privados acotados para tokenizar, segmentar y clasificar comandos destructivos reales. |
+| `tests/test_core_hooks.py` | Modificar con la reproducción autoritativa RED/GREEN de compuestos, spellings destructivos, controles negativos, `safe-read` y `enforce`. **Este fichero sí lo ejecuta el gate.** |
+| `tests/test_hooks.py` | Conservar el ajuste ya existente del contrato advisory. **El gate no ejecuta este fichero** (`grep -c "tests\.test_hooks\b" tests/run.sh` = 0); esta reparación no añade pruebas nuevas aquí. |
 | `docs/security/2026-08-12-control-plane-core-threat-model.md` | Modificar. Declarar el alcance real de `soft-enforce` y recalcular el footer. |
 | `docs/superpowers/plans/2026-08-22-hook-enforcement-scope.md` | Este documento. Ya creado. |
 
@@ -126,192 +127,99 @@ Registrado aquí para que no se amplíe el alcance a mitad de la implementación
 ## Task 1: Restringir el bloqueo de `soft-enforce` a lo destructivo
 
 **Files:**
-- Modify: `control_plane/hooks.py:1416-1466`
+- Modify: `control_plane/hooks.py` (helpers privados y `_untrusted_pretool_reason`)
 - Test: `tests/test_core_hooks.py` (añadir al final de `CoreHookTests`)
-- Test: `tests/test_hooks.py:287-322` (actualizar el test del contrato viejo)
+- Test: `tests/test_hooks.py` (solo métodos focales existentes; no editar en esta reparación)
 
 **Interfaces:**
 - Consumes: `run_hook(payload: bytes, *, expected_root: Path | None = None) -> str` y `make_repo(path: Path) -> Path`, ya usados en `tests/test_core_hooks.py`.
-- Produces: `_untrusted_pretool_reason(tool_name: str, tool_input: object, root: Path) -> tuple[str | None, bool]` con la misma firma. Solo cambian valores de retorno; ningún consumidor necesita adaptarse.
+- Produces: `_untrusted_pretool_reason(tool_name: str, tool_input: object, root: Path) -> tuple[str | None, bool]` con la misma firma pública interna, respaldada por helpers privados para tokenización estructurada, segmentos top-level y formas destructivas de Git/rm.
 
-- [ ] **Step 1: Escribir el test que falla**
+- [x] **Step 1: Añadir reproducción autoritativa y observar RED**
 
-Añadir al final de la clase `CoreHookTests` en `tests/test_core_hooks.py`:
+Se añadieron casos para destructivos dentro de `&&`, `||`, `;` y pipelines; variantes
+`push --force-with-lease=<ref>:<expect>`, `-d`, `--delete`, `+source:destination` y
+`:refs/heads/...`; texto citado inerte; opciones `--no-force*`; `safe-read` con patrón
+citado; y `enforce` explícito. La ejecución dirigida de cinco métodos terminó con exit `1`,
+`Ran 5 tests` y `10` fallos esperados: cuatro compuestos, cinco spellings de push y el
+`safe-read` con `&&` citado.
 
-```python
-    def test_soft_enforce_denies_only_destructive_commands(self) -> None:
-        from control_plane.hooks import run_hook
+- [x] **Step 2: Implementar el clasificador estructurado mínimo**
 
-        advisory_cases = (
-            ("Bash", {"command": "git status --short"}),
-            ("Bash", {"command": "git diff --stat"}),
-            ("Bash", {"command": "rg pattern"}),
-            ("Bash", {"command": "git push origin feature/work"}),
-            ("Bash", {"command": "make build && make test"}),
-            ("Edit", {"file_path": "README.md"}),
-            ("Write", {"file_path": "README.md"}),
-            ("apply_patch", {"input": "*** Begin Patch"}),
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            repo = make_repo(Path(temporary) / "repo").resolve()
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("CODEX_CONTROL_PLANE_HOOK_MODE", None)
+La implementación separa primero operadores top-level con un scanner acotado que conserva
+el texto raw de cada segmento y trata expansiones anidadas como opacas. Después aplica
+`shlex.split(posix=True)` al segmento completo, elimina solo asignaciones iniciales raw
+`NAME=value` y clasifica por roles. Un segmento estático destructivo prevalece sobre otro
+dinámico; solo entonces se resuelve el residual advisory o el fast path exacto de `safe-read`.
 
-                for tool_name, tool_input in advisory_cases:
-                    with self.subTest(tool=tool_name, input=tool_input):
-                        output = json.loads(
-                            run_hook(
-                                json.dumps(
-                                    {
-                                        "hook_event_name": "PreToolUse",
-                                        "cwd": str(repo),
-                                        "tool_name": tool_name,
-                                        "tool_input": tool_input,
-                                    },
-                                    separators=(",", ":"),
-                                ).encode(),
-                                expected_root=repo,
-                            )
-                        )["hookSpecificOutput"]
+- [x] **Step 3: Repetir la ejecución dirigida y observar GREEN**
 
-                        self.assertNotIn("permissionDecision", output)
+La misma orden dirigida, sin cambiar las pruebas, terminó con exit `0`, `Ran 5 tests` y
+`OK`. Después `python3 -m unittest tests.test_core_hooks -v` terminó con exit `0`,
+`Ran 15 tests` y `OK`.
 
-                destructive = json.loads(
-                    run_hook(
-                        json.dumps(
-                            {
-                                "hook_event_name": "PreToolUse",
-                                "cwd": str(repo),
-                                "tool_name": "Bash",
-                                "tool_input": {
-                                    "command": "git branch -D feature/old"
-                                },
-                            },
-                            separators=(",", ":"),
-                        ).encode(),
-                        expected_root=repo,
-                    )
-                )["hookSpecificOutput"]
-
-                self.assertEqual(destructive.get("permissionDecision"), "deny")
-                self.assertEqual(
-                    destructive.get("permissionDecisionReason"),
-                    "CONTROL_PLANE_SOFT_ENFORCE: "
-                    "destructive_command_requires_explicit_authority",
-                )
-```
-
-- [ ] **Step 2: Ejecutar el test y comprobar que falla**
-
-```bash
-cd /Users/bustaseo/Developer/control-plane-worktrees/hook-enforcement-scope-v1 && python3 -m unittest tests.test_core_hooks.CoreHookTests.test_soft_enforce_denies_only_destructive_commands -v
-```
-
-Esperado: FAIL en el primer subTest (`git status --short`), con `'permissionDecision' unexpectedly found in ...`. Eso demuestra el muro.
-
-- [ ] **Step 3: Aplicar el cambio mínimo**
-
-En `control_plane/hooks.py`, dentro de `_untrusted_pretool_reason`, cambiar `True` por `False` en **siete** valores de retorno, dejando intacto el destructivo:
-
-```python
-        if _SHELL_META.search(command):
-            return "ambiguous_shell_command", False
-        try:
-            argv = tuple(shlex.split(command, posix=True))
-        except ValueError:
-            return "ambiguous_shell_command", False
-```
-
-```python
-        if any(pattern.search(command) for pattern in DESTRUCTIVE_PATTERNS):
-            return "destructive_command_requires_explicit_authority", True
-```
-*(sin cambios: es la única rama que sigue bloqueando)*
-
-```python
-            return "raw_read_requires_safe_read", False
-        if argv and argv[0] == "rg":
-            return "raw_read_requires_safe_read", False
-        if parsed_git is not None and parsed_git[0][0] == "push":
-            return "git_effect_not_host_attested", False
-        return "unresolved_bash_effect", False
-    if tool_name in {"Edit", "Write", "apply_patch"}:
-        return "pending_host_authorization_bridge", False
-    if tool_name.startswith("mcp__"):
-        return "mcp_use_requires_task_authorization_and_egress_check", False
-    return "unrecognized_tool_effect", False
-```
-
-Actualizar también el docstring de la función para que describa el contrato nuevo:
-
-```python
-    """Classify tool effects. Only irreversible ones block under soft-enforce."""
-```
-
-- [ ] **Step 4: Ejecutar el test y comprobar que pasa**
-
-```bash
-cd /Users/bustaseo/Developer/control-plane-worktrees/hook-enforcement-scope-v1 && python3 -m unittest tests.test_core_hooks.CoreHookTests.test_soft_enforce_denies_only_destructive_commands -v
-```
-
-Esperado: PASS.
-
-- [ ] **Step 5: Comprobar que no se rompió el bloqueo de borrado de ramas**
+- [x] **Step 4: Comprobar que no se rompió el bloqueo existente**
 
 ```bash
 cd /Users/bustaseo/Developer/control-plane-worktrees/hook-enforcement-scope-v1 && python3 -m unittest tests.test_core_hooks -v
 ```
 
-Esperado: todos PASS. En particular `test_branch_deletion_commands_are_denied_by_default` y `test_invalid_hook_modes_fail_closed_to_soft_enforce`, que son el objetivo del PR #26 y no deben cambiar de comportamiento.
+Resultado observado: los 15 tests pasan. En particular permanecen verdes
+`test_branch_deletion_commands_are_denied_by_default`,
+`test_invalid_hook_modes_fail_closed_to_soft_enforce` y los controles de `reset --hard`,
+`clean -f`, push forzado y `rm -rf` ejercitados por la matriz dirigida.
 
-- [ ] **Step 6: Actualizar el test que afirma el contrato viejo**
+- [x] **Step 5: Conservar el ajuste compatibility existente**
 
-En `tests/test_hooks.py`, sustituir el test de las líneas 287-322 por esta versión, que renombra e invierte la afirmación:
+`tests/test_hooks.py` ya contiene
+`test_raw_read_is_advisory_in_soft_enforce_and_in_explicit_audit`; esta reparación no lo
+modifica y lo verifica solo junto con los métodos focales relacionados.
 
-```python
-    def test_raw_read_is_advisory_in_soft_enforce_and_in_explicit_audit(
-        self,
-    ) -> None:
-        from control_plane.hooks import run_hook
+### Reparación tras revisión (ronda 1/2)
 
-        encoded = json.dumps(
-            self.payload(
-                "PreToolUse",
-                tool_name="Bash",
-                tool_input={"command": "git status --short"},
-            )
-        ).encode()
-        with patch.dict(
-            os.environ,
-            {"CODEX_CONTROL_PLANE_HOOK_MODE": "audit"},
-            clear=False,
-        ):
-            audit = json.loads(run_hook(encoded))
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CODEX_CONTROL_PLANE_HOOK_MODE", None)
-            default = json.loads(run_hook(encoded))
+La matriz canónica de seis métodos reprodujo las tres regresiones revisadas con exit `1`,
+`Ran 6 tests` y `12` fallos: concatenaciones estáticas no reconocidas, falsos positivos por
+roles/cancelaciones y expansiones dinámicas aceptadas por el fast path. Sin cambiar esas
+pruebas, la ejecución dirigida terminó con exit `0`, `Ran 6 tests` y `OK`.
 
-        self.assertIn(
-            "CONTROL PLANE RISK",
-            audit["hookSpecificOutput"]["additionalContext"],
-        )
-        self.assertNotIn(
-            "permissionDecision", audit["hookSpecificOutput"]
-        )
-        self.assertNotIn(
-            "permissionDecision", default["hookSpecificOutput"]
-        )
-```
+La auto-revisión añadió tres microciclos sobre la misma clase de defecto: process
+substitution produjo exit `1`, `Ran 2 tests` y `4` fallos antes de quedar verde; la tabla
+completa de opciones con valor produjo exit `1`, `Ran 1 test` y `4` fallos; y las
+cancelaciones `--no-delete` produjeron exit `1`, `Ran 1 test` y `2` fallos. Las dos últimas
+reproducciones pasan tras el parser por roles y estado ordenado. Sobre esos bytes, la matriz
+dirigida terminó con exit `0`, `Ran 6 tests`, y `python3 -m unittest tests.test_core_hooks
+-v` terminó con exit `0`, `Ran 19 tests` y `OK`.
 
-- [ ] **Step 7: Ejecutar la batería de hooks completa**
+### Reparación tras revisión (ronda 2/2)
+
+Cinco métodos canónicos reprodujeron las cuatro regresiones finales con exit `1`, `Ran 5
+tests` y `26` fallos esperados: ocho enmascaramientos dinámicos, cuatro concatenaciones de
+fragmentos citados, un motivo ANSI-C incorrecto, nueve roles de opciones y cuatro prefijos
+de asignación. La misma orden quedó en exit `0`, `Ran 5 tests` y `OK` tras sustituir el
+tokenizador por segmentos raw completos y hacer los clasificadores role-aware.
+
+La auto-revisión produjo tres microciclos RED adicionales: asignaciones con `=` escapado o
+nombre citado (`Ran 1 test`, `2` fallos), ANSI-C con comilla escapada junto a un destructivo
+estático (`Ran 1 test`, `2` fallos), y texto `<(` inerte dentro de comillas dobles de
+`safe-read` (`Ran 1 test`, `1` fallo). Cada reproducción quedó verde sin ampliar la
+gramática. La matriz final de seis métodos terminó con exit `0`, `Ran 6 tests`, y el módulo
+Core completo con exit `0`, `Ran 24 tests` y `OK`.
+
+- [ ] **Step 6: Ejecutar solo los métodos focales del módulo excluido**
 
 ```bash
-cd /Users/bustaseo/Developer/control-plane-worktrees/hook-enforcement-scope-v1 && python3 -m unittest tests.test_core_hooks tests.test_hooks -v 2>&1 | tail -20
+python3 -m unittest -v \
+  tests.test_hooks.HookTests.test_passing_pretool_hook_is_silent \
+  tests.test_hooks.HookTests.test_destructive_pretool_is_denied_by_default \
+  tests.test_hooks.HookTests.test_soft_enforce_can_block_curated_destructive_command \
+  tests.test_hooks.HookTests.test_soft_enforce_warns_but_does_not_claim_mcp_authority \
+  tests.test_hooks.HookTests.test_raw_read_is_advisory_in_soft_enforce_and_in_explicit_audit
 ```
 
-Esperado: todos PASS. Si algún otro test afirma que una lectura o edición se deniega, actualízalo con el mismo criterio y anótalo en el mensaje de commit.
+No ejecutar el módulo completo `tests.test_hooks`: está excluido del gate y contiene fallos
+históricos ajenos a este frente.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 cd /Users/bustaseo/Developer/control-plane-worktrees/hook-enforcement-scope-v1 && git add control_plane/hooks.py tests/test_core_hooks.py tests/test_hooks.py && git commit -m "fix: limit soft-enforce denial to destructive commands
@@ -355,13 +263,14 @@ El motivo del orden: el lock es un fichero trackeado, así que re-vincularlo inv
 vez el sello. Sellar antes del lock obliga a sellar dos veces. Solo hay que tocar `hooks`
 si cambia `.codex/hooks.json`, que este frente no toca.
 
-Se añade como Task 2b más abajo, ya ejecutada.
+Forma parte de Task 2 y se ejecuta antes del footer.
 
 ---
 
 ## Task 2: Declarar el alcance en el threat model y re-vincular el sello
 
 **Files:**
+- Modify: `.codex/control-plane.lock` (solo digest `runtime`)
 - Modify: `docs/security/2026-08-12-control-plane-core-threat-model.md`
 - Test: `tests/test_core_documentation.py` (no se edita; se ejecuta)
 
@@ -391,8 +300,9 @@ del documento:
   `reset --hard`, `clean -f`, `push --force` y `rm -rf`. Lecturas, ediciones, `push` simple
   y comandos no enumerados producen aviso sin bloqueo. El modo `enforce`, explícito, sigue
   denegando toda acción no atestiguada por el host. Residuo aceptado: bajo `soft-enforce` un
-  efecto irreversible que no coincida con `DESTRUCTIVE_PATTERNS` no se bloquea; la contención
-  de esa clase recae en la protección de rama del proveedor y en los gates, no en el hook.
+  efecto irreversible fuera de los segmentos top-level y spellings reconocidos no se
+  bloquea; la contención de esa clase recae en la protección de rama del proveedor y en los
+  gates, no en el hook.
 ```
 
 - [ ] **Step 3: Ejecutar el test documental y comprobar que falla solo por el sello**
@@ -445,7 +355,7 @@ requiere revisión de fondo, solo re-vinculación del digest."
 Antes de considerar el frente terminado:
 
 - [ ] **Frontera respetada.** `git diff --name-only origin/main` debe devolver exactamente:
-  `control_plane/hooks.py`, `tests/test_core_hooks.py`, `tests/test_hooks.py`,
+  `.codex/control-plane.lock`, `control_plane/hooks.py`, `tests/test_core_hooks.py`, `tests/test_hooks.py`,
   `docs/security/2026-08-12-control-plane-core-threat-model.md`,
   `docs/superpowers/plans/2026-08-22-hook-enforcement-scope.md`. Cualquier otra ruta es
   desbordamiento: para y dilo.
