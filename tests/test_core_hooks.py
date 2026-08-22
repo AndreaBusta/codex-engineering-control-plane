@@ -282,6 +282,67 @@ class CoreHookTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "E_HOOK_INPUT_LIMIT"):
             run_hook(b"x" * (MAX_INPUT_BYTES + 1))
 
+    def test_soft_enforce_denies_only_destructive_commands(self) -> None:
+        from control_plane.hooks import run_hook
+
+        advisory_cases = (
+            ("Bash", {"command": "git status --short"}),
+            ("Bash", {"command": "git diff --stat"}),
+            ("Bash", {"command": "rg pattern"}),
+            ("Bash", {"command": "git push origin feature/work"}),
+            ("Bash", {"command": "make build && make test"}),
+            ("Edit", {"file_path": "README.md"}),
+            ("Write", {"file_path": "README.md"}),
+            ("apply_patch", {"input": "*** Begin Patch"}),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = make_repo(Path(temporary) / "repo").resolve()
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CODEX_CONTROL_PLANE_HOOK_MODE", None)
+
+                for tool_name, tool_input in advisory_cases:
+                    with self.subTest(tool=tool_name, input=tool_input):
+                        output = json.loads(
+                            run_hook(
+                                json.dumps(
+                                    {
+                                        "hook_event_name": "PreToolUse",
+                                        "cwd": str(repo),
+                                        "tool_name": tool_name,
+                                        "tool_input": tool_input,
+                                    },
+                                    separators=(",", ":"),
+                                ).encode(),
+                                expected_root=repo,
+                            )
+                        )["hookSpecificOutput"]
+
+                        self.assertNotIn("permissionDecision", output)
+
+                destructive = json.loads(
+                    run_hook(
+                        json.dumps(
+                            {
+                                "hook_event_name": "PreToolUse",
+                                "cwd": str(repo),
+                                "tool_name": "Bash",
+                                "tool_input": {
+                                    "command": "git branch -D feature/old"
+                                },
+                            },
+                            separators=(",", ":"),
+                        ).encode(),
+                        expected_root=repo,
+                    )
+                )["hookSpecificOutput"]
+
+                self.assertEqual(destructive.get("permissionDecision"), "deny")
+                self.assertEqual(
+                    destructive.get("permissionDecisionReason"),
+                    "CONTROL_PLANE_SOFT_ENFORCE: "
+                    "destructive_command_requires_explicit_authority",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

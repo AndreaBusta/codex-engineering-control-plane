@@ -284,7 +284,7 @@ class HookTests(unittest.TestCase):
         self.assertIn("CONTROL PLANE RISK", specific["additionalContext"])
         self.assertNotIn("permissionDecision", specific)
 
-    def test_raw_read_is_denied_by_default_and_advisory_in_explicit_audit(
+    def test_raw_read_is_advisory_in_soft_enforce_and_in_explicit_audit(
         self,
     ) -> None:
         from control_plane.hooks import run_hook
@@ -313,12 +313,8 @@ class HookTests(unittest.TestCase):
         self.assertNotIn(
             "permissionDecision", audit["hookSpecificOutput"]
         )
-        self.assertEqual(
-            default["hookSpecificOutput"].get("permissionDecision"), "deny"
-        )
-        self.assertIn(
-            "raw_read_requires_safe_read",
-            default["hookSpecificOutput"]["permissionDecisionReason"],
+        self.assertNotIn(
+            "permissionDecision", default["hookSpecificOutput"]
         )
 
     def test_oversized_input_fails_closed(self) -> None:

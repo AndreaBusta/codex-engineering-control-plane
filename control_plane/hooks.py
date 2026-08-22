@@ -1416,7 +1416,14 @@ def _hook_warning_result(
 def _untrusted_pretool_reason(
     tool_name: str, tool_input: object, root: Path
 ) -> tuple[str | None, bool]:
-    """Classify only mechanics that cannot be weakened by hook JSON."""
+    """Classify tool effects. Only irreversible ones block under soft-enforce.
+
+    The second element is ``block_without_host``: it denies under
+    ``soft-enforce`` and is reserved for destructive commands, whose recovery
+    is manual or impossible. Every other classification stays advisory so the
+    default mode observes without becoming a wall; ``enforce`` still denies
+    every unattested effect.
+    """
 
     if tool_name == "Bash":
         command = (
@@ -1425,11 +1432,11 @@ def _untrusted_pretool_reason(
             else ""
         )
         if _SHELL_META.search(command):
-            return "ambiguous_shell_command", True
+            return "ambiguous_shell_command", False
         try:
             argv = tuple(shlex.split(command, posix=True))
         except ValueError:
-            return "ambiguous_shell_command", True
+            return "ambiguous_shell_command", False
         if (
             len(argv) >= 5
             and argv[0]
@@ -1453,17 +1460,17 @@ def _untrusted_pretool_reason(
             "show",
             "rev-parse",
         }:
-            return "raw_read_requires_safe_read", True
+            return "raw_read_requires_safe_read", False
         if argv and argv[0] == "rg":
-            return "raw_read_requires_safe_read", True
+            return "raw_read_requires_safe_read", False
         if parsed_git is not None and parsed_git[0][0] == "push":
-            return "git_effect_not_host_attested", True
-        return "unresolved_bash_effect", True
+            return "git_effect_not_host_attested", False
+        return "unresolved_bash_effect", False
     if tool_name in {"Edit", "Write", "apply_patch"}:
-        return "pending_host_authorization_bridge", True
+        return "pending_host_authorization_bridge", False
     if tool_name.startswith("mcp__"):
         return "mcp_use_requires_task_authorization_and_egress_check", False
-    return "unrecognized_tool_effect", True
+    return "unrecognized_tool_effect", False
 
 
 def _task_warning_bindings(
