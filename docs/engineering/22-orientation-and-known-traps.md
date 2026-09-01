@@ -1,6 +1,6 @@
 # Orientación y trampas conocidas
 
-Estado: `GOVERNING_CORE`. Actualizado el 2026-08-20. `authorizes=false`.
+Estado: `GOVERNING_CORE`. Actualizado el 2026-09-01. `authorizes=false`.
 
 Punto de entrada para una tarea que llega sin historia. Responde tres preguntas
 antes de que cuesten tiempo: **dónde trabajar**, **qué es verdad ahora mismo** y
@@ -162,6 +162,36 @@ verdad; no solo el digest.
 
 Git no demuestra qué tareas existen ni cuáles están activas. Antes de retirar un
 worktree, confirma por separado que ninguna tarea viva depende de él.
+
+### 3.6 `__pycache__` en `adoption_enablement/` bloquea el tool de adopción
+
+Dos superficies inventarían ese directorio y exigen que contenga exactamente los
+ocho módulos declarados. Un `__pycache__` las afecta de forma distinta y
+deliberada:
+
+| Superficie | Con `__pycache__` presente |
+|---|---|
+| `bash tests/run.sh` | **Tolerado.** El inventario exime un `__pycache__` que sea directorio real |
+| `scripts/control-plane-adoption` | **Rechazado.** `E_ADOPTION_MODULE_SET: runtime inventory is unsafe`, antes de cualquier lectura de comando |
+
+La asimetría es intencionada. El gate es el comando que `README.md` y
+`AGENTS.md` mandan ejecutar en cada cambio, y el desarrollo normal regenera ese
+directorio; un gate que la actividad ordinaria inutiliza no es un gate. El tool
+de adopción muta repositorios ajenos, se invoca raras veces y nunca escribe
+bytecode: allí un `__pycache__` es prueba de que algo importó el paquete fuera
+del entrypoint endurecido, y negarse es la respuesta correcta.
+
+Quien lo crea es una ejecución directa de Python sobre el paquete, típicamente
+`python3 -m unittest tests.test_adoption_enablement_*` sin `-B`. El gate corre
+con `-B` y `pycache_prefix=/dev/null`, así que él nunca lo genera.
+
+**Regla:** ante `E_ADOPTION_MODULE_SET: runtime inventory is unsafe`, comprueba
+`adoption_enablement/__pycache__` antes de tocar código. Bórralo y reintenta. El
+rechazo es la guarda funcionando, no un defecto.
+
+```bash
+ls -d adoption_enablement/__pycache__ 2>/dev/null && echo "presente: bórralo"
+```
 
 ## 4. Verificación antes de afirmar que esta base pasa
 
