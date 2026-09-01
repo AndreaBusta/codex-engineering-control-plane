@@ -1228,6 +1228,7 @@ def exact_directory_inventory(
     *,
     selected_prefixes: tuple[str, ...],
     expected: set[str],
+    ignored_directories: frozenset[str] = frozenset(),
 ) -> None:
     directory = repository / relative
     before = directory.lstat()
@@ -1246,6 +1247,8 @@ def exact_directory_inventory(
                     fail("E_TEST_MANIFEST", f"inventory exceeds its bound: {relative}")
                 if not any(entry.name.startswith(prefix) for prefix in selected_prefixes):
                     continue
+                if entry.name in ignored_directories and entry.is_dir(follow_symlinks=False):
+                    continue
                 if not entry.is_file(follow_symlinks=False):
                     fail("E_TEST_SOURCE", f"manifest entry is not a regular file: {relative}")
                 observed.add(f"{relative}/{entry.name}")
@@ -1260,6 +1263,7 @@ exact_directory_inventory(
     "adoption_enablement",
     selected_prefixes=("",),
     expected=set(adoption_modules),
+    ignored_directories=frozenset({"__pycache__"}),
 )
 exact_directory_inventory(
     "tests",

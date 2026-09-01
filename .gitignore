@@ -9,3 +9,5 @@ htmlcov/
 .mypy_cache/
 build/
 dist/
+.claude/settings.local.json
+.claude/worktrees/
