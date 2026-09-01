@@ -710,6 +710,60 @@ class CoreVerificationTests(unittest.TestCase):
 
             self.assert_stable_gate_error(completed, "E_TEST_SOURCE")
 
+    def test_runner_tolerates_a_bytecode_cache_in_the_adoption_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = runner_fixture(Path(directory))
+            install_gate_sentinel(repository)
+            cache = repository / "adoption_enablement" / "__pycache__"
+            cache.mkdir(mode=0o755)
+            (cache / f"cli.{sys.implementation.cache_tag}.pyc").write_bytes(b"\x00")
+
+            completed = run_fixture_gate(repository)
+
+            self.assert_stable_gate_error(completed, "E_TEST_SENTINEL")
+
+    def test_runner_rejects_an_undeclared_adoption_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = runner_fixture(Path(directory))
+            install_gate_sentinel(repository)
+            (repository / "adoption_enablement" / "undeclared.py").write_text(
+                "",
+                encoding="utf-8",
+            )
+
+            completed = run_fixture_gate(repository)
+
+            self.assert_stable_gate_error(completed, "E_TEST_MANIFEST")
+
+    def test_runner_rejects_a_bytecode_cache_that_is_not_a_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = runner_fixture(Path(directory))
+            install_gate_sentinel(repository)
+            (repository / "adoption_enablement" / "__pycache__").write_text(
+                "",
+                encoding="utf-8",
+            )
+
+            completed = run_fixture_gate(repository)
+
+            self.assert_stable_gate_error(completed, "E_TEST_MANIFEST")
+
+    def test_runner_rejects_a_symlinked_bytecode_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = runner_fixture(root)
+            install_gate_sentinel(repository)
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir(mode=0o755)
+            (repository / "adoption_enablement" / "__pycache__").symlink_to(
+                elsewhere,
+                target_is_directory=True,
+            )
+
+            completed = run_fixture_gate(repository)
+
+            self.assert_stable_gate_error(completed, "E_TEST_SOURCE")
+
     def test_runner_rejects_undeclared_root_from_import_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
