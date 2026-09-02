@@ -49,7 +49,11 @@ def _inventory(root: Path) -> tuple[str, ...]:
     try:
         with os.scandir(package) as entries:
             for index, entry in enumerate(entries, start=1):
-                if index > 64 or not entry.is_file(follow_symlinks=False):
+                if index > 64:
+                    raise ValueError("E_ADOPTION_MODULE_SET: runtime inventory is unsafe")
+                if entry.name == "__pycache__" and entry.is_dir(follow_symlinks=False):
+                    continue
+                if not entry.is_file(follow_symlinks=False):
                     raise ValueError("E_ADOPTION_MODULE_SET: runtime inventory is unsafe")
                 names.append(entry.name)
     except OSError as error:

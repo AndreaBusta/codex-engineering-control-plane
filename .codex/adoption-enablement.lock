@@ -14,5 +14,5 @@ runtime_modules = [
 ]
 
 [digests]
-entrypoint = "sha256:8d079a27ab94fce929bb9b5b5ed15892b268f1531bb84791f13846e9360e1256"
-runtime = "sha256:3ca092f0d71942dff84076fae03d3cdaa45bc97df7189ae1978c7b3b36e3ffe5"
+entrypoint = "sha256:d58f3dddbf7a5640706ec70e37e2ef618db6a41a424c786f2ff460a2f40f7f42"
+runtime = "sha256:9255efb909b7006c39a1c5a3e04435e5ff02c758ef029608be9cbea57f6a8db9"

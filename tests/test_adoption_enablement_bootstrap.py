@@ -121,6 +121,27 @@ class AdoptionBootstrapTests(unittest.TestCase):
         core_lock = (ROOT / ".codex" / "control-plane.lock").read_text(encoding="utf-8")
         self.assertNotIn("adoption_enablement", core_lock)
 
+    def test_lock_validation_ignores_only_a_real_bytecode_cache_directory(self) -> None:
+        for shape in ("directory", "file", "symlink"):
+            with self.subTest(shape=shape), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                marker = root / "marker"
+                self._fixture(root, marker)
+                cache = root / "adoption_enablement" / "__pycache__"
+                if shape == "directory":
+                    cache.mkdir()
+                    expected = ()
+                elif shape == "file":
+                    cache.write_text("not a directory\n", encoding="utf-8")
+                    expected = ("E_ADOPTION_MODULE_SET",)
+                else:
+                    outside = root / "outside-cache"
+                    outside.mkdir()
+                    cache.symlink_to(outside, target_is_directory=True)
+                    expected = ("E_ADOPTION_MODULE_SET",)
+
+                self.assertEqual(validate_lock(root), expected)
+
     def test_stage0_launcher_opens_every_runtime_leaf_nonblocking(self) -> None:
         source = ENTRYPOINT.read_text(encoding="utf-8")
         read_private = source.split("def read_private(path, maximum, code):", 1)[1]
@@ -252,30 +273,78 @@ class AdoptionBootstrapTests(unittest.TestCase):
             self.assertIs(payload["authorizes"], False)
             self.assertNotIn("Traceback", stdout + stderr)
 
-    def test_bootstrap_rejects_pyc_shadow_extra_symlink_hardlink_and_mode_attacks(self) -> None:
-        for attack in ("pyc", "shadow", "extra", "symlink", "hardlink", "mode"):
+    def test_bootstrap_ignores_a_real_bytecode_cache_without_executing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(strict=True)
+            marker = root / "marker"
+            target = self._fixture(root, marker)
+            malicious = target.read_text(encoding="utf-8").replace("captured", "reopened")
+            self.assertEqual(len(malicious), len(target.read_text(encoding="utf-8")))
+            target.write_text(malicious, encoding="utf-8")
+            fixed = 1_700_000_000
+            os.utime(target, (fixed, fixed))
+            cache = target.parent / "__pycache__" / (
+                f"cli.{sys.implementation.cache_tag}.pyc"
+            )
+            cache.parent.mkdir()
+            py_compile.compile(str(target), cfile=str(cache), doraise=True)
+            target.write_text(
+                malicious.replace("reopened", "captured"),
+                encoding="utf-8",
+            )
+            os.utime(target, (fixed, fixed))
+            cache_header = cache.read_bytes()[:16]
+            metadata = target.stat()
+            self.assertEqual(int.from_bytes(cache_header[4:8], "little"), 0)
+            self.assertEqual(
+                int.from_bytes(cache_header[8:12], "little"),
+                int(metadata.st_mtime),
+            )
+            self.assertEqual(
+                int.from_bytes(cache_header[12:16], "little"),
+                metadata.st_size,
+            )
+
+            completed = self._run(
+                root,
+                environment={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "captured")
+
+    def test_bootstrap_rejects_non_directory_bytecode_cache_entries(self) -> None:
+        for attack in ("file", "symlink"):
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(strict=True)
+                marker = root / "marker"
+                target = self._fixture(root, marker)
+                cache = target.parent / "__pycache__"
+                if attack == "file":
+                    cache.write_text("not a directory\n", encoding="utf-8")
+                else:
+                    outside = root / "outside-cache"
+                    outside.mkdir()
+                    cache.symlink_to(outside, target_is_directory=True)
+
+                completed = self._run(
+                    root,
+                    environment={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                )
+
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn("E_ADOPTION_MODULE_SET", completed.stderr)
+                self.assertFalse(marker.exists())
+
+    def test_bootstrap_rejects_shadow_extra_symlink_hardlink_and_mode_attacks(self) -> None:
+        for attack in ("shadow", "extra", "symlink", "hardlink", "mode"):
             with self.subTest(attack=attack), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve(strict=True)
                 marker = root / "marker"
                 target = self._fixture(root, marker)
                 outside = root / "outside.py"
                 outside.write_text("# outside\n", encoding="utf-8")
-                if attack == "pyc":
-                    malicious = target.read_text(encoding="utf-8").replace("captured", "reopened")
-                    self.assertEqual(len(malicious), len(target.read_text(encoding="utf-8")))
-                    target.write_text(malicious, encoding="utf-8")
-                    fixed = 1_700_000_000
-                    os.utime(target, (fixed, fixed))
-                    cache = target.parent / "__pycache__" / (
-                        f"cli.{sys.implementation.cache_tag}.pyc"
-                    )
-                    cache.parent.mkdir()
-                    py_compile.compile(str(target), cfile=str(cache), doraise=True)
-                    target.write_text(
-                        malicious.replace("reopened", "captured"),
-                        encoding="utf-8",
-                    )
-                elif attack == "shadow":
+                if attack == "shadow":
                     shadow = target.parent / "cli"
                     shadow.mkdir()
                     (shadow / "__init__.py").write_text("raise SystemExit(9)\n", encoding="utf-8")

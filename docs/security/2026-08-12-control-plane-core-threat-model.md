@@ -46,9 +46,11 @@ lie outside the protection of cooperative local controls.
 
 Repository invariants:
 
-1. Validate the exact runtime allowlist, materialization, ownership, and digest
-   before importing runtime modules; extra, missing, symlinked, or drifted bytes
-   fail closed.
+1. Validate the exact executable runtime-source allowlist, materialization,
+   ownership, and digest before importing runtime modules; undeclared, missing,
+   symlinked, or drifted source bytes fail closed. Any explicitly ignored
+   residue stays non-executable: Adoption permits only a real non-symlink
+   `__pycache__` directory and never loads its contents.
 2. Core accepts only `answer` and `local_change`; every remote or publication
    effect remains outside the active runtime.
 3. Durable artifacts never serialize or mint authority and always retain
@@ -142,6 +144,7 @@ Repository invariants:
 | A prompt or document says it authorizes commit, install, push, or release | Confused-deputy external effect | Closed outcomes, policy gates, `authorizes=false`, and no active external executor; a compromised host remains outside the model. |
 | uncustomized governance is mistaken for reviewed project authority, or local audit readiness is presented as adoption | Placeholder defaults, consumer README replacement, or local-only evidence drives an unauthorized target effect | The source-owned four-file pack keeps generic bytes outside the consumer and tests five read-only commands on the supported v1 environment, including local remote/base-ref and HEAD-containment prerequisites that do not prove provider state. Anything else is `UNSUPPORTED / STOP`; project selection, substitutions and target-specific bootstrap remain separate, and every artifact is `authorizes=false`. |
 | A package file is added after the digest is computed | Unreviewed code imports into Core | Exact runtime allowlist and digest before import; filesystem mutation after validation remains residual. |
+| bytecode is planted under `adoption_enablement/__pycache__` | Stale or malicious `.pyc` executes instead of the locked source | The launcher ignores only a real non-symlink cache directory, captures and verifies the eight declared source files, starts isolated Python with `-B` and a `/dev/null` cache prefix, and uses its verified source loader. A file or symlink named `__pycache__`, extra source or any other directory still fails `E_ADOPTION_MODULE_SET`; same-UID filesystem mutation after the final identity check remains residual. |
 | a branch deletion removes the last reachable name for local work | A squash merge plus automatic branch deletion makes an unpushed preservation commit unreachable | The `audit-only` distributed hook warns on recognized forms but cannot block them and claims no shell coverage. Branch protection, the unpublished-work pre-push guard, remote observation and exact human authority are the active controls; the hook remains cooperative and can be omitted by another client. |
 | an unrelated push proceeds while another local branch has unique work and no same-name local remote-tracking ref | Later cleanup or automatic remote-branch deletion loses the only useful copy | The pre-push guard compares exact head/tree evidence, exact local remote-tracking ref names and aggregate reachability, permits the exact publishing ref+OID, and otherwise returns `GG_UNPUBLISHED_UNIQUE_BRANCH`; a same-name tracking ref is an explicit exemption even when behind, while unknown or over-budget evidence fails closed. |
 | a stale local remote-tracking ref is treated as remote proof | Survey or the guard overstates preservation after the server ref changed or disappeared | Both surfaces label the ref inventory local-only and retain the stale-ref residual; authenticated remote observation remains separate and absence of it proves no server state. |
@@ -287,4 +290,4 @@ authority, project bytes, or external state.
   preimage.
 
 Repository: sha256:31d48f56964b98247664973b33d474c0f79ce6e9ac191996c9c6ad4307fe8959
-Version: codex-security-snapshot/v1:sha256:163ffd6c07ec9cf92bff143d2eb3b5b0012446a3308035c9c047727bad438977
+Version: codex-security-snapshot/v1:sha256:a87fdb2d067f8a31c806b1ebf7e03e7785edf763d72d4bed584cf32fc1859025

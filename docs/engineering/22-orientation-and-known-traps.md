@@ -163,34 +163,36 @@ verdad; no solo el digest.
 Git no demuestra qué tareas existen ni cuáles están activas. Antes de retirar un
 worktree, confirma por separado que ninguna tarea viva depende de él.
 
-### 3.6 `__pycache__` en `adoption_enablement/` bloquea el tool de adopción
+### 3.6 `__pycache__` real en `adoption_enablement/` es residuo inerte
 
 Dos superficies inventarían ese directorio y exigen que contenga exactamente los
-ocho módulos declarados. Un `__pycache__` las afecta de forma distinta y
-deliberada:
+ocho módulos declarados. Ambas toleran una única excepción estructural:
+`adoption_enablement/__pycache__` debe ser un directorio real, no un fichero ni
+un symlink. Cualquier otro directorio, un fichero o symlink con ese nombre y
+cualquier fuente extra se rechazan antes de ejecutar; cada superficie conserva
+su diagnóstico propio (`E_ADOPTION_MODULE_SET`, `E_TEST_SOURCE` o
+`E_TEST_MANIFEST`).
 
-| Superficie | Con `__pycache__` presente |
+| Superficie | Con un `__pycache__` real presente |
 |---|---|
-| `bash tests/run.sh` | **Tolerado.** El inventario exime un `__pycache__` que sea directorio real |
-| `scripts/control-plane-adoption` | **Rechazado.** `E_ADOPTION_MODULE_SET: runtime inventory is unsafe`, antes de cualquier lectura de comando |
+| `bash tests/run.sh` | **Tolerado.** El inventario exime solo ese directorio real |
+| `scripts/control-plane-adoption` | **Tolerado e inerte.** El launcher inventaría únicamente los ocho módulos fuente declarados |
 
-La asimetría es intencionada. El gate es el comando que `README.md` y
-`AGENTS.md` mandan ejecutar en cada cambio, y el desarrollo normal regenera ese
-directorio; un gate que la actividad ordinaria inutiliza no es un gate. El tool
-de adopción muta repositorios ajenos, se invoca raras veces y nunca escribe
-bytecode: allí un `__pycache__` es prueba de que algo importó el paquete fuera
-del entrypoint endurecido, y negarse es la respuesta correcta.
+El bytecode no entra en la ruta de ejecución: el launcher captura y verifica los
+bytes fuente declarados antes de cargar, inicia Python aislado con `-B`, dirige
+el prefijo de caché a `/dev/null` y usa su loader verificado. Las pruebas fijan
+que incluso un `.pyc` válido y malicioso no se ejecuta. Un fichero o symlink
+llamado `__pycache__`, una fuente adicional o cualquier otra forma inesperada
+continúan siendo inseguras y se rechazan antes de ejecutar el paquete.
 
-Quien lo crea es una ejecución directa de Python sobre el paquete, típicamente
-`python3 -m unittest tests.test_adoption_enablement_*` sin `-B`. El gate corre
-con `-B` y `pycache_prefix=/dev/null`, así que él nunca lo genera.
-
-**Regla:** ante `E_ADOPTION_MODULE_SET: runtime inventory is unsafe`, comprueba
-`adoption_enablement/__pycache__` antes de tocar código. Bórralo y reintenta. El
-rechazo es la guarda funcionando, no un defecto.
+**Regla:** ante un fallo de inventario, inspecciona la forma observada y busca
+entradas inesperadas; no deduzcas la forma exacta solo del texto de una
+superficie. No borres un `__pycache__` que sea un directorio real para conseguir
+un verde: esa forma es compatible con desarrollo normal y no debe ocultar el
+defecto reproducible.
 
 ```bash
-ls -d adoption_enablement/__pycache__ 2>/dev/null && echo "presente: bórralo"
+find adoption_enablement -maxdepth 1 -mindepth 1 -print | sort
 ```
 
 ## 4. Verificación antes de afirmar que esta base pasa
